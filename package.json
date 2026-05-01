@@ -1,0 +1,23 @@
+{
+  "name": "copilot-cli-extensions",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Five Copilot CLI extensions for multi-model orchestration: triple-duck (parallel critique + consensus), triple-review (iterative code review), triple-plan (parallel planning + judge merge), debate (adversarial 2-model + judge), duck-council (6 role-specialized rubber-ducks + judge synthesis). Each extension returns a markdown instruction packet the calling agent executes via the built-in `task` tool.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/dwenograd/copilot-cli-extensions"
+  },
+  "scripts": {
+    "test": "vitest run --passWithNoTests",
+    "test:watch": "vitest",
+    "test:update": "vitest run -u --passWithNoTests"
+  },
+  "dependencies": {
+    "zod": "3.23.8"
+  },
+  "devDependencies": {
+    "vitest": "^1.6.0"
+  }
+}

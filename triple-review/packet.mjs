@@ -1,0 +1,492 @@
+// triple-review/packet.mjs
+//
+// Composes the markdown protocol packet from pre-processed pieces. Pure
+// function — no SDK imports, no I/O. The handler does all orchestration
+// (validation, scrub, policy wrap, scope resolution, model resolution, budget
+// check, synthesis-model resolution) and passes the prepared pieces to this
+// composer.
+
+import {
+    VALID_SEVERITIES,
+} from "../_shared/index.mjs";
+
+export function buildInstructionPacket({
+    trio,
+    synthesisModel,
+    cheap,
+    focusWrapped,
+    scope,
+    scopeMode,
+    scopePaths,
+    diffCommand,
+    shortstatCommand,
+    maxRounds,
+    severityThreshold,
+    synthCap,
+    budgetBlock,
+    substitutionNote,
+    injectionPreamble,
+    scrubNote,
+    injectionWarnings,
+    subAgentInstruction,
+}) {
+    const isNoGit = scopeMode === "no-git";
+    const modeLine = cheap
+        ? `- **Mode:** cheap (non-1M-context variants — reviewers have ~200k context)\n`
+        : "";
+    const warningsBlock = injectionWarnings && injectionWarnings.length > 0
+        ? `\n${injectionWarnings.map((w) => `> ⚠️ ${w}`).join("\n")}\n`
+        : "";
+    const focusBlock = focusWrapped
+        ? `\n**Focus areas (pass to every reviewer):**\n${focusWrapped}\n`
+        : "";
+    const scopeLine = isNoGit
+        ? `User-specified scope: \`${scope}\` — paths-only mode, no git diff (reviewers \`view\` files directly)`
+        : scope
+            ? `User-specified scope: \`${scope}\` (validated by schema; use the pre-computed commands below)`
+            : "No scope specified — auto-detect per Step 0.2 below";
+    const untrackedCheckScopes = scope === "all-uncommitted" || scope?.startsWith("files:");
+    const untrackedCheckNote = untrackedCheckScopes
+        ? `\n**Untracked-file check (REQUIRED before launching reviewers for this scope):** \`git diff\`-based commands do NOT include untracked files. Run \`git ls-files --others --exclude-standard\` ${scope?.startsWith("files:") ? "filtered to the scope's file paths" : ""} first. If ANY untracked files match the scope, **STOP and tell the user**: "Untracked files exist within the requested scope; \`git diff\` will NOT include them. Either \`git add -N\` them so they appear in the diff, \`git add\` them and use scope=\`staged\`, or accept that the review will silently omit them." Do NOT proceed silently. (TIP: if you want reviewers to see those new files anyway, switch to \`paths:<comma-list>\` scope — it bypasses git entirely.)\n`
+        : "";
+
+    const noGitPathList = isNoGit && scopePaths && scopePaths.length > 0
+        ? scopePaths.map((p) => `  - ${p}`).join("\n")
+        : "";
+
+    const resolvedScopeInstructions = isNoGit
+        ? `**No-git mode (paths-only).** The handler did NOT compute git diff/shortstat commands for this scope. Reviewers will inspect the files listed below using the \`view\` tool. There is no baseline diff — reviewers should report issues with the CURRENT state of these files.
+
+\`\`\`
+diffCommand=<NONE — paths-only mode>
+shortstatCommand=<NONE — paths-only mode>
+filesInScope:
+${noGitPathList}
+\`\`\`
+
+Skip Step 0.3 (diff-size sanity gate) and Step 0.4 (backup snapshot) — there's no diff to size and no commits to back up. Proceed directly to Step 0.5 (cost preview) → Step 0.6 (orchestrator-side diff materialization, also skipped here) → Step 1.`
+        : diffCommand && shortstatCommand
+            ? `The handler already resolved the validated scope. Set:\n\n\`\`\`\ndiffCommand=${diffCommand}\nshortstatCommand=${shortstatCommand}\n\`\`\`\n\nUse these exact command strings. Do NOT derive alternate scope commands.\n${scope?.startsWith("files:") ? "\nNote: for `files:<list>` v1 uses `git diff HEAD -- <files>` rather than staged/unstaged auto-detect; keep the file restriction in later rounds.\n" : ""}${untrackedCheckNote}`
+            : `Auto-detect (run ALL of these in order; do NOT short-circuit):
+  1. Capture STAGED = output of \`git diff --cached --name-only\` (file list).
+  2. Capture UNSTAGED = output of \`git diff --name-only\` (file list).
+  3. Capture UNTRACKED = output of \`git ls-files --others --exclude-standard\` (newly-created files git doesn't track yet — \`git diff\` does NOT include these).
+  4. **DISAMBIGUATION GATE:** If MORE THAN ONE of {STAGED, UNSTAGED, UNTRACKED} is non-empty, **STOP and ASK the user** which scope to use (or whether to combine them). Do not silently pick one — silently picking either side has surprised users.
+  5. **If UNTRACKED is the only non-empty set:** STOP and tell the user "Untracked files exist (\${UNTRACKED}) but no diff to review. Either \`git add\` them (then re-run), \`git add -N\` them so they appear in \`git diff\`, or paste the relevant content into a triple-duck invocation instead." Do NOT fall through to \`git show HEAD\` — that would silently review the wrong thing.
+  6. If STAGED is the only non-empty set → diffCommand=\`git diff --cached\`, shortstatCommand=\`git diff --cached --shortstat\`.
+  7. Else if UNSTAGED is the only non-empty set → diffCommand=\`git diff\`, shortstatCommand=\`git diff --shortstat\`.
+  8. Else (all three empty) fall back to last commit. diffCommand=\`git show HEAD\`, shortstatCommand=\`git show --shortstat --format= HEAD\`.
+  9. If clean tree with no recent diff and no untracked files, **STOP and tell the user** to specify a scope or make changes.`;
+    const synthCapLine = Number.isInteger(synthCap) && synthCap > 0
+        ? `\nGLOBAL SYNTHESIS CAP: enforce a maximum of ${synthCap} synthesis calls per round, INCLUDING both Step 1d (3/3 auto-apply) AND Step 1e (manual-accept) calls. Track \`synthesisCallsThisRound\` starting at 0; before EVERY synthesis call (1d or 1e), check \`synthesisCallsThisRound + 1 <= ${synthCap}\`. If exceeded: in 1d, demote excess 3/3 clusters to user-approval flow (1e); in 1e, refuse new accept-synthesis calls and tell the user "synthesis cap reached for this round; defer remaining findings or rerun next round." Synthesis retries DO count against the cap.`
+        : "";
+    const sevIndex = VALID_SEVERITIES.indexOf(severityThreshold);
+
+    return `# TRIPLE-REVIEW PROTOCOL
+
+${budgetBlock}
+${substitutionNote ? substitutionNote + "\n" : ""}${scrubNote ? scrubNote + "\n" : ""}${warningsBlock}
+${injectionPreamble}
+
+You invoked \`triple-review\`. This is a multi-round, multi-model code review.
+Execute the following protocol exactly. Each step has explicit gates — do not
+skip them. Maintain the following state across rounds in your own reasoning:
+
+  - resolvedScope (file list of files under review, set in Step 0)${isNoGit ? `` : `
+  - diffCommand (exact git command producing the diff, set in Step 0)
+  - shortstatCommand (companion command for size measurement, set in Step 0)
+  - preReviewHead (git rev-parse HEAD before any modifications, set in Step 0.4)
+  - backupSha (git stash-create SHA or empty if clean tree, set in Step 0.4)`}
+  - round (1..${maxRounds})
+  - clustersByRound[N] = list of {clusterId, files, lines, rootCause, severity, status}
+      where status ∈ {auto-applied, accepted, rejected, deferred, open}
+  - rejectedClusterIds (carry across rounds — never re-flag)
+  - deferredClusterIds (carry across rounds — pass to reviewers as context)
+  - actualPremiumCalls (counter for honest cost reporting)${isNoGit ? `
+
+(Paths-only mode: \`diffCommand\`, \`shortstatCommand\`, \`preReviewHead\`, and \`backupSha\` are NOT set in this run — Steps 0.3 and 0.4 are skipped, and Step 1's reviewers \`view\` files directly.)` : ``}
+
+## Configuration
+
+- **Reviewer models:** ${trio.join(", ")}
+${modeLine}- **Synthesis model (for 3/3 patch merging):** ${synthesisModel}
+- **Max rounds:** ${maxRounds}
+- **Severity threshold:** ${severityThreshold} (severities ranked: ${VALID_SEVERITIES.join(" > ")})
+- **Scope:** ${scopeLine}
+${focusBlock}---
+
+## Step 0 — Pre-flight
+
+### 0.1 Verify git repo (SKIP in paths-only mode)
+
+${isNoGit
+    ? `**SKIP this step.** Paths-only mode does not require a git repo (it's the no-git mode introduced for reviewing non-git directories like the extensions workspace itself). Proceed directly to Step 0.2.`
+    : `Run \`git rev-parse --is-inside-work-tree\`. If not in a git repo, **STOP and tell the user** (and suggest \`scope: "paths:<comma-list>"\` if they wanted to review a non-git directory).`}
+
+### 0.2 Resolve scope
+${resolvedScopeInstructions}
+${isNoGit ? `` : `
+Record \`resolvedScope\` (file list from \`<diffCommand> --name-only\` where supported; for \`git show\`, derive file list from \`--name-only --format=\`), \`diffCommand\`, and \`shortstatCommand\`. These three are the canonical scope state — do NOT invent a single \`baseRef\` for use elsewhere.`}
+
+### 0.3 Diff-size sanity gate
+${isNoGit
+    ? `**SKIP this step.** Paths-only mode has no diff to size. The cost preview in Step 0.5 will still warn if the worst-case call count is large.`
+    : `Run \`<shortstatCommand>\` (the exact command resolved in 0.2). Parse the line count.
+- **>1500 lines:** Warn the user this is a large review (worst-case ~${maxRounds * (6 + synthCap)} premium calls). **ASK** to continue.
+- **<30 lines:** Force \`max_rounds=1\` for this run (don't iterate trivially small reviews). Tell the user.`}
+
+### 0.4 Backup snapshot (non-destructive)
+${isNoGit
+    ? `**SKIP this step.** Paths-only mode does not create a backup (no git, no commits to back up). **WARNING:** if Step 1d/1e auto-applies any edits, they will NOT be recoverable through this protocol — the orchestrator should warn the user explicitly before approving any auto-apply, and prefer the manual-accept flow (1e) over auto-apply (1d) in this mode.`
+    : `**Do NOT use \`git stash push\`** — it modifies the working tree (with \`-u\` it captures untracked, without \`--keep-index\` it removes unstaged, with both flags it still removes unstaged content and would hide the very content the reviewers need to see).
+
+Instead:
+\`\`\`
+preReviewHead=$(git rev-parse HEAD)
+backupSha=$(git stash create)   # creates a stash COMMIT without modifying tree; outputs SHA or empty
+if [ -n "$backupSha" ]; then
+    git update-ref refs/triple-review/backup-<round-1-timestamp> "$backupSha"
+fi
+\`\`\`
+On Windows PowerShell, the equivalent:
+\`\`\`powershell
+$preReviewHead = (git rev-parse HEAD).Trim()
+$backupSha = (git stash create).Trim()
+if ($backupSha) { git update-ref refs/triple-review/backup "$backupSha" }
+\`\`\`
+Capture both \`preReviewHead\` and \`backupSha\` (may be empty if clean tree). Store both for the final report.`}
+
+### 0.5 Cost preview
+Tell the user, BEFORE round 1:
+\`\`\`
+Triple-review starting:
+  Scope: <resolvedScope summary>
+  Reviewers: ${trio.join(", ")}
+  Max rounds: ${maxRounds}
+  Worst-case cost: ${maxRounds * (6 + synthCap)} premium calls (${maxRounds * 3} reviewers + up to ${maxRounds * 3} reviewer retries + up to ${maxRounds * synthCap} synthesis calls — synthesis cap is GLOBAL per round and includes retries)
+${isNoGit
+    ? `  Backup: <NONE — paths-only mode skipped Step 0.4; auto-applied edits in this run are NOT recoverable through this protocol. The orchestrator MAY still proceed but should warn the user before any Step 1d auto-apply.>`
+    : `  Backup: <backupSha or "none (clean tree)"> @ HEAD <preReviewHead>`}
+\`\`\`
+
+### 0.6 Materialize the diff snapshot (orchestrator-side; SKIP in paths-only mode)
+
+${isNoGit
+    ? `**SKIP this step.** Paths-only mode does not produce a diff. Reviewers will \`view\` the canonical files listed in Step 0.2.`
+    : `Run \`<diffCommand>\` ONCE in the orchestrator and write the output to a file. Pass that absolute path to reviewers in Step 1a as \`diffSnapshotPath\`. **Do NOT pipe the diff through \`Select-Object -First N\` or any truncating consumer** — that's the exact pattern that has hung sub-agent shells indefinitely (PowerShell pipelines don't always propagate stop-upstream to native processes; git can block on full stdout buffer waiting for a downstream read that never happens).
+
+Use a fully-draining redirect:
+
+\`\`\`powershell
+$diffPath = Join-Path $env:TEMP "triple-review-round-$round-$([guid]::NewGuid().ToString('N').Substring(0,8)).diff"
+${diffCommand || "<diffCommand>"} | Out-File -Encoding utf8 -FilePath $diffPath
+# Or, for very large diffs, use Set-Content with -Raw to avoid line-by-line buffering:
+# (& <diffCommand>) -join "\`n" | Set-Content -Path $diffPath -Encoding utf8 -NoNewline
+\`\`\`
+
+\`Out-File\` reads the entire stream synchronously and writes to disk — no truncation, no upstream block, no zombie git process.
+
+Pass \`$diffPath\` (the absolute path) to reviewers as \`diffSnapshotPath\` in Step 1a. They will \`view\` it via the file-reading tool, NOT shell out to git themselves. If the diff is empty (zero changes for the resolved scope), STOP and tell the user there's nothing to review.`}
+
+---
+
+## Step 1 — Round loop (round = 1; loop while not stopped)
+
+### 1a. Launch 3 parallel code-review agents
+
+**CRITICAL:** Emit all three \`task\` calls in a SINGLE response (one tool-calls block, no narration between them). Sequential calls = serial latency = wasted time.
+
+For each model in [${trio.map(m => `"${m}"`).join(", ")}]:
+
+\`\`\`
+task(
+  agent_type="code-review",
+  mode="sync",
+  model=<this model>,
+  name="reviewer-r<round>-<model-shortname>",
+  description="Triple-review round <round> reviewer",
+  prompt=<see template below>
+)
+\`\`\`
+
+Increment \`actualPremiumCalls\` by 3.
+
+**Reviewer prompt template (same for all 3):**
+\`\`\`
+You are 1 of 3 INDEPENDENT reviewers. Disagreement is valuable — do NOT
+anticipate or echo the others. You will not see their outputs.
+
+# Code under review
+Files in scope (absolute paths — \`view\` requires absolute, and the handler resolves relative paths against the orchestrator's cwd before reaching this packet):
+<one resolvedScope path per line>
+
+Diff snapshot (read with the \`view\` tool to see the unified diff):
+<diffSnapshotPath OR "n/a — paths-only mode, read files directly">
+
+# Inspection — STRICT TOOLING RULES
+- Use the \`view\` tool to read file contents and the diff snapshot. Use \`grep\`/\`glob\` for searching.
+- **DO NOT run \`git diff\`, \`git show\`, \`git log -p\`, \`git status\`, or any \`git\` command via the powershell/bash tool.** All needed git output has been pre-materialized into the diff snapshot above (or is unnecessary in paths-only mode).
+- **DO NOT pipe long-output commands to \`Select-Object -First N\`** or any truncating consumer in PowerShell. PowerShell pipelines do not always propagate stop-upstream signals to native processes; the upstream process can block on full stdout buffer indefinitely. (This pattern caused 5+ hung shells in past sessions; the diff snapshot exists specifically to remove the need for it.)
+- If you need targeted git context (e.g., blame for one line, the history of a function), report the request as a Finding instead of running it yourself. The orchestrator can run it on your behalf in a controlled context.
+
+Consider full file context (not only diff lines). Read surrounding code as
+needed to understand intent.
+
+# Constraints
+- DO NOT modify files. DO NOT run formatters. DO NOT stage changes.
+- Report findings ONLY.
+- Skip style/formatting/trivial nits.
+${focusWrapped ? "- Focus areas: use the focus USER_INPUT envelope from the packet verbatim; do not strip its markers." : ""}
+- ${subAgentInstruction}
+
+# Round-specific context
+${"<INJECT FOR ROUND 2+:>"}
+Previously auto-applied fixes (verify they are correct — flag if not). ${isNoGit
+    ? `**No diff snapshot exists** — paths-only mode runs without a baseline diff. Re-\`view\` the absolute file paths listed under "Files in scope" above to see the current state, including any edits applied in round 1.`
+    : `Round-N+1 diff snapshot path: \`<diffSnapshotPath-N+1>\`. Read it with \`view\` (do NOT shell out).`}
+
+Previously deferred findings (do NOT re-flag unless materially worse):
+<bulleted list of deferredClusterIds with one-line summaries>
+
+Previously rejected findings (do NOT re-flag at all):
+<bulleted list of rejectedClusterIds with one-line summaries>
+
+# Output format (STRICT — use this exact markdown structure)
+### Finding 1
+- **Title:** <one line>
+- **Severity:** critical|high|medium|low|nit
+- **Location:** path/to/file.ext:LINE or LINE-LINE
+- **Issue:** <2-4 sentence explanation of the bug or risk>
+- **Fix:** <preferred: before/after code blocks; acceptable: prose>
+
+### Finding 2
+...
+\`\`\`
+
+### 1b. Reviewer-failure handling
+For each of the 3 reviewer calls:
+- If the call failed (error, timeout) OR returned UNPARSEABLE output (neither numbered \`### Finding N\` blocks NOR an explicit "no findings" sentinel like \`### No findings\` / "No significant issues found"):
+  - **Retry that one reviewer once** (count it in actualPremiumCalls).
+  - If still failing: mark this round **advisory-only** (no auto-apply this round). Note the failed model in the final report.
+
+A clean "no findings" response is a SUCCESSFUL review (zero findings to cluster), not a failure — do not retry it.
+
+If fewer than 2 reviewers returned valid output: skip auto-apply, present everything to user, do NOT iterate (treat as terminal).
+
+### 1c. Cluster findings
+
+For each finding from each reviewer, build clusters using these RULES:
+
+Two findings cluster together if ALL of:
+1. Same file path (after path normalization).
+2. Line ranges overlap OR start-lines within ±10.
+3. Root-cause keywords overlap (case-insensitive token overlap on Issue text — at least 2 shared content words excluding stopwords).
+
+Each cluster has:
+- \`clusterId\`: stable hash of (file + normalized issue keywords)
+- \`reviewers\`: which of the 3 contributed (drives consensus level)
+- \`severity\`: **MAX** across member findings (per validated design choice)
+- \`fixes\`: array of suggested fix texts from each reviewer
+
+Tag consensus level: **3/3** (all 3 reviewers), **2/3** (two), **1/3** (single).
+
+### 1d. Synthesize and auto-apply 3/3 fixes
+
+For each 3/3 cluster:
+
+**1d-i. Conflict pre-check.** If any two of the three suggested fixes touch overlapping line ranges with materially different replacement text → mark cluster "contested," demote to user-approval flow (1e), skip synthesis.
+
+**1d-ii. Synthesis call.** Otherwise, launch a single synthesis agent.${synthCapLine}
+
+\`\`\`
+task(
+  agent_type="general-purpose",
+  mode="sync",
+  model="${synthesisModel}",
+  name="synth-<clusterId>",
+  description="Synthesize canonical patch for 3/3 cluster",
+  prompt=<see synthesis template>
+)
+\`\`\`
+
+Increment \`actualPremiumCalls\` by 1.
+
+**Synthesis prompt template:**
+\`\`\`
+Three independent reviewers identified the same issue and proposed fixes.
+Produce ONE canonical patch addressing the consensus root cause.
+
+# Cluster
+File: <path>
+Lines: <range>
+Severity: <max severity>
+Root cause: <issue summary, derived from Title/Issue text of all 3>
+
+# Reviewer-proposed fixes
+Reviewer 1 (${trio[0]}): <fix1>
+Reviewer 2 (${trio[1]}): <fix2>
+Reviewer 3 (${trio[2]}): <fix3>
+
+# Output format (STRICT)
+Either:
+
+  PATCH
+  <unified diff OR before/after blocks with EXACT current file content as "before">
+
+OR (if the three fixes are semantically incompatible):
+
+  CONFLICT: <one-sentence reason>
+
+Constraints:
+- The "before" block must EXACTLY match current file content (you can read the
+  file to verify).
+- Patch must be minimal — address ONLY the consensus root cause, no drive-by
+  refactoring.
+- Do not introduce new dependencies.
+\`\`\`
+
+**1d-iii. Validate and apply.**
+- If synthesis returned \`CONFLICT:\` → demote to user-approval (1e).
+- **If synthesis returned NEITHER a parseable \`PATCH\` block (with before/after content or unified diff) NOR a line starting with \`CONFLICT:\` → retry the synthesis call once with a stricter prompt ("Output MUST start with literal token PATCH or CONFLICT:"). If still malformed, treat as \`CONFLICT: synthesis returned unparseable output\`, demote to user-approval, note in final report.**
+- Read the target file. Verify the patch's "before" block matches current content EXACTLY. If not → demote to user-approval.
+- **Show the user the synthesized diff** (full diff, not summary). Then apply it via \`edit\`.
+- Mark cluster status = \`auto-applied\`.
+
+**1d-iv. (deprecated section — see 1e-post below for the unified validation gate.)**
+The validation gate has been pulled out into its own structurally-separate Step 1e-post that runs unconditionally after both 1d and 1e, regardless of whether 1e produced any work. Do NOT treat this section as a no-op slot — implementations should run validation in Step 1e-post.
+
+### 1e. Present 2/3 and 1/3 findings (and demoted 3/3 contested findings)
+
+Cap at top 10 findings per round, sorted by:
+1. severity (critical > high > medium > low > nit)
+2. consensus (3/3 > 2/3 > 1/3)
+
+Auto-defer the rest into final report (mark status = \`deferred\`, add to \`deferredClusterIds\`).
+
+If there are zero findings to present (all clusters were 3/3 and auto-applied in 1d, or every cluster was already triaged in 1d), Step 1e is a no-op for this round — proceed directly to Step 1e-post.
+
+For each presented finding, batched per file, ask the user: **accept / reject / defer**.
+- accept → run synthesis (1d-ii) on this single cluster's fixes (use whichever 1-2 reviewers proposed fixes), verify before-block matches, apply via \`edit\`. **Counts against the GLOBAL SYNTHESIS CAP (Step 1d-ii); if the cap is exhausted, refuse the accept and ask the user to defer it instead.** Mark status = \`accepted\`.
+- reject → mark status = \`rejected\`, add clusterId to \`rejectedClusterIds\` (never re-flag).
+- defer → mark status = \`deferred\`, add to \`deferredClusterIds\` (carry forward as reviewer context).
+
+### 1e-post. Validation gate (UNCONDITIONAL — runs every round if any fix was applied)
+
+This is the gate that catches build-breaking patches. Trigger condition:
+- **RUN if** \`(any 3/3 cluster was auto-applied in 1d this round) OR (any 1e accept-synthesis was applied this round)\`.
+- **SKIP if** zero fixes were applied this round (no auto-applies AND no accepts) — there's nothing to validate.
+
+This runs OUTSIDE Step 1e on purpose. If clustering produced only 3/3 clusters with no demotions, Step 1e is a no-op — but Step 1e-post still runs.
+
+Discover and run available targeted validation. Try in order, use first available:
+- Node/TS: \`npm run typecheck\` or \`tsc --noEmit\` or \`npm test -- --bail\` (focused on changed files)
+- Python: \`pytest -k <related>\` or \`python -m mypy <files>\`
+- Go: \`go build ./...\` or \`go test <package>\`
+- Rust: \`cargo check\`
+- C#/.NET: \`dotnet build\`
+
+If validation FAILS:
+- **STOP the loop.** Do not proceed to Step 1f / next round.
+- Report: which patch likely caused the failure (last-applied — could be from 1d or 1e), the validation output, and the restore command.
+
+**If NO validator is discoverable at all** (e.g., docs repo, shell scripts, unknown stack):
+- Mark this round's validation status = \`skipped — no validator available\`.
+- **ASK the user**: "No automated validator was discovered for this codebase. Continue to next round (validation gate disabled), or stop now?" Default: stop conservatively.
+
+### 1f. Stopping criteria
+
+A cluster's effective status at this point is one of: \`auto-applied\`, \`accepted\`, \`rejected\`, \`deferred\`. There is no leftover \`open\` state — every cluster has been triaged in 1d or 1e.
+
+The "still problematic" set after this round is **\`deferredClusterIds\`** (user wants to think about it later) plus any clusters that were demoted-but-not-applied in 1d (synthesis failure, before-block mismatch, contested fixes — these go through 1e and end up accepted/rejected/deferred too).
+
+Compute:
+- \`unresolved_this_round\` = clusters with status ∈ {\`deferred\`}
+- \`max_unresolved_severity\` = MAX severity across \`unresolved_this_round\` (or "none" if empty)
+- \`new_clusters_this_round\` = clusters this round that do NOT match any cluster from round N-1's UNRESOLVED set (deferred ∪ rejected from prior round), using the clustering rules from 1c **with line-shift adjustment** (see note below)
+
+**STOP** if EITHER:
+\`\`\`
+  round >= ${maxRounds}
+\`\`\`
+OR
+\`\`\`
+  ( max_unresolved_severity is below "${severityThreshold}" in the order ${VALID_SEVERITIES.join(" > ")} )
+  AND
+  ( new_clusters_this_round is empty )
+\`\`\`
+
+(The first ORed clause is a hard cap; the second is the early-stop conjunction. Severity index for the configured threshold is ${sevIndex}.)
+
+**Line-shift note for cross-round matching:** Round 1 auto-applied edits will shift line numbers in modified files. When checking if a round N+1 cluster "matches" a round N cluster:
+- Same file path is required.
+- For lines: if the cluster is in a file modified in any prior round, treat the ±10 line-proximity as ±50 OR fall back to "same enclosing function/symbol if AST-discoverable, else loose Issue-text similarity." Do NOT rely on raw line numbers as the only matching signal across rounds.
+- If still ambiguous, prefer marking as "matched (carry-forward)" rather than "new" — false-negatives on novelty are safer than infinite loops.
+
+Otherwise: \`round += 1\`, go to 1a.
+
+**Round 2+ scope handling — CRITICAL.** ${isNoGit
+    ? `In paths-only mode, there is no \`diffCommand\` — reviewers re-\`view\` the same \`resolvedScope\` file list (which now reflects round-1 auto-applied edits and any manually-accepted patches). When you launch round 2+ reviewers, give them the SAME \`resolvedScope\` paths but tell them explicitly: "Files have been modified since round 1 — re-read with the \`view\` tool to see current content." If you want them to focus on changes specifically, list which files were modified during round 1 (you can derive this from the cluster log). No \`diffCommand\` adjustment is needed because there is no diff.`
+    : `The \`diffCommand\` from Step 0.2 may NOT see auto-applied edits depending on scope. Adjust per scope before launching round 2+ reviewers:
+- **staged:** auto-applied edits are in the working tree, not the index. Either (a) re-stage modified files with \`git add <changed files>\` so \`git diff --cached\` reflects them, OR (b) for round 2+, switch \`diffCommand\` to \`git diff --cached HEAD -- <resolvedScope files>\` ∪ \`git diff -- <resolvedScope files>\` (both indexed and unstaged of the original file set).
+- **unstaged / all-uncommitted:** auto-applied edits are also unstaged → \`diffCommand\` continues to work as-is.
+- **branch:\\<base\\>:** the round-1 \`git diff <base>...HEAD\` uses the merge-base. Round 2+ MUST also use the merge-base, NOT the raw base ref — \`git diff <base> -- <files>\` would pull in unrelated base-branch changes on diverged branches. Compute \`MERGE_BASE = $(git merge-base <base> HEAD)\` ONCE in Step 0 and use \`git diff $MERGE_BASE -- <resolvedScope files>\` in round 2+.
+- **commit:\\<sha\\>:** original review was of \`git show <sha>\` which is \`git diff <sha>^ <sha>\` — i.e., the commit's CHANGES, not the commit's post-state. Round 2+ must compare the current working tree against the commit's PARENT (the pre-image), not the commit itself. Compute \`COMMIT_PARENT = $(git rev-parse <sha>^)\` ONCE in Step 0 (or use \`<sha>~1\` for non-merge commits; for root commits with no parent, use \`git diff --root <sha> -- <files>\` or fall back to \`git show <sha>\`). Then round 2+ uses \`git diff $COMMIT_PARENT -- <resolvedScope files>\` — this preserves the original review's intent (comparing against the pre-state) while picking up auto-applied fixes in the working tree.
+- **files:\\<list\\>:** keep the file restriction; choose the round 2+ command from one of the above based on the original base (v1 default is HEAD).
+
+Document the new \`diffCommand\` to round 2+ reviewers explicitly.`}
+
+---
+
+## Step 2 — Final report
+
+Present this to the user:
+
+\`\`\`
+## Triple-Review Complete
+
+**Scope:** <resolvedScope summary>
+**Rounds:** <N> / ${maxRounds}
+**Stopped because:** <max_rounds | clean threshold + no new findings | validation failure | reviewer failure>
+
+### Auto-applied (3/3 consensus + synthesized + validated)
+- <file:line> — <title> [<severity>]
+- ...
+(<count> total)
+
+### Manually accepted
+- ...
+
+### Deferred (open, not addressed)
+- <file:line> — <title> [<severity>] — _<deferral reason or "user deferred">_
+- ...
+
+### Rejected (suppressed by user)
+- <file:line> — <title> — _<user comment if any>_
+- ...
+
+### Validation status
+- Round 1: <pass | fail | skipped — <reason>>
+- Round 2: ...
+- ...
+
+### Cost
+- Reviewer calls: <count>
+- Synthesis calls: <count>
+- **Total premium calls: <actualPremiumCalls>**
+
+### Restore
+${isNoGit
+    ? `**No restore available.** Paths-only mode skipped Step 0.4 (no git, no backup snapshot). If round 1d/1e auto-applied edits and you want to undo them, you must rely on whatever VCS or backup system you had in place before invoking triple-review (or use editor undo, OS file history, etc.). Future runs of triple-review with a non-paths scope on a git repo will create a recoverable backup automatically.`
+    : `To undo all changes from this triple-review session:
+  # 1. Discard all working-tree changes back to pre-review HEAD:
+  git reset --hard <preReviewHead>
+  # 2. If a backup snapshot was created (uncommitted state existed pre-review), restore it:
+  git stash apply <backupSha>      # only if backupSha is non-empty
+  # 3. Optional cleanup: drop the backup ref:
+  git update-ref -d refs/triple-review/backup`}
+\`\`\`
+
+---
+
+**Begin Step 0 now. Do not summarize this protocol back to the user — execute it.**`;
+}
