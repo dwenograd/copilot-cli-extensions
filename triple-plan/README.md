@@ -46,7 +46,7 @@ Don't use for trivial single-file edits — overkill.
 - **Worst case:** 8 premium calls (3 planners + up to 3 planner retries + 1 judge + 1 judge retry)
 - The orchestrator only invokes the judge if ≥2 planners succeeded.
 
-Use `cheap: true` for ~23% planner-cost savings with 200k context instead of 1M (judge stays high-quality unless you also pass `judge: "..."`).
+Use `cheap: true` for ~23% planner-cost savings with 200k context instead of 1M. **In cheap mode the judge ALSO defaults to a non-1M-context model** (`claude-opus-4.7`, ~200k); if you have plans large enough to need 1M context for the judge, pass `judge: "..."` explicitly to override.
 
 ## Defaults
 

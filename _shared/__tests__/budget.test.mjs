@@ -48,6 +48,22 @@ describe("checkBudget", () => {
         expect(debateError).toContain("17");
         expect(debateError).toContain("5");
     });
+
+    it("emits tool-aware knob hints in the rejection error (post-publish duck-council finding)", () => {
+        // Pre-fix: every rejection said "lower max_rounds/rounds". Tools
+        // like triple-duck/triple-plan/duck-council don't have those knobs,
+        // so users were being directed to nonexistent parameters. Each
+        // tool's hint should now name the right knob (or admit there isn't one).
+        expect(checkBudget("triple-review", { max_premium_calls: 1 })).toMatch(/lower `max_rounds`/);
+        expect(checkBudget("debate", { max_premium_calls: 1 })).toMatch(/lower `rounds`/);
+        expect(checkBudget("duck-council", { max_premium_calls: 1 })).toMatch(/`skip_judge: true`/);
+        // Triple-duck and triple-plan have no rounds knob — honest about that.
+        expect(checkBudget("triple-duck", { max_premium_calls: 1 })).toMatch(/worst case is fixed/);
+        expect(checkBudget("triple-plan", { max_premium_calls: 1 })).toMatch(/worst case is fixed/);
+        // None of them should still mention the misleading "max_rounds/rounds" combo.
+        expect(checkBudget("triple-duck", { max_premium_calls: 1 })).not.toMatch(/max_rounds\/rounds/);
+        expect(checkBudget("triple-plan", { max_premium_calls: 1 })).not.toMatch(/max_rounds\/rounds/);
+    });
 });
 
 describe("renderBudgetBlock", () => {

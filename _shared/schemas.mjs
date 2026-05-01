@@ -16,6 +16,32 @@ import {
     CHEAP_COUNCIL_JUDGE,
 } from "./models.mjs";
 
+// Credential-storage path patterns. These are the SAME high-confidence path
+// patterns enforced by `_shared/policy.mjs` HARD_BLOCK_PATTERNS on free-text
+// fields like `topic` / `context` / `focus`. Mirrored here (rather than
+// imported) because schema validation runs before policy wrapping; we want
+// `paths:`/`files:` scope entries blocked at parse time so the failure
+// message is structurally part of the schema error rather than emerging
+// later from the policy layer. Keep the two lists in sync if either changes.
+const CREDENTIAL_PATH_PATTERNS = [
+    { label: "~/.ssh", pattern: /~[/\\]\.ssh/i },
+    { label: ".ssh/", pattern: /\.ssh[/\\]/i },
+    { label: "id_rsa", pattern: /id_rsa/i },
+    { label: "id_ed25519", pattern: /id_ed25519/i },
+    { label: "id_ecdsa", pattern: /id_ecdsa/i },
+    { label: "id_dsa", pattern: /id_dsa/i },
+    { label: "~/.aws/credentials", pattern: /~[/\\]\.aws[/\\]credentials/i },
+    { label: "~/.aws/config", pattern: /~[/\\]\.aws[/\\]config/i },
+    { label: ".aws/credentials", pattern: /\.aws[/\\]credentials/i },
+    { label: ".aws/config", pattern: /\.aws[/\\]config/i },
+    { label: ".npmrc", pattern: /\.npmrc/i },
+    { label: "kubeconfig", pattern: /kubeconfig/i },
+];
+
+function pathLooksLikeCredentialStore(path) {
+    return CREDENTIAL_PATH_PATTERNS.find(({ pattern }) => pattern.test(path));
+}
+
 const FREE_TEXT_CAP = 65536;
 const SEVERITIES = ["critical", "high", "medium", "low", "nit"];
 
@@ -122,6 +148,12 @@ function validateScope(scope) {
         // diff against HEAD; `paths:` produces NO diff and reviewers `view`
         // the files directly (used when there's no useful baseline OR to
         // sidestep the sub-agent-spawned-shell hang pattern).
+        //
+        // Credential-store paths are blocked HERE (in addition to the
+        // free-text policy layer) because reviewers will `view` the file
+        // contents directly and ship them to 3 third-party model providers
+        // — exfiltration. The block is on the path string, not the file
+        // contents, so the rejection happens at parse time.
         const prefix = scope.startsWith("files:") ? "files:" : "paths:";
         const rawList = scope.slice(prefix.length);
         if (!rawList.trim()) {
@@ -131,7 +163,8 @@ function validateScope(scope) {
             const path = rawPath.trim();
             return path.length > 0
                 && filePathRe.test(path)
-                && !hasParentSegment(path);
+                && !hasParentSegment(path)
+                && !pathLooksLikeCredentialStore(path);
         });
     }
 

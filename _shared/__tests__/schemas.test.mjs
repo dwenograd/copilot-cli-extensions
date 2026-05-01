@@ -159,6 +159,33 @@ describe("shared zod schemas", () => {
         expectInvalid(tripleReviewSchema.safeParse({ scope: "paths:../../../etc/passwd" }), "scope must be one of");
     });
 
+    it("rejects credential-store paths in paths:/files: scope (post-publish duck-council finding — exfiltration)", () => {
+        // Reviewers `view` paths-only entries directly and ship the file
+        // contents to 3 third-party model providers. The duck-council
+        // recursive review surfaced that paths:/files: scope was bypassing
+        // the same credential-path block enforced on free-text fields.
+        const credentialPaths = [
+            "paths:~/.ssh/id_rsa",
+            "paths:.ssh/id_ed25519",
+            "paths:C:\\Users\\me\\.ssh\\id_rsa",
+            "paths:~/.aws/credentials",
+            "paths:.aws/config",
+            "paths:src/legit.js,~/.ssh/id_rsa",
+            "files:~/.aws/credentials",
+            "files:.npmrc",
+            "paths:./kubeconfig",
+        ];
+        for (const scope of credentialPaths) {
+            expectInvalid(
+                tripleReviewSchema.safeParse({ scope }),
+                "scope must be one of",
+            );
+        }
+        // Sanity: similar-looking-but-not-credential paths still pass.
+        expect(tripleReviewSchema.safeParse({ scope: "paths:src/ssh-helper.js" }).success).toBe(true);
+        expect(tripleReviewSchema.safeParse({ scope: "paths:docs/aws-setup.md" }).success).toBe(true);
+    });
+
     it("rejects model IDs containing disallowed characters (pass 7 — packet-injection prevention)", () => {
         // The pre-pass-7 schema only checked non-empty after trim, allowing
         // newlines/markdown to slip into the rendered protocol packet.

@@ -70,7 +70,29 @@ export function checkBudget(toolName, args = {}) {
         return null;
     }
 
-    return `${toolName} error: max_premium_calls=${cap} cannot satisfy worst-case run cost (${worstCase} calls). Either lower max_rounds/rounds or raise max_premium_calls (or omit it for no cap).`;
+    // Build a tool-aware hint about which knob to lower (different tools
+    // have different cost-driver parameters). The previous one-size-fits-
+    // all hint mentioned `max_rounds`/`rounds`, which doesn't exist on
+    // triple-duck/triple-plan/duck-council and confused users into
+    // googling for nonexistent params.
+    const knobHint = (() => {
+        switch (toolName) {
+            case "triple-review":
+                return "lower `max_rounds` (each round costs up to 6 + synthesis-cap calls)";
+            case "debate":
+                return "lower `rounds` (each round costs 4 calls in the worst case)";
+            case "duck-council":
+                return "set `skip_judge: true` (drops the +2 judge calls)";
+            case "triple-duck":
+            case "triple-plan":
+                // No round/iteration knob — the worst-case is fixed at 8.
+                return "the worst case is fixed for this tool — raise `max_premium_calls` to at least " + worstCase;
+            default:
+                return "raise `max_premium_calls` to at least " + worstCase;
+        }
+    })();
+
+    return `${toolName} error: max_premium_calls=${cap} cannot satisfy worst-case run cost (${worstCase} calls). Either ${knobHint}, or raise \`max_premium_calls\` (or omit it for no cap).`;
 }
 
 // Markdown block embedded at the top of protocol packets.
