@@ -5,12 +5,27 @@
 // the API-direct contract by saving source bytes or path enumerations to
 // disk via PowerShell (`Out-File`, `Set-Content`, `iwr -OutFile`, etc.).
 //
-// The `onPreToolUse` enforcement hook in enforcement.mjs would deny most
-// of those calls, but the Copilot CLI 1.0.x runtime does NOT invoke
-// `onPreToolUse` for built-in tools (powershell/view/glob/grep) — see the
-// "Honest disclosure" section of README.md. This wrapper runs INSIDE the
-// extension process where we control execution, so it works regardless of
-// the runtime hook bug.
+// The `preToolUseHook` policy in enforcement.mjs would deny most of those
+// calls if it were wired in — but as of v4-r3 we do NOT register
+// `onPreToolUse` (the elevated "register hooks" permission isn't worth
+// paying for a hook the runtime ignores anyway; see README's "Honest
+// disclosure" section and extension.mjs top-of-file comment for the full
+// rationale). Even when the hook was registered, Copilot CLI 1.0.x did
+// not invoke `onPreToolUse` for built-in tools (powershell/view/glob/grep).
+// This wrapper runs INSIDE the extension process where we control
+// execution unconditionally — so cleanup works regardless of hook status.
+//
+// Lifecycle role (v4-r3): this wrapper is also the canonical end-of-audit
+// deactivation point for the active-audit state machine in enforcement.mjs.
+// The packet instructs the agent to call sweep AFTER cleanup (section 9,
+// "REQUIRED — call this after cleanup"), and sweep is called for every
+// mode (build, audit-only, API-direct, metadata_only). So sweep is the
+// last wrapper in the audit lifecycle, which makes it the right place to
+// call deactivateAudit + clearRecordedOutcome. Doing so closes the audit
+// state Map entry cleanly without depending on the removed onSessionEnd
+// hook or on TTL eviction. Dry-run sweeps do NOT deactivate (the agent
+// is just inspecting; the real sweep+deactivate happens on the follow-up
+// non-dry-run call).
 //
 // Substitutional safety:
 // - Only deletes top-level FILES (never directories — protects _reports/,
@@ -23,7 +38,8 @@
 import { existsSync, readdirSync, rmSync } from "node:fs";
 import nodePath from "node:path";
 
-import { getTrustedAuditContext } from "../enforcement.mjs";
+import { clearRecordedOutcome } from "./state.mjs";
+import { deactivateAudit, getTrustedAuditContext } from "../enforcement.mjs";
 
 import { DEFAULT_BUILD_ROOT } from "./defaults.mjs";
 
@@ -188,6 +204,20 @@ export async function sweepAuditScratchHandler(args, invocation) {
         }
     }
 
+    // v4-r3: end-of-audit lifecycle close. See top-of-file "Lifecycle role".
+    // We've reached the success return path without hitting any earlier
+    // failure, so close out the audit-state Map entries. Both operations
+    // are idempotent Map.delete calls — safe to invoke even if the audit
+    // was already evicted by TTL or by a previous sweep call in the same
+    // session. Dry-run sweeps do NOT deactivate (the agent is just
+    // inspecting; the real sweep+deactivate happens on the follow-up
+    // non-dry-run call).
+    const auditDeactivated = !!(sessionId && !dryRun);
+    if (auditDeactivated) {
+        clearRecordedOutcome(sessionId);
+        deactivateAudit(sessionId);
+    }
+
     return success({
         buildRoot,
         sweptDirs: sweepDirs,
@@ -197,6 +227,7 @@ export async function sweepAuditScratchHandler(args, invocation) {
         removedCount: dryRun ? 0 : removed.length,
         removed: dryRun ? null : removed,
         errors,
+        auditDeactivated,
     });
 }
 

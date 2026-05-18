@@ -276,21 +276,63 @@ directly via the shell instead of through these wrappers, **nothing
 stops it today** (see *Honest disclosure* below). The packet is
 explicit about this — and the wrappers are the only correct path.
 
-### Honest disclosure: the hook layer is currently non-functional
+### Honest disclosure: no `onPreToolUse` hook is registered
 
-Earlier versions of this README claimed an `onPreToolUse` hook would
-DENY dangerous shell calls as a backstop if the agent strayed from the
-packet. Empirical probes against Copilot CLI **1.0.x** (May 2026)
-showed that `onPreToolUse` and `onPostToolUse` do NOT fire for built-in
-tools (`powershell`, `view`, `glob`, `grep`, etc.) — the SDK's
-`types.d.ts` documents the contract, but the runtime doesn't honor it.
-A bug report has been filed with the GitHub Copilot CLI team.
+Earlier versions of this extension registered an `onPreToolUse` hook in
+`extension.mjs` to DENY dangerous shell calls as a backstop if the agent
+strayed from the packet. Empirical probes against Copilot CLI **1.0.x**
+(May 2026) showed that `onPreToolUse` and `onPostToolUse` do NOT fire
+for built-in tools (`powershell`, `view`, `glob`, `grep`, etc.) — the
+SDK's `types.d.ts` documents the contract, but the runtime doesn't
+honor it. A bug report has been filed with the GitHub Copilot CLI team.
 
-Until the runtime calls the hooks, the **substitutional-safety
-wrappers** above are the actual enforcement mechanism. The hook code is
-still registered in `extension.mjs` so that the day the runtime starts
-calling it, it'll provide a true second layer for free — but **do not
-rely on it today**.
+As of v4-r3 we go further: **the hook is no longer registered at all.**
+Registering any `hooks: {}` block triggers an "extension wants elevated
+permissions: register hooks" confirmation prompt at every CLI launch.
+That capability class is genuinely powerful — a hook can see every
+tool input, modify tool inputs in flight, and execute arbitrary code
+on every invocation — and we don't want to ask operators for a
+capability the extension doesn't actually exercise.
+
+The `preToolUseHook` function still lives in `enforcement.mjs` and is
+still unit-tested as an executable specification of the deny policy. If
+a future CLI release adds an opt-in, narrowly-scoped deny-only hook
+surface, the policy is already written and can be re-wired by adding
+the `hooks: {}` block back to `extension.mjs`.
+
+The **substitutional-safety wrappers** described above are the actual
+enforcement mechanism — they always have been, even when the hook was
+registered.
+
+#### How to re-enable the hook if/when the runtime fix lands
+
+When [the Copilot CLI bug](https://github.com/) is fixed (or if a future
+SDK release introduces an opt-in deny-only hook surface that doesn't
+require the broad elevated-permissions prompt), restore the second-layer
+defence by adding back to `extension.mjs`:
+
+```js
+// near the top, with the other imports
+import { preToolUseHook, deactivateAudit } from "./enforcement.mjs";
+import { clearRecordedOutcome } from "./safeWrappers/state.mjs";
+
+// inside joinSession({ ... }), after the `tools: [ ... ],` array
+hooks: {
+    onPreToolUse: (input, invocation) => preToolUseHook(input, invocation),
+    onSessionEnd: async (_input, invocation) => {
+        if (invocation?.sessionId) {
+            deactivateAudit(invocation.sessionId);
+            clearRecordedOutcome(invocation.sessionId);
+        }
+    },
+},
+```
+
+That's the entire diff. `preToolUseHook`, `deactivateAudit`,
+`clearRecordedOutcome`, `inspectToolCall`, and the full deny-policy
+pattern set in `enforcement.mjs` are all still present, exported, and
+unit-tested by `__tests__/enforcement.test.mjs` — no other code changes
+needed.
 
 For the specific case of sub-agents leaving scratch files in
 `build_root` after an audit, the active mitigation is
@@ -402,10 +444,14 @@ extension's handler runs.
 
 ## Hardened clone
 
-The packet uses this exact command (substitute variants are denied by
-the hook when the hook runs). `<NULL>` is `NUL` on Windows and
-`/dev/null` on POSIX — chosen at runtime so git can never find a hook
-script via that path on either platform:
+The packet uses this exact command (substitute variants — missing
+hardening flags, wrong destination path, or a non-GitHub URL — are
+refused by `zerotrust_safe_clone` and by the `inspectToolCall` policy
+in `enforcement.mjs`; the latter is the *spec*, not a runtime hook,
+since `onPreToolUse` is no longer registered — see "Honest disclosure"
+above). `<NULL>` is `NUL` on Windows and `/dev/null` on POSIX — chosen
+at runtime so git can never find a hook script via that path on either
+platform:
 
 ```text
 git -c protocol.file.allow=never -c protocol.allow=https \
@@ -435,8 +481,9 @@ Minimum git version: 2.39.
   "dependency-audit not yet implemented for this ecosystem."
 - **Synthetic malicious-fixture corpus** for regression testing of
   the audit logic. Currently ships unit tests for the deterministic
-  pieces (URL parser, enforcement hook, safe wrappers) plus a
-  clean-control corpus harness — but no adversarial fixtures.
+  pieces (URL parser, `preToolUseHook` / `inspectToolCall` deny-policy
+  spec, safe wrappers) plus a clean-control corpus harness — but no
+  adversarial fixtures.
 - **`_shared/resolveModels()` integration** for automatic model
   fallback in the council. Currently zerotrust hard-fails at runtime
   if a default model is unavailable; the orchestrator extensions
@@ -448,11 +495,11 @@ Minimum git version: 2.39.
 
 ```text
 zerotrust-sourcecheck/
-  extension.mjs           ← thin shell, joinSession + tool + onPreToolUse hook
+  extension.mjs           ← thin shell, joinSession + tool registrations (no `hooks: {}` block — see "Honest disclosure")
   handler.mjs             ← runHandler entry: validate, scrub, build packet
   urlParser.mjs           ← pure URL/owner/repo/ref/path validation
   localPathValidator.mjs  ← local-path validation for local-mode audits
-  enforcement.mjs         ← hook logic + audit-in-progress state machine
+  enforcement.mjs         ← audit-in-progress state machine (used by wrappers) + unregistered preToolUseHook policy
   packet.mjs              ← long instruction-packet template
   modes.mjs               ← mode enum + per-mode policy helpers
   council/                ← role manifest + per-role prompt templates

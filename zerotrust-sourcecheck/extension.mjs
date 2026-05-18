@@ -6,28 +6,48 @@
 // commands (clone/install/build) executed by the extension itself via
 // safe-wrapper tools rather than by the agent's raw shell.
 //
-// IMPORTANT — runtime hook reality (Step 0.2 + 0.8 empirical findings):
-// Copilot CLI 1.0.44-1 does NOT invoke the onPreToolUse or onPostToolUse
-// hooks for built-in tools. The hooks: {} block below registers the v2
-// hook for forward-compatibility (it works correctly when called; the
-// runtime just doesn't call it). All actual safety in v3 comes from
-// the safe-wrapper tools below — those run inside the extension process
-// where we control execution, not in the agent's powershell.
+// IMPORTANT — no `hooks: {}` registration (operator-elevated-permissions
+// minimization, v4-r3): earlier versions registered an onPreToolUse hook
+// (forward-compat against a known Copilot CLI 1.0.x bug where the runtime
+// doesn't fire it for built-in tools) and an onSessionEnd hook (per-session
+// Map cleanup). Registering hooks at all triggers an "extension wants
+// elevated permissions: register hooks" prompt at every CLI launch, which
+// exposes capabilities (see-every-tool-input, modify-tool-input, run
+// arbitrary code on every invocation) that this extension does not actually
+// need. We dropped the registration entirely:
+//   - onPreToolUse was vestigial anyway; the safe-wrapper tools below are
+//     the real safety mechanism, not the hook.
+//   - onSessionEnd cleanup is replaced by the canonical end-of-audit
+//     lifecycle close inside safeWrappers/sweepWrapper.mjs. The packet's
+//     Section 9 instructs the agent to call zerotrust_sweep_audit_scratch
+//     (REQUIRED) for EVERY mode (build, audit-only, API-direct,
+//     metadata_only), and sweep is documented to run AFTER cleanup. So
+//     sweep is the last wrapper in the audit lifecycle and on success
+//     (non-dry-run) it calls clearRecordedOutcome + deactivateAudit to
+//     close the audit-state Map entries. Per-mode TTL inside
+//     enforcement.mjs::getActiveAudit remains a secondary safety net for
+//     audits that never reach sweep (TTL expiry deletes the audit entry
+//     and dispatches clearRecordedOutcome). Worst case: a session that
+//     ends without reaching sweep AND without further audit access
+//     leaves a few hundred bytes of stale Map state until the extension
+//     process exits — bounded and trivial.
+// `preToolUseHook` is still exported from enforcement.mjs and unit-tested;
+// the function is just not wired into the SDK. If a future CLI release
+// adds a non-elevated way to register an opt-in deny-only hook, that's
+// the time to revisit.
 //
 // Architecture:
-//   - extension.mjs (this file): joinSession + tool registrations + (vestigial) hooks
+//   - extension.mjs (this file): joinSession + tool registrations
 //   - handler.mjs              : URL parsing, mode resolution, scrub, council dispatch, packet build entry
 //   - modes.mjs                : single source of truth for mode taxonomy + helpers
 //   - urlParser.mjs            : pure URL/owner/repo/ref/path validation
-//   - enforcement.mjs          : (vestigial under current runtime) onPreToolUse logic — runs if the runtime ever calls it
+//   - enforcement.mjs          : audit-in-progress state machine (activate/getActive/deactivate) used by the wrappers; also exports the unregistered preToolUseHook for tests and future re-wiring
 //   - packet.mjs               : the natural-language playbook the agent executes
 //   - council/                 : 32-role roster + universal prompt template + extra-roles validator
 //   - safeWrappers/            : the substitutional-safety tools (v3 core architecture)
 
 import { joinSession } from "@github/copilot-sdk/extension";
 import { runHandler } from "./handler.mjs";
-import { preToolUseHook, deactivateAudit } from "./enforcement.mjs";
-import { clearRecordedOutcome } from "./safeWrappers/state.mjs";
 import {
     safeCloneHandler,
     safeInstallHandler,
@@ -384,7 +404,7 @@ const session = await joinSession({
         {
             name: "zerotrust_sweep_audit_scratch",
             description:
-                "Delete stray scratch files left at the top level of build_root and (optionally) its immediate parent dir at the end of an audit. Sub-agents are SUPPOSED to use API-direct tools (zerotrust_safe_fetch_file / zerotrust_safe_list_tree) but sometimes write source bytes or path lists to disk via PowerShell `Out-File` / `Set-Content` / `iwr -OutFile`. The onPreToolUse hook would catch most of those, but the Copilot CLI runtime currently doesn't invoke the hook for built-in tools — so this wrapper runs the cleanup inside the extension process where we control execution. Only deletes top-level FILES (never directories) and skips known-good names (README, .gitignore, etc.). Pass `dry_run: true` to inspect the list before deleting. Recommended call site: as part of the audit's epilogue, AFTER zerotrust_finalize_report / zerotrust_record_council_outcome and AFTER any zerotrust_cleanup_audit you do for build modes.",
+                "Delete stray scratch files left at the top level of build_root and (optionally) its immediate parent dir at the end of an audit. Sub-agents are SUPPOSED to use API-direct tools (zerotrust_safe_fetch_file / zerotrust_safe_list_tree) but sometimes write source bytes or path lists to disk via PowerShell `Out-File` / `Set-Content` / `iwr -OutFile`. The `preToolUseHook` policy in enforcement.mjs would deny most of those — but the hook is not registered (see top-of-file comment) and even if it were, Copilot CLI 1.0.x does not invoke `onPreToolUse` for built-in tools — so this wrapper runs the cleanup inside the extension process where we control execution unconditionally. Only deletes top-level FILES (never directories) and skips known-good names (README, .gitignore, etc.). Pass `dry_run: true` to inspect the list before deleting. Recommended call site: as part of the audit's epilogue, AFTER zerotrust_finalize_report / zerotrust_record_council_outcome and AFTER any zerotrust_cleanup_audit you do for build modes.",
             parameters: {
                 type: "object",
                 properties: {
@@ -406,23 +426,10 @@ const session = await joinSession({
             handler: (args, invocation) => sweepAuditScratchHandler(args, { sessionId: invocation?.sessionId }),
         },
     ],
-    hooks: {
-        // NOTE — runtime reality: as of Copilot CLI 1.0.44-1 the runtime does
-        // NOT call onPreToolUse or onPostToolUse for built-in tools (verified
-        // empirically in v3 Step 0.2 + 0.8 probes). These hooks are kept
-        // registered so they "just work" if a future runtime version starts
-        // calling them — and so the unit tests for inspectToolCall remain
-        // meaningful documentation of what the policy is — but actual
-        // safety in v3 comes from the safeWrappers/* tools above, not from
-        // this hook. See plan.md "v3 architectural redesign" section.
-        onPreToolUse: (input, invocation) => preToolUseHook(input, invocation),
-        // Deactivate per-session audit + recorded council outcome on session
-        // end so in-process state doesn't accumulate.
-        onSessionEnd: async (_input, invocation) => {
-            if (invocation?.sessionId) {
-                deactivateAudit(invocation.sessionId);
-                clearRecordedOutcome(invocation.sessionId);
-            }
-        },
-    },
+    // Intentionally no `hooks: {}` block — see top-of-file comment. We do
+    // not register onPreToolUse or onSessionEnd because doing so would
+    // require the operator to grant the "register hooks" elevated
+    // permission (a capability class that allows seeing every tool input,
+    // modifying tool inputs, and running arbitrary code on every
+    // invocation) for no actual benefit under the current runtime.
 });

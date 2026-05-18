@@ -1125,7 +1125,7 @@ If the audit verdict is clean (or low-severity) and the user explicitly wants to
 
 ## What you must NOT do (wrapper-required operations)
 
-${modeUsesApiDirect(mode) ? `- Run \`git clone\` (or \`gh repo clone\`) **at all** — this is an API-direct audit mode. There is no on-disk clone, none is needed, and the enforcement hook will refuse any clone attempt regardless of destination path. Read source via \`zerotrust_safe_fetch_file\` instead.
+${modeUsesApiDirect(mode) ? `- Run \`git clone\` (or \`gh repo clone\`) **at all** — this is an API-direct audit mode. There is no on-disk clone, none is needed, and \`zerotrust_safe_clone\` will refuse for this mode. **There is no runtime backstop:** if you bypass the wrappers and run raw \`git clone\` via \`powershell\`, nothing on the host will stop you — but you will silently invalidate the audit (the report would no longer reflect bytes that came through the trusted-context flow). Respect this instruction; it is your only guard rail. Read source via \`zerotrust_safe_fetch_file\` instead.
 - Run \`zerotrust_safe_clone\` (the wrapper itself) — it will refuse for this mode.` : `- Run \`git clone\` to anywhere outside \`${buildRoot}\`, or via \`gh repo clone\` (which bypasses our safe-clone hardening flags). Use \`zerotrust_safe_clone\` (preferred) or raw \`git clone\` with the hardening flags applied.`}
 - Run \`npm install\` / \`yarn\` / \`pnpm install\` / \`pip install\` / \`cargo install\` without the safe-mode flag, OUTSIDE of full-build modes
 - Run any package-manager install at all, OUTSIDE of build modes

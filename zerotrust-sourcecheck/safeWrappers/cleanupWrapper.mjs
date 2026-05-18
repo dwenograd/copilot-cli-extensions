@@ -139,7 +139,18 @@ export async function cleanupAuditHandler(args, invocation) {
         }
     }
 
-    if (sessionId) clearRecordedOutcome(sessionId);
+    if (sessionId) {
+        clearRecordedOutcome(sessionId);
+        // v4-r3 lifecycle note: deactivateAudit is intentionally NOT called
+        // here. The packet's epilogue ordering is cleanup_audit →
+        // sweep_audit_scratch (sweep runs last). sweepAuditScratchHandler
+        // performs the canonical deactivateAudit at end-of-success, so by
+        // the time sweep runs the audit context is still live and sweep
+        // can resolve the correct build_root via getTrustedAuditContext.
+        // Putting the deactivate here would break sweep on non-default
+        // build_root because ctx.hasActiveAudit would be false and the
+        // fallback would silently target DEFAULT_BUILD_ROOT.
+    }
 
     return success({
         clonePath: args.clone_path,

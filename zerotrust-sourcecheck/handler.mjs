@@ -6,7 +6,14 @@
 //   3. Resolves the audit mode (explicit, env, or default from URL kind).
 //   4. Scrubs and applies injection-policy to user-provided strings (focus, ref).
 //   5. Computes the canonical clone / report / quarantine paths under build_root.
-//   6. Activates compatibility audit state for the vestigial hook path.
+//   6. Activates audit state via enforcement.mjs::activateAudit. This state is
+//      consumed by the safe-wrapper tools (clone/install/build/list_tree/
+//      fetch_file/cleanup/sweep) to enforce trusted-context binding —
+//      build_root, owner/repo, ref/SHA, and clone-path containment all check
+//      against this record. (Historically the same state also gated the
+//      onPreToolUse hook; that hook is no longer registered — see
+//      extension.mjs top-of-file comment — but the state machine remains
+//      load-bearing for the wrappers.)
 //   7. Builds and returns the instruction packet.
 //
 // The handler does NOT clone, fetch, or write anything. All side effects

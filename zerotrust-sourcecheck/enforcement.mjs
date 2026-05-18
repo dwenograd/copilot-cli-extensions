@@ -1,16 +1,44 @@
-// enforcement.mjs — onPreToolUse hook logic + audit-in-progress state machine.
+// enforcement.mjs — audit-in-progress state machine + (unregistered)
+// onPreToolUse hook logic.
 //
-// The instruction packet is the primary control (it tells the agent what
-// commands are safe). The hook here is the SECOND LAYER of defense: even if
-// the agent ignores the packet, the hook intercepts dangerous shell calls
-// before they execute on the user's host. This is what makes the extension
-// "zerotrust" rather than merely advisory.
+// Two distinct concerns live in this file:
+//
+//   1. The active-audit state machine (activateAudit, getActiveAudit,
+//      deactivateAudit, recordResolvedClonePath, recordResolvedSha,
+//      getTrustedAuditContext). This is REAL, LOAD-BEARING code: the
+//      safeWrappers/* tools call into it to decide whether a clone /
+//      install / build / fetch is bound to a trusted, in-flight audit
+//      with a matching build_root, owner/repo, and resolved SHA. Without
+//      this state the wrappers can't tell a legitimate audit apart from
+//      an opportunistic invocation.
+//
+//   2. The preToolUseHook function at the bottom of the file. This was
+//      designed as a second-layer defence — even if the agent ignored
+//      the packet, the hook would intercept dangerous shell calls before
+//      they ran on the operator's host. Empirically, Copilot CLI 1.0.x
+//      does not invoke onPreToolUse for built-in tools (powershell, view,
+//      glob, grep) — the SDK's types.d.ts documents the contract but the
+//      runtime doesn't honor it. A bug report was filed.
+//
+//      As of v4-r3 we no longer REGISTER this hook in extension.mjs.
+//      Registering hooks at all triggers an "extension wants elevated
+//      permissions: register hooks" prompt at every CLI launch (the
+//      class includes see-every-tool-input, modify-tool-input, and run
+//      arbitrary code on every invocation), and we don't want to ask
+//      operators for a capability the extension doesn't actually need.
+//      The function is still EXPORTED so the unit tests in
+//      __tests__/enforcement.test.mjs continue to pin the deny policy as
+//      executable documentation, and so that if a future CLI release
+//      offers a narrower opt-in deny-only hook surface the policy is
+//      already written.
 //
 // State model: the handler activates an audit by recording { sessionId,
-// buildPath, mode, expiresAt } in an in-memory Map. While an audit is active
-// for a session, the hook applies strict rules to any shell-flavored tool
-// call. The audit auto-expires after the mode-specific TTL so a forgotten
-// audit doesn't leave the session permanently locked-down.
+// buildPath, mode, expiresAt } in an in-memory Map. While an audit is
+// active for a session, the wrappers apply strict rules to any audit-
+// dangerous tool call. The audit auto-expires after the mode-specific
+// TTL so a forgotten audit doesn't leave the session permanently locked
+// down; TTL expiry also clears the recorded council outcome to prevent
+// a passing outcome from one audit satisfying a different mode's gate.
 
 import nodePath from "node:path";
 import {
@@ -22,9 +50,11 @@ import { parseGithubUrl } from "./urlParser.mjs";
 
 // TTL is mode-dependent (v3 fix). The 30-min default silently expired during
 // real audit_source_council runs (15-30 min wall-clock) — once expiresAt
-// passed, getActiveAudit() returned null and the entire enforcement hook
-// became a no-op for the rest of the session. New per-mode TTLs leave
-// generous headroom for retries and slow networks.
+// passed, getActiveAudit() returned null, the safeWrappers/* tools refused
+// (or fell back to default-build-root behaviour) for the rest of the
+// session, and any session-end cleanup that would have hit the audit
+// became a no-op. New per-mode TTLs leave generous headroom for retries
+// and slow networks.
 // Add TTL entries for the new local-source modes.
 const AUDIT_TTL_MS_BY_MODE = {
     "metadata_only": 15 * 60 * 1000,
@@ -153,9 +183,12 @@ const recentlyExpired = new Map(); // sessionId -> { mode, expiredAt }
 
 /**
  * Returns the most recent expiry record for a session and clears it. Lets
- * callers (or higher-level diagnostic code) surface "your enforcement TTL
- * just expired and your hook went no-op" warnings instead of letting that
- * happen silently.
+ * callers (or higher-level diagnostic code) surface "your audit TTL just
+ * expired and your wrappers/policy are operating without an active-audit
+ * anchor" warnings instead of letting that happen silently. (Historically
+ * this also covered the onPreToolUse hook becoming a no-op on expiry;
+ * the hook is no longer registered as of v4-r3, but the diagnostic value
+ * for wrapper callers remains.)
  */
 export function consumeExpiryNotice(sessionId) {
     const notice = recentlyExpired.get(sessionId);

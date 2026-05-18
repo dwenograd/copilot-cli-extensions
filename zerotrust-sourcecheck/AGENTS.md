@@ -122,19 +122,52 @@ active-audit anchor. Don't try to thread the production
 `DEFAULT_BUILD_ROOT` into those test fixtures; the decoupling is
 intentional.
 
-## The `onPreToolUse` hook is currently load-bearing for forward-compat only
+## The `onPreToolUse` hook is intentionally NOT registered
 
 Copilot CLI 1.0.x does not invoke `onPreToolUse` for built-in tools
 (`powershell`, `view`, `glob`, `grep`). The hook code in
-`enforcement.mjs` is correct and tested — when the runtime starts
-firing it, it provides a true second layer of defence. Until then, the
-`safeWrappers/*` tools are the actual mitigation.
+`enforcement.mjs::preToolUseHook` is correct and tested — when the
+runtime starts firing it, it could provide a true second layer of
+defence. But as of v4-r3 we no longer register it in `extension.mjs`.
 
-When working on `enforcement.mjs`, do not assume the hook fires for
-arbitrary shell calls. Test coverage exists (and is the right
-forward-compat investment), but the production safety story today goes
-through the wrappers. The README's "Honest disclosure" section spells
-this out for users; preserve that wording when editing.
+Reason: any `hooks: {}` block triggers an "extension wants elevated
+permissions: register hooks" confirmation prompt at every CLI launch.
+The hook capability class includes see-every-tool-input, modify-tool-
+input, and run arbitrary code on every invocation — strong enough that
+asking an operator to grant it for a hook the runtime ignores is a bad
+trade. Operator-elevated-permission minimization wins over forward-
+compat insurance.
+
+When working on `enforcement.mjs`:
+- `preToolUseHook` is still exported and still unit-tested as an
+  executable specification of the deny policy. Don't delete it; if a
+  future CLI release exposes a narrower opt-in deny-only hook surface,
+  this is the policy that gets re-wired.
+- The active-audit state machine (`activateAudit` /
+  `getActiveAudit` / `deactivateAudit` / `recordResolvedClonePath` /
+  `recordResolvedSha` / `getTrustedAuditContext`) is the load-bearing
+  half of this file — the `safeWrappers/*` tools call into it.
+- The README's "Honest disclosure" section spells this out for users;
+  preserve that wording when editing.
+
+Operationally, per-session cleanup that used to happen in the now-
+removed `onSessionEnd` hook is now performed by the canonical
+end-of-audit close in `safeWrappers/sweepWrapper.mjs`. The packet's
+Section 9 instructs the agent to call `zerotrust_sweep_audit_scratch`
+(REQUIRED) for **every** mode (build, audit-only, API-direct,
+metadata_only, local-source). Sweep runs strictly after cleanup, so on
+a successful (non-dry-run) sweep the wrapper calls
+`clearRecordedOutcome + deactivateAudit` to close the audit-state Map
+entries cleanly. (Note: deactivate intentionally lives in sweep, not
+cleanup — calling it in cleanup would null out `getTrustedAuditContext`
+for the subsequent sweep call and silently retarget sweep at
+`DEFAULT_BUILD_ROOT`. See `cleanupWrapper.mjs:144-152` for the same
+note.) Per-mode TTL inside `getActiveAudit` is the secondary safety
+net for sessions that never reach sweep — expired entries are deleted
+on next access and that path also dispatches `clearRecordedOutcome`.
+Worst case: a session that ends without reaching sweep AND without
+further audit access leaves a few hundred bytes of stale Map state
+until the extension process exits — bounded and trivial.
 
 ## Test seam: `__internals` exports
 

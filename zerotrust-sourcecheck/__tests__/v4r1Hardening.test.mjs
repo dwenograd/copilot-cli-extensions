@@ -10,9 +10,15 @@
 //      zerotrust_safe_fetch_file in API-direct, not look for a clone).
 //   4. safeCloneHandler refuses when sessionId given but no active
 //      audit (TTL-expiry guard, mirrors install/build wrappers).
-//   5. enforcement denies `git clone` in audit-only modes regardless
-//      of path (the second-layer defense — packet says don't clone,
-//      hook also refuses if the agent tries anyway).
+//   5. inspectToolCall denies `git clone` in audit-only modes regardless
+//      of path. NOTE: this is the executable spec for the unregistered
+//      `preToolUseHook` (see enforcement.mjs top comment + README "Honest
+//      disclosure"). The Copilot CLI runtime doesn't fire onPreToolUse
+//      for built-in tools, AND as of v4-r3 we no longer register the
+//      hook at all — so this test pins the deny POLICY (what would
+//      happen if the hook were re-wired), not a live runtime defense.
+//      The actual runtime defense is the safeWrappers/* tools (the
+//      packet instructs the agent to use those rather than raw shell).
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -121,7 +127,7 @@ test("v4-r1: safeCloneHandler refuses when sessionId given but no active audit (
     assert.match(r.textResultForLlm, /no active audit|TTL expired|sourcecheck not invoked/i);
 });
 
-// ---------- 5. enforcement clone-mode refusal (the second-layer defense) ----------
+// ---------- 5. inspectToolCall clone-mode refusal (executable spec for the unregistered preToolUseHook — see file header) ----------
 
 test("v4-r1: enforcement denies git clone in audit_source mode regardless of path", () => {
     const sid = "v4r1-clone-deny-" + Math.random().toString(36).slice(2, 8);
