@@ -1,6 +1,11 @@
 // _shared/models.mjs
 //
-// Single source of truth for model presets across the five extensions.
+// Single source of truth for model presets across the five orchestrator
+// extensions (triple-duck, triple-review, triple-plan, debate,
+// duck-council). The sixth extension (zerotrust-sourcecheck) maintains
+// its own ALLOWED_MODEL_IDS in council/roster.mjs and does NOT currently
+// route through resolveModels — see zerotrust-sourcecheck/README.md
+// "Model availability" for the implications.
 //
 // ---------------------------------------------------------------------------
 // FALLBACK TABLE DRIFT POLICY (read this if you touch MODEL_FALLBACK_MAP):

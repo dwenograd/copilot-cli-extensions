@@ -1,0 +1,3 @@
+# url	kind	expected_min_verdict	required_tags	forbidden_tags
+https://github.com/octocat/Hello-World	clean-control	no red flags found		
+https://github.com/github/gitignore	clean-control	no red flags found		

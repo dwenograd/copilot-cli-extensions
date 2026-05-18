@@ -1,6 +1,6 @@
 # Copilot CLI Extensions Workspace
 
-Five interrelated Copilot CLI extensions for multi-model orchestration:
+Six interrelated Copilot CLI extensions for multi-model orchestration and zero-trust source auditing:
 
 | Extension | What it does |
 |---|---|
@@ -9,8 +9,16 @@ Five interrelated Copilot CLI extensions for multi-model orchestration:
 | **triple-plan** | 3 planning agents in parallel → merged plan with consensus + alternatives + contested decisions |
 | **debate** | 2 debaters arguing opposing positions + 1 independent judge |
 | **duck-council** | 6 role-specialized rubber-ducks (security/stability/perf/maintainer/skeptic/user) + 1 judge synthesis pass |
+| **zerotrust-sourcecheck** | 32-role multi-model security council against a GitHub URL OR an on-disk local directory. API-direct for URL audits (no source bytes on disk); local-source mode for already-downloaded repos via `view`/`grep`/`glob` with path containment. Build-mode wrappers (clone/install/build) for runtime verification. Section 9b walks the operator through defang / delete-project / keep-as-is per HIGH/CRITICAL finding when any on-disk content was produced. |
 
-All five return a **markdown instruction packet** that the calling Copilot CLI agent then executes via the built-in `task` tool — no agent runtimes are spawned by these extensions themselves. They're orchestrators-of-orchestrations.
+All five orchestrator extensions (`triple-*`, `debate`, `duck-council`) return a **markdown instruction packet** that the calling Copilot CLI agent then executes via the built-in `task` tool — no agent runtimes are spawned by these extensions themselves. They're orchestrators-of-orchestrations. `zerotrust-sourcecheck` follows the same pattern (instruction packet) and additionally exposes a set of substitutional-safety wrapper tools (hardened clone / install / build / fetch / sweep) for operations the packet directs the agent to perform.
+
+## Prerequisites
+
+- **Node.js 20+** (the Copilot CLI itself requires this; orchestrator extensions use vitest, zerotrust uses Node's built-in `node:test`).
+- **npm** (ships with Node).
+- **`gh` CLI authenticated** (`gh auth login`) — only required by `zerotrust-sourcecheck` API-direct modes (`audit_source`, `audit_source_council`, `verify_release`); the orchestrator extensions have no network dependencies.
+- **`git` 2.39+** — only required by `zerotrust-sourcecheck` build modes (`audit_and_*_build*`).
 
 ## Installation
 
@@ -29,7 +37,7 @@ npm install
 # Restart Copilot CLI (or run `extensions_reload` from inside it).
 ```
 
-After restart, the 5 tools (`triple-duck`, `triple-review`, `triple-plan`, `debate`, `duck-council`) become invokable in any session.
+After restart, the six tools (`triple-duck`, `triple-review`, `triple-plan`, `debate`, `duck-council`, `zerotrust_sourcecheck`) become invokable in any session.
 
 > **Already have a `~/.copilot/extensions/` directory?** Back it up first; the clone needs to write into an empty path. Existing extensions can be moved alongside (the workspace's `_shared/` is namespaced under `_shared/`, and each extension lives in its own subdirectory).
 
@@ -39,10 +47,10 @@ After restart, the 5 tools (`triple-duck`, `triple-review`, `triple-plan`, `deba
 
 ```
 extensions/
-├── _shared/                    # shared module — imported by all 5 extensions
+├── _shared/                    # shared module — imported by all 6 extensions
 │   ├── index.mjs               # barrel export
 │   ├── models.mjs              # DEFAULT_MODELS, CHEAP_MODELS, COUNCIL_*, MODEL_FALLBACK_MAP, etc.
-│   ├── schemas.mjs             # zod schemas — validation for all 5 tools
+│   ├── schemas.mjs             # zod schemas — validation for the trio + debate + duck-council tools
 │   ├── policy.mjs              # prompt-injection policy (warn-only + narrow hard-block; per-call USER_INPUT envelope)
 │   ├── scrub.mjs               # secrets/PII scrubber
 │   ├── budget.mjs              # cost ceiling enforcement (incl. duck-council 14/12 formula)
@@ -58,7 +66,20 @@ extensions/
 ├── triple-plan/                # same structure
 ├── debate/                     # same structure
 ├── duck-council/               # same structure (+ AGENTS.md no-`git diff` reminder)
-├── package.json                # workspace root (vitest + zod)
+├── zerotrust-sourcecheck/      # 32-role security council + safeWrapper tools
+│   ├── extension.mjs           # tool registrations + onPreToolUse hook (vestigial — see README)
+│   ├── handler.mjs             # runHandler entry: validate, scrub, build packet
+│   ├── packet.mjs              # long instruction-packet template
+│   ├── enforcement.mjs         # hook logic + audit-in-progress state machine
+│   ├── urlParser.mjs           # GitHub URL/owner/repo/ref/path validation
+│   ├── localPathValidator.mjs  # local-mode on-disk path validation
+│   ├── modes.mjs               # mode enum + per-mode policy helpers
+│   ├── council/                # 32-role manifest + per-role prompt templates
+│   ├── safeWrappers/           # clone / install / build / report / cleanup / sweep / fetch / list-tree
+│   ├── __corpus__/             # regression corpus harness (clean-control URLs only)
+│   ├── __tests__/              # node:test unit + integration tests
+│   └── AGENTS.md               # agent-design notes (sub-agent file-write rule, etc.)
+├── package.json                # workspace root (vitest + zod for the orchestrators; zerotrust uses node:test)
 └── .gitignore
 ```
 
@@ -98,9 +119,18 @@ npm install   # one-time
 npm test
 ```
 
-199 tests across 15 files: 89 shared-module unit tests (12 policy + 12 budget + 11 resolveModels + 31 scrub + 23 schemas) + 84 handler integration tests (18×3 trio handlers + 16 debate + 14 duck-council) + 26 packet snapshot tests (6×4 + 2 duck-council).
+`npm test` runs both test runners in sequence: `vitest` for the five orchestrator extensions + `_shared/`, then `node --test` for `zerotrust-sourcecheck/` (which uses Node's built-in `node:test` runner). Test counts vary as the suites grow — at last count the orchestrator + shared suites total 207 tests across 15 files, and the zerotrust suite totals 753 tests across 29 files (reported as 13 suites by `node --test`), all green.
 
-If you change a packet wording deliberately, regenerate snapshots once with `npm run test:update`.
+If you change a packet wording deliberately in any orchestrator extension, regenerate vitest snapshots once with `npm run test:update`. The zerotrust suite has no snapshots — its tests are explicit assertions.
+
+To run only zerotrust:
+
+```bash
+cd ~/.copilot/extensions/zerotrust-sourcecheck
+node --test "__tests__/*.test.mjs"
+```
+
+(Pass the glob explicitly — `node --test __tests__/` errors with "cannot find module".)
 
 ## Operational notes
 

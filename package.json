@@ -3,14 +3,16 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Five Copilot CLI extensions for multi-model orchestration: triple-duck (parallel critique + consensus), triple-review (iterative code review), triple-plan (parallel planning + judge merge), debate (adversarial 2-model + judge), duck-council (6 role-specialized rubber-ducks + judge synthesis). Each extension returns a markdown instruction packet the calling agent executes via the built-in `task` tool.",
+  "description": "Six Copilot CLI extensions: five orchestrators for multi-model workflows (triple-duck parallel critique + consensus; triple-review iterative code review; triple-plan parallel planning + judge merge; debate adversarial 2-model + judge; duck-council 6 role-specialized rubber-ducks + judge synthesis) and zerotrust-sourcecheck (32-role multi-model security council against a GitHub URL or local on-disk directory, with hardened clone/install/build safe-wrapper tools for runtime verification). Each extension returns a markdown instruction packet the calling agent executes via the built-in `task` tool.",
   "license": "MIT",
   "repository": {
     "type": "git",
     "url": "https://github.com/dwenograd/copilot-cli-extensions"
   },
   "scripts": {
-    "test": "vitest run --passWithNoTests",
+    "test": "vitest run --passWithNoTests && node --test \"zerotrust-sourcecheck/__tests__/*.test.mjs\"",
+    "test:vitest": "vitest run --passWithNoTests",
+    "test:zerotrust": "node --test \"zerotrust-sourcecheck/__tests__/*.test.mjs\"",
     "test:watch": "vitest",
     "test:update": "vitest run -u --passWithNoTests"
   },

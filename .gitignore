@@ -2,3 +2,4 @@ node_modules/
 *.log
 .vitest-cache/
 coverage/
+zerotrust-sourcecheck/__corpus__/results/

@@ -1,0 +1,9 @@
+{
+  "slug": "github-gitignore",
+  "url": "https://github.com/github/gitignore",
+  "kind": "clean-control",
+  "expected_min_verdict": "no red flags found",
+  "required_tags": [],
+  "forbidden_tags": [],
+  "notes": "Committed clean-control fixture. Operator-local risky fixtures must use category letters and generic tags only."
+}

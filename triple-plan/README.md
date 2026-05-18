@@ -71,4 +71,4 @@ cd ~/.copilot/extensions
 npm test
 ```
 
-See the workspace `README.md` for an overview of all five extensions.
+See the workspace `README.md` for an overview of all six extensions (the five orchestrators plus zerotrust-sourcecheck).
