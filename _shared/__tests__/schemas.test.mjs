@@ -19,11 +19,11 @@ describe("shared zod schemas", () => {
     it("accepts each tool's minimal happy path", () => {
         expect(tripleDuckSchema.parse({ topic: "review this" })).toMatchObject({
             topic: "review this",
-            effectiveJudge: "claude-opus-4.7-xhigh",
+            effectiveJudge: "claude-opus-4.8",
         });
         expect(triplePlanSchema.parse({ task: "plan this" })).toMatchObject({
             task: "plan this",
-            effectiveJudge: "claude-opus-4.6-1m",
+            effectiveJudge: "claude-opus-4.7-1m-internal",
         });
         expect(tripleReviewSchema.parse({})).toMatchObject({
             max_rounds: 3,
@@ -32,7 +32,7 @@ describe("shared zod schemas", () => {
         expect(debateSchema.parse({ question: "A or B?" })).toMatchObject({
             question: "A or B?",
             rounds: 1,
-            effectiveJudge: "claude-opus-4.6-1m",
+            effectiveJudge: "claude-opus-4.7-1m-internal",
         });
     });
 
@@ -128,7 +128,7 @@ describe("shared zod schemas", () => {
 
     it("rejects debate judge/debater collision after resolving defaults", () => {
         expectInvalid(
-            debateSchema.safeParse({ question: "x", debaters: ["claude-opus-4.6-1m", "x"] }),
+            debateSchema.safeParse({ question: "x", debaters: ["claude-opus-4.7-1m-internal", "x"] }),
             "judge must differ from both debaters",
         );
     });
@@ -236,6 +236,7 @@ describe("shared zod schemas", () => {
         // (no judge-vs-debater collision check) for a clean isolation test.
         const realIds = [
             "claude-opus-4.6-1m",
+            "claude-opus-4.7-1m-internal",
             "claude-opus-4.7",
             "claude-opus-4.6",
             "claude-sonnet-4.6",
@@ -243,6 +244,7 @@ describe("shared zod schemas", () => {
             "claude-sonnet-4",
             "claude-opus-4.7-high",
             "claude-opus-4.7-xhigh",
+            "claude-opus-4.8",
             "gpt-5.5",
             "gpt-5.4",
             "gpt-5.2",
@@ -276,8 +278,8 @@ describe("duckCouncilSchema (pass 15 — duck-council extension)", () => {
         expect(Object.keys(r.data.effectiveRoles).sort()).toEqual(
             ["maintainer", "performance", "security", "skeptic", "stability", "user"]
         );
-        expect(r.data.effectiveRoles.security).toBe("claude-opus-4.7-xhigh");
-        expect(r.data.effectiveJudge).toBe("claude-opus-4.7-xhigh");
+        expect(r.data.effectiveRoles.security).toBe("claude-opus-4.8");
+        expect(r.data.effectiveJudge).toBe("claude-opus-4.8");
     });
 
     it("rejects empty/whitespace topic", () => {
@@ -294,7 +296,7 @@ describe("duckCouncilSchema (pass 15 — duck-council extension)", () => {
         expect(r.data.effectiveRoles.security).toBe("gpt-5.5");
         expect(r.data.effectiveRoles.performance).toBe("claude-opus-4.7-high");
         // Other 4 roles still on defaults.
-        expect(r.data.effectiveRoles.stability).toBe("claude-opus-4.7-xhigh");
+        expect(r.data.effectiveRoles.stability).toBe("claude-opus-4.8");
         expect(r.data.effectiveRoles.user).toBe("claude-sonnet-4.6");
     });
 

@@ -64,7 +64,7 @@ describe("duck-council handler", () => {
         expect(r.textResultForLlm).toMatch(/security.*gpt-5\.5/);
         // Other defaults still present (e.g., performance default is gpt-5.5 too,
         // skeptic default is gpt-5.4 — assert maintainer keeps its 1m default)
-        expect(r.textResultForLlm).toMatch(/maintainer.*claude-opus-4\.6-1m/);
+        expect(r.textResultForLlm).toMatch(/maintainer.*claude-opus-4\.7-1m-internal/);
     });
 
     it("skip_judge=true omits the judge step from the packet", async () => {

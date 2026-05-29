@@ -28,7 +28,7 @@ const session = await joinSession({
                         minItems: 3,
                         maxItems: 3,
                         description:
-                            "Optional. Exactly 3 model IDs for the reviewer trio. Default: claude-opus-4.7-xhigh, claude-opus-4.6-1m, gpt-5.5. (xhigh = extra-high reasoning, ~200k context; pass a 1M-context model variant here if reviewing a very large diff.)",
+                            "Optional. Exactly 3 model IDs for the reviewer trio. Default: claude-opus-4.8, claude-opus-4.7-1m-internal, gpt-5.5. (4.8 = current top reasoning model, ~200k context; slot 2 is a 1M-context variant for very large diffs.)",
                     },
                     focus: {
                         type: "string",

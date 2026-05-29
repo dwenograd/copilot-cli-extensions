@@ -37,11 +37,11 @@ Don't use for questions with a clear right answer — debate forces both sides t
 
 ## Defaults
 
-- Debaters: `claude-opus-4.7-xhigh` vs `gpt-5.5` (different model families maximize divergence; xhigh = extra-high reasoning, ~200k ctx)
-- Judge: `claude-opus-4.6-1m` (different family from debater A, 1M ctx for full transcript handling)
+- Debaters: `claude-opus-4.8` vs `gpt-5.5` (different model families maximize divergence; 4.8 = current top reasoning model, ~200k ctx)
+- Judge: `claude-opus-4.7-1m-internal` (different family from debater A, 1M ctx for full transcript handling)
 - Cheap debaters: `claude-opus-4.7` vs `gpt-5.5`; cheap judge: `claude-opus-4.6`
 
-**xhigh tradeoff:** for very long debates with extensive context, override `debaters` with a 1M-context model variant (use whatever your provider offers).
+**Context tradeoff:** for very long debates with extensive context, override `debaters` with a 1M-context model variant (use whatever your provider offers).
 
 ---
 

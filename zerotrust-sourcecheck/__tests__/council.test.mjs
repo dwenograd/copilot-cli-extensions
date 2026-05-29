@@ -125,7 +125,7 @@ test("unknown model override preserves original + records error", () => {
     assert.equal(r.errors.length, 1);
     assert.match(r.errors[0], /unknown model id/);
     const obf = r.roles.find((x) => x.id === "obfuscation");
-    assert.equal(obf.model, "claude-opus-4.7-xhigh"); // original
+    assert.equal(obf.model, "claude-opus-4.8"); // original
 });
 
 test("override for a non-existent role-id is silently ignored", () => {

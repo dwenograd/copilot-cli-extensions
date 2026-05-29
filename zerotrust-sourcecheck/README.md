@@ -490,6 +490,32 @@ Minimum git version: 2.39.
   silently substitute via the workspace `MODEL_FALLBACK_MAP`. See
   [Model availability](#model-availability) for the operator
   workaround.
+- **`/sandbox` integration as a third defense layer.** Copilot CLI
+  v1.0.51 (May 2026) added a session-level `/sandbox` toggle that runs
+  the agent's built-in shell tool calls inside a sandbox layer, with
+  filesystem and network access individually constrained
+  (`settings.json` → `sandbox`). This is potentially the runtime-level
+  backstop that the unregistered `onPreToolUse` hook (see [Honest
+  disclosure](#honest-disclosure-no-onpretooluse-hook-is-registered))
+  was supposed to provide: a containment layer that catches the agent
+  shelling out to `git clone` / `npm install` / `cargo build` directly
+  via the built-in `powershell` tool, bypassing the safe wrappers. With
+  a strict config (working dir excluded, outbound connections off,
+  local network off), even a wrapper-bypass would execute inside
+  containment instead of with full user privileges.
+
+  **Not adopting yet** because `/sandbox` is a session-global setting
+  the operator must remember to enable with the correct multi-toggle
+  config *before* invoking zerotrust. Defaults are wrong for this use
+  case (working dir auto-included, outbound connections allowed). One
+  forgotten toggle = no containment. The whole point of this extension
+  is to be the thing you don't have to trust yourself to remember; a
+  load-bearing user-discipline assumption defeats that. Revisit when
+  the Copilot CLI provides at least one of: per-project sandbox policy
+  enforcement (e.g., a `.copilot/settings.json` scope override),
+  session-startup hooks that can refuse to start when sandbox config
+  doesn't match a required policy, or a way to declare a required
+  sandbox policy from the extension manifest.
 
 ## Layout
 
@@ -549,7 +575,7 @@ pattern that the rest of the workspace also enforces.
 
 The council role defaults assume access to GitHub Models / Anthropic /
 OpenAI tiers. If your provider doesn't offer a specific default model
-(e.g. `claude-opus-4.7-xhigh`), the underlying `task` call will **fail
+(e.g. `claude-opus-4.8`), the underlying `task` call will **fail
 loudly at runtime** rather than silently substituting — zerotrust does
 not currently wire through the `_shared/resolveModels()` fallback chain
 that the other extensions in this workspace use.

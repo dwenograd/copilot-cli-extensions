@@ -133,10 +133,10 @@ describe("triple-plan handler", () => {
         const { deps, logged } = mockDeps();
         const r = await runHandler({ task: "x" }, deps);
         expect(r.resultType).toBe("success");
-        expect(r.textResultForLlm).toContain("claude-opus-4.6-1m");
+        expect(r.textResultForLlm).toContain("claude-opus-4.7-1m-internal");
         expect(r.textResultForLlm).toContain("Judge");
         expect(r.textResultForLlm).toContain("triple-plan-judge");
-        expect(logged.some((l) => l.includes("judge: claude-opus-4.6-1m"))).toBe(true);
+        expect(logged.some((l) => l.includes("judge: claude-opus-4.7-1m-internal"))).toBe(true);
     });
 
     it("honors an explicit judge override (cheap + judge override is allowed)", async () => {

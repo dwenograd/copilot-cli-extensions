@@ -16,7 +16,7 @@ const session = await joinSession({
         {
             name: "duck-council",
             description:
-                "Critique a topic with 6 role-specialized rubber-duck reviewers (security / stability / performance / maintainer / skeptic / user) + a judge synthesis pass. Each role uses a tiered model (xhigh for reasoning-heavy roles, GPT for cross-family diversity, Sonnet for UX). Use INSTEAD of triple_duck when you want different angles, not consensus. The judge produces cross-role contradiction adjudication + ranked top priorities + a premise challenge (\"what no duck noticed\") + executive summary; raw role outputs preserved in an appendix. Returns an instruction packet — the calling agent then executes the pattern using the built-in `task` tool.",
+                "Critique a topic with 6 role-specialized rubber-duck reviewers (security / stability / performance / maintainer / skeptic / user) + a judge synthesis pass. Each role uses a tiered model (the top reasoning model for reasoning-heavy roles, GPT for cross-family diversity, Sonnet for UX). Use INSTEAD of triple_duck when you want different angles, not consensus. The judge produces cross-role contradiction adjudication + ranked top priorities + a premise challenge (\"what no duck noticed\") + executive summary; raw role outputs preserved in an appendix. Returns an instruction packet — the calling agent then executes the pattern using the built-in `task` tool.",
             parameters: {
                 type: "object",
                 properties: {
@@ -52,7 +52,7 @@ const session = await joinSession({
                     judge: {
                         type: "string",
                         description:
-                            "Optional. Override the judge model. Default is claude-opus-4.7-xhigh (cheap mode: claude-opus-4.7).",
+                            "Optional. Override the judge model. Default is claude-opus-4.8 (cheap mode: claude-opus-4.7).",
                     },
                     skip_judge: {
                         type: "boolean",
@@ -64,7 +64,7 @@ const session = await joinSession({
                         type: "boolean",
                         default: false,
                         description:
-                            "Optional. Use cheap-tier role models — drops xhigh/high reasoning upgrades to save cost. Note: cheap stability default keeps `claude-opus-4.6-1m` to preserve large-context support for big code reviews; cheap performance/skeptic/user defaults are unchanged from defaults. MUTUALLY EXCLUSIVE with `roles` (an empty `roles: {}` object is treated as no override and is allowed alongside `cheap`).",
+                            "Optional. Use cheap-tier role models — drops the premium reasoning models to cheaper variants to save cost. Note: cheap stability default keeps `claude-opus-4.6-1m` (the cheaper 1M-context variant) to preserve large-context support for big code reviews; cheap performance/skeptic/user defaults are unchanged from defaults. MUTUALLY EXCLUSIVE with `roles` (an empty `roles: {}` object is treated as no override and is allowed alongside `cheap`).",
                     },
                     max_premium_calls: {
                         type: "integer",

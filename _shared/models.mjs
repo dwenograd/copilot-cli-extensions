@@ -29,18 +29,24 @@
 
 // Three-model trios — used by triple-duck, triple-plan, triple-review.
 //
-// `claude-opus-4.7-xhigh` is the default because pass-7 of the iterative
-// triple-review surfaced 2 real medium bugs (cross-extension consistency gap
-// + a prompt-injection vector via model overrides) that 6 prior passes with
-// 1M-context defaults missed. The extra-high reasoning earns its cost.
+// `claude-opus-4.8` is the default reasoning model. It supersedes the prior
+// `claude-opus-4.7-xhigh` default: 4.8's headline gain is being ~4x less
+// likely to let a coding flaw pass unremarked, which is exactly the job of
+// these reviewer/critique orchestrators. We accept the trade-off below.
 //
-// Trade-off vs a 1M-context default: xhigh has ~200k context (sufficient for
-// the vast majority of invocations) instead of 1M. For genuinely huge inputs
-// (multi-megabyte diffs, very large plans), pass an explicit `models: [...]`
-// override using a 1M-context model variant if your provider offers one.
+// Trade-off vs the old 4.7-xhigh default: 4.8 has no extra-high reasoning
+// (`-xhigh`) variant yet, so this is a generational upgrade but a lower
+// explicit reasoning tier than 4.7-xhigh was. Revisit and promote to
+// `claude-opus-4.8-xhigh` once that variant ships. Context is ~200k (no
+// `-1m` 4.8 variant yet either); for genuinely huge inputs (multi-megabyte
+// diffs, very large plans) pass an explicit `models: [...]` override using a
+// 1M-context variant. The 1M-context default slots below (reviewer/planner
+// slot-2, the debate/triple-plan judges, and duck-council's maintainer role)
+// use `claude-opus-4.7-1m-internal` — the newest 1M-context Opus variant, which keeps generational diversity vs the 4.8 slot-1 model
+// (4.8 + 4.7 + GPT) while being smarter than the prior 4.6-1m pick.
 export const DEFAULT_MODELS = [
-    "claude-opus-4.7-xhigh",
-    "claude-opus-4.6-1m",
+    "claude-opus-4.8",
+    "claude-opus-4.7-1m-internal",
     "gpt-5.5",
 ];
 
@@ -54,13 +60,14 @@ export const CHEAP_MODELS = [
 ];
 
 // Debate-specific defaults: 2 debaters from different model families
-// (maximize divergence) + 1 independent judge. xhigh upgrade applied to the
-// Opus 4.7 debater for the same reason as DEFAULT_MODELS above.
+// (maximize divergence) + 1 independent judge. The Opus debater is on 4.8
+// for the same reason as DEFAULT_MODELS above (generational + honesty gain;
+// no -xhigh 4.8 variant yet).
 export const DEFAULT_DEBATERS = [
-    "claude-opus-4.7-xhigh",
+    "claude-opus-4.8",
     "gpt-5.5",
 ];
-export const DEFAULT_JUDGE = "claude-opus-4.6-1m";
+export const DEFAULT_JUDGE = "claude-opus-4.7-1m-internal";
 
 export const CHEAP_DEBATERS = [
     "claude-opus-4.7",
@@ -69,8 +76,8 @@ export const CHEAP_DEBATERS = [
 export const CHEAP_JUDGE = "claude-opus-4.6";
 
 // duck-council: 6 role-specialized reviewers + 1 judge synthesis pass.
-// Tiered model assignment (NOT all-xhigh) per pass-15 triple-plan synthesis:
-// - reasoning-heavy roles (security, stability) get xhigh
+// Tiered model assignment (NOT all-4.8) per pass-15 triple-plan synthesis:
+// - reasoning-heavy roles (security, stability) get the top reasoning model (4.8)
 // - pattern-matching roles (performance) get cross-family GPT
 // - context-heavy roles (maintainer) get 1M-context Opus
 // - prior-diverse roles (skeptic) get a different GPT variant
@@ -78,32 +85,34 @@ export const CHEAP_JUDGE = "claude-opus-4.6";
 // Family balance: 4 Claude + 2 GPT reviewers + Claude judge.
 export const COUNCIL_ROLE_NAMES = ["security", "stability", "performance", "maintainer", "skeptic", "user"];
 export const DEFAULT_COUNCIL_ROLES = Object.freeze({
-    security: "claude-opus-4.7-xhigh",
-    stability: "claude-opus-4.7-xhigh",
+    security: "claude-opus-4.8",
+    stability: "claude-opus-4.8",
     performance: "gpt-5.5",
-    maintainer: "claude-opus-4.6-1m",
+    maintainer: "claude-opus-4.7-1m-internal",
     skeptic: "gpt-5.4",
     user: "claude-sonnet-4.6",
 });
 export const CHEAP_COUNCIL_ROLES = Object.freeze({
     security: "claude-opus-4.7",
+    // Cheap tier intentionally stays on 4.6-1m (not 4.7-1m-internal): this is
+    // the cost-optimized preset, and 4.6-1m is the cheaper 1M-context option.
     stability: "claude-opus-4.6-1m",
     performance: "gpt-5.5",
     maintainer: "claude-opus-4.6",
     skeptic: "gpt-5.4",
     user: "claude-sonnet-4.6",
 });
-export const DEFAULT_COUNCIL_JUDGE = "claude-opus-4.7-xhigh";
+export const DEFAULT_COUNCIL_JUDGE = "claude-opus-4.8";
 export const CHEAP_COUNCIL_JUDGE = "claude-opus-4.7";
 
 // Triple-review's synthesis model (used for merging 3/3 reviewer fixes).
 export const SYNTHESIS_MODEL = "claude-sonnet-4.6";
 
 // Triple-duck judge: synthesizes 3 reviewer critiques into a unified, consensus-
-// ranked output. Critiques are typically small (<10k each), so xhigh's ~200k
-// context window is plenty; the win is the extra-high reasoning tier for
-// nuanced cluster-and-conflict-resolution work.
-export const DEFAULT_TRIPLE_DUCK_JUDGE = "claude-opus-4.7-xhigh";
+// ranked output. Critiques are typically small (<10k each), so 4.8's ~200k
+// context window is plenty; the win is the generational + honesty improvement
+// for nuanced cluster-and-conflict-resolution work.
+export const DEFAULT_TRIPLE_DUCK_JUDGE = "claude-opus-4.8";
 // Cheap variant: standard reasoning, ~200k context. Cheap mode targets ~23%
 // reviewer-cost savings; the judge stays on the highest model the cheap-mode
 // theme allows (no reasoning-tier upgrade).
@@ -112,8 +121,8 @@ export const CHEAP_TRIPLE_DUCK_JUDGE = "claude-opus-4.7";
 // Triple-plan judge: plans can be 30-50k tokens each, so 3 plans + judge
 // instructions can easily exceed 150k. Default to a 1M-context variant to
 // avoid silent truncation. Users who don't need 1M can override with
-// `judge: "claude-opus-4.7-xhigh"` (deeper reasoning, smaller window).
-export const DEFAULT_TRIPLE_PLAN_JUDGE = "claude-opus-4.6-1m";
+// `judge: "claude-opus-4.8"` (newer generation, smaller ~200k window).
+export const DEFAULT_TRIPLE_PLAN_JUDGE = "claude-opus-4.7-1m-internal";
 export const CHEAP_TRIPLE_PLAN_JUDGE = "claude-opus-4.7";
 
 // Triple-review severity ranking: index 0 = highest severity.
@@ -130,8 +139,10 @@ export const KNOWN_DEPRECATED_MODELS = new Set([
 // Fallback chains. resolveModels() walks each chain when a default model is
 // in KNOWN_DEPRECATED_MODELS, picking the first non-deprecated entry.
 export const MODEL_FALLBACK_MAP = {
+    "claude-opus-4.8": ["claude-opus-4.7-xhigh", "claude-opus-4.7", "claude-opus-4.6"],
     "claude-opus-4.7-xhigh": ["claude-opus-4.7-high", "claude-opus-4.7", "claude-opus-4.6"],
     "claude-opus-4.7-high": ["claude-opus-4.7", "claude-opus-4.6"],
+    "claude-opus-4.7-1m-internal": ["claude-opus-4.6-1m", "claude-opus-4.6", "claude-sonnet-4.6"],
     "claude-opus-4.6-1m": ["claude-opus-4.6", "claude-sonnet-4.6"],
     "claude-opus-4.7": ["claude-opus-4.6", "claude-sonnet-4.6"],
     "claude-opus-4.6": ["claude-sonnet-4.6"],

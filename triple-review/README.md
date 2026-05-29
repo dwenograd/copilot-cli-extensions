@@ -6,7 +6,7 @@ User-level Copilot CLI extension that registers a `triple-review` tool — a mul
 
 `triple-review` launches three `code-review` sub-agents in parallel against the same diff, clusters their findings by consensus (3/3, 2/3, 1/3 agreement), runs a fourth **synthesis agent** to merge the 3 reviewer-proposed fixes for each 3/3 cluster into one canonical patch, validates and auto-applies, then iterates until findings stabilize.
 
-Default reviewer trio: **Claude Opus 4.7 (xhigh reasoning)**, **Claude Opus 4.6 (1M)**, **GPT-5.5**.
+Default reviewer trio: **Claude Opus 4.8**, **Claude Opus 4.7 (1M, internal)**, **GPT-5.5**.
 Synthesis model: **Claude Sonnet 4.6** (cheaper, lower-latency).
 
 The tool's handler does NOT spawn agents. It returns an instruction packet that the calling agent executes via its built-in `task` and `edit` tools. This keeps orchestration adaptive (multi-round, with user-interactive gates) and avoids re-implementing agent lifecycle in the extension process.
@@ -37,8 +37,8 @@ triple-review({
                               //     a baseline)
                               // default: auto-detect (with disambiguation)
   models?: string[],          // exactly 3 distinct model IDs
-                              // default: claude-opus-4.7-xhigh,
-                              //          claude-opus-4.6-1m, gpt-5.5
+                              // default: claude-opus-4.8,
+                              //          claude-opus-4.7-1m-internal, gpt-5.5
   focus?: string,             // e.g., "security, error handling"
   max_rounds?: number,        // 1..10, default 3
   severity_threshold?: string // "critical"|"high"|"medium"|"low"|"nit"
@@ -54,14 +54,14 @@ Pass `cheap: true` (or invoke as "triple review cheap") to swap the default revi
 
 | Slot | Default trio | Cheap trio |
 |---|---|---|
-| 1 | claude-opus-4.7-xhigh (extra-high reasoning, ~200k ctx) | claude-opus-4.7 (7.5×) |
-| 2 | claude-opus-4.6-1m (6×) | claude-opus-4.6 (3×) |
+| 1 | claude-opus-4.8 (top reasoning model, ~200k ctx) | claude-opus-4.7 (7.5×) |
+| 2 | claude-opus-4.7-1m-internal (1M ctx) | claude-opus-4.6 (3×) |
 | 3 | gpt-5.5 (7.5×) | gpt-5.5 (7.5×) |
 
 **Synthesis model is unchanged** (claude-sonnet-4.6 — already cheap).
 
 **Tradeoffs:**
-- The default's slot-1 (xhigh) catches subtler bugs than standard reasoning, at ~200k context. For diffs that genuinely exceed 200k tokens, override `models` with a 1M-context variant in slot 1 (use whatever your provider offers).
+- The default's slot-1 (`claude-opus-4.8`) is the current top reasoning model, at ~200k context. For diffs that genuinely exceed 200k tokens, override `models` with a 1M-context variant in slot 1 (use whatever your provider offers).
 - Cheap mode's slot-1 (`claude-opus-4.7`) is standard reasoning, 200k context — meaningfully weaker but cheaper.
 
 **For maximum savings**, pair `cheap: true` with `max_rounds: 1`.

@@ -102,14 +102,14 @@ Each stage can short-circuit with a clear error before the next runs.
 - **Secrets scrubber:** high-confidence patterns only (AWS keys + STS, GitHub tokens (PAT/OAuth/server/user/refresh), private-key blocks (PKCS#1/8/EC/OpenSSH/DSA/PGP/ENCRYPTED), Bearer tokens (case-insensitive, JSON/YAML-quoted), DB connection strings). Emails NOT scrubbed (false positive rate is too high to be worth the trust cost).
 - **Model fallback:** static map (since extension SDK doesn't expose `listModels()` to extensions). Built-in defaults silently substitute when in `KNOWN_DEPRECATED_MODELS`; user overrides honored or fail loudly. Every substitution logged via `session.log` with `[fallback]` prefix.
 
-## Default models (after pass-7 upgrade)
+## Default models (slot-1 now claude-opus-4.8)
 
-- **Trio defaults** (triple-duck, triple-plan, triple-review): `claude-opus-4.7-xhigh`, `claude-opus-4.6-1m`, `gpt-5.5`
-- **Debate defaults**: debaters `["claude-opus-4.7-xhigh", "gpt-5.5"]`, judge `"claude-opus-4.6-1m"`
+- **Trio defaults** (triple-duck, triple-plan, triple-review): `claude-opus-4.8`, `claude-opus-4.7-1m-internal`, `gpt-5.5`
+- **Debate defaults**: debaters `["claude-opus-4.8", "gpt-5.5"]`, judge `"claude-opus-4.7-1m-internal"`
 - **Cheap presets** (unchanged): `claude-opus-4.7`, `claude-opus-4.6`, `gpt-5.5`
-- **Duck-council defaults** (tiered, see `duck-council/README.md` for the table): security/stability/judge on `claude-opus-4.7-xhigh`; performance on `gpt-5.5`; maintainer on `claude-opus-4.6-1m`; skeptic on `gpt-5.4`; user on `claude-sonnet-4.6`. Family-diverse: 4 Claude + 2 GPT among the 6 reviewers.
+- **Duck-council defaults** (tiered, see `duck-council/README.md` for the table): security/stability/judge on `claude-opus-4.8`; performance on `gpt-5.5`; maintainer on `claude-opus-4.7-1m-internal`; skeptic on `gpt-5.4`; user on `claude-sonnet-4.6`. Family-diverse: 4 Claude + 2 GPT among the 6 reviewers.
 
-The slot-1 default upgraded from a 1M-context Claude variant → `claude-opus-4.7-xhigh` after pass-7 of the iterative hardening review proved the extra-high reasoning catches bugs that standard reasoning misses (2 real medium bugs that 6 prior passes overlooked). Tradeoff: xhigh is ~200k context vs the prior 1M; for genuinely huge inputs, pass `models: ["claude-opus-4.6-1m", ...]` explicitly to recover 1M context.
+History: the slot-1 reviewer default was `claude-opus-4.7-xhigh` (chosen after pass-7 of the iterative hardening review proved extra-high reasoning caught 2 real medium bugs that 6 prior 1M-context passes missed). It moved to `claude-opus-4.8` on the 4.8 release — a newer generation that is ~4x less likely to let a coding flaw pass unremarked, which is precisely these tools' job. Trade-off: 4.8 has no `-xhigh` (extra-high reasoning) or `-1m` variant yet, so slot-1 is now a lower explicit reasoning tier (~200k context) than 4.7-xhigh was. The 1M-context default slots (reviewer/planner slot-2, the debate & triple-plan judges, and duck-council's maintainer role) moved from `claude-opus-4.6-1m` to `claude-opus-4.7-1m-internal` (newest 1M-context Opus — smarter than 4.6 and keeps generational diversity: 4.8 + 4.7 + GPT). No single model combines 1M context AND extra-high reasoning; those are separate variants, so the 1M slots run at default reasoning. Revisit slot-1 → `claude-opus-4.8-xhigh` once that variant ships. The cheap-tier stability slot intentionally stays on `claude-opus-4.6-1m` (the cheaper 1M-context option).
 
 ## Tests
 

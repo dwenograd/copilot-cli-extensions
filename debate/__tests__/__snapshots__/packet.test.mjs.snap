@@ -33,9 +33,9 @@ no, conditionals are simpler
 <<<NONCE>>>USER_INPUT_END field="position_b"<<<NONCE>>>
 
 ## Roles
-- **Debater A:** claude-opus-4.7-xhigh — argues Position A
+- **Debater A:** claude-opus-4.8 — argues Position A
 - **Debater B:** gpt-5.5 — argues Position B
-- **Judge:** claude-opus-4.6-1m — independent, sees both sides only at the end
+- **Judge:** claude-opus-4.7-1m-internal — independent, sees both sides only at the end
 - **Rounds:** 1 (opening only — no rebuttals)
 - **Expected total premium calls:** 3 (2 debater + 1 judge)
 
@@ -46,7 +46,7 @@ no, conditionals are simpler
 In a SINGLE response, make two \`task\` tool calls in parallel:
 
 \`\`\`
-task(agent_type="general-purpose", mode="sync", model="claude-opus-4.7-xhigh",
+task(agent_type="general-purpose", mode="sync", model="claude-opus-4.8",
      name="debater-A-r1",
      description="Debate round 1 — Position A",
      prompt=<see below>)
@@ -79,7 +79,7 @@ If any debater call fails OR refuses to take its assigned position:
 Make ONE \`task\` call to the judge:
 
 \`\`\`
-task(agent_type="general-purpose", mode="sync", model="claude-opus-4.6-1m",
+task(agent_type="general-purpose", mode="sync", model="claude-opus-4.7-1m-internal",
      name="debate-judge",
      description="Debate judge",
      prompt=<see below>)
@@ -108,9 +108,9 @@ The judge's prompt must contain:
 \`\`\`
 ## Debate: <question summary>
 
-**Position A** (claude-opus-4.7-xhigh): <one-line summary>
+**Position A** (claude-opus-4.8): <one-line summary>
 **Position B** (gpt-5.5): <one-line summary>
-**Judge** (claude-opus-4.6-1m)
+**Judge** (claude-opus-4.7-1m-internal)
 
 ### Strongest arguments
 - A: ...
@@ -311,9 +311,9 @@ _(unspecified — debater B must articulate the strongest case for the OPPOSING 
 **Note on unspecified positions:** No positions were specified. You (the orchestrator) must FIRST decide the two opposing positions yourself based on the question, then pass them explicitly to the debaters. Do NOT let each debater pick their own side independently — they could end up on the same side. Write the two positions out before launching agents.
 
 ## Roles
-- **Debater A:** claude-opus-4.7-xhigh — argues Position A
+- **Debater A:** claude-opus-4.8 — argues Position A
 - **Debater B:** gpt-5.5 — argues Position B
-- **Judge:** claude-opus-4.6-1m — independent, sees both sides only at the end
+- **Judge:** claude-opus-4.7-1m-internal — independent, sees both sides only at the end
 - **Rounds:** 1 (opening only — no rebuttals)
 - **Expected total premium calls:** 3 (2 debater + 1 judge)
 
@@ -324,7 +324,7 @@ _(unspecified — debater B must articulate the strongest case for the OPPOSING 
 In a SINGLE response, make two \`task\` tool calls in parallel:
 
 \`\`\`
-task(agent_type="general-purpose", mode="sync", model="claude-opus-4.7-xhigh",
+task(agent_type="general-purpose", mode="sync", model="claude-opus-4.8",
      name="debater-A-r1",
      description="Debate round 1 — Position A",
      prompt=<see below>)
@@ -357,7 +357,7 @@ If any debater call fails OR refuses to take its assigned position:
 Make ONE \`task\` call to the judge:
 
 \`\`\`
-task(agent_type="general-purpose", mode="sync", model="claude-opus-4.6-1m",
+task(agent_type="general-purpose", mode="sync", model="claude-opus-4.7-1m-internal",
      name="debate-judge",
      description="Debate judge",
      prompt=<see below>)
@@ -386,9 +386,9 @@ The judge's prompt must contain:
 \`\`\`
 ## Debate: <question summary>
 
-**Position A** (claude-opus-4.7-xhigh): <one-line summary>
+**Position A** (claude-opus-4.8): <one-line summary>
 **Position B** (gpt-5.5): <one-line summary>
-**Judge** (claude-opus-4.6-1m)
+**Judge** (claude-opus-4.7-1m-internal)
 
 ### Strongest arguments
 - A: ...
@@ -587,9 +587,9 @@ _(unspecified — debater B must articulate the strongest case for the OPPOSING 
 **Note on unspecified positions:** No positions were specified. You (the orchestrator) must FIRST decide the two opposing positions yourself based on the question, then pass them explicitly to the debaters. Do NOT let each debater pick their own side independently — they could end up on the same side. Write the two positions out before launching agents.
 
 ## Roles
-- **Debater A:** claude-opus-4.7-xhigh — argues Position A
+- **Debater A:** claude-opus-4.8 — argues Position A
 - **Debater B:** gpt-5.5 — argues Position B
-- **Judge:** claude-opus-4.6-1m — independent, sees both sides only at the end
+- **Judge:** claude-opus-4.7-1m-internal — independent, sees both sides only at the end
 - **Rounds:** 3 (1 opening + 2 rebuttal round(s))
 - **Expected total premium calls:** 7 (6 debater + 1 judge)
 
@@ -600,7 +600,7 @@ _(unspecified — debater B must articulate the strongest case for the OPPOSING 
 In a SINGLE response, make two \`task\` tool calls in parallel:
 
 \`\`\`
-task(agent_type="general-purpose", mode="sync", model="claude-opus-4.7-xhigh",
+task(agent_type="general-purpose", mode="sync", model="claude-opus-4.8",
      name="debater-A-r1",
      description="Debate round 1 — Position A",
      prompt=<see below>)
@@ -636,7 +636,7 @@ Each rebuttal prompt MUST contain:
 In a SINGLE response, make two parallel \`task\` calls:
 
 \`\`\`
-task(agent_type="general-purpose", mode="sync", model="claude-opus-4.7-xhigh",
+task(agent_type="general-purpose", mode="sync", model="claude-opus-4.8",
      name="debater-A-r2",
      description="Debate round 2 — A rebuts B",
      prompt=<question verbatim + shared context verbatim + Position A verbatim + Position B verbatim + "You are debater A; you argue Position A. You are 1 of 2 advocates; the judge is independent." + debater A's full prior transcript (rounds 1..1, labeled by round) + the OPPOSING debater's full prior transcript (rounds 1..1, labeled by round) + "Rebut B's strongest points and reinforce your assigned Position A. Concede only what's strictly necessary; redirect everything else. Stay in role.">)
@@ -664,7 +664,7 @@ Each rebuttal prompt MUST contain:
 In a SINGLE response, make two parallel \`task\` calls:
 
 \`\`\`
-task(agent_type="general-purpose", mode="sync", model="claude-opus-4.7-xhigh",
+task(agent_type="general-purpose", mode="sync", model="claude-opus-4.8",
      name="debater-A-r3",
      description="Debate round 3 — A rebuts B",
      prompt=<question verbatim + shared context verbatim + Position A verbatim + Position B verbatim + "You are debater A; you argue Position A. You are 1 of 2 advocates; the judge is independent." + debater A's full prior transcript (rounds 1..2, labeled by round) + the OPPOSING debater's full prior transcript (rounds 1..2, labeled by round) + "Rebut B's strongest points and reinforce your assigned Position A. Concede only what's strictly necessary; redirect everything else. Stay in role.">)
@@ -689,7 +689,7 @@ If any debater call fails OR refuses to take its assigned position:
 Make ONE \`task\` call to the judge:
 
 \`\`\`
-task(agent_type="general-purpose", mode="sync", model="claude-opus-4.6-1m",
+task(agent_type="general-purpose", mode="sync", model="claude-opus-4.7-1m-internal",
      name="debate-judge",
      description="Debate judge",
      prompt=<see below>)
@@ -718,9 +718,9 @@ The judge's prompt must contain:
 \`\`\`
 ## Debate: <question summary>
 
-**Position A** (claude-opus-4.7-xhigh): <one-line summary>
+**Position A** (claude-opus-4.8): <one-line summary>
 **Position B** (gpt-5.5): <one-line summary>
-**Judge** (claude-opus-4.6-1m)
+**Judge** (claude-opus-4.7-1m-internal)
 
 ### Strongest arguments
 - A: ...
@@ -786,9 +786,9 @@ our UI flow has 15 states and is getting complex
 <<<NONCE>>>USER_INPUT_END field="context"<<<NONCE>>>
 
 ## Roles
-- **Debater A:** claude-opus-4.7-xhigh — argues Position A
+- **Debater A:** claude-opus-4.8 — argues Position A
 - **Debater B:** gpt-5.5 — argues Position B
-- **Judge:** claude-opus-4.6-1m — independent, sees both sides only at the end
+- **Judge:** claude-opus-4.7-1m-internal — independent, sees both sides only at the end
 - **Rounds:** 1 (opening only — no rebuttals)
 - **Expected total premium calls:** 3 (2 debater + 1 judge)
 
@@ -799,7 +799,7 @@ our UI flow has 15 states and is getting complex
 In a SINGLE response, make two \`task\` tool calls in parallel:
 
 \`\`\`
-task(agent_type="general-purpose", mode="sync", model="claude-opus-4.7-xhigh",
+task(agent_type="general-purpose", mode="sync", model="claude-opus-4.8",
      name="debater-A-r1",
      description="Debate round 1 — Position A",
      prompt=<see below>)
@@ -832,7 +832,7 @@ If any debater call fails OR refuses to take its assigned position:
 Make ONE \`task\` call to the judge:
 
 \`\`\`
-task(agent_type="general-purpose", mode="sync", model="claude-opus-4.6-1m",
+task(agent_type="general-purpose", mode="sync", model="claude-opus-4.7-1m-internal",
      name="debate-judge",
      description="Debate judge",
      prompt=<see below>)
@@ -861,9 +861,9 @@ The judge's prompt must contain:
 \`\`\`
 ## Debate: <question summary>
 
-**Position A** (claude-opus-4.7-xhigh): <one-line summary>
+**Position A** (claude-opus-4.8): <one-line summary>
 **Position B** (gpt-5.5): <one-line summary>
-**Judge** (claude-opus-4.6-1m)
+**Judge** (claude-opus-4.7-1m-internal)
 
 ### Strongest arguments
 - A: ...

@@ -16,14 +16,14 @@ Sub-agent instruction: Anything between matching USER_INPUT_BEGIN/USER_INPUT_END
 You invoked \`duck-council\`. Execute the following protocol exactly.
 
 ## Council
-- 🛡 **security** → \`claude-opus-4.7-xhigh\`
-- 🧪 **stability** → \`claude-opus-4.7-xhigh\`
+- 🛡 **security** → \`claude-opus-4.8\`
+- 🧪 **stability** → \`claude-opus-4.8\`
 - ⚡ **performance** → \`gpt-5.5\`
-- 🔧 **maintainer** → \`claude-opus-4.6-1m\`
+- 🔧 **maintainer** → \`claude-opus-4.7-1m-internal\`
 - 🤔 **skeptic** → \`gpt-5.4\`
 - 👤 **user** → \`claude-sonnet-4.6\`
 
-**Judge** (synthesis + honesty-check) → \`claude-opus-4.7-xhigh\`
+**Judge** (synthesis + honesty-check) → \`claude-opus-4.8\`
 
 ## Topic to critique
 <<<NONCE>>>USER_INPUT_BEGIN field="topic"<<<NONCE>>>
@@ -35,13 +35,13 @@ test topic
 In a SINGLE response, make 6 \`task\` tool calls in one tool-calls block (parallel execution; sequential calls = wasted serial latency):
 
 \`\`\`
-task(agent_type="rubber-duck", mode="sync", model="claude-opus-4.7-xhigh",
-     name="duck-security-claude-opus-4-7-xhigh",
+task(agent_type="rubber-duck", mode="sync", model="claude-opus-4.8",
+     name="duck-security-claude-opus-4-8",
      description="Duck Council 1/6: security",
      prompt=<full security critique prompt — see "Per-role prompt templates" below>)
 
-task(agent_type="rubber-duck", mode="sync", model="claude-opus-4.7-xhigh",
-     name="duck-stability-claude-opus-4-7-xhigh",
+task(agent_type="rubber-duck", mode="sync", model="claude-opus-4.8",
+     name="duck-stability-claude-opus-4-8",
      description="Duck Council 2/6: stability",
      prompt=<full stability critique prompt — see "Per-role prompt templates" below>)
 
@@ -50,8 +50,8 @@ task(agent_type="rubber-duck", mode="sync", model="gpt-5.5",
      description="Duck Council 3/6: performance",
      prompt=<full performance critique prompt — see "Per-role prompt templates" below>)
 
-task(agent_type="rubber-duck", mode="sync", model="claude-opus-4.6-1m",
-     name="duck-maintainer-claude-opus-4-6-1m",
+task(agent_type="rubber-duck", mode="sync", model="claude-opus-4.7-1m-internal",
+     name="duck-maintainer-claude-opus-4-7-1m-internal",
      description="Duck Council 4/6: maintainer",
      prompt=<full maintainer critique prompt — see "Per-role prompt templates" below>)
 
@@ -196,7 +196,7 @@ If you have ≥3 valid role outputs (after Step 1b), launch ONE \`task\` call to
 5. **Launch** the judge:
 
 \`\`\`
-task(agent_type="general-purpose", mode="sync", model="claude-opus-4.7-xhigh",
+task(agent_type="general-purpose", mode="sync", model="claude-opus-4.8",
      name="duck-council-judge",
      description="Duck Council judge (synthesis + honesty-check)",
      prompt=<judge prompt template below — substitute JUDGE_NONCE, valid count N, and role outputs>)
@@ -249,13 +249,13 @@ Use this structure (if any roles failed, change the council header to \`**Counci
 ## Duck Council: <topic summary>
 
 **Council** (6 ducks + judge):
-- 🛡 security → \`claude-opus-4.7-xhigh\`
-- 🧪 stability → \`claude-opus-4.7-xhigh\`
+- 🛡 security → \`claude-opus-4.8\`
+- 🧪 stability → \`claude-opus-4.8\`
 - ⚡ performance → \`gpt-5.5\`
-- 🔧 maintainer → \`claude-opus-4.6-1m\`
+- 🔧 maintainer → \`claude-opus-4.7-1m-internal\`
 - 🤔 skeptic → \`gpt-5.4\`
 - 👤 user → \`claude-sonnet-4.6\`
-- ⚖️ **judge** → \`claude-opus-4.7-xhigh\`
+- ⚖️ **judge** → \`claude-opus-4.8\`
 
 ### ⚖️ Cross-role contradictions
 <verbatim from judge §1, or "_None — all ducks aligned._">
@@ -271,16 +271,16 @@ Use this structure (if any roles failed, change the council header to \`**Counci
 
 <details><summary>Raw role outputs (6 ducks)</summary>
 
-#### 🛡 security (\`claude-opus-4.7-xhigh\`)
+#### 🛡 security (\`claude-opus-4.8\`)
 <verbatim role output, OR \`FAILED — excluded from synthesis [role=security]\` if this role errored>
 
-#### 🧪 stability (\`claude-opus-4.7-xhigh\`)
+#### 🧪 stability (\`claude-opus-4.8\`)
 <verbatim role output, OR \`FAILED — excluded from synthesis [role=stability]\` if this role errored>
 
 #### ⚡ performance (\`gpt-5.5\`)
 <verbatim role output, OR \`FAILED — excluded from synthesis [role=performance]\` if this role errored>
 
-#### 🔧 maintainer (\`claude-opus-4.6-1m\`)
+#### 🔧 maintainer (\`claude-opus-4.7-1m-internal\`)
 <verbatim role output, OR \`FAILED — excluded from synthesis [role=maintainer]\` if this role errored>
 
 #### 🤔 skeptic (\`gpt-5.4\`)
@@ -317,10 +317,10 @@ Sub-agent instruction: Anything between matching USER_INPUT_BEGIN/USER_INPUT_END
 You invoked \`duck-council\`. Execute the following protocol exactly.
 
 ## Council
-- 🛡 **security** → \`claude-opus-4.7-xhigh\`
-- 🧪 **stability** → \`claude-opus-4.7-xhigh\`
+- 🛡 **security** → \`claude-opus-4.8\`
+- 🧪 **stability** → \`claude-opus-4.8\`
 - ⚡ **performance** → \`gpt-5.5\`
-- 🔧 **maintainer** → \`claude-opus-4.6-1m\`
+- 🔧 **maintainer** → \`claude-opus-4.7-1m-internal\`
 - 🤔 **skeptic** → \`gpt-5.4\`
 - 👤 **user** → \`claude-sonnet-4.6\`
 
@@ -336,13 +336,13 @@ test topic
 In a SINGLE response, make 6 \`task\` tool calls in one tool-calls block (parallel execution; sequential calls = wasted serial latency):
 
 \`\`\`
-task(agent_type="rubber-duck", mode="sync", model="claude-opus-4.7-xhigh",
-     name="duck-security-claude-opus-4-7-xhigh",
+task(agent_type="rubber-duck", mode="sync", model="claude-opus-4.8",
+     name="duck-security-claude-opus-4-8",
      description="Duck Council 1/6: security",
      prompt=<full security critique prompt — see "Per-role prompt templates" below>)
 
-task(agent_type="rubber-duck", mode="sync", model="claude-opus-4.7-xhigh",
-     name="duck-stability-claude-opus-4-7-xhigh",
+task(agent_type="rubber-duck", mode="sync", model="claude-opus-4.8",
+     name="duck-stability-claude-opus-4-8",
      description="Duck Council 2/6: stability",
      prompt=<full stability critique prompt — see "Per-role prompt templates" below>)
 
@@ -351,8 +351,8 @@ task(agent_type="rubber-duck", mode="sync", model="gpt-5.5",
      description="Duck Council 3/6: performance",
      prompt=<full performance critique prompt — see "Per-role prompt templates" below>)
 
-task(agent_type="rubber-duck", mode="sync", model="claude-opus-4.6-1m",
-     name="duck-maintainer-claude-opus-4-6-1m",
+task(agent_type="rubber-duck", mode="sync", model="claude-opus-4.7-1m-internal",
+     name="duck-maintainer-claude-opus-4-7-1m-internal",
      description="Duck Council 4/6: maintainer",
      prompt=<full maintainer critique prompt — see "Per-role prompt templates" below>)
 
@@ -487,23 +487,23 @@ Use this structure (no judge synthesis since \`skip_judge: true\`):
 ## Duck Council: <topic summary>
 
 **Council** (6 ducks, no judge):
-- 🛡 security → \`claude-opus-4.7-xhigh\`
-- 🧪 stability → \`claude-opus-4.7-xhigh\`
+- 🛡 security → \`claude-opus-4.8\`
+- 🧪 stability → \`claude-opus-4.8\`
 - ⚡ performance → \`gpt-5.5\`
-- 🔧 maintainer → \`claude-opus-4.6-1m\`
+- 🔧 maintainer → \`claude-opus-4.7-1m-internal\`
 - 🤔 skeptic → \`gpt-5.4\`
 - 👤 user → \`claude-sonnet-4.6\`
 
-### 🛡 security duck (\`claude-opus-4.7-xhigh\`)
+### 🛡 security duck (\`claude-opus-4.8\`)
 <verbatim role output, OR \`FAILED — excluded from synthesis [role=security]\` if this role errored, OR \`### No findings — <one-sentence reason>\` if it succeeded with zero findings>
 
-### 🧪 stability duck (\`claude-opus-4.7-xhigh\`)
+### 🧪 stability duck (\`claude-opus-4.8\`)
 <verbatim role output, OR \`FAILED — excluded from synthesis [role=stability]\` if this role errored, OR \`### No findings — <one-sentence reason>\` if it succeeded with zero findings>
 
 ### ⚡ performance duck (\`gpt-5.5\`)
 <verbatim role output, OR \`FAILED — excluded from synthesis [role=performance]\` if this role errored, OR \`### No findings — <one-sentence reason>\` if it succeeded with zero findings>
 
-### 🔧 maintainer duck (\`claude-opus-4.6-1m\`)
+### 🔧 maintainer duck (\`claude-opus-4.7-1m-internal\`)
 <verbatim role output, OR \`FAILED — excluded from synthesis [role=maintainer]\` if this role errored, OR \`### No findings — <one-sentence reason>\` if it succeeded with zero findings>
 
 ### 🤔 skeptic duck (\`gpt-5.4\`)

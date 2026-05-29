@@ -34,12 +34,12 @@ const session = await joinSession({
                         minItems: 3,
                         maxItems: 3,
                         description:
-                            "Optional. Exactly 3 model IDs to override the default reviewer trio. Defaults to claude-opus-4.7-xhigh, claude-opus-4.6-1m, gpt-5.5. (xhigh = extra-high reasoning, ~200k context; pass a 1M-context model variant here if you need it for very large inputs.)",
+                            "Optional. Exactly 3 model IDs to override the default reviewer trio. Defaults to claude-opus-4.8, claude-opus-4.7-1m-internal, gpt-5.5. (4.8 = current top reasoning model, ~200k context; slot 2 is a 1M-context variant for large inputs.)",
                     },
                     judge: {
                         type: "string",
                         description:
-                            "Optional. Model ID for the judge that synthesizes the 3 reviewer critiques into the final unified output. Defaults to `claude-opus-4.7-xhigh` (highest-quality reasoning available, ~200k context — sufficient for typical critique sizes). Pass a 1M-context model variant if your reviewer outputs are unusually large. Compatible with `cheap: true` (cheap reviewer trio + premium judge is a sensible config).",
+                            "Optional. Model ID for the judge that synthesizes the 3 reviewer critiques into the final unified output. Defaults to `claude-opus-4.8` (current top reasoning model, ~200k context — sufficient for typical critique sizes). Pass a 1M-context model variant if your reviewer outputs are unusually large. Compatible with `cheap: true` (cheap reviewer trio + premium judge is a sensible config).",
                     },
                     focus: {
                         type: "string",

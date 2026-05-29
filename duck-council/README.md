@@ -25,21 +25,21 @@ The "ignore X" lines in each prompt are load-bearing — they prevent every duck
 - 🤔 **skeptic** — argues this should NOT be built or should be built smaller. YAGNI, scope creep, unvalidated assumptions, simpler alternatives.
 - 👤 **user** — surprising behavior, error messages, defaults, silent failures, accessibility, breaking changes. *Ignores* implementation details.
 
-## Default models (TIERED, not all-xhigh)
+## Default models (TIERED, not all top-tier)
 
 Tiered for cost/quality balance. Family-diverse: 4 Claude + 2 GPT among reviewers + Claude judge.
 
 | Role | Default | Cheap mode |
 |---|---|---|
-| security | `claude-opus-4.7-xhigh` | `claude-opus-4.7` |
-| stability | `claude-opus-4.7-xhigh` | `claude-opus-4.6-1m` |
+| security | `claude-opus-4.8` | `claude-opus-4.7` |
+| stability | `claude-opus-4.8` | `claude-opus-4.6-1m` |
 | performance | `gpt-5.5` | `gpt-5.5` |
-| maintainer | `claude-opus-4.6-1m` | `claude-opus-4.6` |
+| maintainer | `claude-opus-4.7-1m-internal` | `claude-opus-4.6` |
 | skeptic | `gpt-5.4` | `gpt-5.4` |
 | user | `claude-sonnet-4.6` | `claude-sonnet-4.6` |
-| **judge** | `claude-opus-4.7-xhigh` | `claude-opus-4.7` |
+| **judge** | `claude-opus-4.8` | `claude-opus-4.7` |
 
-Why tiered: an artist-grade UX duck doesn't need xhigh; security/stability do. The judge is highest-stakes (adjudicating 6 critiques + finding what they all missed) and gets xhigh by default.
+Why tiered: an artist-grade UX duck doesn't need the top reasoning model; security/stability do. The judge is highest-stakes (adjudicating 6 critiques + finding what they all missed) and gets the top reasoning model (`claude-opus-4.8`) by default.
 
 ## Judge pass
 

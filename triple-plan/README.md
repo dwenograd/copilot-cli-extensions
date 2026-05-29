@@ -12,7 +12,7 @@ Launches three planning agents in parallel using different models, then has a **
 - **Contested decisions** — where models took different approaches
 - **Risks & open questions** — merged across all planners
 
-The judge defaults to `claude-opus-4.6-1m` because three full planner outputs can easily exceed the ~200k context window of `xhigh`. If your plans are smaller and you'd rather have deeper reasoning than more context, override with `judge: "claude-opus-4.7-xhigh"`.
+The judge defaults to `claude-opus-4.7-1m-internal` because three full planner outputs can easily exceed the ~200k context window of `xhigh`. If your plans are smaller and you'd rather have deeper reasoning than more context, override with `judge: "claude-opus-4.7-xhigh"`.
 
 If the judge fails twice, the orchestrator falls back to merging the plans itself — but **explicitly labels the output** so you know the judge layer was bypassed.
 
@@ -24,7 +24,7 @@ triple-plan({
   context?: string,          // Optional extra context / file paths / scope
   constraints?: string,      // Optional hard constraints every plan MUST respect
   models?: string[],         // Optional planner trio override (must be 3 distinct model IDs)
-  judge?: string,            // Optional judge override (default: claude-opus-4.6-1m)
+  judge?: string,            // Optional judge override (default: claude-opus-4.7-1m-internal)
                              // Compatible with `cheap: true` for "cheap planners, premium judge"
   cheap?: boolean,           // Optional. Use cheap planner trio (see Cheap mode below).
                              // Mutually exclusive with `models` (NOT with `judge`).
@@ -50,12 +50,12 @@ Use `cheap: true` for ~23% planner-cost savings with 200k context instead of 1M.
 
 ## Defaults
 
-- **Planner trio:** `claude-opus-4.7-xhigh`, `claude-opus-4.6-1m`, `gpt-5.5`
+- **Planner trio:** `claude-opus-4.8`, `claude-opus-4.7-1m-internal`, `gpt-5.5`
 - **Cheap planner trio:** `claude-opus-4.7`, `claude-opus-4.6`, `gpt-5.5`
-- **Judge:** `claude-opus-4.6-1m` (1M context for large plan inputs)
+- **Judge:** `claude-opus-4.7-1m-internal` (1M context for large plan inputs)
 - **Cheap judge:** `claude-opus-4.7`
 
-**xhigh tradeoff:** the default's slot-1 has ~200k context. For very large planning tasks, override `models` with a 1M-context variant in slot 1 (use whatever your provider offers).
+**Context tradeoff:** the default's slot-1 (`claude-opus-4.8`) has ~200k context. For very large planning tasks, override `models` with a 1M-context variant in slot 1 (use whatever your provider offers).
 
 ---
 

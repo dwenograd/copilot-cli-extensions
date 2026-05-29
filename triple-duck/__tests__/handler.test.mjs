@@ -133,10 +133,10 @@ describe("triple-duck handler", () => {
         const { deps, logged } = mockDeps();
         const r = await runHandler({ topic: "x" }, deps);
         expect(r.resultType).toBe("success");
-        expect(r.textResultForLlm).toContain("claude-opus-4.7-xhigh");
+        expect(r.textResultForLlm).toContain("claude-opus-4.8");
         expect(r.textResultForLlm).toContain("Judge");
         expect(r.textResultForLlm).toContain("triple-duck-judge");
-        expect(logged.some((l) => l.includes("judge: claude-opus-4.7-xhigh"))).toBe(true);
+        expect(logged.some((l) => l.includes("judge: claude-opus-4.8"))).toBe(true);
     });
 
     it("honors an explicit judge override (cheap + judge override is allowed)", async () => {
