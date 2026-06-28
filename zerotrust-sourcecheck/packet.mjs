@@ -10,6 +10,7 @@
 // wrappers enforce their own path, flag, and council-gate checks inside the
 // extension process.
 
+import { renderSpawnArgs } from "../_shared/index.mjs";
 import {
     modeIsBuild,
     modeIsAudit,
@@ -330,7 +331,7 @@ function renderLocalCouncilBlock({ councilManifest, councilJudgeModel, councilSu
     ).join("\n");
     const taskCalls = councilManifest.map((r, i) => {
         const safeName = `zerotrust-${r.id}`.replace(/[^a-z0-9-]/gi, "-");
-        return `task(agent_type="general-purpose", mode="sync", model=${JSON.stringify(r.model)},
+        return `task(agent_type="general-purpose", mode="sync", ${renderSpawnArgs(r.model, { elevated: true })},
      name=${JSON.stringify(safeName)},
      description=${JSON.stringify(`Council ${i + 1}/${councilManifest.length}: ${r.id}`)},
      prompt=<the renderedPrompt for ${r.id} from the role manifest below>)`;
@@ -343,8 +344,8 @@ function renderLocalCouncilBlock({ councilManifest, councilJudgeModel, councilSu
 **Roster:**
 ${roleList}
 
-**Sub-judge** (groups same-category findings): \`${councilSubJudgeModel}\`
-**Meta-judge** (final synthesis): \`${councilJudgeModel}\`
+**Sub-judge** (groups same-category findings) — launch with \`${renderSpawnArgs(councilSubJudgeModel, { elevated: true })}\`
+**Meta-judge** (final synthesis) — launch with \`${renderSpawnArgs(councilJudgeModel, { elevated: true })}\`
 **Premium-call ceiling:** ${maxPremiumCalls} (initialize \`actualPremiumCalls = 0\`; refuse next launch when ceiling reached; reserve at least 2 for judges).
 
 ### Step 5a — Launch all ${councilManifest.length} roles in PARALLEL
@@ -699,7 +700,9 @@ Current mode summary: **${currentModeLine}**.
         // agent doesn't get confused about which prompt belongs to which role.
         const roleManifestRendered = councilManifest.map((r, idx) => {
             const mandTag = r.mandatory ? " [MANDATORY ★]" : "";
-            return `### Role ${idx + 1} of ${totalRoles}: \`${r.id}\` (category ${r.category}, model \`${r.model}\`, tier \`${r.tier}\`)${mandTag}
+            return `### Role ${idx + 1} of ${totalRoles}: \`${r.id}\` (category ${r.category}, tier \`${r.tier}\`)${mandTag}
+
+**task args:** \`${renderSpawnArgs(r.model, { elevated: true })}\`
 
 \`\`\`text
 ${r.renderedPrompt}
@@ -725,7 +728,7 @@ You will now run a **${totalRoles}-role security council** in addition to (not i
 
 Use the \`task\` tool with **\`agent_type: "${modeUsesApiDirect(mode) ? "general-purpose" : "explore"}"\`** and **\`mode: "sync"\`** for every role. ${modeUsesApiDirect(mode) ? "(general-purpose is required for API-direct: only general-purpose sub-agents have access to the extension tools `zerotrust_safe_fetch_file` / `zerotrust_safe_list_tree`. The `explore` agent type only has built-in tools.)" : "(explore is sufficient since the on-disk clone is reachable via view/grep/glob.)"} Launch in **batches of ≤ 8 task calls per single tool-call block**.
 
-For each role below, the prompt to pass to \`task\` is given verbatim in a fenced \`text\` block. Copy the full block (without the fences) as the \`prompt\` argument. The \`model\` to pass to \`task\` is given in the role header.
+For each role below, the prompt to pass to \`task\` is given verbatim in a fenced \`text\` block. Copy the full block (without the fences) as the \`prompt\` argument. The **task args** to pass to \`task\` (model plus any \`reasoning_effort\` / \`context_tier\`) are given in each role header.
 
 **Per-role retry policy:** if a role's output does not parse against the OUTPUT CONTRACT in its prompt (missing \`findings\` or \`coverage_performed\` keys, missing \`quoted_evidence\` on a finding), retry that one role ONCE with the same model and prompt. After retry, if still invalid, mark the role FAILED.
 
@@ -752,7 +755,7 @@ If all three gates pass, proceed to Step 3 (synthesis). If any gate fails, write
 
 #### Step 3a — Launch ${categories.length} category sub-judges in parallel
 
-Use \`task\` with \`agent_type: "general-purpose"\`, \`mode: "sync"\`, \`model: "${councilSubJudgeModel}"\`. All ${categories.length} sub-judges go in ONE tool-call block.
+Use \`task\` with \`agent_type="general-purpose"\`, \`mode="sync"\`, \`${renderSpawnArgs(councilSubJudgeModel, { elevated: true })}\`. All ${categories.length} sub-judges go in ONE tool-call block.
 
 Each sub-judge's prompt has this structure:
 - A short instruction to cluster the role outputs in this category, preserve all critical/high singletons (do NOT drop quiet but severe findings), and produce a category-level rolled-up findings list with per-finding cross-validation count.
@@ -763,7 +766,7 @@ ${subJudgeList}
 
 #### Step 3b — Launch the meta-judge
 
-Use \`task\` with \`agent_type: "general-purpose"\`, \`mode: "sync"\`, \`model: "${councilJudgeModel}"\`.
+Use \`task\` with \`agent_type="general-purpose"\`, \`mode="sync"\`, \`${renderSpawnArgs(councilJudgeModel, { elevated: true })}\`.
 
 The meta-judge prompt receives:
 - The ${categories.length} category sub-judge outputs (each in its own fresh-nonce USER_INPUT envelope)

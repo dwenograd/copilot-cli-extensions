@@ -39,18 +39,18 @@ const session = await joinSession({
                         minItems: 3,
                         maxItems: 3,
                         description:
-                            "Optional. Exactly 3 model IDs to override the default planner trio. Defaults to claude-opus-4.8, claude-opus-4.7-1m-internal, gpt-5.5. (4.8 = current top reasoning model, ~200k context; slot 2 is a 1M-context variant for large inputs.)",
+                            "Optional. Exactly 3 model IDs to override the default planner trio. Defaults to claude-opus-4.8, claude-opus-4.7-1m-internal, gpt-5.5. (Aliases are translated at spawn time; every spawned planner runs with context_tier:\"long_context\".)",
                     },
                     judge: {
                         type: "string",
                         description:
-                            "Optional. Model ID for the judge that merges the 3 planner outputs into one canonical plan. Defaults to `claude-opus-4.7-1m-internal` (1M context — three full plans easily exceed the 200k window of `-xhigh`). Pass `claude-opus-4.7-xhigh` for deeper reasoning when your plans are small enough to fit. Compatible with `cheap: true` (cheap planner trio + premium judge is a sensible config).",
+                            "Optional. Model ID for the judge that merges the 3 planner outputs into one canonical plan. Defaults to `claude-opus-4.7-1m-internal` (alias translated at spawn time; every spawned judge runs with context_tier:\"long_context\"). Pass `claude-opus-4.7-xhigh` for extra-high reasoning effort. Compatible with `cheap: true` (cheap planner trio + premium judge is a sensible config).",
                     },
                     cheap: {
                         type: "boolean",
                         default: false,
                         description:
-                            "Optional. When true, use the cheap planner trio (claude-opus-4.7, claude-opus-4.6, gpt-5.5 — non-1M-context variants). ~23% planner-cost savings, but planners have ~200k context instead of 1M. Judge defaults to `claude-opus-4.7` in cheap mode unless overridden via `judge`. Set this when the user invokes 'triple plan cheap <task>' or asks for cheap mode. MUTUALLY EXCLUSIVE with `models` (but compatible with explicit `judge`).",
+                            "Optional. When true, use the cheap planner trio (claude-opus-4.7, claude-opus-4.6, gpt-5.5). ~23% planner-cost savings; every spawned planner still runs with context_tier:\"long_context\". Judge defaults to `claude-opus-4.7` in cheap mode unless overridden via `judge`. Set this when the user invokes 'triple plan cheap <task>' or asks for cheap mode. MUTUALLY EXCLUSIVE with `models` (but compatible with explicit `judge`).",
                     },
                     max_premium_calls: {
                         type: "integer",

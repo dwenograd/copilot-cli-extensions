@@ -155,7 +155,7 @@ const session = await joinSession({
                     judge: {
                         type: "string",
                         description:
-                            "Optional (council modes only). Override the meta-judge model. Default is claude-opus-4.7-1m-internal (chosen for 1M context to ingest the 7 sub-judge outputs).",
+                            "Optional (council modes only). Override the meta-judge model. Default is claude-opus-4.7-1m-internal (alias translated at spawn time; every spawned meta-judge runs with context_tier:\"long_context\").",
                     },
                     max_premium_calls: {
                         type: "integer",

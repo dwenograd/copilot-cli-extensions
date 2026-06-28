@@ -425,10 +425,7 @@ export const ALLOWED_MODEL_IDS = Object.freeze([
     "gpt-5.4",
     "gpt-5.4-mini",
     "gpt-5.3-codex",
-    "gpt-5.2",
-    "gpt-5.2-codex",
     "gpt-5-mini",
-    "gpt-4.1",
 ]);
 
 export const DEFAULT_SUB_JUDGE_MODEL = "claude-opus-4.7-1m-internal";

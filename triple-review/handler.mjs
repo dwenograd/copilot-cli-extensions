@@ -16,6 +16,7 @@ import {
     injectionInstructionForSubAgents,
     resolveModels,
     renderSubstitutionNote,
+    displayModels,
     formatZodError,
 } from "../_shared/index.mjs";
 import { tripleReviewSchema } from "../_shared/schemas.mjs";
@@ -213,7 +214,7 @@ export async function runHandler(args, deps = {}) {
         await log(`[fallback] ${sub.requested} -> ${sub.used}: ${sub.reason}`);
     }
     await log(
-        `${TOOL} invoked — ${input.cheap && !isUserOverride ? "CHEAP mode — " : ""}reviewers: ${resolved.models.join(", ")} — max ${input.max_rounds} round(s) — scope: ${input.scope || "auto-detect"}`,
+        `${TOOL} invoked — ${input.cheap && !isUserOverride ? "CHEAP mode — " : ""}reviewers: ${displayModels(resolved.models).join(", ")} — max ${input.max_rounds} round(s) — scope: ${input.scope || "auto-detect"}`,
     );
 
     return { textResultForLlm: packet, resultType: "success" };

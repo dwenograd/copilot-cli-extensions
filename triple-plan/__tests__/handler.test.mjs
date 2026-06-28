@@ -136,7 +136,9 @@ describe("triple-plan handler", () => {
         expect(r.textResultForLlm).toContain("claude-opus-4.7-1m-internal");
         expect(r.textResultForLlm).toContain("Judge");
         expect(r.textResultForLlm).toContain("triple-plan-judge");
-        expect(logged.some((l) => l.includes("judge: claude-opus-4.7-1m-internal"))).toBe(true);
+        expect(logged.some((l) => l.includes("triple-plan invoked") && l.includes("judge: claude-opus-4.7"))).toBe(true);
+        // The user-facing banner must NOT leak the -1m-internal context alias.
+        expect(logged.some((l) => l.includes("triple-plan invoked") && l.includes("-1m-internal"))).toBe(false);
     });
 
     it("honors an explicit judge override (cheap + judge override is allowed)", async () => {
@@ -147,7 +149,7 @@ describe("triple-plan handler", () => {
             judge: "claude-opus-4.7-xhigh",
         }, deps);
         expect(r.resultType).toBe("success");
-        expect(r.textResultForLlm).toContain('"claude-opus-4.7-xhigh"');
+        expect(r.textResultForLlm).toContain('model="claude-opus-4.7", reasoning_effort="xhigh", context_tier="long_context"');
         expect(logged.some((l) => l.includes("judge: claude-opus-4.7-xhigh"))).toBe(true);
         expect(logged.some((l) => l.includes("CHEAP mode"))).toBe(true);
     });
@@ -177,7 +179,7 @@ describe("triple-plan handler", () => {
         const r = await runHandler({ task: "x", cheap: true }, deps);
         expect(r.resultType).toBe("success");
         expect(logged.some((l) => l.includes("judge: claude-opus-4.7"))).toBe(true);
-        // Should not also log the default (1M-context) judge.
+        // Should not also log the default (non-cheap) judge alias.
         expect(logged.some((l) => /judge: claude-opus-4\.6-1m/.test(l))).toBe(false);
     });
 

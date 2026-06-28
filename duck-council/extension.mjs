@@ -64,7 +64,7 @@ const session = await joinSession({
                         type: "boolean",
                         default: false,
                         description:
-                            "Optional. Use cheap-tier role models — drops the premium reasoning models to cheaper variants to save cost. Note: cheap stability default keeps `claude-opus-4.6-1m` (the cheaper 1M-context variant) to preserve large-context support for big code reviews; cheap performance/skeptic/user defaults are unchanged from defaults. MUTUALLY EXCLUSIVE with `roles` (an empty `roles: {}` object is treated as no override and is allowed alongside `cheap`).",
+                            "Optional. Use cheap-tier role models — drops the premium reasoning models to cheaper variants to save cost. Note: cheap stability default keeps the `claude-opus-4.6-1m` alias, but every spawned role still runs with context_tier:\"long_context\"; cheap performance/skeptic/user defaults are unchanged from defaults. MUTUALLY EXCLUSIVE with `roles` (an empty `roles: {}` object is treated as no override and is allowed alongside `cheap`).",
                     },
                     max_premium_calls: {
                         type: "integer",

@@ -35,32 +35,32 @@ test topic
 In a SINGLE response, make 6 \`task\` tool calls in one tool-calls block (parallel execution; sequential calls = wasted serial latency):
 
 \`\`\`
-task(agent_type="rubber-duck", mode="sync", model="claude-opus-4.8",
+task(agent_type="rubber-duck", mode="sync", model="claude-opus-4.8", reasoning_effort="xhigh", context_tier="long_context",
      name="duck-security-claude-opus-4-8",
      description="Duck Council 1/6: security",
      prompt=<full security critique prompt — see "Per-role prompt templates" below>)
 
-task(agent_type="rubber-duck", mode="sync", model="claude-opus-4.8",
+task(agent_type="rubber-duck", mode="sync", model="claude-opus-4.8", reasoning_effort="xhigh", context_tier="long_context",
      name="duck-stability-claude-opus-4-8",
      description="Duck Council 2/6: stability",
      prompt=<full stability critique prompt — see "Per-role prompt templates" below>)
 
-task(agent_type="rubber-duck", mode="sync", model="gpt-5.5",
+task(agent_type="rubber-duck", mode="sync", model="gpt-5.5", reasoning_effort="xhigh", context_tier="long_context",
      name="duck-performance-gpt-5-5",
      description="Duck Council 3/6: performance",
      prompt=<full performance critique prompt — see "Per-role prompt templates" below>)
 
-task(agent_type="rubber-duck", mode="sync", model="claude-opus-4.7-1m-internal",
+task(agent_type="rubber-duck", mode="sync", model="claude-opus-4.7", reasoning_effort="xhigh", context_tier="long_context",
      name="duck-maintainer-claude-opus-4-7-1m-internal",
      description="Duck Council 4/6: maintainer",
      prompt=<full maintainer critique prompt — see "Per-role prompt templates" below>)
 
-task(agent_type="rubber-duck", mode="sync", model="gpt-5.4",
+task(agent_type="rubber-duck", mode="sync", model="gpt-5.4", reasoning_effort="xhigh", context_tier="long_context",
      name="duck-skeptic-gpt-5-4",
      description="Duck Council 5/6: skeptic",
      prompt=<full skeptic critique prompt — see "Per-role prompt templates" below>)
 
-task(agent_type="rubber-duck", mode="sync", model="claude-sonnet-4.6",
+task(agent_type="rubber-duck", mode="sync", model="claude-sonnet-4.6", context_tier="long_context",
      name="duck-user-claude-sonnet-4-6",
      description="Duck Council 6/6: user",
      prompt=<full user critique prompt — see "Per-role prompt templates" below>)
@@ -196,7 +196,7 @@ If you have ≥3 valid role outputs (after Step 1b), launch ONE \`task\` call to
 5. **Launch** the judge:
 
 \`\`\`
-task(agent_type="general-purpose", mode="sync", model="claude-opus-4.8",
+task(agent_type="general-purpose", mode="sync", model="claude-opus-4.8", reasoning_effort="xhigh", context_tier="long_context",
      name="duck-council-judge",
      description="Duck Council judge (synthesis + honesty-check)",
      prompt=<judge prompt template below — substitute JUDGE_NONCE, valid count N, and role outputs>)
@@ -336,32 +336,32 @@ test topic
 In a SINGLE response, make 6 \`task\` tool calls in one tool-calls block (parallel execution; sequential calls = wasted serial latency):
 
 \`\`\`
-task(agent_type="rubber-duck", mode="sync", model="claude-opus-4.8",
+task(agent_type="rubber-duck", mode="sync", model="claude-opus-4.8", reasoning_effort="xhigh", context_tier="long_context",
      name="duck-security-claude-opus-4-8",
      description="Duck Council 1/6: security",
      prompt=<full security critique prompt — see "Per-role prompt templates" below>)
 
-task(agent_type="rubber-duck", mode="sync", model="claude-opus-4.8",
+task(agent_type="rubber-duck", mode="sync", model="claude-opus-4.8", reasoning_effort="xhigh", context_tier="long_context",
      name="duck-stability-claude-opus-4-8",
      description="Duck Council 2/6: stability",
      prompt=<full stability critique prompt — see "Per-role prompt templates" below>)
 
-task(agent_type="rubber-duck", mode="sync", model="gpt-5.5",
+task(agent_type="rubber-duck", mode="sync", model="gpt-5.5", reasoning_effort="xhigh", context_tier="long_context",
      name="duck-performance-gpt-5-5",
      description="Duck Council 3/6: performance",
      prompt=<full performance critique prompt — see "Per-role prompt templates" below>)
 
-task(agent_type="rubber-duck", mode="sync", model="claude-opus-4.7-1m-internal",
+task(agent_type="rubber-duck", mode="sync", model="claude-opus-4.7", reasoning_effort="xhigh", context_tier="long_context",
      name="duck-maintainer-claude-opus-4-7-1m-internal",
      description="Duck Council 4/6: maintainer",
      prompt=<full maintainer critique prompt — see "Per-role prompt templates" below>)
 
-task(agent_type="rubber-duck", mode="sync", model="gpt-5.4",
+task(agent_type="rubber-duck", mode="sync", model="gpt-5.4", reasoning_effort="xhigh", context_tier="long_context",
      name="duck-skeptic-gpt-5-4",
      description="Duck Council 5/6: skeptic",
      prompt=<full skeptic critique prompt — see "Per-role prompt templates" below>)
 
-task(agent_type="rubber-duck", mode="sync", model="claude-sonnet-4.6",
+task(agent_type="rubber-duck", mode="sync", model="claude-sonnet-4.6", context_tier="long_context",
      name="duck-user-claude-sonnet-4-6",
      description="Duck Council 6/6: user",
      prompt=<full user critique prompt — see "Per-role prompt templates" below>)

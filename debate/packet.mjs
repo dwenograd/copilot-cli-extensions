@@ -5,6 +5,8 @@
 // (validation, scrub, policy wrap, model resolution, budget check) and
 // passes the prepared pieces to this composer.
 
+import { renderSpawnArgs } from "../_shared/index.mjs";
+
 export function buildInstructionPacket({
     effectiveDebaters,
     effectiveJudge,
@@ -22,7 +24,7 @@ export function buildInstructionPacket({
     subAgentInstruction,
 }) {
     const modeLine = cheap
-        ? `\n**Mode:** cheap (non-1M-context variants)\n`
+        ? `\n**Mode:** cheap (cheaper model variants)\n`
         : "";
 
     const warningsBlock = injectionWarnings && injectionWarnings.length > 0
@@ -57,12 +59,12 @@ export function buildInstructionPacket({
 In a SINGLE response, make two \`task\` tool calls in parallel:
 
 \`\`\`
-task(agent_type="general-purpose", mode="sync", model=${JSON.stringify(effectiveDebaters[0])},
+task(agent_type="general-purpose", mode="sync", ${renderSpawnArgs(effectiveDebaters[0], { elevated: !cheap })},
      name="debater-A-r1",
      description="Debate round ${r} — Position A",
      prompt=<see below>)
 
-task(agent_type="general-purpose", mode="sync", model=${JSON.stringify(effectiveDebaters[1])},
+task(agent_type="general-purpose", mode="sync", ${renderSpawnArgs(effectiveDebaters[1], { elevated: !cheap })},
      name="debater-B-r1",
      description="Debate round ${r} — Position B",
      prompt=<see below>)
@@ -95,12 +97,12 @@ Each rebuttal prompt MUST contain:
 In a SINGLE response, make two parallel \`task\` calls:
 
 \`\`\`
-task(agent_type="general-purpose", mode="sync", model=${JSON.stringify(effectiveDebaters[0])},
+task(agent_type="general-purpose", mode="sync", ${renderSpawnArgs(effectiveDebaters[0], { elevated: !cheap })},
      name="debater-A-r${r}",
      description="Debate round ${r} — A rebuts B",
      prompt=<question verbatim + shared context verbatim + Position A verbatim + Position B verbatim + "You are debater A; you argue Position A. You are 1 of 2 advocates; the judge is independent." + debater A's full prior transcript (rounds 1..${r - 1}, labeled by round) + the OPPOSING debater's full prior transcript (rounds 1..${r - 1}, labeled by round) + "Rebut B's strongest points and reinforce your assigned Position A. Concede only what's strictly necessary; redirect everything else. Stay in role.">)
 
-task(agent_type="general-purpose", mode="sync", model=${JSON.stringify(effectiveDebaters[1])},
+task(agent_type="general-purpose", mode="sync", ${renderSpawnArgs(effectiveDebaters[1], { elevated: !cheap })},
      name="debater-B-r${r}",
      description="Debate round ${r} — B rebuts A",
      prompt=<question verbatim + shared context verbatim + Position A verbatim + Position B verbatim + "You are debater B; you argue Position B. You are 1 of 2 advocates; the judge is independent." + debater B's full prior transcript (rounds 1..${r - 1}, labeled by round) + the OPPOSING debater's full prior transcript (rounds 1..${r - 1}, labeled by round) + "Rebut A's strongest points and reinforce your assigned Position B. Concede only what's strictly necessary; redirect everything else. Stay in role.">)
@@ -151,7 +153,7 @@ If any debater call fails OR refuses to take its assigned position:
 Make ONE \`task\` call to the judge:
 
 \`\`\`
-task(agent_type="general-purpose", mode="sync", model=${JSON.stringify(effectiveJudge)},
+task(agent_type="general-purpose", mode="sync", ${renderSpawnArgs(effectiveJudge, { elevated: !cheap })},
      name="debate-judge",
      description="Debate judge",
      prompt=<see below>)

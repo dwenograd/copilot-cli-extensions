@@ -43,7 +43,131 @@ function pathLooksLikeCredentialStore(path) {
 }
 
 const FREE_TEXT_CAP = 65536;
+const RESEARCH_ARTIFACT_BODY_CAP = 4 * 1024 * 1024;
 const SEVERITIES = ["critical", "high", "medium", "low", "nit"];
+const DANGEROUS_OBJECT_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+
+function isDangerousObjectKey(key) {
+    return DANGEROUS_OBJECT_KEYS.has(key);
+}
+
+function safeRecordKey(fieldName) {
+    return z.string()
+        .max(128, { message: `${fieldName} keys must be at most 128 chars` })
+        .refine((key) => key.length > 0, { message: `${fieldName} keys must be non-empty` })
+        .refine((key) => !/[\u0000-\u001f\u007f]/.test(key), { message: `${fieldName} keys must not contain control characters` })
+        .refine((key) => !isDangerousObjectKey(key), { message: `${fieldName} keys may not be __proto__, constructor, or prototype` });
+}
+
+function assertPlainRecordObject(value, ctx, fieldName) {
+    const proto = Object.getPrototypeOf(value);
+    if (proto !== Object.prototype) {
+        ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: `${fieldName} must be a plain JSON object with Object.prototype (null/custom prototypes are rejected)`,
+        });
+    }
+}
+
+function safeRecord(fieldName, valueSchema, { maxKeys = 200 } = {}) {
+    return z.record(safeRecordKey(fieldName), valueSchema).superRefine((value, ctx) => {
+        assertPlainRecordObject(value, ctx, fieldName);
+        const keys = Object.keys(value);
+        if (keys.length > maxKeys) {
+            ctx.addIssue({
+                code: z.ZodIssueCode.custom,
+                message: `${fieldName} has too many keys (max ${maxKeys})`,
+            });
+        }
+    });
+}
+
+const boundedRecordString = (fieldName) => z.string()
+    .max(FREE_TEXT_CAP, { message: `${fieldName} exceeds 64KB cap` })
+    .superRefine((value, ctx) => {
+        if (Buffer.byteLength(value, "utf8") > FREE_TEXT_CAP) {
+            ctx.addIssue({ code: z.ZodIssueCode.custom, message: `${fieldName} exceeds 64KB cap` });
+        }
+    });
+
+const SAFE_REGEX_MAX_LEN = 256;
+const UNSAFE_REGEX_PATTERNS = [
+    /\([^)]*[+*][^)]*\)[+*{]/,
+    /\([^)]*\{[^)]*,[^)]*\}[^)]*\)[+*{]/,
+    /\[[^\]]+\][+*]\s*[+*{]/,
+    /\.\*[+*{]/,
+];
+
+function validateSafeRegexPattern(pattern, ctx, path) {
+    if (typeof pattern !== "string") return;
+    if (pattern.length > SAFE_REGEX_MAX_LEN) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, message: `prediction.value regex is too long for operator:"matches" (max ${SAFE_REGEX_MAX_LEN} chars)`, path });
+        return;
+    }
+    for (const unsafe of UNSAFE_REGEX_PATTERNS) {
+        if (unsafe.test(pattern)) {
+            ctx.addIssue({ code: z.ZodIssueCode.custom, message: "prediction.value regex uses nested/ambiguous quantifiers that are rejected to avoid ReDoS", path });
+            return;
+        }
+    }
+    try {
+        new RegExp(pattern);
+    } catch (err) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, message: `prediction.value must be a valid regex for operator:"matches" (${err.message})`, path });
+    }
+}
+
+function validateJsonLike(value, ctx, fieldName, path = [], depth = 0) {
+    if (depth > 8) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, message: `${fieldName} is too deeply nested (max depth 8)`, path });
+        return;
+    }
+    if (value === null || typeof value === "boolean") return;
+    if (typeof value === "number") {
+        if (!Number.isFinite(value)) {
+            ctx.addIssue({ code: z.ZodIssueCode.custom, message: `${fieldName} numbers must be finite`, path });
+        }
+        return;
+    }
+    if (typeof value === "string") {
+        if (Buffer.byteLength(value, "utf8") > FREE_TEXT_CAP) {
+            ctx.addIssue({ code: z.ZodIssueCode.custom, message: `${fieldName} strings exceed 64KB cap`, path });
+        }
+        return;
+    }
+    if (Array.isArray(value)) {
+        if (value.length > 1000) {
+            ctx.addIssue({ code: z.ZodIssueCode.custom, message: `${fieldName} arrays may contain at most 1000 items`, path });
+        }
+        value.forEach((item, i) => validateJsonLike(item, ctx, fieldName, [...path, i], depth + 1));
+        return;
+    }
+    if (typeof value === "object") {
+        const proto = Object.getPrototypeOf(value);
+        if (proto !== Object.prototype) {
+            ctx.addIssue({ code: z.ZodIssueCode.custom, message: `${fieldName} nested objects must be plain JSON objects`, path });
+        }
+        const keys = Object.keys(value);
+        if (keys.length > 200) {
+            ctx.addIssue({ code: z.ZodIssueCode.custom, message: `${fieldName} objects may contain at most 200 keys`, path });
+        }
+        for (const key of keys) {
+            if (key.length === 0 || key.length > 128 || /[\u0000-\u001f\u007f]/.test(key) || isDangerousObjectKey(key)) {
+                ctx.addIssue({ code: z.ZodIssueCode.custom, message: `${fieldName} contains an unsafe object key "${key}"`, path: [...path, key] });
+            } else {
+                validateJsonLike(value[key], ctx, fieldName, [...path, key], depth + 1);
+            }
+        }
+        return;
+    }
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: `${fieldName} must contain only JSON values`, path });
+}
+
+function safeJsonRecord(fieldName) {
+    return safeRecord(fieldName, z.unknown()).superRefine((value, ctx) => {
+        validateJsonLike(value, ctx, fieldName);
+    });
+}
 
 const trimString = () => z.string().transform((s) => s.trim());
 const severityThresholdSchema = trimString().pipe(z.enum(SEVERITIES));

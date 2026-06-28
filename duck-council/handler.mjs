@@ -18,6 +18,7 @@ import {
     injectionInstructionForSubAgents,
     resolveModels,
     renderSubstitutionNote,
+    displayModel,
     formatZodError,
 } from "../_shared/index.mjs";
 import { duckCouncilSchema } from "../_shared/schemas.mjs";
@@ -135,9 +136,9 @@ export async function runHandler(args, deps = {}) {
     for (const sub of allSubstitutions) {
         await log(`[fallback] ${sub.role}: ${sub.requested} -> ${sub.used}: ${sub.reason}`);
     }
-    const rolesSummary = COUNCIL_ROLE_NAMES.map((r) => `${r}=${resolvedRoles[r]}`).join(", ");
+    const rolesSummary = COUNCIL_ROLE_NAMES.map((r) => `${r}=${displayModel(resolvedRoles[r])}`).join(", ");
     await log(
-        `${TOOL} invoked — ${input.cheap && !isAnyRolesOverride ? "CHEAP mode — " : ""}roles: ${rolesSummary}, judge: ${effectiveJudge}, skip_judge=${input.skip_judge === true}`,
+        `${TOOL} invoked — ${input.cheap && !isAnyRolesOverride ? "CHEAP mode — " : ""}roles: ${rolesSummary}, judge: ${displayModel(effectiveJudge)}, skip_judge=${input.skip_judge === true}`,
     );
 
     return { textResultForLlm: packet, resultType: "success" };

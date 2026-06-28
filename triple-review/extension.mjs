@@ -28,7 +28,7 @@ const session = await joinSession({
                         minItems: 3,
                         maxItems: 3,
                         description:
-                            "Optional. Exactly 3 model IDs for the reviewer trio. Default: claude-opus-4.8, claude-opus-4.7-1m-internal, gpt-5.5. (4.8 = current top reasoning model, ~200k context; slot 2 is a 1M-context variant for very large diffs.)",
+                            "Optional. Exactly 3 model IDs for the reviewer trio. Default: claude-opus-4.8, claude-opus-4.7-1m-internal, gpt-5.5. (Aliases are translated at spawn time; every spawned reviewer runs with context_tier:\"long_context\".)",
                     },
                     focus: {
                         type: "string",
@@ -52,7 +52,7 @@ const session = await joinSession({
                         type: "boolean",
                         default: false,
                         description:
-                            "Optional. When true, use the cheap reviewer trio (claude-opus-4.7, claude-opus-4.6, gpt-5.5 — non-1M-context variants) instead of the default heavy trio. ~23% per-round reviewer-cost savings; synthesis model unchanged. Reviewers have ~200k context instead of 1M — for large diffs (>500 lines) the default trio's full-context comprehension is meaningfully better. Set this when the user invokes 'triple review cheap' or asks for cheap mode. MUTUALLY EXCLUSIVE with `models` — pass one or the other, not both. Combine with `max_rounds: 1` for maximum savings.",
+                            "Optional. When true, use the cheap reviewer trio (claude-opus-4.7, claude-opus-4.6, gpt-5.5) instead of the default heavy trio. ~23% per-round reviewer-cost savings; synthesis model unchanged. Every spawned reviewer still runs with context_tier:\"long_context\"; reasoning effort/context are task() params, not ID suffixes. Set this when the user invokes 'triple review cheap' or asks for cheap mode. MUTUALLY EXCLUSIVE with `models` — pass one or the other, not both. Combine with `max_rounds: 1` for maximum savings.",
                     },
                     max_premium_calls: {
                         type: "integer",

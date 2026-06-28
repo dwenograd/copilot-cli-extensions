@@ -5,6 +5,8 @@
 // (validation, scrub, policy wrap, model resolution, budget check) and
 // passes the prepared pieces to this composer.
 
+import { renderSpawnArgs } from "../_shared/index.mjs";
+
 export function buildInstructionPacket({
     trio,
     effectiveJudge,
@@ -21,7 +23,7 @@ export function buildInstructionPacket({
     subAgentInstruction,
 }) {
     const modeLine = cheap
-        ? `\n**Mode:** cheap (non-1M-context variants — planners have ~200k context)\n`
+        ? `\n**Mode:** cheap (cheaper model variants)\n`
         : "";
 
     const warningsBlock = injectionWarnings && injectionWarnings.length > 0
@@ -38,13 +40,13 @@ export function buildInstructionPacket({
     let judgeDefaultNote;
     if (judgeOverridden) {
         // Caller passed an explicit `judge:` — don't claim anything is the
-        // "default"; just say what's being used and skip the cheap/non-cheap
-        // recommendation entirely.
+        // "default"; just say what's being used.
         judgeDefaultNote = `> **Judge:** \`${effectiveJudge}\` (explicit override).`;
-    } else if (cheap) {
-        judgeDefaultNote = `> **Note on judge default:** in cheap mode, the judge default is a non-1M-context model (\`${effectiveJudge}\`). Pass \`judge: "claude-opus-4.7-xhigh"\` for deeper reasoning, or a 1M-context variant if your plans are unusually large.`;
     } else {
-        judgeDefaultNote = `> **Note on judge default:** triple-plan's judge defaults to a 1M-context model variant because three planner outputs can easily exceed the ~200k context of \`-xhigh\`. Pass \`judge: "claude-opus-4.7-xhigh"\` if you want the deeper-reasoning variant and your plans are small enough to fit.`;
+        // Context is global (every sub-agent runs with long context), so the
+        // old "1M variant vs -xhigh window" tradeoff no longer applies — the
+        // remaining knob is reasoning depth.
+        judgeDefaultNote = `> **Note on judge default:** triple-plan's judge defaults to \`${effectiveJudge}\`${cheap ? " (cheap mode)" : ""}. Every sub-agent runs with long context, so large plans fit; pass \`judge: "claude-opus-4.7-xhigh"\` for deeper reasoning.`;
     }
 
     return `# TRIPLE-PLAN PROTOCOL
@@ -70,17 +72,17 @@ ${contextBlock}${constraintsBlock}
 In a SINGLE response, make three \`task\` tool calls (parallel execution):
 
 \`\`\`
-task(agent_type="general-purpose", mode="sync", model=${JSON.stringify(trio[0])},
+task(agent_type="general-purpose", mode="sync", ${renderSpawnArgs(trio[0], { elevated: !cheap })},
      name=${JSON.stringify(`planner-1-${trio[0].replace(/[^a-z0-9]+/gi, "-")}`)},
      description="Triple-plan (model 1)",
      prompt=<full planning prompt — see below>)
 
-task(agent_type="general-purpose", mode="sync", model=${JSON.stringify(trio[1])},
+task(agent_type="general-purpose", mode="sync", ${renderSpawnArgs(trio[1], { elevated: !cheap })},
      name=${JSON.stringify(`planner-2-${trio[1].replace(/[^a-z0-9]+/gi, "-")}`)},
      description="Triple-plan (model 2)",
      prompt=<full planning prompt — see below>)
 
-task(agent_type="general-purpose", mode="sync", model=${JSON.stringify(trio[2])},
+task(agent_type="general-purpose", mode="sync", ${renderSpawnArgs(trio[2], { elevated: !cheap })},
      name=${JSON.stringify(`planner-3-${trio[2].replace(/[^a-z0-9]+/gi, "-")}`)},
      description="Triple-plan (model 3)",
      prompt=<full planning prompt — see below>)
@@ -115,7 +117,7 @@ Bail-out gates (decide BEFORE invoking the judge in Step 2):
 Make ONE \`task\` call to the judge. The judge will align steps across plans, identify consensus/contested decisions, and produce the final unified plan.
 
 \`\`\`
-task(agent_type="general-purpose", mode="sync", model=${JSON.stringify(effectiveJudge)},
+task(agent_type="general-purpose", mode="sync", ${renderSpawnArgs(effectiveJudge, { elevated: !cheap })},
      name="triple-plan-judge",
      description="Triple-plan judge — merge plans into one canonical plan",
      prompt=<see below>)

@@ -33,15 +33,15 @@ Don't use for questions with a clear right answer — debate forces both sides t
 
 **Worst case** (with retries): `4N + 1` calls — the handler reserves one retry per debater call. If you set `max_premium_calls`, it MUST satisfy the worst-case formula or the handler rejects the request.
 
-`cheap: true` swaps in non-1M-context variants.
+`cheap: true` swaps in cheaper model presets; context remains global long-context for every spawned sub-agent.
 
 ## Defaults
 
-- Debaters: `claude-opus-4.8` vs `gpt-5.5` (different model families maximize divergence; 4.8 = current top reasoning model, ~200k ctx)
-- Judge: `claude-opus-4.7-1m-internal` (different family from debater A, 1M ctx for full transcript handling)
+- Debaters: `claude-opus-4.8` vs `gpt-5.5` (different model families maximize divergence; 4.8 = current top reasoning model)
+- Judge: `claude-opus-4.7-1m-internal` (different family from debater A; alias translated at spawn time)
 - Cheap debaters: `claude-opus-4.7` vs `gpt-5.5`; cheap judge: `claude-opus-4.6`
 
-**Context tradeoff:** for very long debates with extensive context, override `debaters` with a 1M-context model variant (use whatever your provider offers).
+**Context:** every spawned debater and judge runs with `context_tier:"long_context"`; override `debaters` only when you want different model families or reasoning presets.
 
 ---
 

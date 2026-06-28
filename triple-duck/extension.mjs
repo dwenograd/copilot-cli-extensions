@@ -34,12 +34,12 @@ const session = await joinSession({
                         minItems: 3,
                         maxItems: 3,
                         description:
-                            "Optional. Exactly 3 model IDs to override the default reviewer trio. Defaults to claude-opus-4.8, claude-opus-4.7-1m-internal, gpt-5.5. (4.8 = current top reasoning model, ~200k context; slot 2 is a 1M-context variant for large inputs.)",
+                            "Optional. Exactly 3 model IDs to override the default reviewer trio. Defaults to claude-opus-4.8, claude-opus-4.7-1m-internal, gpt-5.5. (Aliases are translated at spawn time; every spawned reviewer runs with context_tier:\"long_context\".)",
                     },
                     judge: {
                         type: "string",
                         description:
-                            "Optional. Model ID for the judge that synthesizes the 3 reviewer critiques into the final unified output. Defaults to `claude-opus-4.8` (current top reasoning model, ~200k context — sufficient for typical critique sizes). Pass a 1M-context model variant if your reviewer outputs are unusually large. Compatible with `cheap: true` (cheap reviewer trio + premium judge is a sensible config).",
+                            "Optional. Model ID for the judge that synthesizes the 3 reviewer critiques into the final unified output. Defaults to `claude-opus-4.8` (current top reasoning model; every spawned judge runs with context_tier:\"long_context\"). Compatible with `cheap: true` (cheap reviewer trio + premium judge is a sensible config).",
                     },
                     focus: {
                         type: "string",
@@ -50,7 +50,7 @@ const session = await joinSession({
                         type: "boolean",
                         default: false,
                         description:
-                            "Optional. When true, use the cheap reviewer trio (claude-opus-4.7, claude-opus-4.6, gpt-5.5 — non-1M-context variants) instead of the default heavy trio. ~23% reviewer-cost savings, but reviewers have ~200k context instead of 1M. Judge defaults to `claude-opus-4.7` in cheap mode unless overridden via `judge`. MUTUALLY EXCLUSIVE with `models` (but compatible with explicit `judge`).",
+                            "Optional. When true, use the cheap reviewer trio (claude-opus-4.7, claude-opus-4.6, gpt-5.5) instead of the default heavy trio. ~23% reviewer-cost savings; every spawned reviewer still runs with context_tier:\"long_context\". Judge defaults to `claude-opus-4.7` in cheap mode unless overridden via `judge`. MUTUALLY EXCLUSIVE with `models` (but compatible with explicit `judge`).",
                     },
                     max_premium_calls: {
                         type: "integer",

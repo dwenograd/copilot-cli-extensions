@@ -12,6 +12,8 @@ import {
     injectionInstructionForSubAgents,
     resolveModels,
     renderSubstitutionNote,
+    displayModel,
+    displayModels,
     formatZodError,
 } from "../_shared/index.mjs";
 import { debateSchema } from "../_shared/schemas.mjs";
@@ -143,7 +145,7 @@ export async function runHandler(args, deps = {}) {
         await log(`[fallback] ${sub.requested} -> ${sub.used}: ${sub.reason}`);
     }
     await log(
-        `${TOOL} invoked — ${input.cheap && input.debaters === undefined && input.judge === undefined ? "CHEAP mode — " : ""}${input.rounds} round(s), debaters: ${resolvedDebaters.models.join(" vs ")}, judge: ${effectiveJudge}`,
+        `${TOOL} invoked — ${input.cheap && input.debaters === undefined && input.judge === undefined ? "CHEAP mode — " : ""}${input.rounds} round(s), debaters: ${displayModels(resolvedDebaters.models).join(" vs ")}, judge: ${displayModel(effectiveJudge)}`,
     );
 
     return { textResultForLlm: packet, resultType: "success" };

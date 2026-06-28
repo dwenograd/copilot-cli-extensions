@@ -8,6 +8,7 @@
 
 import {
     VALID_SEVERITIES,
+    renderSpawnArgs,
 } from "../_shared/index.mjs";
 
 export function buildInstructionPacket({
@@ -32,7 +33,7 @@ export function buildInstructionPacket({
 }) {
     const isNoGit = scopeMode === "no-git";
     const modeLine = cheap
-        ? `- **Mode:** cheap (non-1M-context variants — reviewers have ~200k context)\n`
+        ? `- **Mode:** cheap (cheaper model variants)\n`
         : "";
     const warningsBlock = injectionWarnings && injectionWarnings.length > 0
         ? `\n${injectionWarnings.map((w) => `> ⚠️ ${w}`).join("\n")}\n`
@@ -196,13 +197,14 @@ Pass \`$diffPath\` (the absolute path) to reviewers as \`diffSnapshotPath\` in S
 
 **CRITICAL:** Emit all three \`task\` calls in a SINGLE response (one tool-calls block, no narration between them). Sequential calls = serial latency = wasted time.
 
-For each model in [${trio.map(m => `"${m}"`).join(", ")}]:
+Spawn one reviewer per line below, using the exact \`model\`/\`reasoning_effort\`/\`context_tier\` args shown for each:
+${trio.map((m, i) => `- reviewer ${i + 1}: ${renderSpawnArgs(m, { elevated: !cheap })}`).join("\n")}
 
 \`\`\`
 task(
   agent_type="code-review",
   mode="sync",
-  model=<this model>,
+  <model / reasoning_effort / context_tier args from this reviewer's line above>,
   name="reviewer-r<round>-<model-shortname>",
   description="Triple-review round <round> reviewer",
   prompt=<see template below>
@@ -302,7 +304,7 @@ For each 3/3 cluster:
 task(
   agent_type="general-purpose",
   mode="sync",
-  model="${synthesisModel}",
+  ${renderSpawnArgs(synthesisModel, { elevated: !cheap })},
   name="synth-<clusterId>",
   description="Synthesize canonical patch for 3/3 cluster",
   prompt=<see synthesis template>

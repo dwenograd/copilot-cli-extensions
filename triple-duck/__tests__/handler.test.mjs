@@ -147,7 +147,7 @@ describe("triple-duck handler", () => {
             judge: "claude-opus-4.7-xhigh",
         }, deps);
         expect(r.resultType).toBe("success");
-        expect(r.textResultForLlm).toContain('"claude-opus-4.7-xhigh"');
+        expect(r.textResultForLlm).toContain('model="claude-opus-4.7", reasoning_effort="xhigh", context_tier="long_context"');
         expect(logged.some((l) => l.includes("judge: claude-opus-4.7-xhigh"))).toBe(true);
         expect(logged.some((l) => l.includes("CHEAP mode"))).toBe(true);
     });

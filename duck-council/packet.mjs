@@ -11,6 +11,8 @@
 //   Step 3  — present verdict + raw role outputs in a collapsible appendix
 //   Step 4  — honest cost report
 
+import { renderSpawnArgs } from "../_shared/index.mjs";
+
 // Role-specific prompts. The "Ignore X" lines are LOAD-BEARING — they prevent
 // every duck from drifting into generic critique. Each role has a sharp scope.
 const ROLE_PROMPTS = {
@@ -36,9 +38,9 @@ const ROLE_EMOJIS = {
     user: "👤",
 };
 
-function renderRoleTask(role, model, idx) {
+function renderRoleTask(role, model, idx, elevated) {
     const safeName = `duck-${role}-${model.replace(/[^a-z0-9]+/gi, "-")}`;
-    return `task(agent_type="rubber-duck", mode="sync", model=${JSON.stringify(model)},
+    return `task(agent_type="rubber-duck", mode="sync", ${renderSpawnArgs(model, { elevated })},
      name=${JSON.stringify(safeName)},
      description="Duck Council ${idx}/6: ${role}",
      prompt=<full ${role} critique prompt — see "Per-role prompt templates" below>)`;
@@ -84,7 +86,7 @@ export function buildInstructionPacket({
         : `**Judge** (synthesis + honesty-check) → \`${effectiveJudge}\``;
 
     const taskCalls = roleNames
-        .map((r, i) => renderRoleTask(r, roleAssignment[r], i + 1))
+        .map((r, i) => renderRoleTask(r, roleAssignment[r], i + 1, !cheap))
         .join("\n\n");
 
     const rolePromptTemplates = roleNames
@@ -120,7 +122,7 @@ If you have ≥3 valid role outputs (after Step 1b), launch ONE \`task\` call to
 5. **Launch** the judge:
 
 \`\`\`
-task(agent_type="general-purpose", mode="sync", model=${JSON.stringify(effectiveJudge)},
+task(agent_type="general-purpose", mode="sync", ${renderSpawnArgs(effectiveJudge, { elevated: !cheap })},
      name="duck-council-judge",
      description="Duck Council judge (synthesis + honesty-check)",
      prompt=<judge prompt template below — substitute JUDGE_NONCE, valid count N, and role outputs>)

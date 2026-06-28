@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Six Copilot CLI extensions: five orchestrators for multi-model workflows (triple-duck parallel critique + consensus; triple-review iterative code review; triple-plan parallel planning + judge merge; debate adversarial 2-model + judge; duck-council 6 role-specialized rubber-ducks + judge synthesis) and zerotrust-sourcecheck (32-role multi-model security council against a GitHub URL or local on-disk directory, with hardened clone/install/build safe-wrapper tools for runtime verification). Each extension returns a markdown instruction packet the calling agent executes via the built-in `task` tool.",
+  "description": "Seven Copilot CLI extensions: five multi-model orchestrators (triple-duck parallel critique + consensus; triple-review iterative code review; triple-plan parallel planning + judge merge; debate adversarial 2-model + judge; duck-council 6 role-specialized rubber-ducks + judge synthesis) that return a markdown instruction packet the calling agent executes via the built-in `task` tool; zerotrust-sourcecheck (32-role multi-model security council against a GitHub URL or local on-disk directory, with hardened clone/install/build safe-wrapper tools for runtime verification); and mcp-autoreload (auto-reloads stale MCP server connections on transport errors, escalating to the user if a reload doesn't recover, and exposes an `mcp_reload_now` tool).",
   "license": "MIT",
   "repository": {
     "type": "git",

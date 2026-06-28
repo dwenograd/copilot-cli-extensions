@@ -1,6 +1,6 @@
 # Copilot CLI Extensions Workspace
 
-Six interrelated Copilot CLI extensions for multi-model orchestration and zero-trust source auditing:
+Seven interrelated Copilot CLI extensions for multi-model orchestration, zero-trust source auditing, and MCP-connection resilience:
 
 | Extension | What it does |
 |---|---|
@@ -10,6 +10,7 @@ Six interrelated Copilot CLI extensions for multi-model orchestration and zero-t
 | **debate** | 2 debaters arguing opposing positions + 1 independent judge |
 | **duck-council** | 6 role-specialized rubber-ducks (security/stability/perf/maintainer/skeptic/user) + 1 judge synthesis pass |
 | **zerotrust-sourcecheck** | 32-role multi-model security council against a GitHub URL OR an on-disk local directory. API-direct for URL audits (no source bytes on disk); local-source mode for already-downloaded repos via `view`/`grep`/`glob` with path containment. Build-mode wrappers (clone/install/build) for runtime verification. Section 9b walks the operator through defang / delete-project / keep-as-is per HIGH/CRITICAL finding when any on-disk content was produced. |
+| **mcp-autoreload** | Auto-reloads a stale MCP server connection when an MCP tool fails with a transport error, verifies it reconnected, then asks the agent to retry; escalates to the user if a reload doesn't recover. Exposes a manual `mcp_reload_now` tool. (Hook-based utility — does not use `_shared`.) |
 
 All five orchestrator extensions (`triple-*`, `debate`, `duck-council`) return a **markdown instruction packet** that the calling Copilot CLI agent then executes via the built-in `task` tool — no agent runtimes are spawned by these extensions themselves. They're orchestrators-of-orchestrations. `zerotrust-sourcecheck` follows the same pattern (instruction packet) and additionally exposes a set of substitutional-safety wrapper tools (hardened clone / install / build / fetch / sweep) for operations the packet directs the agent to perform.
 
@@ -37,7 +38,7 @@ npm install
 # Restart Copilot CLI (or run `extensions_reload` from inside it).
 ```
 
-After restart, the six tools (`triple-duck`, `triple-review`, `triple-plan`, `debate`, `duck-council`, `zerotrust_sourcecheck`) become invokable in any session.
+After restart, the seven tools (`triple-duck`, `triple-review`, `triple-plan`, `debate`, `duck-council`, `zerotrust_sourcecheck`, `mcp_reload_now`) become invokable in any session.
 
 > **Already have a `~/.copilot/extensions/` directory?** Back it up first; the clone needs to write into an empty path. Existing extensions can be moved alongside (the workspace's `_shared/` is namespaced under `_shared/`, and each extension lives in its own subdirectory).
 
@@ -47,7 +48,7 @@ After restart, the six tools (`triple-duck`, `triple-review`, `triple-plan`, `de
 
 ```
 extensions/
-├── _shared/                    # shared module — imported by all 6 extensions
+├── _shared/                    # shared module — imported by the orchestrator + zerotrust extensions (mcp-autoreload is standalone)
 │   ├── index.mjs               # barrel export
 │   ├── models.mjs              # DEFAULT_MODELS, CHEAP_MODELS, COUNCIL_*, MODEL_FALLBACK_MAP, etc.
 │   ├── schemas.mjs             # zod schemas — validation for the trio + debate + duck-council tools
@@ -109,7 +110,7 @@ Each stage can short-circuit with a clear error before the next runs.
 - **Cheap presets** (unchanged): `claude-opus-4.7`, `claude-opus-4.6`, `gpt-5.5`
 - **Duck-council defaults** (tiered, see `duck-council/README.md` for the table): security/stability/judge on `claude-opus-4.8`; performance on `gpt-5.5`; maintainer on `claude-opus-4.7-1m-internal`; skeptic on `gpt-5.4`; user on `claude-sonnet-4.6`. Family-diverse: 4 Claude + 2 GPT among the 6 reviewers.
 
-History: the slot-1 reviewer default was `claude-opus-4.7-xhigh` (chosen after pass-7 of the iterative hardening review proved extra-high reasoning caught 2 real medium bugs that 6 prior 1M-context passes missed). It moved to `claude-opus-4.8` on the 4.8 release — a newer generation that is ~4x less likely to let a coding flaw pass unremarked, which is precisely these tools' job. Trade-off: 4.8 has no `-xhigh` (extra-high reasoning) or `-1m` variant yet, so slot-1 is now a lower explicit reasoning tier (~200k context) than 4.7-xhigh was. The 1M-context default slots (reviewer/planner slot-2, the debate & triple-plan judges, and duck-council's maintainer role) moved from `claude-opus-4.6-1m` to `claude-opus-4.7-1m-internal` (newest 1M-context Opus — smarter than 4.6 and keeps generational diversity: 4.8 + 4.7 + GPT). No single model combines 1M context AND extra-high reasoning; those are separate variants, so the 1M slots run at default reasoning. Revisit slot-1 → `claude-opus-4.8-xhigh` once that variant ships. The cheap-tier stability slot intentionally stays on `claude-opus-4.6-1m` (the cheaper 1M-context option).
+History: the slot-1 reviewer default was `claude-opus-4.7-xhigh` (chosen after pass-7 of the iterative hardening review proved extra-high reasoning caught 2 real medium bugs that 6 prior passes missed). It moved to `claude-opus-4.8` on the 4.8 release — a newer generation that is ~4x less likely to let a coding flaw pass unremarked, which is precisely these tools' job. Effort and context are now separate `task()` parameters: aliases such as `-xhigh` and `-1m-internal` remain readable presets, but `renderSpawnArgs` translates them to base model IDs plus `reasoning_effort`, and every spawned sub-agent runs with `context_tier:"long_context"`. The default slots moved from `claude-opus-4.6-1m` to `claude-opus-4.7-1m-internal` where useful for generational diversity (4.8 + 4.7 + GPT). The cheap-tier stability slot intentionally keeps the `claude-opus-4.6-1m` alias preset.
 
 ## Tests
 

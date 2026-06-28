@@ -14,6 +14,8 @@ import {
     injectionInstructionForSubAgents,
     resolveModels,
     renderSubstitutionNote,
+    displayModel,
+    displayModels,
     formatZodError,
 } from "../_shared/index.mjs";
 import { triplePlanSchema } from "../_shared/schemas.mjs";
@@ -122,7 +124,7 @@ export async function runHandler(args, deps = {}) {
         await log(`[fallback] ${sub.requested} -> ${sub.used}: ${sub.reason}`);
     }
     await log(
-        `${TOOL} invoked — ${input.cheap && !isUserOverride ? "CHEAP mode — " : ""}planners: ${resolved.models.join(", ")}, judge: ${effectiveJudge}`,
+        `${TOOL} invoked — ${input.cheap && !isUserOverride ? "CHEAP mode — " : ""}planners: ${displayModels(resolved.models).join(", ")}, judge: ${displayModel(effectiveJudge)}`,
     );
 
     return { textResultForLlm: packet, resultType: "success" };

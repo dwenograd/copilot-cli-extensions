@@ -54,7 +54,7 @@ const session = await joinSession({
                         minItems: 2,
                         maxItems: 2,
                         description:
-                            "Optional. Exactly 2 distinct model IDs for the two debaters. Defaults to claude-opus-4.8 and gpt-5.5 (different model families maximize divergence; 4.8 = current top reasoning model, ~200k context).",
+                            "Optional. Exactly 2 distinct model IDs for the two debaters. Defaults to claude-opus-4.8 and gpt-5.5 (different model families maximize divergence; 4.8 = current top reasoning model).",
                     },
                     judge: {
                         type: "string",
@@ -65,7 +65,7 @@ const session = await joinSession({
                         type: "boolean",
                         default: false,
                         description:
-                            "Optional. When true, use cheap variants (claude-opus-4.7, gpt-5.5 debaters; claude-opus-4.6 judge — non-1M-context). Set when the user invokes 'debate cheap <question>'. MUTUALLY EXCLUSIVE with explicit `debaters` or `judge`.",
+                            "Optional. When true, use cheap variants (claude-opus-4.7, gpt-5.5 debaters; claude-opus-4.6 judge). Every spawned debater and judge still runs with context_tier:\"long_context\". Set when the user invokes 'debate cheap <question>'. MUTUALLY EXCLUSIVE with explicit `debaters` or `judge`.",
                     },
                     max_premium_calls: {
                         type: "integer",

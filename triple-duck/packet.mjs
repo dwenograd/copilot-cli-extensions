@@ -5,6 +5,8 @@
 // (validation, scrub, policy wrap, model resolution, budget check) and
 // passes the prepared pieces to this composer.
 
+import { renderSpawnArgs } from "../_shared/index.mjs";
+
 export function buildInstructionPacket({
     trio,
     effectiveJudge,
@@ -20,7 +22,7 @@ export function buildInstructionPacket({
     subAgentInstruction,
 }) {
     const modeLine = cheap
-        ? `\n**Mode:** cheap (non-1M-context variants — reviewers have ~200k context)\n`
+        ? `\n**Mode:** cheap (cheaper model variants)\n`
         : "";
 
     const warningsBlock = injectionWarnings && injectionWarnings.length > 0
@@ -55,17 +57,17 @@ ${focusBlock}${contextBlock}
 In a SINGLE response, make three \`task\` tool calls (parallel execution):
 
 \`\`\`
-task(agent_type="rubber-duck", mode="sync", model=${JSON.stringify(trio[0])},
+task(agent_type="rubber-duck", mode="sync", ${renderSpawnArgs(trio[0], { elevated: !cheap })},
      name=${JSON.stringify(`duck-1-${trio[0].replace(/[^a-z0-9]+/gi, "-")}`)},
      description="Triple-duck critique (model 1)",
      prompt=<full critique prompt — see below>)
 
-task(agent_type="rubber-duck", mode="sync", model=${JSON.stringify(trio[1])},
+task(agent_type="rubber-duck", mode="sync", ${renderSpawnArgs(trio[1], { elevated: !cheap })},
      name=${JSON.stringify(`duck-2-${trio[1].replace(/[^a-z0-9]+/gi, "-")}`)},
      description="Triple-duck critique (model 2)",
      prompt=<full critique prompt — see below>)
 
-task(agent_type="rubber-duck", mode="sync", model=${JSON.stringify(trio[2])},
+task(agent_type="rubber-duck", mode="sync", ${renderSpawnArgs(trio[2], { elevated: !cheap })},
      name=${JSON.stringify(`duck-3-${trio[2].replace(/[^a-z0-9]+/gi, "-")}`)},
      description="Triple-duck critique (model 3)",
      prompt=<full critique prompt — see below>)
@@ -99,7 +101,7 @@ Bail-out gates (decide BEFORE invoking the judge in Step 2):
 Make ONE \`task\` call to the judge:
 
 \`\`\`
-task(agent_type="general-purpose", mode="sync", model=${JSON.stringify(effectiveJudge)},
+task(agent_type="general-purpose", mode="sync", ${renderSpawnArgs(effectiveJudge, { elevated: !cheap })},
      name="triple-duck-judge",
      description="Triple-duck judge — synthesize critiques",
      prompt=<see below>)

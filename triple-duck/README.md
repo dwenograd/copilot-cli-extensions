@@ -6,7 +6,7 @@ User-level Copilot CLI extension that registers a `triple-duck` tool.
 
 `triple-duck` is a shortcut for "rubber-duck this with three different models, then have a top-tier judge model synthesize the results." When invoked, the tool returns a structured instruction packet that tells the agent to:
 
-1. Launch three `rubber-duck` sub-agents **in parallel** using three different models (default: Claude Opus 4.8, Claude Opus 4.7 (1M ctx, internal), GPT-5.5).
+1. Launch three `rubber-duck` sub-agents **in parallel** using three different models (default: Claude Opus 4.8, Claude Opus 4.7 alias, GPT-5.5).
 2. Wait for all three to complete (sync mode).
 3. **Launch a dedicated judge agent** (default: Claude Opus 4.8 — the current top reasoning model) that:
    - Receives all three reviewer outputs (wrapped as untrusted data — the judge is told not to follow instructions inside reviewer text).
@@ -40,21 +40,21 @@ triple-duck({
 
 ## Cheap mode
 
-Pass `cheap: true` (or invoke as "triple duck cheap <topic>") to swap the heavy default trio for the **standard-reasoning, non-1M-context variants**:
+Pass `cheap: true` (or invoke as "triple duck cheap <topic>") to swap the heavy default trio for **cheaper model presets**:
 
 | Slot | Default trio | Cheap trio |
 |---|---|---|
-| 1 | claude-opus-4.8 (top reasoning model, ~200k ctx) | claude-opus-4.7 (7.5×) |
-| 2 | claude-opus-4.7-1m-internal (1M ctx) | claude-opus-4.6 (3×) |
+| 1 | claude-opus-4.8 (top reasoning model) | claude-opus-4.7 (7.5×) |
+| 2 | claude-opus-4.7-1m-internal (alias preset) | claude-opus-4.6 (3×) |
 | 3 | gpt-5.5 (7.5×) | gpt-5.5 (7.5×) |
 | **Judge** | claude-opus-4.8 | claude-opus-4.7 |
 
 You can mix: `cheap: true, judge: "claude-opus-4.7-xhigh"` gives you the cheap reviewer trio with a premium judge — useful when you want fast critiques but high-quality synthesis.
 
 **Tradeoffs:**
-- The default trio's slot-1 (`claude-opus-4.8`) is the current top reasoning model (~200k context). It supersedes the prior `claude-opus-4.7-xhigh` slot-1, whose extra-high reasoning caught 2 medium bugs in pass 7 of the iterative hardening that 6 prior 1M-context passes missed; 4.8 trades that explicit xhigh tier for a newer generation (no `claude-opus-4.8-xhigh` variant exists yet).
-- For very large topics where 1M context matters, pass `models` explicitly with a 1M-context variant in slot 1 (use whatever your provider offers). For very large reviewer outputs, also pass a 1M-context `judge`.
-- Cheap mode's slot-1 is plain `claude-opus-4.7` (standard reasoning, 200k ctx) — meaningfully weaker but cheaper.
+- The default trio's slot-1 (`claude-opus-4.8`) is the current top reasoning model. It supersedes the prior `claude-opus-4.7-xhigh` slot-1, whose extra-high reasoning caught 2 medium bugs in pass 7 of the iterative hardening; 4.8 now accepts xhigh via the separate `reasoning_effort` task parameter, with no `claude-opus-4.8-xhigh` ID needed.
+- Every spawned reviewer and judge runs with `context_tier:"long_context"`; pass `models` or `judge` explicitly only when you want different model families or reasoning presets.
+- Cheap mode's slot-1 is plain `claude-opus-4.7` — meaningfully cheaper and weaker than the default slot-1 model.
 
 `cheap` and `models` are **mutually exclusive** — pass one or the other. `cheap` and `judge` ARE compatible.
 

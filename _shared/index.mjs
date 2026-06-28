@@ -34,6 +34,14 @@ export {
 } from "./policy.mjs";
 export { scrub } from "./scrub.mjs";
 export { resolveModels, renderSubstitutionNote } from "./resolveModels.mjs";
+export {
+    LONG_CONTEXT_TIER,
+    SPAWN_ALIASES,
+    resolveSpawnSpec,
+    renderSpawnArgs,
+    displayModel,
+    displayModels,
+} from "./spawnSpec.mjs";
 export { formatZodError } from "./formatZodError.mjs";
 export {
     SYNTH_CAP_PER_ROUND,

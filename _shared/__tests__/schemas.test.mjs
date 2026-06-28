@@ -241,13 +241,11 @@ describe("shared zod schemas", () => {
             "claude-opus-4.6",
             "claude-sonnet-4.6",
             "claude-sonnet-4.5",
-            "claude-sonnet-4",
             "claude-opus-4.7-high",
             "claude-opus-4.7-xhigh",
             "claude-opus-4.8",
             "gpt-5.5",
             "gpt-5.4",
-            "gpt-5.2",
         ];
         for (const id of realIds) {
             // Pass three distinct IDs to avoid the distinctness check; only

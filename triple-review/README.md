@@ -50,19 +50,19 @@ triple-review({
 
 ## Cheap mode
 
-Pass `cheap: true` (or invoke as "triple review cheap") to swap the default reviewer trio for the **standard-reasoning, non-1M-context variants**:
+Pass `cheap: true` (or invoke as "triple review cheap") to swap the default reviewer trio for **cheaper model presets**:
 
 | Slot | Default trio | Cheap trio |
 |---|---|---|
-| 1 | claude-opus-4.8 (top reasoning model, ~200k ctx) | claude-opus-4.7 (7.5×) |
-| 2 | claude-opus-4.7-1m-internal (1M ctx) | claude-opus-4.6 (3×) |
+| 1 | claude-opus-4.8 (top reasoning model) | claude-opus-4.7 (7.5×) |
+| 2 | claude-opus-4.7-1m-internal (alias preset) | claude-opus-4.6 (3×) |
 | 3 | gpt-5.5 (7.5×) | gpt-5.5 (7.5×) |
 
 **Synthesis model is unchanged** (claude-sonnet-4.6 — already cheap).
 
 **Tradeoffs:**
-- The default's slot-1 (`claude-opus-4.8`) is the current top reasoning model, at ~200k context. For diffs that genuinely exceed 200k tokens, override `models` with a 1M-context variant in slot 1 (use whatever your provider offers).
-- Cheap mode's slot-1 (`claude-opus-4.7`) is standard reasoning, 200k context — meaningfully weaker but cheaper.
+- The default's slot-1 (`claude-opus-4.8`) is the current top reasoning model. Every spawned reviewer runs with `context_tier:"long_context"`; override `models` only when you want different model families or reasoning presets.
+- Cheap mode's slot-1 (`claude-opus-4.7`) is meaningfully cheaper and weaker than the default slot-1 model.
 
 **For maximum savings**, pair `cheap: true` with `max_rounds: 1`.
 
