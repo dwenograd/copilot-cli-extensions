@@ -112,14 +112,16 @@ Each stage can short-circuit with a clear error before the next runs.
 - **Secrets scrubber:** high-confidence patterns only (AWS keys + STS, GitHub tokens (PAT/OAuth/server/user/refresh), private-key blocks (PKCS#1/8/EC/OpenSSH/DSA/PGP/ENCRYPTED), Bearer tokens (case-insensitive, JSON/YAML-quoted), DB connection strings). Emails NOT scrubbed (false positive rate is too high to be worth the trust cost).
 - **Model fallback:** static map (since extension SDK doesn't expose `listModels()` to extensions). Built-in defaults silently substitute when in `KNOWN_DEPRECATED_MODELS`; user overrides honored or fail loudly. Every substitution logged via `session.log` with `[fallback]` prefix.
 
-## Default models (slot-1 now claude-opus-4.8)
+## Default models
 
-- **Trio defaults** (triple-duck, triple-plan, triple-review): `claude-opus-4.8`, `claude-opus-4.7-1m-internal`, `gpt-5.5`
-- **Debate defaults**: debaters `["claude-opus-4.8", "gpt-5.5"]`, judge `"claude-opus-4.7-1m-internal"`
-- **Cheap presets** (unchanged): `claude-opus-4.7`, `claude-opus-4.6`, `gpt-5.5`
-- **Duck-council defaults** (tiered, see `duck-council/README.md` for the table): security/stability/judge on `claude-opus-4.8`; performance on `gpt-5.5`; maintainer on `claude-opus-4.7-1m-internal`; skeptic on `gpt-5.4`; user on `claude-sonnet-4.6`. Family-diverse: 4 Claude + 2 GPT among the 6 reviewers.
+- **Trio defaults** (triple-duck, triple-plan, triple-review): `claude-opus-4.8`, `gpt-5.6-sol`, `claude-opus-4.7`
+- **Triple-duck / triple-plan judges**: `claude-opus-4.8`
+- **Triple-review synthesis**: `gpt-5.6-sol`
+- **Debate defaults**: debaters `["claude-opus-4.8", "gpt-5.6-sol"]`, judge `"gemini-3.1-pro-preview"`
+- **Cheap presets**: `claude-opus-4.7`, `claude-opus-4.6`, `gpt-5.5`
+- **Duck-council defaults** (tiered, see `duck-council/README.md` for the table): security/stability/judge on `claude-opus-4.8`; performance on `gpt-5.6-sol`; maintainer on `claude-opus-4.7`; skeptic on `gpt-5.4`; user on `claude-sonnet-4.6`. Family-diverse: 4 Claude + 2 GPT among the 6 reviewers.
 
-History: the slot-1 reviewer default was `claude-opus-4.7-xhigh` (chosen after pass-7 of the iterative hardening review proved extra-high reasoning caught 2 real medium bugs that 6 prior passes missed). It moved to `claude-opus-4.8` on the 4.8 release — a newer generation that is ~4x less likely to let a coding flaw pass unremarked, which is precisely these tools' job. Effort and context are now separate `task()` parameters: aliases such as `-xhigh` and `-1m-internal` remain readable presets, but `renderSpawnArgs` translates them to base model IDs plus `reasoning_effort`, and every spawned sub-agent runs with `context_tier:"long_context"`. The default slots moved from `claude-opus-4.6-1m` to `claude-opus-4.7-1m-internal` where useful for generational diversity (4.8 + 4.7 + GPT). The cheap-tier stability slot intentionally keeps the `claude-opus-4.6-1m` alias preset.
+Reasoning effort and context are separate `task()` parameters rather than parts of model IDs. Every spawned sub-agent runs with `context_tier:"long_context"`; orchestration code selects `reasoning_effort` independently where needed.
 
 ## Tests
 

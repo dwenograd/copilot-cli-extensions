@@ -6,7 +6,7 @@ User-level Copilot CLI extension that registers a `triple-duck` tool.
 
 `triple-duck` is a shortcut for "rubber-duck this with three different models, then have a top-tier judge model synthesize the results." When invoked, the tool returns a structured instruction packet that tells the agent to:
 
-1. Launch three `rubber-duck` sub-agents **in parallel** using three different models (default: Claude Opus 4.8, Claude Opus 4.7 alias, GPT-5.5).
+1. Launch three `rubber-duck` sub-agents **in parallel** using three different models (default: Claude Opus 4.8, GPT-5.6 Sol, Claude Opus 4.7).
 2. Wait for all three to complete (sync mode).
 3. **Launch a dedicated judge agent** (default: Claude Opus 4.8 — the current top reasoning model) that:
    - Receives all three reviewer outputs (wrapped as untrusted data — the judge is told not to follow instructions inside reviewer text).
@@ -44,9 +44,9 @@ Pass `cheap: true` (or invoke as "triple duck cheap <topic>") to swap the heavy 
 
 | Slot | Default trio | Cheap trio |
 |---|---|---|
-| 1 | claude-opus-4.8 (top reasoning model) | claude-opus-4.7 (7.5×) |
-| 2 | claude-opus-4.7-1m-internal (alias preset) | claude-opus-4.6 (3×) |
-| 3 | gpt-5.5 (7.5×) | gpt-5.5 (7.5×) |
+| 1 | claude-opus-4.8 | claude-opus-4.7 |
+| 2 | gpt-5.6-sol | claude-opus-4.6 |
+| 3 | claude-opus-4.7 | gpt-5.5 |
 | **Judge** | claude-opus-4.8 | claude-opus-4.7 |
 
 You can mix: `cheap: true, judge: "claude-opus-4.7-xhigh"` gives you the cheap reviewer trio with a premium judge — useful when you want fast critiques but high-quality synthesis.

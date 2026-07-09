@@ -32,9 +32,9 @@ Tiered for cost/quality balance. Family-diverse: 4 Claude + 2 GPT among reviewer
 | Role | Default | Cheap mode |
 |---|---|---|
 | security | `claude-opus-4.8` | `claude-opus-4.7` |
-| stability | `claude-opus-4.8` | `claude-opus-4.6-1m` |
-| performance | `gpt-5.5` | `gpt-5.5` |
-| maintainer | `claude-opus-4.7-1m-internal` | `claude-opus-4.6` |
+| stability | `claude-opus-4.8` | `claude-opus-4.6` |
+| performance | `gpt-5.6-sol` | `gpt-5.5` |
+| maintainer | `claude-opus-4.7` | `claude-opus-4.6` |
 | skeptic | `gpt-5.4` | `gpt-5.4` |
 | user | `claude-sonnet-4.6` | `claude-sonnet-4.6` |
 | **judge** | `claude-opus-4.8` | `claude-opus-4.7` |

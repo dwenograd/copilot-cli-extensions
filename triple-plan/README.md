@@ -12,7 +12,7 @@ Launches three planning agents in parallel using different models, then has a **
 - **Contested decisions** — where models took different approaches
 - **Risks & open questions** — merged across all planners
 
-The judge defaults to `claude-opus-4.7-1m-internal` as a distinct Opus 4.7 alias for generational diversity. Every spawned judge already runs with `context_tier:"long_context"`; override with `judge: "claude-opus-4.7-xhigh"` only when you want that extra-high reasoning preset.
+The judge defaults to `claude-opus-4.8`. Every spawned judge already runs with `context_tier:"long_context"`; override `judge` only when you want a different model.
 
 If the judge fails twice, the orchestrator falls back to merging the plans itself — but **explicitly labels the output** so you know the judge layer was bypassed.
 
@@ -24,7 +24,7 @@ triple-plan({
   context?: string,          // Optional extra context / file paths / scope
   constraints?: string,      // Optional hard constraints every plan MUST respect
   models?: string[],         // Optional planner trio override (must be 3 distinct model IDs)
-  judge?: string,            // Optional judge override (default: claude-opus-4.7-1m-internal)
+  judge?: string,            // Optional judge override (default: claude-opus-4.8)
                              // Compatible with `cheap: true` for "cheap planners, premium judge"
   cheap?: boolean,           // Optional. Use cheap planner trio (see Cheap mode below).
                              // Mutually exclusive with `models` (NOT with `judge`).
@@ -50,9 +50,9 @@ Use `cheap: true` for ~23% planner-cost savings by switching to cheaper planner 
 
 ## Defaults
 
-- **Planner trio:** `claude-opus-4.8`, `claude-opus-4.7-1m-internal`, `gpt-5.5`
+- **Planner trio:** `claude-opus-4.8`, `gpt-5.6-sol`, `claude-opus-4.7`
 - **Cheap planner trio:** `claude-opus-4.7`, `claude-opus-4.6`, `gpt-5.5`
-- **Judge:** `claude-opus-4.7-1m-internal` (alias translated at spawn time)
+- **Judge:** `claude-opus-4.8`
 - **Cheap judge:** `claude-opus-4.7`
 
 **Context:** every spawned planner and judge runs with `context_tier:"long_context"`; override `models` only when you want different model families or reasoning presets.
