@@ -112,7 +112,7 @@ duck-council(topic: "Critique this README rewrite",
 **Per-role override — heavier security bench:**
 ```
 duck-council(topic: "Should this endpoint be public?",
-             roles: { security: "claude-opus-4.7-xhigh", maintainer: "claude-opus-4.7-xhigh" })
+             roles: { security: "claude-opus-4.8", maintainer: "claude-opus-4.7" })
 ```
 
 ## Implementation notes
@@ -128,4 +128,4 @@ duck-council(topic: "Should this endpoint be public?",
 npm test
 ```
 
-16 duck-council tests (14 handler integration + 2 packet snapshots) on top of the broader 183-test workspace suite (199 total).
+The workspace command runs the council handler and packet tests along with the shared and sibling-extension suites.

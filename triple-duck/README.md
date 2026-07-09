@@ -35,6 +35,7 @@ triple-duck({
   focus?: string,            // Optional focus areas (e.g., "security, performance")
   cheap?: boolean,           // Optional. Use cheap reviewer trio (see Cheap mode below).
                              // Mutually exclusive with `models` (NOT with `judge`).
+  max_premium_calls?: number // Optional worst-case call cap; minimum 8 for a full run.
 })
 ```
 
@@ -49,10 +50,10 @@ Pass `cheap: true` (or invoke as "triple duck cheap <topic>") to swap the heavy 
 | 3 | claude-opus-4.7 | gpt-5.5 |
 | **Judge** | claude-opus-4.8 | claude-opus-4.7 |
 
-You can mix: `cheap: true, judge: "claude-opus-4.7-xhigh"` gives you the cheap reviewer trio with a premium judge — useful when you want fast critiques but high-quality synthesis.
+You can mix `cheap: true` with an explicit judge override, for example `judge: "claude-opus-4.8"`, when you want cheaper reviewers but full-quality synthesis.
 
 **Tradeoffs:**
-- The default trio's slot-1 (`claude-opus-4.8`) is the current top reasoning model. It supersedes the prior `claude-opus-4.7-xhigh` slot-1, whose extra-high reasoning caught 2 medium bugs in pass 7 of the iterative hardening; 4.8 now accepts xhigh via the separate `reasoning_effort` task parameter, with no `claude-opus-4.8-xhigh` ID needed.
+- The default trio's slot-1 (`claude-opus-4.8`) handles senior-review judgment, while GPT-5.6 Sol adds a cross-family operator/tool perspective.
 - Every spawned reviewer and judge runs with `context_tier:"long_context"`; pass `models` or `judge` explicitly only when you want different model families or reasoning presets.
 - Cheap mode's slot-1 is plain `claude-opus-4.7` — meaningfully cheaper and weaker than the default slot-1 model.
 
@@ -92,4 +93,4 @@ cd ~/.copilot/extensions
 npm test
 ```
 
-See the workspace `README.md` for an overview of all six extensions (the five orchestrators plus zerotrust-sourcecheck).
+See the workspace `README.md` for an overview of all eight extensions.

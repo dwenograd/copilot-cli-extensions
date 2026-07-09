@@ -24,7 +24,7 @@ gives the orchestrator a tight playbook for triaging them.
 | `zerotrust_safe_build` | Build step gated on prior council outcome (council-build modes). |
 | `zerotrust_record_council_outcome` | In-memory pass/fail recording the build-gate consults. |
 | `zerotrust_finalize_report` | Canonical-path `REPORT.md` write under `<build_root>/_reports/`. |
-| `zerotrust_cleanup_audit` | Removes the clone + report + quarantine artefacts. |
+| `zerotrust_cleanup_audit` | Removes the clone and quarantine artefacts; preserves the report unless explicitly asked to delete it. |
 | `zerotrust_sweep_audit_scratch` | Deletes stray scratch files at the top of `build_root` + parent. |
 
 ## Quick start
@@ -55,18 +55,22 @@ deterministic mode the workspace default. All other modes are opt-in
 ## API-direct by default — no files on disk for audits
 
 Default audit modes (`audit_source`, `audit_source_council`,
-`verify_release`, `metadata_only`) operate entirely via the GitHub API.
+`verify_release`, `metadata_only`) obtain repository source through the GitHub API.
 The audit pipeline:
 
 1. `zerotrust_safe_list_tree` enumerates the repo's file tree at a pinned
    SHA via `gh api`. Returns `{sha, entries: [...]}` in memory.
 2. `zerotrust_safe_fetch_file` fetches each interesting file (manifests,
    lockfiles, install/build hooks, recently-changed files) from the
-   GitHub API. Returns text or base64 in memory. Files >5MB return
-   `{contentTooLarge, sha256, sizeBytes, previewBase64}` instead.
+   GitHub API. Text is returned in memory; binaries return metadata plus
+   a 256-byte magic-byte preview. Files >5MB return metadata plus a 4KB
+   preview instead of full content.
 3. The deterministic checklist + 32-role council overlay reason about
    the in-memory content.
-4. The final `REPORT.md` is the **only** thing written to disk.
+4. The final `REPORT.md` is the only on-disk output for ordinary source
+   audits. `verify_release` additionally downloads release artifacts into
+   `_quarantine/` for hash and magic-byte verification, then removes them
+   during cleanup.
 
 This means: Defender / EDR never sees a source byte. Even if the audited
 repo is known-distributed malware, the audit can complete cleanly
@@ -490,8 +494,8 @@ Minimum git version: 2.39.
   silently substitute via the workspace `MODEL_FALLBACK_MAP`. See
   [Model availability](#model-availability) for the operator
   workaround.
-- **`/sandbox` integration as a third defense layer.** Copilot CLI
-  v1.0.51 (May 2026) added a session-level `/sandbox` toggle that runs
+- **`/sandbox` integration as a third defense layer.** Recent Copilot CLI
+  releases provide a session-level `/sandbox` toggle that runs
   the agent's built-in shell tool calls inside a sandbox layer, with
   filesystem and network access individually constrained
   (`settings.json` → `sandbox`). This is potentially the runtime-level
@@ -548,8 +552,9 @@ node --test "__tests__/*.test.mjs"
 (Pass the glob explicitly — `node --test __tests__/` errors with
 "cannot find module".)
 
-Current test suite: 753 tests, 752 passing, 1 skipped (Windows-only
-dev-mode symlink test), 0 failing.
+The command runs the complete zerotrust unit and integration suite; the
+Windows-only development-mode symlink case may be skipped when the host
+cannot create symlinks.
 
 ## Contributing
 

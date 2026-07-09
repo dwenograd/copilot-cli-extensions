@@ -12,7 +12,7 @@ This is the **opposite** pattern from `triple-duck`. Triple-duck seeks consensus
 
 ## Tool
 
-- `debate(question, position_a?, position_b?, context?, rounds?, debaters?, judge?, cheap?)`
+- `debate(question, position_a?, position_b?, context?, rounds?, debaters?, judge?, cheap?, max_premium_calls?)`
 
 `position_a` and `position_b` must be supplied **together** or **neither** (otherwise the debate is unbalanced). If neither is supplied, the orchestrator infers both opposing positions from the question.
 
@@ -55,4 +55,4 @@ cd ~/.copilot/extensions
 npm test
 ```
 
-See the workspace `README.md` for an overview of all six extensions (the five orchestrators plus zerotrust-sourcecheck).
+See the workspace `README.md` for an overview of all eight extensions.

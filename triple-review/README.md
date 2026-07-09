@@ -45,6 +45,8 @@ triple-review({
                               // default "high" (stop when no open ≥ this remain)
   cheap?: boolean,            // Optional. Use cheap trio (see Cheap mode below).
                               // Mutually exclusive with `models`.
+  max_premium_calls?: number  // Optional worst-case call cap:
+                              // max_rounds × 16 (48 at the default 3 rounds).
 })
 ```
 
@@ -147,4 +149,4 @@ cd ~/.copilot/extensions
 npm test
 ```
 
-See the workspace `README.md` for an overview of all six extensions (the five orchestrators plus zerotrust-sourcecheck).
+See the workspace `README.md` for an overview of all eight extensions.

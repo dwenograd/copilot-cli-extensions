@@ -43,7 +43,7 @@ After restart, the orchestrator/audit tools plus Crucible's four-tool lifecycle 
 
 > **Already have a `~/.copilot/extensions/` directory?** Back it up first; the clone needs to write into an empty path. Existing extensions can be moved alongside (the workspace's `_shared/` is namespaced under `_shared/`, and each extension lives in its own subdirectory).
 
-> **Heads-up on model availability:** if a model your provider doesn't offer is requested, the handler logs a `[fallback]` entry and silently substitutes per the static `_shared/models.mjs` `MODEL_FALLBACK_MAP` — but ONLY for model IDs explicitly listed in `KNOWN_DEPRECATED_MODELS` (empty by default). Other unavailable models will fail at call time, not silently fall back; if your provider doesn't offer one of the defaults, override it explicitly via `models` / `judge` / `debaters` / `roles`. The defaults assume access to GitHub Models / Anthropic / OpenAI tiers; less-equipped accounts may want to override explicitly.
+> **Heads-up on model availability:** if a model your provider doesn't offer is requested, the handler logs a `[fallback]` entry and silently substitutes per the static `_shared/models.mjs` `MODEL_FALLBACK_MAP` — but ONLY for model IDs explicitly listed in `KNOWN_DEPRECATED_MODELS` (empty by default). Other unavailable models will fail at call time, not silently fall back; if your provider doesn't offer one of the defaults, override it explicitly via `models` / `judge` / `debaters` / `roles`. The defaults span Anthropic, OpenAI, and Google model families; less-equipped accounts may want to override explicitly.
 
 ## Workspace layout
 
@@ -68,7 +68,7 @@ extensions/
 ├── triple-plan/                # same structure
 ├── debate/                     # same structure
 ├── duck-council/               # same structure (+ AGENTS.md no-`git diff` reminder)
-├── crucible/                  # autonomous event-sourced investigation runner
+├── crucible/                    # autonomous event-sourced investigation runner
 │   ├── extension.mjs           # four-tool thin SDK adapter
 │   ├── api/                    # generated schemas + start/status/stop/result handlers
 │   ├── domain/                 # pure reducer, decisions, contracts, evidence ranking
@@ -76,8 +76,11 @@ extensions/
 │   ├── measurement/            # allowlisted/staged harness execution boundary
 │   ├── runtime/                # restricted SDK workers + runner + supervisor
 │   └── __tests__/              # domain, persistence, measurement, runtime, API tests
+├── mcp-autoreload/
+│   ├── extension.mjs           # standalone MCP recovery hook + mcp_reload_now tool
+│   └── README.md
 ├── zerotrust-sourcecheck/      # 32-role security council + safeWrapper tools
-│   ├── extension.mjs           # tool registrations + onPreToolUse hook (vestigial — see README)
+│   ├── extension.mjs           # tool registrations only; no hooks block
 │   ├── handler.mjs             # runHandler entry: validate, scrub, build packet
 │   ├── packet.mjs              # long instruction-packet template
 │   ├── enforcement.mjs         # hook logic + audit-in-progress state machine
@@ -93,7 +96,7 @@ extensions/
 └── .gitignore
 ```
 
-## Handler pipeline (every extension follows this exact order)
+## Orchestrator handler pipeline
 
 ```
 parse (zod schema) → check budget → scrub each free-text field
@@ -102,7 +105,7 @@ parse (zod schema) → check budget → scrub each free-text field
                                   → buildInstructionPacket (compose meta-blocks + protocol)
 ```
 
-Each stage can short-circuit with a clear error before the next runs.
+Each orchestrator stage can short-circuit with a clear error before the next runs. Crucible, zerotrust-sourcecheck, and mcp-autoreload have purpose-built pipelines described in their own READMEs.
 
 ## Hardening features
 

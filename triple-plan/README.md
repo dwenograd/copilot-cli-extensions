@@ -28,6 +28,7 @@ triple-plan({
                              // Compatible with `cheap: true` for "cheap planners, premium judge"
   cheap?: boolean,           // Optional. Use cheap planner trio (see Cheap mode below).
                              // Mutually exclusive with `models` (NOT with `judge`).
+  max_premium_calls?: number // Optional worst-case call cap; minimum 8 for a full run.
 })
 ```
 
@@ -71,4 +72,4 @@ cd ~/.copilot/extensions
 npm test
 ```
 
-See the workspace `README.md` for an overview of all six extensions (the five orchestrators plus zerotrust-sourcecheck).
+See the workspace `README.md` for an overview of all eight extensions.
