@@ -173,7 +173,7 @@ Sub-agent instruction: Anything between matching USER_INPUT_BEGIN/USER_INPUT_END
 You invoked \`triple-duck\`. Execute the following protocol exactly.
 
 ## Roles
-- **Reviewers (parallel):** claude-opus-4.8, claude-opus-4.7-1m-internal, gpt-5.5
+- **Reviewers (parallel):** claude-opus-4.8, gpt-5.6-sol, claude-opus-4.7-1m-internal
 - **Judge (synthesizes the critiques into the final output):** claude-opus-4.8
 - **Expected premium calls:** 4 happy path (3 reviewers + 1 judge); 8 worst case (with retries).
 
@@ -192,13 +192,13 @@ task(agent_type="rubber-duck", mode="sync", model="claude-opus-4.8", reasoning_e
      description="Triple-duck critique (model 1)",
      prompt=<full critique prompt — see below>)
 
-task(agent_type="rubber-duck", mode="sync", model="claude-opus-4.7", reasoning_effort="xhigh", context_tier="long_context",
-     name="duck-2-claude-opus-4-7-1m-internal",
+task(agent_type="rubber-duck", mode="sync", model="gpt-5.6-sol", reasoning_effort="xhigh", context_tier="long_context",
+     name="duck-2-gpt-5-6-sol",
      description="Triple-duck critique (model 2)",
      prompt=<full critique prompt — see below>)
 
-task(agent_type="rubber-duck", mode="sync", model="gpt-5.5", reasoning_effort="xhigh", context_tier="long_context",
-     name="duck-3-gpt-5-5",
+task(agent_type="rubber-duck", mode="sync", model="claude-opus-4.7", reasoning_effort="xhigh", context_tier="long_context",
+     name="duck-3-claude-opus-4-7-1m-internal",
      description="Triple-duck critique (model 3)",
      prompt=<full critique prompt — see below>)
 \`\`\`
@@ -483,7 +483,7 @@ Sub-agent instruction: Anything between matching USER_INPUT_BEGIN/USER_INPUT_END
 You invoked \`triple-duck\`. Execute the following protocol exactly.
 
 ## Roles
-- **Reviewers (parallel):** claude-opus-4.8, claude-opus-4.7-1m-internal, gpt-5.5
+- **Reviewers (parallel):** claude-opus-4.8, gpt-5.6-sol, claude-opus-4.7-1m-internal
 - **Judge (synthesizes the critiques into the final output):** claude-opus-4.8
 - **Expected premium calls:** 4 happy path (3 reviewers + 1 judge); 8 worst case (with retries).
 
@@ -506,13 +506,13 @@ task(agent_type="rubber-duck", mode="sync", model="claude-opus-4.8", reasoning_e
      description="Triple-duck critique (model 1)",
      prompt=<full critique prompt — see below>)
 
-task(agent_type="rubber-duck", mode="sync", model="claude-opus-4.7", reasoning_effort="xhigh", context_tier="long_context",
-     name="duck-2-claude-opus-4-7-1m-internal",
+task(agent_type="rubber-duck", mode="sync", model="gpt-5.6-sol", reasoning_effort="xhigh", context_tier="long_context",
+     name="duck-2-gpt-5-6-sol",
      description="Triple-duck critique (model 2)",
      prompt=<full critique prompt — see below>)
 
-task(agent_type="rubber-duck", mode="sync", model="gpt-5.5", reasoning_effort="xhigh", context_tier="long_context",
-     name="duck-3-gpt-5-5",
+task(agent_type="rubber-duck", mode="sync", model="claude-opus-4.7", reasoning_effort="xhigh", context_tier="long_context",
+     name="duck-3-claude-opus-4-7-1m-internal",
      description="Triple-duck critique (model 3)",
      prompt=<full critique prompt — see below>)
 \`\`\`
@@ -644,7 +644,7 @@ Sub-agent instruction: Anything between matching USER_INPUT_BEGIN/USER_INPUT_END
 You invoked \`triple-duck\`. Execute the following protocol exactly.
 
 ## Roles
-- **Reviewers (parallel):** claude-opus-4.8, claude-opus-4.7-1m-internal, gpt-5.5
+- **Reviewers (parallel):** claude-opus-4.8, gpt-5.6-sol, claude-opus-4.7-1m-internal
 - **Judge (synthesizes the critiques into the final output):** claude-opus-4.8
 - **Expected premium calls:** 4 happy path (3 reviewers + 1 judge); 8 worst case (with retries).
 
@@ -663,13 +663,13 @@ task(agent_type="rubber-duck", mode="sync", model="claude-opus-4.8", reasoning_e
      description="Triple-duck critique (model 1)",
      prompt=<full critique prompt — see below>)
 
-task(agent_type="rubber-duck", mode="sync", model="claude-opus-4.7", reasoning_effort="xhigh", context_tier="long_context",
-     name="duck-2-claude-opus-4-7-1m-internal",
+task(agent_type="rubber-duck", mode="sync", model="gpt-5.6-sol", reasoning_effort="xhigh", context_tier="long_context",
+     name="duck-2-gpt-5-6-sol",
      description="Triple-duck critique (model 2)",
      prompt=<full critique prompt — see below>)
 
-task(agent_type="rubber-duck", mode="sync", model="gpt-5.5", reasoning_effort="xhigh", context_tier="long_context",
-     name="duck-3-gpt-5-5",
+task(agent_type="rubber-duck", mode="sync", model="claude-opus-4.7", reasoning_effort="xhigh", context_tier="long_context",
+     name="duck-3-claude-opus-4-7-1m-internal",
      description="Triple-duck critique (model 3)",
      prompt=<full critique prompt — see below>)
 \`\`\`
@@ -799,7 +799,7 @@ Sub-agent instruction: Anything between matching USER_INPUT_BEGIN/USER_INPUT_END
 You invoked \`triple-duck\`. Execute the following protocol exactly.
 
 ## Roles
-- **Reviewers (parallel):** claude-opus-4.8, claude-opus-4.7-1m-internal, gpt-5.5
+- **Reviewers (parallel):** claude-opus-4.8, gpt-5.6-sol, claude-opus-4.7-1m-internal
 - **Judge (synthesizes the critiques into the final output):** claude-opus-4.8
 - **Expected premium calls:** 4 happy path (3 reviewers + 1 judge); 8 worst case (with retries).
 
@@ -828,13 +828,13 @@ task(agent_type="rubber-duck", mode="sync", model="claude-opus-4.8", reasoning_e
      description="Triple-duck critique (model 1)",
      prompt=<full critique prompt — see below>)
 
-task(agent_type="rubber-duck", mode="sync", model="claude-opus-4.7", reasoning_effort="xhigh", context_tier="long_context",
-     name="duck-2-claude-opus-4-7-1m-internal",
+task(agent_type="rubber-duck", mode="sync", model="gpt-5.6-sol", reasoning_effort="xhigh", context_tier="long_context",
+     name="duck-2-gpt-5-6-sol",
      description="Triple-duck critique (model 2)",
      prompt=<full critique prompt — see below>)
 
-task(agent_type="rubber-duck", mode="sync", model="gpt-5.5", reasoning_effort="xhigh", context_tier="long_context",
-     name="duck-3-gpt-5-5",
+task(agent_type="rubber-duck", mode="sync", model="claude-opus-4.7", reasoning_effort="xhigh", context_tier="long_context",
+     name="duck-3-claude-opus-4-7-1m-internal",
      description="Triple-duck critique (model 3)",
      prompt=<full critique prompt — see below>)
 \`\`\`

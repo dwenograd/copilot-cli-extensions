@@ -23,7 +23,7 @@ describe("shared zod schemas", () => {
         });
         expect(triplePlanSchema.parse({ task: "plan this" })).toMatchObject({
             task: "plan this",
-            effectiveJudge: "claude-opus-4.7-1m-internal",
+            effectiveJudge: "claude-opus-4.8",
         });
         expect(tripleReviewSchema.parse({})).toMatchObject({
             max_rounds: 3,
@@ -32,7 +32,7 @@ describe("shared zod schemas", () => {
         expect(debateSchema.parse({ question: "A or B?" })).toMatchObject({
             question: "A or B?",
             rounds: 1,
-            effectiveJudge: "claude-opus-4.7-1m-internal",
+            effectiveJudge: "gemini-3.1-pro-preview",
         });
     });
 
@@ -128,7 +128,7 @@ describe("shared zod schemas", () => {
 
     it("rejects debate judge/debater collision after resolving defaults", () => {
         expectInvalid(
-            debateSchema.safeParse({ question: "x", debaters: ["claude-opus-4.7-1m-internal", "x"] }),
+            debateSchema.safeParse({ question: "x", debaters: ["gemini-3.1-pro-preview", "x"] }),
             "judge must differ from both debaters",
         );
     });
@@ -244,6 +244,7 @@ describe("shared zod schemas", () => {
             "claude-opus-4.7-high",
             "claude-opus-4.7-xhigh",
             "claude-opus-4.8",
+            "gpt-5.6-sol",
             "gpt-5.5",
             "gpt-5.4",
         ];

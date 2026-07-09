@@ -124,6 +124,9 @@ describe("renderSpawnArgs — elevated reasoning", () => {
         expect(renderSpawnArgs("gpt-5.5", { elevated: true })).toBe(
             'model="gpt-5.5", reasoning_effort="xhigh", context_tier="long_context"',
         );
+        expect(renderSpawnArgs("gpt-5.6-sol", { elevated: true })).toBe(
+            'model="gpt-5.6-sol", reasoning_effort="xhigh", context_tier="long_context"',
+        );
     });
 
     it("does NOT elevate a model that lacks xhigh support", () => {

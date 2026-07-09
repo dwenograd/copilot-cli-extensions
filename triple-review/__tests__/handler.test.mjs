@@ -161,8 +161,8 @@ describe("triple-review handler", () => {
         // synthesis task() example. Hard-coded SYNTHESIS_MODEL would still
         // appear; this test fails if a future edit reverts the param-driven
         // rendering and re-introduces the bypass.
-        expect(r.textResultForLlm).toContain("Synthesis model (for 3/3 patch merging):** claude-sonnet-4.6");
-        expect(r.textResultForLlm).toContain('model="claude-sonnet-4.6"');
+        expect(r.textResultForLlm).toContain("Synthesis model (for 3/3 patch merging):** gpt-5.6-sol");
+        expect(r.textResultForLlm).toContain('model="gpt-5.6-sol"');
     });
 
     it("auto-detect step explicitly handles untracked files (pass 8 fix)", async () => {

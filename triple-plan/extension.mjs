@@ -39,12 +39,12 @@ const session = await joinSession({
                         minItems: 3,
                         maxItems: 3,
                         description:
-                            "Optional. Exactly 3 model IDs to override the default planner trio. Defaults to claude-opus-4.8, claude-opus-4.7-1m-internal, gpt-5.5. (Aliases are translated at spawn time; every spawned planner runs with context_tier:\"long_context\".)",
+                            "Optional. Exactly 3 model IDs to override the default planner trio. Defaults to claude-opus-4.8, gpt-5.6-sol, claude-opus-4.7-1m-internal: architectural judgment, operator/tool reasoning, and generational diversity. (Aliases are translated at spawn time; every spawned planner runs with context_tier:\"long_context\".)",
                     },
                     judge: {
                         type: "string",
                         description:
-                            "Optional. Model ID for the judge that merges the 3 planner outputs into one canonical plan. Defaults to `claude-opus-4.7-1m-internal` (alias translated at spawn time; every spawned judge runs with context_tier:\"long_context\"). Pass `claude-opus-4.7-xhigh` for extra-high reasoning effort. Compatible with `cheap: true` (cheap planner trio + premium judge is a sensible config).",
+                            "Optional. Model ID for the judge that merges the 3 planner outputs into one canonical plan. Defaults to `claude-opus-4.8` for senior architectural judgment; every spawned judge runs with context_tier:\"long_context\" and full-quality judges use elevated reasoning. Compatible with `cheap: true` (cheap planner trio + premium judge is a sensible config).",
                     },
                     cheap: {
                         type: "boolean",

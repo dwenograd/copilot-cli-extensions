@@ -18,7 +18,7 @@ You invoked \`duck-council\`. Execute the following protocol exactly.
 ## Council
 - 🛡 **security** → \`claude-opus-4.8\`
 - 🧪 **stability** → \`claude-opus-4.8\`
-- ⚡ **performance** → \`gpt-5.5\`
+- ⚡ **performance** → \`gpt-5.6-sol\`
 - 🔧 **maintainer** → \`claude-opus-4.7-1m-internal\`
 - 🤔 **skeptic** → \`gpt-5.4\`
 - 👤 **user** → \`claude-sonnet-4.6\`
@@ -45,8 +45,8 @@ task(agent_type="rubber-duck", mode="sync", model="claude-opus-4.8", reasoning_e
      description="Duck Council 2/6: stability",
      prompt=<full stability critique prompt — see "Per-role prompt templates" below>)
 
-task(agent_type="rubber-duck", mode="sync", model="gpt-5.5", reasoning_effort="xhigh", context_tier="long_context",
-     name="duck-performance-gpt-5-5",
+task(agent_type="rubber-duck", mode="sync", model="gpt-5.6-sol", reasoning_effort="xhigh", context_tier="long_context",
+     name="duck-performance-gpt-5-6-sol",
      description="Duck Council 3/6: performance",
      prompt=<full performance critique prompt — see "Per-role prompt templates" below>)
 
@@ -251,7 +251,7 @@ Use this structure (if any roles failed, change the council header to \`**Counci
 **Council** (6 ducks + judge):
 - 🛡 security → \`claude-opus-4.8\`
 - 🧪 stability → \`claude-opus-4.8\`
-- ⚡ performance → \`gpt-5.5\`
+- ⚡ performance → \`gpt-5.6-sol\`
 - 🔧 maintainer → \`claude-opus-4.7-1m-internal\`
 - 🤔 skeptic → \`gpt-5.4\`
 - 👤 user → \`claude-sonnet-4.6\`
@@ -277,7 +277,7 @@ Use this structure (if any roles failed, change the council header to \`**Counci
 #### 🧪 stability (\`claude-opus-4.8\`)
 <verbatim role output, OR \`FAILED — excluded from synthesis [role=stability]\` if this role errored>
 
-#### ⚡ performance (\`gpt-5.5\`)
+#### ⚡ performance (\`gpt-5.6-sol\`)
 <verbatim role output, OR \`FAILED — excluded from synthesis [role=performance]\` if this role errored>
 
 #### 🔧 maintainer (\`claude-opus-4.7-1m-internal\`)
@@ -319,7 +319,7 @@ You invoked \`duck-council\`. Execute the following protocol exactly.
 ## Council
 - 🛡 **security** → \`claude-opus-4.8\`
 - 🧪 **stability** → \`claude-opus-4.8\`
-- ⚡ **performance** → \`gpt-5.5\`
+- ⚡ **performance** → \`gpt-5.6-sol\`
 - 🔧 **maintainer** → \`claude-opus-4.7-1m-internal\`
 - 🤔 **skeptic** → \`gpt-5.4\`
 - 👤 **user** → \`claude-sonnet-4.6\`
@@ -346,8 +346,8 @@ task(agent_type="rubber-duck", mode="sync", model="claude-opus-4.8", reasoning_e
      description="Duck Council 2/6: stability",
      prompt=<full stability critique prompt — see "Per-role prompt templates" below>)
 
-task(agent_type="rubber-duck", mode="sync", model="gpt-5.5", reasoning_effort="xhigh", context_tier="long_context",
-     name="duck-performance-gpt-5-5",
+task(agent_type="rubber-duck", mode="sync", model="gpt-5.6-sol", reasoning_effort="xhigh", context_tier="long_context",
+     name="duck-performance-gpt-5-6-sol",
      description="Duck Council 3/6: performance",
      prompt=<full performance critique prompt — see "Per-role prompt templates" below>)
 
@@ -489,7 +489,7 @@ Use this structure (no judge synthesis since \`skip_judge: true\`):
 **Council** (6 ducks, no judge):
 - 🛡 security → \`claude-opus-4.8\`
 - 🧪 stability → \`claude-opus-4.8\`
-- ⚡ performance → \`gpt-5.5\`
+- ⚡ performance → \`gpt-5.6-sol\`
 - 🔧 maintainer → \`claude-opus-4.7-1m-internal\`
 - 🤔 skeptic → \`gpt-5.4\`
 - 👤 user → \`claude-sonnet-4.6\`
@@ -500,7 +500,7 @@ Use this structure (no judge synthesis since \`skip_judge: true\`):
 ### 🧪 stability duck (\`claude-opus-4.8\`)
 <verbatim role output, OR \`FAILED — excluded from synthesis [role=stability]\` if this role errored, OR \`### No findings — <one-sentence reason>\` if it succeeded with zero findings>
 
-### ⚡ performance duck (\`gpt-5.5\`)
+### ⚡ performance duck (\`gpt-5.6-sol\`)
 <verbatim role output, OR \`FAILED — excluded from synthesis [role=performance]\` if this role errored, OR \`### No findings — <one-sentence reason>\` if it succeeded with zero findings>
 
 ### 🔧 maintainer duck (\`claude-opus-4.7-1m-internal\`)

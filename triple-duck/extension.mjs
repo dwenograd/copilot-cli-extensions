@@ -34,7 +34,7 @@ const session = await joinSession({
                         minItems: 3,
                         maxItems: 3,
                         description:
-                            "Optional. Exactly 3 model IDs to override the default reviewer trio. Defaults to claude-opus-4.8, claude-opus-4.7-1m-internal, gpt-5.5. (Aliases are translated at spawn time; every spawned reviewer runs with context_tier:\"long_context\".)",
+                            "Optional. Exactly 3 model IDs to override the default reviewer trio. Defaults to claude-opus-4.8, gpt-5.6-sol, claude-opus-4.7-1m-internal: senior review, operator/tool reasoning, and generational diversity. (Aliases are translated at spawn time; every spawned reviewer runs with context_tier:\"long_context\".)",
                     },
                     judge: {
                         type: "string",

@@ -38,7 +38,7 @@ const session = await joinSession({
                     roles: {
                         type: "object",
                         description:
-                            "Optional. Per-role model overrides — partial object, not all 6 required. E.g. `{ security: \"claude-opus-4.7-xhigh\", performance: \"gpt-5.5\" }`. Roles you don't specify use the tiered defaults. MUTUALLY EXCLUSIVE with `cheap` (an empty `{}` is treated as no override).",
+                            "Optional. Per-role model overrides — partial object, not all 6 required. E.g. `{ security: \"claude-opus-4.8\", performance: \"gpt-5.6-sol\" }`. Roles you don't specify use the tiered defaults. MUTUALLY EXCLUSIVE with `cheap` (an empty `{}` is treated as no override).",
                         additionalProperties: false,
                         properties: {
                             security: { type: "string" },

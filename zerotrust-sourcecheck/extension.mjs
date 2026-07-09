@@ -143,7 +143,7 @@ const session = await joinSession({
                     roles: {
                         type: "object",
                         description:
-                            "Optional (council modes only). Per-role-id model overrides as a partial object, e.g. { \"obfuscation\": \"gpt-5.5\" }. Roles you don't specify use the tiered defaults. Unknown role IDs are silently ignored; unknown model IDs produce an error.",
+                            "Optional (council modes only). Per-role-id model overrides as a partial object, e.g. { \"obfuscation\": \"gpt-5.6-sol\" }. Roles you don't specify use the tiered defaults. Unknown role IDs are silently ignored; unknown model IDs produce an error.",
                         additionalProperties: { type: "string" },
                     },
                     extra_roles: {
@@ -155,7 +155,7 @@ const session = await joinSession({
                     judge: {
                         type: "string",
                         description:
-                            "Optional (council modes only). Override the meta-judge model. Default is claude-opus-4.7-1m-internal (alias translated at spawn time; every spawned meta-judge runs with context_tier:\"long_context\").",
+                            "Optional (council modes only). Override the meta-judge model. Default is claude-opus-4.8 for senior security-review judgment; every spawned meta-judge runs with context_tier:\"long_context\".",
                     },
                     max_premium_calls: {
                         type: "integer",

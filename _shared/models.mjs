@@ -43,17 +43,15 @@
 // Keeping the readable aliases here keeps logs, notes, and the fallback map
 // legible; spawnSpec is the only place that needs the real IDs.
 //
-// `claude-opus-4.8` is the default reasoning model — ~4x less likely to let a
-// coding flaw pass unremarked than the prior `claude-opus-4.7-xhigh` default,
-// which is exactly the job of these reviewer/critique orchestrators. Slot 2
-// stays on a distinct Opus 4.7 alias for generational diversity (4.8 + 4.7 +
-// GPT). To run a slot at extra-high reasoning, pass a `-xhigh` alias via a
-// `models`/`judge` override; `claude-opus-4.8` also accepts xhigh effort now,
-// so a future preset could spawn 4.8 at xhigh directly if desired.
+// Opus 4.8 anchors critique and senior-review judgment; GPT-5.6 Sol supplies
+// the stronger operator/tool-orchestration perspective; Opus 4.7 preserves
+// generational diversity. This balance is shared by critique, planning, and
+// review trios so each run includes judgment, execution, and an independent
+// second Claude generation.
 export const DEFAULT_MODELS = [
     "claude-opus-4.8",
+    "gpt-5.6-sol",
     "claude-opus-4.7-1m-internal",
-    "gpt-5.5",
 ];
 
 // Cheap-mode trio: same model families, cheaper model variants, no
@@ -71,9 +69,9 @@ export const CHEAP_MODELS = [
 // 4.8 also accepts xhigh effort via the reasoning_effort param if wanted).
 export const DEFAULT_DEBATERS = [
     "claude-opus-4.8",
-    "gpt-5.5",
+    "gpt-5.6-sol",
 ];
-export const DEFAULT_JUDGE = "claude-opus-4.7-1m-internal";
+export const DEFAULT_JUDGE = "gemini-3.1-pro-preview";
 
 export const CHEAP_DEBATERS = [
     "claude-opus-4.7",
@@ -84,7 +82,7 @@ export const CHEAP_JUDGE = "claude-opus-4.6";
 // duck-council: 6 role-specialized reviewers + 1 judge synthesis pass.
 // Tiered model assignment (NOT all-4.8) per pass-15 triple-plan synthesis:
 // - reasoning-heavy roles (security, stability) get the top reasoning model (4.8)
-// - pattern-matching roles (performance) get cross-family GPT
+// - operational/dataflow roles (performance) get cross-family Sol
 // - cross-generation diversity (maintainer) gets a distinct Opus 4.7 alias
 // - prior-diverse roles (skeptic) get a different GPT variant
 // - intuition-heavy roles (user/UX) get a cheaper tier
@@ -93,7 +91,7 @@ export const COUNCIL_ROLE_NAMES = ["security", "stability", "performance", "main
 export const DEFAULT_COUNCIL_ROLES = Object.freeze({
     security: "claude-opus-4.8",
     stability: "claude-opus-4.8",
-    performance: "gpt-5.5",
+    performance: "gpt-5.6-sol",
     maintainer: "claude-opus-4.7-1m-internal",
     skeptic: "gpt-5.4",
     user: "claude-sonnet-4.6",
@@ -111,8 +109,8 @@ export const CHEAP_COUNCIL_ROLES = Object.freeze({
 export const DEFAULT_COUNCIL_JUDGE = "claude-opus-4.8";
 export const CHEAP_COUNCIL_JUDGE = "claude-opus-4.7";
 
-// Triple-review's synthesis model (used for merging 3/3 reviewer fixes).
-export const SYNTHESIS_MODEL = "claude-sonnet-4.6";
+// Triple-review's synthesis model performs the implementation-heavy merge.
+export const SYNTHESIS_MODEL = "gpt-5.6-sol";
 
 // Triple-duck judge: synthesizes 3 reviewer critiques into a unified, consensus-
 // ranked output. The win is the generational + honesty improvement for nuanced
@@ -123,11 +121,9 @@ export const DEFAULT_TRIPLE_DUCK_JUDGE = "claude-opus-4.8";
 // (no reasoning-tier upgrade).
 export const CHEAP_TRIPLE_DUCK_JUDGE = "claude-opus-4.7";
 
-// Triple-plan judge: plans can be 30-50k tokens each, but every spawn now runs
-// with long context, so truncation isn't a concern. The default keeps a distinct
-// Opus 4.7 alias for generational diversity vs the planner trio; override with
-// `judge: "claude-opus-4.8"` if you prefer the newer generation.
-export const DEFAULT_TRIPLE_PLAN_JUDGE = "claude-opus-4.7-1m-internal";
+// Triple-plan judgment is architectural review, so Opus 4.8 merges the planner
+// outputs while Sol remains represented in the planner trio.
+export const DEFAULT_TRIPLE_PLAN_JUDGE = "claude-opus-4.8";
 export const CHEAP_TRIPLE_PLAN_JUDGE = "claude-opus-4.7";
 
 // Triple-review severity ranking: index 0 = highest severity.
@@ -145,6 +141,7 @@ export const KNOWN_DEPRECATED_MODELS = new Set([
 // in KNOWN_DEPRECATED_MODELS, picking the first non-deprecated entry.
 export const MODEL_FALLBACK_MAP = {
     "claude-opus-4.8": ["claude-opus-4.7-xhigh", "claude-opus-4.7", "claude-opus-4.6"],
+    "gpt-5.6-sol": ["gpt-5.5", "gpt-5.4", "gpt-5.3-codex"],
     "claude-opus-4.7-xhigh": ["claude-opus-4.7-high", "claude-opus-4.7", "claude-opus-4.6"],
     "claude-opus-4.7-high": ["claude-opus-4.7", "claude-opus-4.6"],
     "claude-opus-4.7-1m-internal": ["claude-opus-4.6-1m", "claude-opus-4.6", "claude-sonnet-4.6"],

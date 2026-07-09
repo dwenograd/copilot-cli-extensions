@@ -130,7 +130,7 @@ export const ROLES = [
     {
         id: "persistence",
         category: "B",
-        model: "gpt-5.5",
+        model: "gpt-5.6-sol",
         tier: "source-inspection",
         mandatory: false,
         angle: "Find code that arranges to run again after the current process exits. Apply your knowledge of cross-platform persistence mechanisms.",
@@ -163,7 +163,7 @@ export const ROLES = [
     {
         id: "data-exfil",
         category: "B",
-        model: "gpt-5.5",
+        model: "gpt-5.6-sol",
         tier: "source-inspection",
         mandatory: false,
         angle: "Find outbound channels that carry sensitive data off the host with a demonstrated source-to-sink path. Your scope is the sink half of any exfiltration chain — where the data leaves.",
@@ -294,7 +294,7 @@ export const ROLES = [
     {
         id: "ml-model-file",
         category: "D",
-        model: "gpt-5.5",
+        model: "gpt-5.6-sol",
         tier: "source-inspection",
         mandatory: false,
         angle: "Find machine-learning model files and inspect how they are loaded. Apply your knowledge of model-format deserialization risks.",
@@ -332,7 +332,7 @@ export const ROLES = [
     {
         id: "ai-slopsquat-and-hallucinated-deps",
         category: "F",
-        model: "gpt-5.5",
+        model: "gpt-5.6-sol",
         tier: "source-inspection",
         mandatory: false,
         angle: "Find dependencies that look like LLM-hallucinated package names, including non-existent packages and packages with AI-generated-looking metadata. Cross-check declared deps against canonical registries.",
@@ -354,7 +354,7 @@ export const ROLES = [
     {
         id: "ai-agent-tooling-and-memory",
         category: "F",
-        model: "gpt-5.5",
+        model: "gpt-5.6-sol",
         tier: "source-inspection",
         mandatory: false,
         angle: "Find dedicated AI-development-tool configuration files and inspect them for hostile content. Includes assistant-rule files, tool-server registrations, agent memory or knowledge-base files, and machine-readable schema descriptions that an AI tool would consume.",
@@ -378,7 +378,7 @@ export const ROLES = [
     {
         id: "project-fit",
         category: "G",
-        model: "gpt-5.5",
+        model: "gpt-5.6-sol",
         tier: "source-inspection",
         mandatory: false,
         angle: "Compare the README's stated purpose against the actual code. Look for utility functions, dependencies, modules, or capabilities that do not fit the stated purpose. Project-purpose mismatch is a classic supply-chain compromise signal.",
@@ -421,6 +421,7 @@ export const ALLOWED_MODEL_IDS = Object.freeze([
     "claude-sonnet-4.6",
     "claude-sonnet-4.5",
     "claude-haiku-4.5",
+    "gpt-5.6-sol",
     "gpt-5.5",
     "gpt-5.4",
     "gpt-5.4-mini",
@@ -428,5 +429,5 @@ export const ALLOWED_MODEL_IDS = Object.freeze([
     "gpt-5-mini",
 ]);
 
-export const DEFAULT_SUB_JUDGE_MODEL = "claude-opus-4.7-1m-internal";
-export const DEFAULT_META_JUDGE_MODEL = "claude-opus-4.7-1m-internal";
+export const DEFAULT_SUB_JUDGE_MODEL = "claude-opus-4.8";
+export const DEFAULT_META_JUDGE_MODEL = "claude-opus-4.8";

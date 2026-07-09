@@ -133,10 +133,10 @@ describe("triple-plan handler", () => {
         const { deps, logged } = mockDeps();
         const r = await runHandler({ task: "x" }, deps);
         expect(r.resultType).toBe("success");
-        expect(r.textResultForLlm).toContain("claude-opus-4.7-1m-internal");
+        expect(r.textResultForLlm).toContain("claude-opus-4.8");
         expect(r.textResultForLlm).toContain("Judge");
         expect(r.textResultForLlm).toContain("triple-plan-judge");
-        expect(logged.some((l) => l.includes("triple-plan invoked") && l.includes("judge: claude-opus-4.7"))).toBe(true);
+        expect(logged.some((l) => l.includes("triple-plan invoked") && l.includes("judge: claude-opus-4.8"))).toBe(true);
         // The user-facing banner must NOT leak the -1m-internal context alias.
         expect(logged.some((l) => l.includes("triple-plan invoked") && l.includes("-1m-internal"))).toBe(false);
     });

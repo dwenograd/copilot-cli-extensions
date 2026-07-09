@@ -33,7 +33,7 @@ skip them. Maintain the following state across rounds in your own reasoning:
 
 - **Reviewer models:** claude-opus-4.7, claude-opus-4.6, gpt-5.5
 - **Mode:** cheap (cheaper model variants)
-- **Synthesis model (for 3/3 patch merging):** claude-sonnet-4.6
+- **Synthesis model (for 3/3 patch merging):** gpt-5.6-sol
 - **Max rounds:** 1
 - **Severity threshold:** high (severities ranked: critical > high > medium > low > nit)
 - **Scope:** No scope specified — auto-detect per Step 0.2 below
@@ -227,7 +227,7 @@ GLOBAL SYNTHESIS CAP: enforce a maximum of 10 synthesis calls per round, INCLUDI
 task(
   agent_type="general-purpose",
   mode="sync",
-  model="claude-sonnet-4.6", context_tier="long_context",
+  model="gpt-5.6-sol", context_tier="long_context",
   name="synth-<clusterId>",
   description="Synthesize canonical patch for 3/3 cluster",
   prompt=<see synthesis template>
@@ -443,8 +443,8 @@ skip them. Maintain the following state across rounds in your own reasoning:
 
 ## Configuration
 
-- **Reviewer models:** claude-opus-4.8, claude-opus-4.7-1m-internal, gpt-5.5
-- **Synthesis model (for 3/3 patch merging):** claude-sonnet-4.6
+- **Reviewer models:** claude-opus-4.8, gpt-5.6-sol, claude-opus-4.7-1m-internal
+- **Synthesis model (for 3/3 patch merging):** gpt-5.6-sol
 - **Max rounds:** 3
 - **Severity threshold:** critical (severities ranked: critical > high > medium > low > nit)
 - **Scope:** No scope specified — auto-detect per Step 0.2 below
@@ -499,7 +499,7 @@ Tell the user, BEFORE round 1:
 \`\`\`
 Triple-review starting:
   Scope: <resolvedScope summary>
-  Reviewers: claude-opus-4.8, claude-opus-4.7-1m-internal, gpt-5.5
+  Reviewers: claude-opus-4.8, gpt-5.6-sol, claude-opus-4.7-1m-internal
   Max rounds: 3
   Worst-case cost: 48 premium calls (9 reviewers + up to 9 reviewer retries + up to 30 synthesis calls — synthesis cap is GLOBAL per round and includes retries)
   Backup: <backupSha or "none (clean tree)"> @ HEAD <preReviewHead>
@@ -532,8 +532,8 @@ Pass \`$diffPath\` (the absolute path) to reviewers as \`diffSnapshotPath\` in S
 
 Spawn one reviewer per line below, using the exact \`model\`/\`reasoning_effort\`/\`context_tier\` args shown for each:
 - reviewer 1: model="claude-opus-4.8", reasoning_effort="xhigh", context_tier="long_context"
-- reviewer 2: model="claude-opus-4.7", reasoning_effort="xhigh", context_tier="long_context"
-- reviewer 3: model="gpt-5.5", reasoning_effort="xhigh", context_tier="long_context"
+- reviewer 2: model="gpt-5.6-sol", reasoning_effort="xhigh", context_tier="long_context"
+- reviewer 3: model="claude-opus-4.7", reasoning_effort="xhigh", context_tier="long_context"
 
 \`\`\`
 task(
@@ -638,7 +638,7 @@ GLOBAL SYNTHESIS CAP: enforce a maximum of 10 synthesis calls per round, INCLUDI
 task(
   agent_type="general-purpose",
   mode="sync",
-  model="claude-sonnet-4.6", context_tier="long_context",
+  model="gpt-5.6-sol", reasoning_effort="xhigh", context_tier="long_context",
   name="synth-<clusterId>",
   description="Synthesize canonical patch for 3/3 cluster",
   prompt=<see synthesis template>
@@ -660,8 +660,8 @@ Root cause: <issue summary, derived from Title/Issue text of all 3>
 
 # Reviewer-proposed fixes
 Reviewer 1 (claude-opus-4.8): <fix1>
-Reviewer 2 (claude-opus-4.7-1m-internal): <fix2>
-Reviewer 3 (gpt-5.5): <fix3>
+Reviewer 2 (gpt-5.6-sol): <fix2>
+Reviewer 3 (claude-opus-4.7-1m-internal): <fix3>
 
 # Output format (STRICT)
 Either:
@@ -854,8 +854,8 @@ skip them. Maintain the following state across rounds in your own reasoning:
 
 ## Configuration
 
-- **Reviewer models:** claude-opus-4.8, claude-opus-4.7-1m-internal, gpt-5.5
-- **Synthesis model (for 3/3 patch merging):** claude-sonnet-4.6
+- **Reviewer models:** claude-opus-4.8, gpt-5.6-sol, claude-opus-4.7-1m-internal
+- **Synthesis model (for 3/3 patch merging):** gpt-5.6-sol
 - **Max rounds:** 3
 - **Severity threshold:** high (severities ranked: critical > high > medium > low > nit)
 - **Scope:** No scope specified — auto-detect per Step 0.2 below
@@ -910,7 +910,7 @@ Tell the user, BEFORE round 1:
 \`\`\`
 Triple-review starting:
   Scope: <resolvedScope summary>
-  Reviewers: claude-opus-4.8, claude-opus-4.7-1m-internal, gpt-5.5
+  Reviewers: claude-opus-4.8, gpt-5.6-sol, claude-opus-4.7-1m-internal
   Max rounds: 3
   Worst-case cost: 48 premium calls (9 reviewers + up to 9 reviewer retries + up to 30 synthesis calls — synthesis cap is GLOBAL per round and includes retries)
   Backup: <backupSha or "none (clean tree)"> @ HEAD <preReviewHead>
@@ -943,8 +943,8 @@ Pass \`$diffPath\` (the absolute path) to reviewers as \`diffSnapshotPath\` in S
 
 Spawn one reviewer per line below, using the exact \`model\`/\`reasoning_effort\`/\`context_tier\` args shown for each:
 - reviewer 1: model="claude-opus-4.8", reasoning_effort="xhigh", context_tier="long_context"
-- reviewer 2: model="claude-opus-4.7", reasoning_effort="xhigh", context_tier="long_context"
-- reviewer 3: model="gpt-5.5", reasoning_effort="xhigh", context_tier="long_context"
+- reviewer 2: model="gpt-5.6-sol", reasoning_effort="xhigh", context_tier="long_context"
+- reviewer 3: model="claude-opus-4.7", reasoning_effort="xhigh", context_tier="long_context"
 
 \`\`\`
 task(
@@ -1049,7 +1049,7 @@ GLOBAL SYNTHESIS CAP: enforce a maximum of 10 synthesis calls per round, INCLUDI
 task(
   agent_type="general-purpose",
   mode="sync",
-  model="claude-sonnet-4.6", context_tier="long_context",
+  model="gpt-5.6-sol", reasoning_effort="xhigh", context_tier="long_context",
   name="synth-<clusterId>",
   description="Synthesize canonical patch for 3/3 cluster",
   prompt=<see synthesis template>
@@ -1071,8 +1071,8 @@ Root cause: <issue summary, derived from Title/Issue text of all 3>
 
 # Reviewer-proposed fixes
 Reviewer 1 (claude-opus-4.8): <fix1>
-Reviewer 2 (claude-opus-4.7-1m-internal): <fix2>
-Reviewer 3 (gpt-5.5): <fix3>
+Reviewer 2 (gpt-5.6-sol): <fix2>
+Reviewer 3 (claude-opus-4.7-1m-internal): <fix3>
 
 # Output format (STRICT)
 Either:
@@ -1265,8 +1265,8 @@ skip them. Maintain the following state across rounds in your own reasoning:
 
 ## Configuration
 
-- **Reviewer models:** claude-opus-4.8, claude-opus-4.7-1m-internal, gpt-5.5
-- **Synthesis model (for 3/3 patch merging):** claude-sonnet-4.6
+- **Reviewer models:** claude-opus-4.8, gpt-5.6-sol, claude-opus-4.7-1m-internal
+- **Synthesis model (for 3/3 patch merging):** gpt-5.6-sol
 - **Max rounds:** 3
 - **Severity threshold:** high (severities ranked: critical > high > medium > low > nit)
 - **Scope:** User-specified scope: \`branch:main\` (validated by schema; use the pre-computed commands below)
@@ -1320,7 +1320,7 @@ Tell the user, BEFORE round 1:
 \`\`\`
 Triple-review starting:
   Scope: <resolvedScope summary>
-  Reviewers: claude-opus-4.8, claude-opus-4.7-1m-internal, gpt-5.5
+  Reviewers: claude-opus-4.8, gpt-5.6-sol, claude-opus-4.7-1m-internal
   Max rounds: 3
   Worst-case cost: 48 premium calls (9 reviewers + up to 9 reviewer retries + up to 30 synthesis calls — synthesis cap is GLOBAL per round and includes retries)
   Backup: <backupSha or "none (clean tree)"> @ HEAD <preReviewHead>
@@ -1353,8 +1353,8 @@ Pass \`$diffPath\` (the absolute path) to reviewers as \`diffSnapshotPath\` in S
 
 Spawn one reviewer per line below, using the exact \`model\`/\`reasoning_effort\`/\`context_tier\` args shown for each:
 - reviewer 1: model="claude-opus-4.8", reasoning_effort="xhigh", context_tier="long_context"
-- reviewer 2: model="claude-opus-4.7", reasoning_effort="xhigh", context_tier="long_context"
-- reviewer 3: model="gpt-5.5", reasoning_effort="xhigh", context_tier="long_context"
+- reviewer 2: model="gpt-5.6-sol", reasoning_effort="xhigh", context_tier="long_context"
+- reviewer 3: model="claude-opus-4.7", reasoning_effort="xhigh", context_tier="long_context"
 
 \`\`\`
 task(
@@ -1459,7 +1459,7 @@ GLOBAL SYNTHESIS CAP: enforce a maximum of 10 synthesis calls per round, INCLUDI
 task(
   agent_type="general-purpose",
   mode="sync",
-  model="claude-sonnet-4.6", context_tier="long_context",
+  model="gpt-5.6-sol", reasoning_effort="xhigh", context_tier="long_context",
   name="synth-<clusterId>",
   description="Synthesize canonical patch for 3/3 cluster",
   prompt=<see synthesis template>
@@ -1481,8 +1481,8 @@ Root cause: <issue summary, derived from Title/Issue text of all 3>
 
 # Reviewer-proposed fixes
 Reviewer 1 (claude-opus-4.8): <fix1>
-Reviewer 2 (claude-opus-4.7-1m-internal): <fix2>
-Reviewer 3 (gpt-5.5): <fix3>
+Reviewer 2 (gpt-5.6-sol): <fix2>
+Reviewer 3 (claude-opus-4.7-1m-internal): <fix3>
 
 # Output format (STRICT)
 Either:
@@ -1675,8 +1675,8 @@ skip them. Maintain the following state across rounds in your own reasoning:
 
 ## Configuration
 
-- **Reviewer models:** claude-opus-4.8, claude-opus-4.7-1m-internal, gpt-5.5
-- **Synthesis model (for 3/3 patch merging):** claude-sonnet-4.6
+- **Reviewer models:** claude-opus-4.8, gpt-5.6-sol, claude-opus-4.7-1m-internal
+- **Synthesis model (for 3/3 patch merging):** gpt-5.6-sol
 - **Max rounds:** 3
 - **Severity threshold:** high (severities ranked: critical > high > medium > low > nit)
 - **Scope:** User-specified scope: \`files:a.js,b.js\` (validated by schema; use the pre-computed commands below)
@@ -1734,7 +1734,7 @@ Tell the user, BEFORE round 1:
 \`\`\`
 Triple-review starting:
   Scope: <resolvedScope summary>
-  Reviewers: claude-opus-4.8, claude-opus-4.7-1m-internal, gpt-5.5
+  Reviewers: claude-opus-4.8, gpt-5.6-sol, claude-opus-4.7-1m-internal
   Max rounds: 3
   Worst-case cost: 48 premium calls (9 reviewers + up to 9 reviewer retries + up to 30 synthesis calls — synthesis cap is GLOBAL per round and includes retries)
   Backup: <backupSha or "none (clean tree)"> @ HEAD <preReviewHead>
@@ -1767,8 +1767,8 @@ Pass \`$diffPath\` (the absolute path) to reviewers as \`diffSnapshotPath\` in S
 
 Spawn one reviewer per line below, using the exact \`model\`/\`reasoning_effort\`/\`context_tier\` args shown for each:
 - reviewer 1: model="claude-opus-4.8", reasoning_effort="xhigh", context_tier="long_context"
-- reviewer 2: model="claude-opus-4.7", reasoning_effort="xhigh", context_tier="long_context"
-- reviewer 3: model="gpt-5.5", reasoning_effort="xhigh", context_tier="long_context"
+- reviewer 2: model="gpt-5.6-sol", reasoning_effort="xhigh", context_tier="long_context"
+- reviewer 3: model="claude-opus-4.7", reasoning_effort="xhigh", context_tier="long_context"
 
 \`\`\`
 task(
@@ -1873,7 +1873,7 @@ GLOBAL SYNTHESIS CAP: enforce a maximum of 10 synthesis calls per round, INCLUDI
 task(
   agent_type="general-purpose",
   mode="sync",
-  model="claude-sonnet-4.6", context_tier="long_context",
+  model="gpt-5.6-sol", reasoning_effort="xhigh", context_tier="long_context",
   name="synth-<clusterId>",
   description="Synthesize canonical patch for 3/3 cluster",
   prompt=<see synthesis template>
@@ -1895,8 +1895,8 @@ Root cause: <issue summary, derived from Title/Issue text of all 3>
 
 # Reviewer-proposed fixes
 Reviewer 1 (claude-opus-4.8): <fix1>
-Reviewer 2 (claude-opus-4.7-1m-internal): <fix2>
-Reviewer 3 (gpt-5.5): <fix3>
+Reviewer 2 (gpt-5.6-sol): <fix2>
+Reviewer 3 (claude-opus-4.7-1m-internal): <fix3>
 
 # Output format (STRICT)
 Either:
@@ -2087,8 +2087,8 @@ skip them. Maintain the following state across rounds in your own reasoning:
 
 ## Configuration
 
-- **Reviewer models:** claude-opus-4.8, claude-opus-4.7-1m-internal, gpt-5.5
-- **Synthesis model (for 3/3 patch merging):** claude-sonnet-4.6
+- **Reviewer models:** claude-opus-4.8, gpt-5.6-sol, claude-opus-4.7-1m-internal
+- **Synthesis model (for 3/3 patch merging):** gpt-5.6-sol
 - **Max rounds:** 3
 - **Severity threshold:** high (severities ranked: critical > high > medium > low > nit)
 - **Scope:** User-specified scope: \`paths:a.js,src/b.js\` — paths-only mode, no git diff (reviewers \`view\` files directly)
@@ -2125,7 +2125,7 @@ Tell the user, BEFORE round 1:
 \`\`\`
 Triple-review starting:
   Scope: <resolvedScope summary>
-  Reviewers: claude-opus-4.8, claude-opus-4.7-1m-internal, gpt-5.5
+  Reviewers: claude-opus-4.8, gpt-5.6-sol, claude-opus-4.7-1m-internal
   Max rounds: 3
   Worst-case cost: 48 premium calls (9 reviewers + up to 9 reviewer retries + up to 30 synthesis calls — synthesis cap is GLOBAL per round and includes retries)
   Backup: <NONE — paths-only mode skipped Step 0.4; auto-applied edits in this run are NOT recoverable through this protocol. The orchestrator MAY still proceed but should warn the user before any Step 1d auto-apply.>
@@ -2145,8 +2145,8 @@ Triple-review starting:
 
 Spawn one reviewer per line below, using the exact \`model\`/\`reasoning_effort\`/\`context_tier\` args shown for each:
 - reviewer 1: model="claude-opus-4.8", reasoning_effort="xhigh", context_tier="long_context"
-- reviewer 2: model="claude-opus-4.7", reasoning_effort="xhigh", context_tier="long_context"
-- reviewer 3: model="gpt-5.5", reasoning_effort="xhigh", context_tier="long_context"
+- reviewer 2: model="gpt-5.6-sol", reasoning_effort="xhigh", context_tier="long_context"
+- reviewer 3: model="claude-opus-4.7", reasoning_effort="xhigh", context_tier="long_context"
 
 \`\`\`
 task(
@@ -2251,7 +2251,7 @@ GLOBAL SYNTHESIS CAP: enforce a maximum of 10 synthesis calls per round, INCLUDI
 task(
   agent_type="general-purpose",
   mode="sync",
-  model="claude-sonnet-4.6", context_tier="long_context",
+  model="gpt-5.6-sol", reasoning_effort="xhigh", context_tier="long_context",
   name="synth-<clusterId>",
   description="Synthesize canonical patch for 3/3 cluster",
   prompt=<see synthesis template>
@@ -2273,8 +2273,8 @@ Root cause: <issue summary, derived from Title/Issue text of all 3>
 
 # Reviewer-proposed fixes
 Reviewer 1 (claude-opus-4.8): <fix1>
-Reviewer 2 (claude-opus-4.7-1m-internal): <fix2>
-Reviewer 3 (gpt-5.5): <fix3>
+Reviewer 2 (gpt-5.6-sol): <fix2>
+Reviewer 3 (claude-opus-4.7-1m-internal): <fix3>
 
 # Output format (STRICT)
 Either:
@@ -2456,8 +2456,8 @@ skip them. Maintain the following state across rounds in your own reasoning:
 
 ## Configuration
 
-- **Reviewer models:** claude-opus-4.8, claude-opus-4.7-1m-internal, gpt-5.5
-- **Synthesis model (for 3/3 patch merging):** claude-sonnet-4.6
+- **Reviewer models:** claude-opus-4.8, gpt-5.6-sol, claude-opus-4.7-1m-internal
+- **Synthesis model (for 3/3 patch merging):** gpt-5.6-sol
 - **Max rounds:** 3
 - **Severity threshold:** high (severities ranked: critical > high > medium > low > nit)
 - **Scope:** User-specified scope: \`files:auth.ts\` (validated by schema; use the pre-computed commands below)
@@ -2520,7 +2520,7 @@ Tell the user, BEFORE round 1:
 \`\`\`
 Triple-review starting:
   Scope: <resolvedScope summary>
-  Reviewers: claude-opus-4.8, claude-opus-4.7-1m-internal, gpt-5.5
+  Reviewers: claude-opus-4.8, gpt-5.6-sol, claude-opus-4.7-1m-internal
   Max rounds: 3
   Worst-case cost: 48 premium calls (9 reviewers + up to 9 reviewer retries + up to 30 synthesis calls — synthesis cap is GLOBAL per round and includes retries)
   Backup: <backupSha or "none (clean tree)"> @ HEAD <preReviewHead>
@@ -2553,8 +2553,8 @@ Pass \`$diffPath\` (the absolute path) to reviewers as \`diffSnapshotPath\` in S
 
 Spawn one reviewer per line below, using the exact \`model\`/\`reasoning_effort\`/\`context_tier\` args shown for each:
 - reviewer 1: model="claude-opus-4.8", reasoning_effort="xhigh", context_tier="long_context"
-- reviewer 2: model="claude-opus-4.7", reasoning_effort="xhigh", context_tier="long_context"
-- reviewer 3: model="gpt-5.5", reasoning_effort="xhigh", context_tier="long_context"
+- reviewer 2: model="gpt-5.6-sol", reasoning_effort="xhigh", context_tier="long_context"
+- reviewer 3: model="claude-opus-4.7", reasoning_effort="xhigh", context_tier="long_context"
 
 \`\`\`
 task(
@@ -2659,7 +2659,7 @@ GLOBAL SYNTHESIS CAP: enforce a maximum of 10 synthesis calls per round, INCLUDI
 task(
   agent_type="general-purpose",
   mode="sync",
-  model="claude-sonnet-4.6", context_tier="long_context",
+  model="gpt-5.6-sol", reasoning_effort="xhigh", context_tier="long_context",
   name="synth-<clusterId>",
   description="Synthesize canonical patch for 3/3 cluster",
   prompt=<see synthesis template>
@@ -2681,8 +2681,8 @@ Root cause: <issue summary, derived from Title/Issue text of all 3>
 
 # Reviewer-proposed fixes
 Reviewer 1 (claude-opus-4.8): <fix1>
-Reviewer 2 (claude-opus-4.7-1m-internal): <fix2>
-Reviewer 3 (gpt-5.5): <fix3>
+Reviewer 2 (gpt-5.6-sol): <fix2>
+Reviewer 3 (claude-opus-4.7-1m-internal): <fix3>
 
 # Output format (STRICT)
 Either:

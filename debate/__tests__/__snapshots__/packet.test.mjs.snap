@@ -34,8 +34,8 @@ no, conditionals are simpler
 
 ## Roles
 - **Debater A:** claude-opus-4.8 — argues Position A
-- **Debater B:** gpt-5.5 — argues Position B
-- **Judge:** claude-opus-4.7-1m-internal — independent, sees both sides only at the end
+- **Debater B:** gpt-5.6-sol — argues Position B
+- **Judge:** gemini-3.1-pro-preview — independent, sees both sides only at the end
 - **Rounds:** 1 (opening only — no rebuttals)
 - **Expected total premium calls:** 3 (2 debater + 1 judge)
 
@@ -51,7 +51,7 @@ task(agent_type="general-purpose", mode="sync", model="claude-opus-4.8", reasoni
      description="Debate round 1 — Position A",
      prompt=<see below>)
 
-task(agent_type="general-purpose", mode="sync", model="gpt-5.5", reasoning_effort="xhigh", context_tier="long_context",
+task(agent_type="general-purpose", mode="sync", model="gpt-5.6-sol", reasoning_effort="xhigh", context_tier="long_context",
      name="debater-B-r1",
      description="Debate round 1 — Position B",
      prompt=<see below>)
@@ -79,7 +79,7 @@ If any debater call fails OR refuses to take its assigned position:
 Make ONE \`task\` call to the judge:
 
 \`\`\`
-task(agent_type="general-purpose", mode="sync", model="claude-opus-4.7", reasoning_effort="xhigh", context_tier="long_context",
+task(agent_type="general-purpose", mode="sync", model="gemini-3.1-pro-preview", context_tier="long_context",
      name="debate-judge",
      description="Debate judge",
      prompt=<see below>)
@@ -109,8 +109,8 @@ The judge's prompt must contain:
 ## Debate: <question summary>
 
 **Position A** (claude-opus-4.8): <one-line summary>
-**Position B** (gpt-5.5): <one-line summary>
-**Judge** (claude-opus-4.7-1m-internal)
+**Position B** (gpt-5.6-sol): <one-line summary>
+**Judge** (gemini-3.1-pro-preview)
 
 ### Strongest arguments
 - A: ...
@@ -312,8 +312,8 @@ _(unspecified — debater B must articulate the strongest case for the OPPOSING 
 
 ## Roles
 - **Debater A:** claude-opus-4.8 — argues Position A
-- **Debater B:** gpt-5.5 — argues Position B
-- **Judge:** claude-opus-4.7-1m-internal — independent, sees both sides only at the end
+- **Debater B:** gpt-5.6-sol — argues Position B
+- **Judge:** gemini-3.1-pro-preview — independent, sees both sides only at the end
 - **Rounds:** 1 (opening only — no rebuttals)
 - **Expected total premium calls:** 3 (2 debater + 1 judge)
 
@@ -329,7 +329,7 @@ task(agent_type="general-purpose", mode="sync", model="claude-opus-4.8", reasoni
      description="Debate round 1 — Position A",
      prompt=<see below>)
 
-task(agent_type="general-purpose", mode="sync", model="gpt-5.5", reasoning_effort="xhigh", context_tier="long_context",
+task(agent_type="general-purpose", mode="sync", model="gpt-5.6-sol", reasoning_effort="xhigh", context_tier="long_context",
      name="debater-B-r1",
      description="Debate round 1 — Position B",
      prompt=<see below>)
@@ -357,7 +357,7 @@ If any debater call fails OR refuses to take its assigned position:
 Make ONE \`task\` call to the judge:
 
 \`\`\`
-task(agent_type="general-purpose", mode="sync", model="claude-opus-4.7", reasoning_effort="xhigh", context_tier="long_context",
+task(agent_type="general-purpose", mode="sync", model="gemini-3.1-pro-preview", context_tier="long_context",
      name="debate-judge",
      description="Debate judge",
      prompt=<see below>)
@@ -387,8 +387,8 @@ The judge's prompt must contain:
 ## Debate: <question summary>
 
 **Position A** (claude-opus-4.8): <one-line summary>
-**Position B** (gpt-5.5): <one-line summary>
-**Judge** (claude-opus-4.7-1m-internal)
+**Position B** (gpt-5.6-sol): <one-line summary>
+**Judge** (gemini-3.1-pro-preview)
 
 ### Strongest arguments
 - A: ...
@@ -588,8 +588,8 @@ _(unspecified — debater B must articulate the strongest case for the OPPOSING 
 
 ## Roles
 - **Debater A:** claude-opus-4.8 — argues Position A
-- **Debater B:** gpt-5.5 — argues Position B
-- **Judge:** claude-opus-4.7-1m-internal — independent, sees both sides only at the end
+- **Debater B:** gpt-5.6-sol — argues Position B
+- **Judge:** gemini-3.1-pro-preview — independent, sees both sides only at the end
 - **Rounds:** 3 (1 opening + 2 rebuttal round(s))
 - **Expected total premium calls:** 7 (6 debater + 1 judge)
 
@@ -605,7 +605,7 @@ task(agent_type="general-purpose", mode="sync", model="claude-opus-4.8", reasoni
      description="Debate round 1 — Position A",
      prompt=<see below>)
 
-task(agent_type="general-purpose", mode="sync", model="gpt-5.5", reasoning_effort="xhigh", context_tier="long_context",
+task(agent_type="general-purpose", mode="sync", model="gpt-5.6-sol", reasoning_effort="xhigh", context_tier="long_context",
      name="debater-B-r1",
      description="Debate round 1 — Position B",
      prompt=<see below>)
@@ -641,7 +641,7 @@ task(agent_type="general-purpose", mode="sync", model="claude-opus-4.8", reasoni
      description="Debate round 2 — A rebuts B",
      prompt=<question verbatim + shared context verbatim + Position A verbatim + Position B verbatim + "You are debater A; you argue Position A. You are 1 of 2 advocates; the judge is independent." + debater A's full prior transcript (rounds 1..1, labeled by round) + the OPPOSING debater's full prior transcript (rounds 1..1, labeled by round) + "Rebut B's strongest points and reinforce your assigned Position A. Concede only what's strictly necessary; redirect everything else. Stay in role.">)
 
-task(agent_type="general-purpose", mode="sync", model="gpt-5.5", reasoning_effort="xhigh", context_tier="long_context",
+task(agent_type="general-purpose", mode="sync", model="gpt-5.6-sol", reasoning_effort="xhigh", context_tier="long_context",
      name="debater-B-r2",
      description="Debate round 2 — B rebuts A",
      prompt=<question verbatim + shared context verbatim + Position A verbatim + Position B verbatim + "You are debater B; you argue Position B. You are 1 of 2 advocates; the judge is independent." + debater B's full prior transcript (rounds 1..1, labeled by round) + the OPPOSING debater's full prior transcript (rounds 1..1, labeled by round) + "Rebut A's strongest points and reinforce your assigned Position B. Concede only what's strictly necessary; redirect everything else. Stay in role.">)
@@ -669,7 +669,7 @@ task(agent_type="general-purpose", mode="sync", model="claude-opus-4.8", reasoni
      description="Debate round 3 — A rebuts B",
      prompt=<question verbatim + shared context verbatim + Position A verbatim + Position B verbatim + "You are debater A; you argue Position A. You are 1 of 2 advocates; the judge is independent." + debater A's full prior transcript (rounds 1..2, labeled by round) + the OPPOSING debater's full prior transcript (rounds 1..2, labeled by round) + "Rebut B's strongest points and reinforce your assigned Position A. Concede only what's strictly necessary; redirect everything else. Stay in role.">)
 
-task(agent_type="general-purpose", mode="sync", model="gpt-5.5", reasoning_effort="xhigh", context_tier="long_context",
+task(agent_type="general-purpose", mode="sync", model="gpt-5.6-sol", reasoning_effort="xhigh", context_tier="long_context",
      name="debater-B-r3",
      description="Debate round 3 — B rebuts A",
      prompt=<question verbatim + shared context verbatim + Position A verbatim + Position B verbatim + "You are debater B; you argue Position B. You are 1 of 2 advocates; the judge is independent." + debater B's full prior transcript (rounds 1..2, labeled by round) + the OPPOSING debater's full prior transcript (rounds 1..2, labeled by round) + "Rebut A's strongest points and reinforce your assigned Position B. Concede only what's strictly necessary; redirect everything else. Stay in role.">)
@@ -689,7 +689,7 @@ If any debater call fails OR refuses to take its assigned position:
 Make ONE \`task\` call to the judge:
 
 \`\`\`
-task(agent_type="general-purpose", mode="sync", model="claude-opus-4.7", reasoning_effort="xhigh", context_tier="long_context",
+task(agent_type="general-purpose", mode="sync", model="gemini-3.1-pro-preview", context_tier="long_context",
      name="debate-judge",
      description="Debate judge",
      prompt=<see below>)
@@ -719,8 +719,8 @@ The judge's prompt must contain:
 ## Debate: <question summary>
 
 **Position A** (claude-opus-4.8): <one-line summary>
-**Position B** (gpt-5.5): <one-line summary>
-**Judge** (claude-opus-4.7-1m-internal)
+**Position B** (gpt-5.6-sol): <one-line summary>
+**Judge** (gemini-3.1-pro-preview)
 
 ### Strongest arguments
 - A: ...
@@ -787,8 +787,8 @@ our UI flow has 15 states and is getting complex
 
 ## Roles
 - **Debater A:** claude-opus-4.8 — argues Position A
-- **Debater B:** gpt-5.5 — argues Position B
-- **Judge:** claude-opus-4.7-1m-internal — independent, sees both sides only at the end
+- **Debater B:** gpt-5.6-sol — argues Position B
+- **Judge:** gemini-3.1-pro-preview — independent, sees both sides only at the end
 - **Rounds:** 1 (opening only — no rebuttals)
 - **Expected total premium calls:** 3 (2 debater + 1 judge)
 
@@ -804,7 +804,7 @@ task(agent_type="general-purpose", mode="sync", model="claude-opus-4.8", reasoni
      description="Debate round 1 — Position A",
      prompt=<see below>)
 
-task(agent_type="general-purpose", mode="sync", model="gpt-5.5", reasoning_effort="xhigh", context_tier="long_context",
+task(agent_type="general-purpose", mode="sync", model="gpt-5.6-sol", reasoning_effort="xhigh", context_tier="long_context",
      name="debater-B-r1",
      description="Debate round 1 — Position B",
      prompt=<see below>)
@@ -832,7 +832,7 @@ If any debater call fails OR refuses to take its assigned position:
 Make ONE \`task\` call to the judge:
 
 \`\`\`
-task(agent_type="general-purpose", mode="sync", model="claude-opus-4.7", reasoning_effort="xhigh", context_tier="long_context",
+task(agent_type="general-purpose", mode="sync", model="gemini-3.1-pro-preview", context_tier="long_context",
      name="debate-judge",
      description="Debate judge",
      prompt=<see below>)
@@ -862,8 +862,8 @@ The judge's prompt must contain:
 ## Debate: <question summary>
 
 **Position A** (claude-opus-4.8): <one-line summary>
-**Position B** (gpt-5.5): <one-line summary>
-**Judge** (claude-opus-4.7-1m-internal)
+**Position B** (gpt-5.6-sol): <one-line summary>
+**Judge** (gemini-3.1-pro-preview)
 
 ### Strongest arguments
 - A: ...

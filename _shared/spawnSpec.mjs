@@ -48,6 +48,7 @@ export const SPAWN_ALIASES = Object.freeze({
 export const ELEVATED_EFFORT = Object.freeze({
     "claude-opus-4.8": "xhigh",
     "claude-opus-4.7": "xhigh",
+    "gpt-5.6-sol": "xhigh",
     "gpt-5.5": "xhigh",
     "gpt-5.4": "xhigh",
     "gpt-5.3-codex": "xhigh",
