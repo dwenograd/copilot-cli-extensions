@@ -118,11 +118,11 @@ Each orchestrator stage can short-circuit with a clear error before the next run
 ## Default models
 
 - **Trio defaults** (triple-duck, triple-plan, triple-review): `claude-opus-4.8`, `gpt-5.6-sol`, `claude-opus-4.7`
-- **Triple-duck / triple-plan judges**: `claude-opus-4.8`
+- **Triple-duck / triple-plan judges**: `gpt-5.6-sol`
 - **Triple-review synthesis**: `gpt-5.6-sol`
-- **Debate defaults**: debaters `["claude-opus-4.8", "gpt-5.6-sol"]`, judge `"gemini-3.1-pro-preview"`
+- **Debate defaults**: debaters `["claude-opus-4.8", "gemini-3.1-pro-preview"]`, judge `"gpt-5.6-sol"`
 - **Cheap presets**: `claude-opus-4.7`, `claude-opus-4.6`, `gpt-5.5`
-- **Duck-council defaults** (tiered, see `duck-council/README.md` for the table): security/stability/judge on `claude-opus-4.8`; performance on `gpt-5.6-sol`; maintainer on `claude-opus-4.7`; skeptic on `gpt-5.4`; user on `claude-sonnet-4.6`. Family-diverse: 4 Claude + 2 GPT among the 6 reviewers.
+- **Duck-council defaults** (tiered, see `duck-council/README.md` for the table): security/stability on `claude-opus-4.8`; performance and judge on `gpt-5.6-sol`; maintainer on `claude-opus-4.7`; skeptic on `gpt-5.4`; user on `claude-sonnet-4.6`. Family-diverse: 4 Claude + 2 GPT among the 6 reviewers.
 
 Reasoning effort and context are separate `task()` parameters rather than parts of model IDs. Every spawned sub-agent runs with `context_tier:"long_context"`; orchestration code selects `reasoning_effort` independently where needed.
 

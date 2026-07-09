@@ -37,8 +37,8 @@ Don't use for questions with a clear right answer — debate forces both sides t
 
 ## Defaults
 
-- Debaters: `claude-opus-4.8` vs `gpt-5.6-sol` (different model families maximize divergence)
-- Judge: `gemini-3.1-pro-preview` (independent from both debater families)
+- Debaters: `claude-opus-4.8` vs `gemini-3.1-pro-preview` (different model families maximize divergence)
+- Judge: `gpt-5.6-sol` (strongest available model, independent from both debaters)
 - Cheap debaters: `claude-opus-4.7` vs `gpt-5.5`; cheap judge: `claude-opus-4.6`
 
 **Context:** every spawned debater and judge runs with `context_tier:"long_context"`; override `debaters` only when you want different model families or reasoning presets.

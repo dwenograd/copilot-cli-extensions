@@ -52,7 +52,7 @@ const session = await joinSession({
                     judge: {
                         type: "string",
                         description:
-                            "Optional. Override the judge model. Default is claude-opus-4.8 (cheap mode: claude-opus-4.7).",
+                            "Optional. Override the judge model. Default is gpt-5.6-sol with context_tier:\"long_context\" (cheap mode: claude-opus-4.7).",
                     },
                     skip_judge: {
                         type: "boolean",

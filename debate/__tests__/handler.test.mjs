@@ -164,7 +164,7 @@ describe("debate handler", () => {
         const { deps } = mockDeps();
         const r = await runHandler({
             question: "x",
-            debaters: ["gemini-3.1-pro-preview", "x"],
+            debaters: ["gpt-5.6-sol", "x"],
         }, deps);
         expect(r.resultType).toBe("failure");
         expect(r.textResultForLlm).toMatch(/judge must differ/);

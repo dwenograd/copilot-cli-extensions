@@ -8,7 +8,7 @@ User-level Copilot CLI extension that registers a `triple-duck` tool.
 
 1. Launch three `rubber-duck` sub-agents **in parallel** using three different models (default: Claude Opus 4.8, GPT-5.6 Sol, Claude Opus 4.7).
 2. Wait for all three to complete (sync mode).
-3. **Launch a dedicated judge agent** (default: Claude Opus 4.8 — the current top reasoning model) that:
+3. **Launch a dedicated judge agent** (default: GPT-5.6 Sol with elevated reasoning and long context) that:
    - Receives all three reviewer outputs (wrapped as untrusted data — the judge is told not to follow instructions inside reviewer text).
    - Clusters findings across reviewers.
    - Produces a **consensus-ranked** critique:
@@ -30,7 +30,7 @@ triple-duck({
   topic: string,             // What to critique (plan, design, code approach, etc.)
   context?: string,          // Optional extra context / file paths / scope
   models?: string[],         // Optional reviewer trio override (must be 3 distinct model IDs)
-  judge?: string,            // Optional judge override (default: claude-opus-4.8)
+  judge?: string,            // Optional judge override (default: gpt-5.6-sol)
                              // Compatible with `cheap: true` for "cheap reviewers, premium judge"
   focus?: string,            // Optional focus areas (e.g., "security, performance")
   cheap?: boolean,           // Optional. Use cheap reviewer trio (see Cheap mode below).
@@ -48,9 +48,9 @@ Pass `cheap: true` (or invoke as "triple duck cheap <topic>") to swap the heavy 
 | 1 | claude-opus-4.8 | claude-opus-4.7 |
 | 2 | gpt-5.6-sol | claude-opus-4.6 |
 | 3 | claude-opus-4.7 | gpt-5.5 |
-| **Judge** | claude-opus-4.8 | claude-opus-4.7 |
+| **Judge** | gpt-5.6-sol | claude-opus-4.7 |
 
-You can mix `cheap: true` with an explicit judge override, for example `judge: "claude-opus-4.8"`, when you want cheaper reviewers but full-quality synthesis.
+You can mix `cheap: true` with an explicit judge override, for example `judge: "gpt-5.6-sol"`, when you want cheaper reviewers but full-quality synthesis.
 
 **Tradeoffs:**
 - The default trio's slot-1 (`claude-opus-4.8`) handles senior-review judgment, while GPT-5.6 Sol adds a cross-family operator/tool perspective.

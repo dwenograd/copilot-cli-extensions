@@ -174,7 +174,7 @@ You invoked \`triple-duck\`. Execute the following protocol exactly.
 
 ## Roles
 - **Reviewers (parallel):** claude-opus-4.8, gpt-5.6-sol, claude-opus-4.7-1m-internal
-- **Judge (synthesizes the critiques into the final output):** claude-opus-4.8
+- **Judge (synthesizes the critiques into the final output):** gpt-5.6-sol
 - **Expected premium calls:** 4 happy path (3 reviewers + 1 judge); 8 worst case (with retries).
 
 ## Topic to critique
@@ -231,7 +231,7 @@ Bail-out gates (decide BEFORE invoking the judge in Step 2):
 Make ONE \`task\` call to the judge:
 
 \`\`\`
-task(agent_type="general-purpose", mode="sync", model="claude-opus-4.8", reasoning_effort="xhigh", context_tier="long_context",
+task(agent_type="general-purpose", mode="sync", model="gpt-5.6-sol", reasoning_effort="xhigh", context_tier="long_context",
      name="triple-duck-judge",
      description="Triple-duck judge — synthesize critiques",
      prompt=<see below>)
@@ -270,7 +270,7 @@ Construct the judge prompt with these pieces, IN ORDER:
    > ## Triple-Duck Critique: <topic summary>
    >
    > Reviewers: <list models, mark any failures>
-   > Judge: claude-opus-4.8
+   > Judge: gpt-5.6-sol
    >
    > ### High confidence (N/N agreement)
    > 1. <finding> — [severity]
@@ -296,7 +296,7 @@ Construct the judge prompt with these pieces, IN ORDER:
 - If the judge still fails, **fall back to orchestrator-merging**: do the clustering / ranking / contested-findings work yourself, in your own reasoning, following the same output structure. **You MUST prepend the final output with this exact disclosure block** so the user knows the judge layer was bypassed:
 
   > \`\`\`
-  > > ⚠️ **Judge layer failed twice (claude-opus-4.8); this is a fallback orchestrator-merged synthesis. Quality may be lower than a dedicated judge would produce. Re-run \`triple-duck\` later or pass an alternative \`judge: "..."\` to retry with a different model.**
+  > > ⚠️ **Judge layer failed twice (gpt-5.6-sol); this is a fallback orchestrator-merged synthesis. Quality may be lower than a dedicated judge would produce. Re-run \`triple-duck\` later or pass an alternative \`judge: "..."\` to retry with a different model.**
   > \`\`\`
 
 ## Step 3 — Present the judge's output to the user
@@ -329,7 +329,7 @@ You invoked \`triple-duck\`. Execute the following protocol exactly.
 
 ## Roles
 - **Reviewers (parallel):** gpt-5.5, claude-opus-4.7, claude-opus-4.6
-- **Judge (synthesizes the critiques into the final output):** claude-opus-4.8
+- **Judge (synthesizes the critiques into the final output):** gpt-5.6-sol
 - **Expected premium calls:** 4 happy path (3 reviewers + 1 judge); 8 worst case (with retries).
 
 ## Topic to critique
@@ -386,7 +386,7 @@ Bail-out gates (decide BEFORE invoking the judge in Step 2):
 Make ONE \`task\` call to the judge:
 
 \`\`\`
-task(agent_type="general-purpose", mode="sync", model="claude-opus-4.8", reasoning_effort="xhigh", context_tier="long_context",
+task(agent_type="general-purpose", mode="sync", model="gpt-5.6-sol", reasoning_effort="xhigh", context_tier="long_context",
      name="triple-duck-judge",
      description="Triple-duck judge — synthesize critiques",
      prompt=<see below>)
@@ -425,7 +425,7 @@ Construct the judge prompt with these pieces, IN ORDER:
    > ## Triple-Duck Critique: <topic summary>
    >
    > Reviewers: <list models, mark any failures>
-   > Judge: claude-opus-4.8
+   > Judge: gpt-5.6-sol
    >
    > ### High confidence (N/N agreement)
    > 1. <finding> — [severity]
@@ -451,7 +451,7 @@ Construct the judge prompt with these pieces, IN ORDER:
 - If the judge still fails, **fall back to orchestrator-merging**: do the clustering / ranking / contested-findings work yourself, in your own reasoning, following the same output structure. **You MUST prepend the final output with this exact disclosure block** so the user knows the judge layer was bypassed:
 
   > \`\`\`
-  > > ⚠️ **Judge layer failed twice (claude-opus-4.8); this is a fallback orchestrator-merged synthesis. Quality may be lower than a dedicated judge would produce. Re-run \`triple-duck\` later or pass an alternative \`judge: "..."\` to retry with a different model.**
+  > > ⚠️ **Judge layer failed twice (gpt-5.6-sol); this is a fallback orchestrator-merged synthesis. Quality may be lower than a dedicated judge would produce. Re-run \`triple-duck\` later or pass an alternative \`judge: "..."\` to retry with a different model.**
   > \`\`\`
 
 ## Step 3 — Present the judge's output to the user
@@ -484,7 +484,7 @@ You invoked \`triple-duck\`. Execute the following protocol exactly.
 
 ## Roles
 - **Reviewers (parallel):** claude-opus-4.8, gpt-5.6-sol, claude-opus-4.7-1m-internal
-- **Judge (synthesizes the critiques into the final output):** claude-opus-4.8
+- **Judge (synthesizes the critiques into the final output):** gpt-5.6-sol
 - **Expected premium calls:** 4 happy path (3 reviewers + 1 judge); 8 worst case (with retries).
 
 ## Topic to critique
@@ -545,7 +545,7 @@ Bail-out gates (decide BEFORE invoking the judge in Step 2):
 Make ONE \`task\` call to the judge:
 
 \`\`\`
-task(agent_type="general-purpose", mode="sync", model="claude-opus-4.8", reasoning_effort="xhigh", context_tier="long_context",
+task(agent_type="general-purpose", mode="sync", model="gpt-5.6-sol", reasoning_effort="xhigh", context_tier="long_context",
      name="triple-duck-judge",
      description="Triple-duck judge — synthesize critiques",
      prompt=<see below>)
@@ -584,7 +584,7 @@ Construct the judge prompt with these pieces, IN ORDER:
    > ## Triple-Duck Critique: <topic summary>
    >
    > Reviewers: <list models, mark any failures>
-   > Judge: claude-opus-4.8
+   > Judge: gpt-5.6-sol
    >
    > ### High confidence (N/N agreement)
    > 1. <finding> — [severity]
@@ -610,7 +610,7 @@ Construct the judge prompt with these pieces, IN ORDER:
 - If the judge still fails, **fall back to orchestrator-merging**: do the clustering / ranking / contested-findings work yourself, in your own reasoning, following the same output structure. **You MUST prepend the final output with this exact disclosure block** so the user knows the judge layer was bypassed:
 
   > \`\`\`
-  > > ⚠️ **Judge layer failed twice (claude-opus-4.8); this is a fallback orchestrator-merged synthesis. Quality may be lower than a dedicated judge would produce. Re-run \`triple-duck\` later or pass an alternative \`judge: "..."\` to retry with a different model.**
+  > > ⚠️ **Judge layer failed twice (gpt-5.6-sol); this is a fallback orchestrator-merged synthesis. Quality may be lower than a dedicated judge would produce. Re-run \`triple-duck\` later or pass an alternative \`judge: "..."\` to retry with a different model.**
   > \`\`\`
 
 ## Step 3 — Present the judge's output to the user
@@ -645,7 +645,7 @@ You invoked \`triple-duck\`. Execute the following protocol exactly.
 
 ## Roles
 - **Reviewers (parallel):** claude-opus-4.8, gpt-5.6-sol, claude-opus-4.7-1m-internal
-- **Judge (synthesizes the critiques into the final output):** claude-opus-4.8
+- **Judge (synthesizes the critiques into the final output):** gpt-5.6-sol
 - **Expected premium calls:** 4 happy path (3 reviewers + 1 judge); 8 worst case (with retries).
 
 ## Topic to critique
@@ -702,7 +702,7 @@ Bail-out gates (decide BEFORE invoking the judge in Step 2):
 Make ONE \`task\` call to the judge:
 
 \`\`\`
-task(agent_type="general-purpose", mode="sync", model="claude-opus-4.8", reasoning_effort="xhigh", context_tier="long_context",
+task(agent_type="general-purpose", mode="sync", model="gpt-5.6-sol", reasoning_effort="xhigh", context_tier="long_context",
      name="triple-duck-judge",
      description="Triple-duck judge — synthesize critiques",
      prompt=<see below>)
@@ -741,7 +741,7 @@ Construct the judge prompt with these pieces, IN ORDER:
    > ## Triple-Duck Critique: <topic summary>
    >
    > Reviewers: <list models, mark any failures>
-   > Judge: claude-opus-4.8
+   > Judge: gpt-5.6-sol
    >
    > ### High confidence (N/N agreement)
    > 1. <finding> — [severity]
@@ -767,7 +767,7 @@ Construct the judge prompt with these pieces, IN ORDER:
 - If the judge still fails, **fall back to orchestrator-merging**: do the clustering / ranking / contested-findings work yourself, in your own reasoning, following the same output structure. **You MUST prepend the final output with this exact disclosure block** so the user knows the judge layer was bypassed:
 
   > \`\`\`
-  > > ⚠️ **Judge layer failed twice (claude-opus-4.8); this is a fallback orchestrator-merged synthesis. Quality may be lower than a dedicated judge would produce. Re-run \`triple-duck\` later or pass an alternative \`judge: "..."\` to retry with a different model.**
+  > > ⚠️ **Judge layer failed twice (gpt-5.6-sol); this is a fallback orchestrator-merged synthesis. Quality may be lower than a dedicated judge would produce. Re-run \`triple-duck\` later or pass an alternative \`judge: "..."\` to retry with a different model.**
   > \`\`\`
 
 ## Step 3 — Present the judge's output to the user
@@ -800,7 +800,7 @@ You invoked \`triple-duck\`. Execute the following protocol exactly.
 
 ## Roles
 - **Reviewers (parallel):** claude-opus-4.8, gpt-5.6-sol, claude-opus-4.7-1m-internal
-- **Judge (synthesizes the critiques into the final output):** claude-opus-4.8
+- **Judge (synthesizes the critiques into the final output):** gpt-5.6-sol
 - **Expected premium calls:** 4 happy path (3 reviewers + 1 judge); 8 worst case (with retries).
 
 ## Topic to critique
@@ -867,7 +867,7 @@ Bail-out gates (decide BEFORE invoking the judge in Step 2):
 Make ONE \`task\` call to the judge:
 
 \`\`\`
-task(agent_type="general-purpose", mode="sync", model="claude-opus-4.8", reasoning_effort="xhigh", context_tier="long_context",
+task(agent_type="general-purpose", mode="sync", model="gpt-5.6-sol", reasoning_effort="xhigh", context_tier="long_context",
      name="triple-duck-judge",
      description="Triple-duck judge — synthesize critiques",
      prompt=<see below>)
@@ -906,7 +906,7 @@ Construct the judge prompt with these pieces, IN ORDER:
    > ## Triple-Duck Critique: <topic summary>
    >
    > Reviewers: <list models, mark any failures>
-   > Judge: claude-opus-4.8
+   > Judge: gpt-5.6-sol
    >
    > ### High confidence (N/N agreement)
    > 1. <finding> — [severity]
@@ -932,7 +932,7 @@ Construct the judge prompt with these pieces, IN ORDER:
 - If the judge still fails, **fall back to orchestrator-merging**: do the clustering / ranking / contested-findings work yourself, in your own reasoning, following the same output structure. **You MUST prepend the final output with this exact disclosure block** so the user knows the judge layer was bypassed:
 
   > \`\`\`
-  > > ⚠️ **Judge layer failed twice (claude-opus-4.8); this is a fallback orchestrator-merged synthesis. Quality may be lower than a dedicated judge would produce. Re-run \`triple-duck\` later or pass an alternative \`judge: "..."\` to retry with a different model.**
+  > > ⚠️ **Judge layer failed twice (gpt-5.6-sol); this is a fallback orchestrator-merged synthesis. Quality may be lower than a dedicated judge would produce. Re-run \`triple-duck\` later or pass an alternative \`judge: "..."\` to retry with a different model.**
   > \`\`\`
 
 ## Step 3 — Present the judge's output to the user

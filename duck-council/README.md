@@ -27,7 +27,7 @@ The "ignore X" lines in each prompt are load-bearing — they prevent every duck
 
 ## Default models (TIERED, not all top-tier)
 
-Tiered for cost/quality balance. Family-diverse: 4 Claude + 2 GPT among reviewers + Claude judge.
+Tiered for cost/quality balance. Family-diverse: 4 Claude + 2 GPT among reviewers + GPT-5.6 Sol judge.
 
 | Role | Default | Cheap mode |
 |---|---|---|
@@ -37,9 +37,9 @@ Tiered for cost/quality balance. Family-diverse: 4 Claude + 2 GPT among reviewer
 | maintainer | `claude-opus-4.7` | `claude-opus-4.6` |
 | skeptic | `gpt-5.4` | `gpt-5.4` |
 | user | `claude-sonnet-4.6` | `claude-sonnet-4.6` |
-| **judge** | `claude-opus-4.8` | `claude-opus-4.7` |
+| **judge** | `gpt-5.6-sol` | `claude-opus-4.7` |
 
-Why tiered: an artist-grade UX duck doesn't need the top reasoning model; security/stability do. The judge is highest-stakes (adjudicating 6 critiques + finding what they all missed) and gets the top reasoning model (`claude-opus-4.8`) by default.
+Why tiered: an artist-grade UX duck doesn't need the top reasoning model; security/stability do. The judge is highest-stakes (adjudicating 6 critiques + finding what they all missed) and gets GPT-5.6 Sol with elevated reasoning and long context by default.
 
 ## Judge pass
 

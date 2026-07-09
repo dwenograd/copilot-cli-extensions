@@ -430,4 +430,4 @@ export const ALLOWED_MODEL_IDS = Object.freeze([
 ]);
 
 export const DEFAULT_SUB_JUDGE_MODEL = "claude-opus-4.8";
-export const DEFAULT_META_JUDGE_MODEL = "claude-opus-4.8";
+export const DEFAULT_META_JUDGE_MODEL = "gpt-5.6-sol";

@@ -19,11 +19,11 @@ describe("shared zod schemas", () => {
     it("accepts each tool's minimal happy path", () => {
         expect(tripleDuckSchema.parse({ topic: "review this" })).toMatchObject({
             topic: "review this",
-            effectiveJudge: "claude-opus-4.8",
+            effectiveJudge: "gpt-5.6-sol",
         });
         expect(triplePlanSchema.parse({ task: "plan this" })).toMatchObject({
             task: "plan this",
-            effectiveJudge: "claude-opus-4.8",
+            effectiveJudge: "gpt-5.6-sol",
         });
         expect(tripleReviewSchema.parse({})).toMatchObject({
             max_rounds: 3,
@@ -32,7 +32,8 @@ describe("shared zod schemas", () => {
         expect(debateSchema.parse({ question: "A or B?" })).toMatchObject({
             question: "A or B?",
             rounds: 1,
-            effectiveJudge: "gemini-3.1-pro-preview",
+            effectiveDebaters: ["claude-opus-4.8", "gemini-3.1-pro-preview"],
+            effectiveJudge: "gpt-5.6-sol",
         });
     });
 
@@ -128,7 +129,7 @@ describe("shared zod schemas", () => {
 
     it("rejects debate judge/debater collision after resolving defaults", () => {
         expectInvalid(
-            debateSchema.safeParse({ question: "x", debaters: ["gemini-3.1-pro-preview", "x"] }),
+            debateSchema.safeParse({ question: "x", debaters: ["gpt-5.6-sol", "x"] }),
             "judge must differ from both debaters",
         );
     });
@@ -278,7 +279,7 @@ describe("duckCouncilSchema (pass 15 — duck-council extension)", () => {
             ["maintainer", "performance", "security", "skeptic", "stability", "user"]
         );
         expect(r.data.effectiveRoles.security).toBe("claude-opus-4.8");
-        expect(r.data.effectiveJudge).toBe("claude-opus-4.8");
+        expect(r.data.effectiveJudge).toBe("gpt-5.6-sol");
     });
 
     it("rejects empty/whitespace topic", () => {

@@ -64,14 +64,13 @@ export const CHEAP_MODELS = [
 ];
 
 // Debate-specific defaults: 2 debaters from different model families
-// (maximize divergence) + 1 independent judge. The Opus debater is on 4.8
-// for the same reason as DEFAULT_MODELS above (generational + honesty gain;
-// 4.8 also accepts xhigh effort via the reasoning_effort param if wanted).
+// (maximize divergence) + 1 independent judge. Sol is reserved for the judge,
+// so Gemini supplies the second debating perspective.
 export const DEFAULT_DEBATERS = [
     "claude-opus-4.8",
-    "gpt-5.6-sol",
+    "gemini-3.1-pro-preview",
 ];
-export const DEFAULT_JUDGE = "gemini-3.1-pro-preview";
+export const DEFAULT_JUDGE = "gpt-5.6-sol";
 
 export const CHEAP_DEBATERS = [
     "claude-opus-4.7",
@@ -106,7 +105,7 @@ export const CHEAP_COUNCIL_ROLES = Object.freeze({
     skeptic: "gpt-5.4",
     user: "claude-sonnet-4.6",
 });
-export const DEFAULT_COUNCIL_JUDGE = "claude-opus-4.8";
+export const DEFAULT_COUNCIL_JUDGE = "gpt-5.6-sol";
 export const CHEAP_COUNCIL_JUDGE = "claude-opus-4.7";
 
 // Triple-review's synthesis model performs the implementation-heavy merge.
@@ -115,15 +114,15 @@ export const SYNTHESIS_MODEL = "gpt-5.6-sol";
 // Triple-duck judge: synthesizes 3 reviewer critiques into a unified, consensus-
 // ranked output. The win is the generational + honesty improvement for nuanced
 // cluster-and-conflict-resolution work.
-export const DEFAULT_TRIPLE_DUCK_JUDGE = "claude-opus-4.8";
+export const DEFAULT_TRIPLE_DUCK_JUDGE = "gpt-5.6-sol";
 // Cheap variant: standard reasoning. Cheap mode targets ~23% reviewer-cost
 // savings; the judge stays on the highest model the cheap-mode theme allows
 // (no reasoning-tier upgrade).
 export const CHEAP_TRIPLE_DUCK_JUDGE = "claude-opus-4.7";
 
-// Triple-plan judgment is architectural review, so Opus 4.8 merges the planner
-// outputs while Sol remains represented in the planner trio.
-export const DEFAULT_TRIPLE_PLAN_JUDGE = "claude-opus-4.8";
+// Triple-plan judgment is architectural review, so the strongest available
+// model merges the planner outputs.
+export const DEFAULT_TRIPLE_PLAN_JUDGE = "gpt-5.6-sol";
 export const CHEAP_TRIPLE_PLAN_JUDGE = "claude-opus-4.7";
 
 // Triple-review severity ranking: index 0 = highest severity.

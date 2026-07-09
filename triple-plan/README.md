@@ -12,7 +12,7 @@ Launches three planning agents in parallel using different models, then has a **
 - **Contested decisions** — where models took different approaches
 - **Risks & open questions** — merged across all planners
 
-The judge defaults to `claude-opus-4.8`. Every spawned judge already runs with `context_tier:"long_context"`; override `judge` only when you want a different model.
+The judge defaults to `gpt-5.6-sol` with elevated reasoning. Every spawned judge runs with `context_tier:"long_context"`; override `judge` only when you want a different model.
 
 If the judge fails twice, the orchestrator falls back to merging the plans itself — but **explicitly labels the output** so you know the judge layer was bypassed.
 
@@ -24,7 +24,7 @@ triple-plan({
   context?: string,          // Optional extra context / file paths / scope
   constraints?: string,      // Optional hard constraints every plan MUST respect
   models?: string[],         // Optional planner trio override (must be 3 distinct model IDs)
-  judge?: string,            // Optional judge override (default: claude-opus-4.8)
+  judge?: string,            // Optional judge override (default: gpt-5.6-sol)
                              // Compatible with `cheap: true` for "cheap planners, premium judge"
   cheap?: boolean,           // Optional. Use cheap planner trio (see Cheap mode below).
                              // Mutually exclusive with `models` (NOT with `judge`).
@@ -53,7 +53,7 @@ Use `cheap: true` for ~23% planner-cost savings by switching to cheaper planner 
 
 - **Planner trio:** `claude-opus-4.8`, `gpt-5.6-sol`, `claude-opus-4.7`
 - **Cheap planner trio:** `claude-opus-4.7`, `claude-opus-4.6`, `gpt-5.5`
-- **Judge:** `claude-opus-4.8`
+- **Judge:** `gpt-5.6-sol`
 - **Cheap judge:** `claude-opus-4.7`
 
 **Context:** every spawned planner and judge runs with `context_tier:"long_context"`; override `models` only when you want different model families or reasoning presets.

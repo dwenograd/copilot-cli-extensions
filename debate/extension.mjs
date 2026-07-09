@@ -54,12 +54,12 @@ const session = await joinSession({
                         minItems: 2,
                         maxItems: 2,
                         description:
-                            "Optional. Exactly 2 distinct model IDs for the two debaters. Defaults to claude-opus-4.8 and gpt-5.6-sol, pairing senior-review judgment with operator/tool-orchestration reasoning across model families.",
+                            "Optional. Exactly 2 distinct model IDs for the two debaters. Defaults to claude-opus-4.8 and gemini-3.1-pro-preview for cross-family divergence while reserving GPT-5.6 Sol for the judge.",
                     },
                     judge: {
                         type: "string",
                         description:
-                            "Optional. Model ID for the judge. Should differ from both debaters to stay independent. Defaults to gemini-3.1-pro-preview for family-level independence.",
+                            "Optional. Model ID for the judge. Should differ from both debaters to stay independent. Defaults to gpt-5.6-sol with context_tier:\"long_context\".",
                     },
                     cheap: {
                         type: "boolean",

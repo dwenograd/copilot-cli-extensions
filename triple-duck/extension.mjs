@@ -39,7 +39,7 @@ const session = await joinSession({
                     judge: {
                         type: "string",
                         description:
-                            "Optional. Model ID for the judge that synthesizes the 3 reviewer critiques into the final unified output. Defaults to `claude-opus-4.8` (current top reasoning model; every spawned judge runs with context_tier:\"long_context\"). Compatible with `cheap: true` (cheap reviewer trio + premium judge is a sensible config).",
+                            "Optional. Model ID for the judge that synthesizes the 3 reviewer critiques into the final unified output. Defaults to `gpt-5.6-sol` with context_tier:\"long_context\" and elevated reasoning. Compatible with `cheap: true` (cheap reviewer trio + premium judge is a sensible config).",
                     },
                     focus: {
                         type: "string",

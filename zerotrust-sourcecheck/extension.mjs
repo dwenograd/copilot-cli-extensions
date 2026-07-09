@@ -155,7 +155,7 @@ const session = await joinSession({
                     judge: {
                         type: "string",
                         description:
-                            "Optional (council modes only). Override the meta-judge model. Default is claude-opus-4.8 for senior security-review judgment; every spawned meta-judge runs with context_tier:\"long_context\".",
+                            "Optional (council modes only). Override the meta-judge model. Default is gpt-5.6-sol with elevated reasoning; every spawned meta-judge runs with context_tier:\"long_context\".",
                     },
                     max_premium_calls: {
                         type: "integer",

@@ -44,7 +44,7 @@ const session = await joinSession({
                     judge: {
                         type: "string",
                         description:
-                            "Optional. Model ID for the judge that merges the 3 planner outputs into one canonical plan. Defaults to `claude-opus-4.8` for senior architectural judgment; every spawned judge runs with context_tier:\"long_context\" and full-quality judges use elevated reasoning. Compatible with `cheap: true` (cheap planner trio + premium judge is a sensible config).",
+                            "Optional. Model ID for the judge that merges the 3 planner outputs into one canonical plan. Defaults to `gpt-5.6-sol`; every spawned judge runs with context_tier:\"long_context\" and full-quality judges use elevated reasoning. Compatible with `cheap: true` (cheap planner trio + premium judge is a sensible config).",
                     },
                     cheap: {
                         type: "boolean",
