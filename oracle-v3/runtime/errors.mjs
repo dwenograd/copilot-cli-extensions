@@ -1,0 +1,98 @@
+export const RUNTIME_ERROR_CODES = Object.freeze({
+    INVALID_CONFIG: "ORACLE_V3_RUNTIME_INVALID_CONFIG",
+    RUNTIME_FAILURE: "ORACLE_V3_RUNTIME_FAILURE",
+    INTEGRITY_FAILURE: "ORACLE_V3_RUNTIME_INTEGRITY_FAILURE",
+    INVESTIGATION_NOT_OPEN: "ORACLE_V3_RUNTIME_INVESTIGATION_NOT_OPEN",
+    DOMAIN_SEQUENCE_MISMATCH: "ORACLE_V3_RUNTIME_DOMAIN_SEQUENCE_MISMATCH",
+    DOMAIN_EVENT_INVALID: "ORACLE_V3_RUNTIME_DOMAIN_EVENT_INVALID",
+    HARNESS_CONFIGURATION_INVALID: "ORACLE_V3_RUNTIME_HARNESS_CONFIGURATION_INVALID",
+    WORKER_PROTOCOL: "ORACLE_V3_RUNTIME_WORKER_PROTOCOL",
+    WORKER_NO_SUBMISSION: "ORACLE_V3_RUNTIME_WORKER_NO_SUBMISSION",
+    WORKER_MULTIPLE_SUBMISSIONS: "ORACLE_V3_RUNTIME_WORKER_MULTIPLE_SUBMISSIONS",
+    WORKER_WRONG_NONCE: "ORACLE_V3_RUNTIME_WORKER_WRONG_NONCE",
+    WORKER_SESSION_MISMATCH: "ORACLE_V3_RUNTIME_WORKER_SESSION_MISMATCH",
+    WORKER_DUPLICATE_CANDIDATE: "ORACLE_V3_RUNTIME_WORKER_DUPLICATE_CANDIDATE",
+    WORKER_INVALID_CANDIDATE: "ORACLE_V3_RUNTIME_WORKER_INVALID_CANDIDATE",
+    WORKER_STARTUP: "ORACLE_V3_RUNTIME_WORKER_STARTUP",
+    NO_ELIGIBLE_CANDIDATE: "ORACLE_V3_RUNTIME_NO_ELIGIBLE_CANDIDATE",
+    DEADLINE_EXCEEDED: "ORACLE_V3_RUNTIME_DEADLINE_EXCEEDED",
+    PAUSED: "ORACLE_V3_RUNTIME_PAUSED",
+    STOPPED: "ORACLE_V3_RUNTIME_STOPPED",
+    LOCK_HELD: "ORACLE_V3_RUNTIME_LOCK_HELD",
+    LOCK_INVALID: "ORACLE_V3_RUNTIME_LOCK_INVALID",
+    CIRCUIT_OPEN: "ORACLE_V3_RUNTIME_CIRCUIT_OPEN",
+    CHILD_CRASH: "ORACLE_V3_RUNTIME_CHILD_CRASH",
+    RESULT_MISSING: "ORACLE_V3_RUNTIME_RESULT_MISSING",
+    PATH_ESCAPE: "ORACLE_V3_RUNTIME_PATH_ESCAPE",
+    INJECTED_CRASH: "ORACLE_V3_RUNTIME_INJECTED_CRASH",
+});
+
+export class OracleRuntimeError extends Error {
+    constructor(code, message, details = undefined, options = undefined) {
+        super(message, options);
+        this.name = new.target.name;
+        this.code = code;
+        if (details !== undefined) {
+            this.details = details;
+        }
+    }
+}
+
+export class RuntimeConfigError extends OracleRuntimeError {
+    constructor(message, details) {
+        super(RUNTIME_ERROR_CODES.INVALID_CONFIG, message, details);
+    }
+}
+
+export class RuntimeIntegrityError extends OracleRuntimeError {
+    constructor(message, details, options) {
+        super(RUNTIME_ERROR_CODES.INTEGRITY_FAILURE, message, details, options);
+    }
+}
+
+export class WorkerProtocolError extends OracleRuntimeError {
+    constructor(code, message, details) {
+        super(code, message, details);
+    }
+}
+
+export class SupervisorLockError extends OracleRuntimeError {
+    constructor(code, message, details) {
+        super(code, message, details);
+    }
+}
+
+export class InjectedCrashError extends OracleRuntimeError {
+    constructor(point, details = undefined) {
+        super(
+            RUNTIME_ERROR_CODES.INJECTED_CRASH,
+            `Injected runtime crash at ${point}`,
+            { point, ...details },
+        );
+        this.recoverable = true;
+        this.leaveAttemptActive = true;
+    }
+}
+
+export function isRecoverableRuntimeError(error) {
+    if (error?.recoverable === true) {
+        return true;
+    }
+    return [
+        RUNTIME_ERROR_CODES.CHILD_CRASH,
+        RUNTIME_ERROR_CODES.RESULT_MISSING,
+        RUNTIME_ERROR_CODES.WORKER_NO_SUBMISSION,
+        RUNTIME_ERROR_CODES.NO_ELIGIBLE_CANDIDATE,
+        RUNTIME_ERROR_CODES.INJECTED_CRASH,
+    ].includes(error?.code);
+}
+
+export function serializeRuntimeError(error) {
+    return {
+        name: typeof error?.name === "string" ? error.name : "Error",
+        code: typeof error?.code === "string" ? error.code : "UNEXPECTED_ERROR",
+        message: typeof error?.message === "string" ? error.message : String(error),
+        details: error?.details ?? null,
+        recoverable: isRecoverableRuntimeError(error),
+    };
+}

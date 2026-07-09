@@ -1,0 +1,58 @@
+// oracle-v3/measurement/index.mjs
+//
+// Public surface of the Oracle v3 trusted-measurement boundary.
+
+export {
+    MEASUREMENT_ERROR_CODES,
+    MeasurementError,
+    SandboxRequiredError,
+    SandboxRefusedError,
+    AllowlistInvalidError,
+    FileVerificationError,
+    StagingRefusedError,
+    ResultParseError,
+} from "./errors.mjs";
+
+export {
+    FILE_HASH_ALGORITHM,
+    STREAM_HASH_ALGORITHM,
+    normalizeExpectedHash,
+    sha256Bytes,
+    sha256File,
+    verifyAndHashFile,
+    verifyLocalRegularFile,
+} from "./fs-verify.mjs";
+
+export {
+    ALLOWLIST_HASH_ALGORITHM,
+    ARGV_PLACEHOLDERS,
+    ENTRY_HASH_ALGORITHM,
+    isVerifiedHarnessEntry,
+    loadHarnessAllowlist,
+} from "./allowlist.mjs";
+
+export {
+    PARSER_MAX_INPUT_BYTES,
+    PARSER_VERSION,
+    parseHarnessResult,
+} from "./parser.mjs";
+
+export {
+    ARGV_HASH_ALGORITHM,
+    ENV_HASH_ALGORITHM,
+    RECEIPT_DETERMINISM_KEYS,
+    RECEIPT_HASH_ALGORITHM,
+    RECEIPT_VERSION,
+    buildMeasurementReceipt,
+    canonicalizeReceipt,
+    hashArgv,
+    hashEnv,
+    hashReceipt,
+    projectDeterministicReceipt,
+} from "./receipt.mjs";
+
+export { normalizeAdmission } from "./sandbox.mjs";
+
+export { createDefaultProcessAdapter } from "./windows-adapter.mjs";
+
+export { createMeasurementExecutor, toFileUrl } from "./executor.mjs";
