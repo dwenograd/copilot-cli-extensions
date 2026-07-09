@@ -26,7 +26,7 @@ import {
 import { normalizeRunnerConfig } from "./config.mjs";
 import { createDomainRepositoryAdapter, formatAttemptCommand } from "./domain-adapter.mjs";
 import {
-    OracleRuntimeError,
+    CrucibleRuntimeError,
     RUNTIME_ERROR_CODES,
     RuntimeConfigError,
     RuntimeIntegrityError,
@@ -46,8 +46,8 @@ import {
     snapshotObjectHex,
 } from "./utils.mjs";
 
-const VALIDATION_RECEIPT_HASH_ALGORITHM = "sha256:oracle-runtime-validation-receipts-v1";
-const OBSERVATION_STREAM_HASH_ALGORITHM = "sha256:oracle-runtime-observation-streams-v1";
+const VALIDATION_RECEIPT_HASH_ALGORITHM = "sha256:crucible-runtime-validation-receipts-v1";
+const OBSERVATION_STREAM_HASH_ALGORITHM = "sha256:crucible-runtime-observation-streams-v1";
 
 function defaultClock() {
     return {
@@ -81,7 +81,7 @@ function uniqueNonexistentPath(root, prefix, idFactory) {
             return candidate;
         }
     }
-    throw new OracleRuntimeError(
+    throw new CrucibleRuntimeError(
         RUNTIME_ERROR_CODES.CHILD_CRASH,
         "Unable to allocate a unique temporary path",
         { root, prefix },
@@ -206,7 +206,7 @@ export class AutonomousRunner {
         }
         if (thrown !== null) {
             if (result !== undefined) {
-                const cleanupFailure = new OracleRuntimeError(
+                const cleanupFailure = new CrucibleRuntimeError(
                     RUNTIME_ERROR_CODES.RUNTIME_FAILURE,
                     `Autonomous runner cleanup failed: ${thrown?.message ?? String(thrown)}`,
                     {
@@ -219,7 +219,7 @@ export class AutonomousRunner {
                 throw cleanupFailure;
             }
             if (typeof thrown?.code !== "string") {
-                const wrapped = new OracleRuntimeError(
+                const wrapped = new CrucibleRuntimeError(
                     RUNTIME_ERROR_CODES.RUNTIME_FAILURE,
                     `Autonomous runner failed: ${thrown?.message ?? String(thrown)}`,
                     {
@@ -254,7 +254,7 @@ export class AutonomousRunner {
         });
         const opened = this.#adapter.replay();
         if (opened.domainEvents.length === 0 || opened.aggregate.contract === null) {
-            throw new OracleRuntimeError(
+            throw new CrucibleRuntimeError(
                 RUNTIME_ERROR_CODES.INVESTIGATION_NOT_OPEN,
                 "The runner requires an existing investigation_opened domain event",
                 { investigationId: this.#config.investigationId },
@@ -312,7 +312,7 @@ export class AutonomousRunner {
             return;
         }
         const capabilities = [
-            "oracle-v3-autonomous-runtime",
+            "crucible-autonomous-runtime",
             `harness:${aggregate.contract.harnessId}`,
             `parser:${aggregate.contract.parserVersion}`,
             `allowlist:${this.#allowlist.contentHash}`,
@@ -342,7 +342,7 @@ export class AutonomousRunner {
 
     #validateHarnessContract(contract) {
         if (contract.parserVersion !== PARSER_VERSION) {
-            throw new OracleRuntimeError(
+            throw new CrucibleRuntimeError(
                 RUNTIME_ERROR_CODES.HARNESS_CONFIGURATION_INVALID,
                 "Frozen contract parserVersion does not match the trusted measurement parser",
                 { contract: contract.parserVersion, runtime: PARSER_VERSION },
@@ -350,7 +350,7 @@ export class AutonomousRunner {
         }
         const entry = this.#allowlist.getEntry(contract.harnessId);
         if (entry.validationCases === null) {
-            throw new OracleRuntimeError(
+            throw new CrucibleRuntimeError(
                 RUNTIME_ERROR_CODES.HARNESS_CONFIGURATION_INVALID,
                 "Allowlist entry must pin every frozen validation case",
                 { harnessId: contract.harnessId },
@@ -360,7 +360,7 @@ export class AutonomousRunner {
             const allowlisted = entry.validationCases[validationCase.id];
             if (allowlisted === undefined
                 || allowlisted.snapshotHash !== validationCase.artifactHash) {
-                throw new OracleRuntimeError(
+                throw new CrucibleRuntimeError(
                     RUNTIME_ERROR_CODES.HARNESS_CONFIGURATION_INVALID,
                     "Allowlist validation snapshot does not match the immutable contract",
                     {
@@ -476,7 +476,7 @@ export class AutonomousRunner {
                     );
             }
         }
-        throw new OracleRuntimeError(
+        throw new CrucibleRuntimeError(
             RUNTIME_ERROR_CODES.CHILD_CRASH,
             "Runner exceeded maxLoopIterations without a persisted outcome",
             { maxLoopIterations: this.#config.options.maxLoopIterations },
@@ -672,7 +672,7 @@ export class AutonomousRunner {
             if (injectedCrash !== undefined) {
                 throw injectedCrash.reason;
             }
-            const error = new OracleRuntimeError(
+            const error = new CrucibleRuntimeError(
                 RUNTIME_ERROR_CODES.CHILD_CRASH,
                 "One or more trusted validation measurements failed before producing evidence",
                 {
@@ -718,7 +718,7 @@ export class AutonomousRunner {
                 caseMap,
                 compositeReceiptHash,
             },
-            contentType: "application/vnd.oracle-v3.validation-receipt+json",
+            contentType: "application/vnd.crucible.validation-receipt+json",
         });
         this.#adapter.ingestOperationalEvidence({
             attemptId: mainAttemptId,
@@ -782,7 +782,7 @@ export class AutonomousRunner {
                         attemptId,
                         kind: `proposal-${proposal.candidateId}`,
                         value: proposal,
-                        contentType: "application/vnd.oracle-v3.candidate-proposal+json",
+                        contentType: "application/vnd.crucible.candidate-proposal+json",
                     });
                     this.#adapter.ingestOperationalEvidence({
                         attemptId,
@@ -808,7 +808,7 @@ export class AutonomousRunner {
             .filter((item) => item.status === "fulfilled")
             .map((item) => item.value.result);
         if (proposals.length === 0) {
-            const error = new OracleRuntimeError(
+            const error = new CrucibleRuntimeError(
                 RUNTIME_ERROR_CODES.NO_ELIGIBLE_CANDIDATE,
                 "Every configured proposal session failed to submit a valid candidate",
                 {
@@ -864,7 +864,7 @@ export class AutonomousRunner {
                     effect.result.parsed,
                 );
                 if (metricValues === null) {
-                    throw new OracleRuntimeError(
+                    throw new CrucibleRuntimeError(
                         RUNTIME_ERROR_CODES.NO_ELIGIBLE_CANDIDATE,
                         "Measured candidate omitted one or more frozen ranking metrics",
                         { candidateId: proposal.candidateId },
@@ -899,7 +899,7 @@ export class AutonomousRunner {
             for (const proposal of proposals) {
                 this.#workerPool?.releaseCandidateId?.(proposal.candidateId);
             }
-            const error = new OracleRuntimeError(
+            const error = new CrucibleRuntimeError(
                 RUNTIME_ERROR_CODES.NO_ELIGIBLE_CANDIDATE,
                 "No submitted candidate produced domain-eligible harness evidence",
                 {
@@ -1097,14 +1097,14 @@ export class AutonomousRunner {
             attemptId,
             kind: `measurement-receipt-${candidateId}`,
             value: measurement.receipt,
-            contentType: "application/vnd.oracle-v3.measurement-receipt+json",
+            contentType: "application/vnd.crucible.measurement-receipt+json",
         });
         const snapshotArtifact = this.#registerCasObject({
             attemptId,
             kind: `snapshot-${candidateId}`,
             objectId: snapshotId,
             size: this.#artifactStore.readObject(snapshotId).length,
-            contentType: "application/vnd.oracle-v3.snapshot+json",
+            contentType: "application/vnd.crucible.snapshot+json",
         });
         this.#adapter.ingestOperationalEvidence({
             attemptId,

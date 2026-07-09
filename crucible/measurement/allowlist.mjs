@@ -1,4 +1,4 @@
-// oracle-v3/measurement/allowlist.mjs
+// crucible/measurement/allowlist.mjs
 //
 // HarnessAllowlist: the operator-owned, strictly-schema'd catalogue of
 // executables the measurement boundary is permitted to spawn.
@@ -43,8 +43,8 @@ import {
 // Algorithm tag for canonical-JSON hashes of allowlist entries. Kept distinct
 // from the generic domain canonical hash so an entry hash cannot be silently
 // confused with, e.g., a contract hash even if the bytes happened to match.
-export const ENTRY_HASH_ALGORITHM = "sha256:oracle-measurement-entry-v1";
-export const ALLOWLIST_HASH_ALGORITHM = "sha256:oracle-measurement-allowlist-v1";
+export const ENTRY_HASH_ALGORITHM = "sha256:crucible-measurement-entry-v1";
+export const ALLOWLIST_HASH_ALGORITHM = "sha256:crucible-measurement-allowlist-v1";
 
 // Maximum sizes chosen defensively. The allowlist is small operator-owned
 // JSON — 1 MiB is generous; anything larger is almost certainly wrong.

@@ -5,7 +5,7 @@ import { randomUUID } from "node:crypto";
 import { hashCanonical, immutableCanonical } from "../domain/index.mjs";
 import { assertLocalDatabasePath } from "../persistence/index.mjs";
 import {
-    OracleRuntimeError,
+    CrucibleRuntimeError,
     RUNTIME_ERROR_CODES,
     RuntimeConfigError,
     WorkerProtocolError,
@@ -18,7 +18,7 @@ import {
     requireString,
 } from "./utils.mjs";
 
-export const SUBMIT_CANDIDATE_TOOL_NAME = "oracle_submit_candidate";
+export const SUBMIT_CANDIDATE_TOOL_NAME = "crucible_submit_candidate";
 
 export const DEFAULT_CANDIDATE_LIMITS = Object.freeze({
     maxFiles: 32,
@@ -132,7 +132,7 @@ export function validateCandidateSubmission(args, options = {}) {
     if (args === null || typeof args !== "object" || Array.isArray(args)) {
         throw protocolError(
             RUNTIME_ERROR_CODES.WORKER_INVALID_CANDIDATE,
-            "oracle_submit_candidate arguments must be an object",
+            "crucible_submit_candidate arguments must be an object",
         );
     }
     const allowedKeys = new Set(["challenge", "candidateId", "mechanism", "files"]);
@@ -140,7 +140,7 @@ export function validateCandidateSubmission(args, options = {}) {
         if (!allowedKeys.has(key)) {
             throw protocolError(
                 RUNTIME_ERROR_CODES.WORKER_INVALID_CANDIDATE,
-                `oracle_submit_candidate has unknown field ${JSON.stringify(key)}`,
+                `crucible_submit_candidate has unknown field ${JSON.stringify(key)}`,
             );
         }
     }
@@ -300,7 +300,7 @@ export function buildProposalPrompt({
 }) {
     const context = additionalContext === null ? "" : `\nSearch context:\n${additionalContext}\n`;
     return [
-        "You are an Oracle v3 search/diversity worker.",
+        "You are an Crucible search/diversity worker.",
         "You propose source files only. You never decide whether a candidate passes, is verified,",
         "is unreachable, is terminal, or is a result. The trusted harness makes every such determination.",
         `Objective: ${objective}`,
@@ -441,10 +441,10 @@ export class SdkWorkerPool {
                         // Preserve the startup failure.
                     }
                 }
-                if (error instanceof OracleRuntimeError) {
+                if (error instanceof CrucibleRuntimeError) {
                     throw error;
                 }
-                throw new OracleRuntimeError(
+                throw new CrucibleRuntimeError(
                     RUNTIME_ERROR_CODES.WORKER_STARTUP,
                     `SDK worker pool startup failed: ${error?.message ?? String(error)}`,
                     { cause: error?.code ?? null },
@@ -499,7 +499,7 @@ export class SdkWorkerPool {
         }
         const promptHash = hashCanonical(
             { prompt },
-            "sha256:oracle-runtime-worker-prompt-v1",
+            "sha256:crucible-runtime-worker-prompt-v1",
         );
 
         let submission = null;
@@ -513,7 +513,7 @@ export class SdkWorkerPool {
             }
             return {
                 resultType: "rejected",
-                textResultForLlm: "Candidate submission rejected by the Oracle runtime protocol.",
+                textResultForLlm: "Candidate submission rejected by the Crucible runtime protocol.",
                 error: error.message,
             };
         };
@@ -561,7 +561,7 @@ export class SdkWorkerPool {
                 claimedByThisSession = candidate.candidateId;
                 const payloadHash = hashCanonical(
                     candidate,
-                    "sha256:oracle-runtime-candidate-payload-v1",
+                    "sha256:crucible-runtime-candidate-payload-v1",
                 );
                 submission = immutableCanonical({
                     ...candidate,
@@ -586,7 +586,7 @@ export class SdkWorkerPool {
         try {
             const sessionConfig = {
                 sessionId,
-                clientName: "oracle-v3-autonomous-runtime",
+                clientName: "crucible-autonomous-runtime",
                 model,
                 tools: [tool],
                 availableTools: [`custom:${SUBMIT_CANDIDATE_TOOL_NAME}`],
@@ -649,14 +649,14 @@ export class SdkWorkerPool {
         if (callCount === 0 || submission === null) {
             throw protocolError(
                 RUNTIME_ERROR_CODES.WORKER_NO_SUBMISSION,
-                "Proposal session returned without calling oracle_submit_candidate",
+                "Proposal session returned without calling crucible_submit_candidate",
                 { sessionId, model },
             );
         }
         if (callCount !== 1) {
             throw protocolError(
                 RUNTIME_ERROR_CODES.WORKER_MULTIPLE_SUBMISSIONS,
-                "Proposal session called oracle_submit_candidate more than once",
+                "Proposal session called crucible_submit_candidate more than once",
                 { sessionId, callCount },
             );
         }
@@ -677,7 +677,7 @@ export function createSdkWorkerPool(options) {
 
 export function assertWorkerSessionsAreNonTerminal(proposal) {
     if (proposal?.identity === null || typeof proposal?.identity !== "object") {
-        throw new OracleRuntimeError(
+        throw new CrucibleRuntimeError(
             RUNTIME_ERROR_CODES.WORKER_PROTOCOL,
             "Worker proposal is missing code-stamped identity",
         );

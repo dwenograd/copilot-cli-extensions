@@ -1,4 +1,4 @@
-// oracle-v3/persistence/bundle.mjs
+// crucible/persistence/bundle.mjs
 //
 // Self-contained investigation audit bundle: export + verified import.
 //
@@ -29,14 +29,14 @@ import fs from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
 
-import { OraclePersistenceError, InvalidArgumentError } from "./errors.mjs";
+import { CruciblePersistenceError, InvalidArgumentError } from "./errors.mjs";
 import { assertLocalDatabasePath } from "./paths.mjs";
 import { canonicalize } from "./canonical.mjs";
 import { DatabaseSync } from "./sqlite.mjs";
 import { ArtifactStore, parseObjectId, objectIdFor, objectRelPath } from "./artifact-store.mjs";
 
 const ALGO = "sha256";
-const BUNDLE_TYPE = "oracle-v3-audit-bundle";
+const BUNDLE_TYPE = "crucible-audit-bundle";
 const BUNDLE_VERSION = 1;
 const INVENTORY_NAME = "inventory.sha256";
 const MANIFEST_NAME = "manifest.json";
@@ -46,16 +46,16 @@ const COPY_CHUNK = 1 << 16;
 // --- typed errors ---------------------------------------------------------
 
 export const BUNDLE_ERROR_CODES = Object.freeze({
-    INVALID_ARGUMENT: "ORACLE_BUNDLE_INVALID_ARGUMENT",
-    DESTINATION_EXISTS: "ORACLE_BUNDLE_DESTINATION_EXISTS",
-    SOURCE_INVALID: "ORACLE_BUNDLE_SOURCE_INVALID",
-    OBJECT_MISSING: "ORACLE_BUNDLE_OBJECT_MISSING",
-    INVENTORY_INVALID: "ORACLE_BUNDLE_INVENTORY_INVALID",
-    TAMPER_DETECTED: "ORACLE_BUNDLE_TAMPER_DETECTED",
-    IO_ERROR: "ORACLE_BUNDLE_IO_ERROR",
+    INVALID_ARGUMENT: "CRUCIBLE_BUNDLE_INVALID_ARGUMENT",
+    DESTINATION_EXISTS: "CRUCIBLE_BUNDLE_DESTINATION_EXISTS",
+    SOURCE_INVALID: "CRUCIBLE_BUNDLE_SOURCE_INVALID",
+    OBJECT_MISSING: "CRUCIBLE_BUNDLE_OBJECT_MISSING",
+    INVENTORY_INVALID: "CRUCIBLE_BUNDLE_INVENTORY_INVALID",
+    TAMPER_DETECTED: "CRUCIBLE_BUNDLE_TAMPER_DETECTED",
+    IO_ERROR: "CRUCIBLE_BUNDLE_IO_ERROR",
 });
 
-export class BundleError extends OraclePersistenceError {
+export class BundleError extends CruciblePersistenceError {
     constructor(code, message, details) {
         super(code, message, details);
         this.name = "BundleError";

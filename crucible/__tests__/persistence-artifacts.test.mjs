@@ -1,4 +1,4 @@
-// oracle-v3/__tests__/persistence-artifacts.test.mjs
+// crucible/__tests__/persistence-artifacts.test.mjs
 //
 // Artifact metadata: inline BLOB round-trip and the external durable gate.
 // The repository intentionally does NOT implement the filesystem CAS; it only

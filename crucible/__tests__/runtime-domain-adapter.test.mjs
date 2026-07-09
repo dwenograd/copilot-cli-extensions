@@ -172,7 +172,7 @@ function appendFullVerifiedHistory(adapter) {
     return aggregate;
 }
 
-describe("Oracle v3 domain/persistence adapter", () => {
+describe("Crucible domain/persistence adapter", () => {
     it("stores one canonical repository event per domain event with identical sequence", () => {
         const { repository, adapter } = openAdapter("one-to-one");
         const aggregate = appendFullVerifiedHistory(adapter);

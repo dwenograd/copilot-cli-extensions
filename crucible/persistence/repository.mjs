@@ -1,6 +1,6 @@
-// oracle-v3/persistence/repository.mjs
+// crucible/persistence/repository.mjs
 //
-// Transactional SQLite event repository for Oracle v3, built on the Node 24
+// Transactional SQLite event repository for Crucible, built on the Node 24
 // built-in `node:sqlite` (DatabaseSync). ESM, synchronous engine.
 //
 // Design guarantees:
@@ -16,7 +16,7 @@
 //   * Read-only query methods that never repair or mutate.
 //   * Structural integrity verification (no domain-policy recomputation).
 //
-// Every failure throws a typed OraclePersistenceError subclass; there is no
+// Every failure throws a typed CruciblePersistenceError subclass; there is no
 // broad catch-that-returns-success anywhere.
 
 import { DatabaseSync } from "./sqlite.mjs";
@@ -24,7 +24,7 @@ import { DatabaseSync } from "./sqlite.mjs";
 import {
     ERROR_CODES,
     SQLITE_ERRCODE,
-    OraclePersistenceError,
+    CruciblePersistenceError,
     InvalidArgumentError,
     NotFoundError,
     CasConflictError,
@@ -356,7 +356,7 @@ export class EventRepository {
                     createdAt,
                 });
                 if (ev.expectedEventHash != null && ev.expectedEventHash !== eventHash) {
-                    throw new OraclePersistenceError(
+                    throw new CruciblePersistenceError(
                         ERROR_CODES.EVENT_HASH_MISMATCH,
                         "supplied event hash does not match canonical computation",
                         { seq, expected: ev.expectedEventHash, computed: eventHash },
@@ -416,21 +416,21 @@ export class EventRepository {
                 return new TerminalExistsError("investigation already has a terminal event", { investigationId });
             }
             if (msg.includes("event_hash")) {
-                return new OraclePersistenceError(
+                return new CruciblePersistenceError(
                     ERROR_CODES.EVENT_HASH_MISMATCH,
                     "duplicate event hash for investigation",
                     { investigationId, seq },
                 );
             }
             if (msg.includes("evidence") || msg.includes("attempt")) {
-                return new OraclePersistenceError(
+                return new CruciblePersistenceError(
                     ERROR_CODES.EVIDENCE_CONFLICT,
                     "duplicate evidence key",
                     { investigationId, seq },
                 );
             }
             // seq / primary-key collision => sequence conflict.
-            return new OraclePersistenceError(
+            return new CruciblePersistenceError(
                 ERROR_CODES.SEQUENCE_CONFLICT,
                 "sequence conflict while appending event",
                 { investigationId, seq },
@@ -641,7 +641,7 @@ export class EventRepository {
             } catch (err) {
                 if (isUniqueViolation(err)) {
                     if (err.errcode === SQLITE_ERRCODE.CONSTRAINT_UNIQUE) {
-                        throw new OraclePersistenceError(
+                        throw new CruciblePersistenceError(
                             ERROR_CODES.RESERVATION_CONFLICT,
                             "an active reservation already exists for this command",
                             { investigationId, command },
@@ -912,7 +912,7 @@ export class EventRepository {
                     .run({ inv: investigationId, art: artifactId, seq, at: createdAt });
             } catch (err) {
                 if (isUniqueViolation(err)) {
-                    throw new OraclePersistenceError(
+                    throw new CruciblePersistenceError(
                         ERROR_CODES.ARTIFACT_CONFLICT,
                         "artifact already referenced at this seq",
                         { artifactId, seq },
@@ -990,7 +990,7 @@ export class EventRepository {
 
     #translateArtifactInsert(err, artifactId) {
         if (isUniqueViolation(err)) {
-            return new OraclePersistenceError(
+            return new CruciblePersistenceError(
                 ERROR_CODES.ARTIFACT_CONFLICT,
                 `artifact '${artifactId}' already exists`,
                 { artifactId },

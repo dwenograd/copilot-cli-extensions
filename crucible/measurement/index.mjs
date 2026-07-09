@@ -1,6 +1,6 @@
-// oracle-v3/measurement/index.mjs
+// crucible/measurement/index.mjs
 //
-// Public surface of the Oracle v3 trusted-measurement boundary.
+// Public surface of the Crucible trusted-measurement boundary.
 
 export {
     MEASUREMENT_ERROR_CODES,

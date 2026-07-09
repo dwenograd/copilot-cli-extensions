@@ -1,6 +1,6 @@
-// oracle-v3/api/result.mjs
+// crucible/api/result.mjs
 //
-// Structured result helpers for the Oracle v3 API boundary. Every tool returns
+// Structured result helpers for the Crucible API boundary. Every tool returns
 // JSON (never prose) as `{ textResultForLlm, resultType }` so the orchestrating
 // agent can only relay what the code computed, never reinterpret a verdict.
 //

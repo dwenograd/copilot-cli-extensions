@@ -1,4 +1,4 @@
-// oracle-v3/__tests__/measurement-fs-verify.test.mjs
+// crucible/__tests__/measurement-fs-verify.test.mjs
 //
 // Verifies the local-regular-file gate that every trusted file must pass
 // (allowlist, harness executable, dependencies) before any measurement.

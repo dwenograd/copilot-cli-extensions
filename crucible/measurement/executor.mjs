@@ -1,4 +1,4 @@
-// oracle-v3/measurement/executor.mjs
+// crucible/measurement/executor.mjs
 //
 // MeasurementExecutor: the fail-closed trusted-measurement boundary.
 //
@@ -238,7 +238,7 @@ function normalizeScratchRoot(value) {
 
 function makeAttemptStage(scratchRoot, attemptId) {
     try {
-        const stage = path.join(scratchRoot, `.oracle-stage-${attemptId}`);
+        const stage = path.join(scratchRoot, `.crucible-stage-${attemptId}`);
         fs.mkdirSync(stage, { recursive: false, mode: 0o700 });
         try { fs.chmodSync(stage, 0o700); } catch { /* Windows ACLs govern access */ }
         return stage;
@@ -361,8 +361,8 @@ async function runOnce({
             env[k] = v;
         }
         env.CANDIDATE_SNAPSHOT_PATH = snapshot.path;
-        env.ORACLE_ATTEMPT_ID = attemptId;
-        env.ORACLE_RUNNER_EPOCH_ID = runnerEpochId;
+        env.CRUCIBLE_ATTEMPT_ID = attemptId;
+        env.CRUCIBLE_RUNNER_EPOCH_ID = runnerEpochId;
 
         const argvHash = hashArgv(spawnArgv);
         const envHash = hashEnv(env);

@@ -1,4 +1,4 @@
-// oracle-v3/__tests__/persistence-artifact-store.test.mjs
+// crucible/__tests__/persistence-artifact-store.test.mjs
 //
 // Immutable content-addressed artifact store: durable writes safe against
 // duplicate writers, corruption detection, traversal + symlink rejection,
@@ -268,7 +268,7 @@ describe("materialization", () => {
     it("refuses a manifest whose entry path escapes the destination (traversal)", () => {
         const inner = store.putBytes(Buffer.from("x"));
         const manifest = {
-            type: "oracle-v3-snapshot",
+            type: "crucible-snapshot",
             version: 1,
             algo: "sha256",
             fileCount: 1,
@@ -284,7 +284,7 @@ describe("materialization", () => {
     it("refuses a manifest with an absolute entry path", () => {
         const inner = store.putBytes(Buffer.from("y"));
         const manifest = {
-            type: "oracle-v3-snapshot",
+            type: "crucible-snapshot",
             version: 1,
             algo: "sha256",
             fileCount: 1,
@@ -397,7 +397,7 @@ describe("reconciliation", () => {
 
     it("requires a non-negative caller-provided age", () => {
         const err = catchErr(() => store.reconcile({ referenced: [], olderThanMs: -1, now: Date.now() }));
-        expect(err.code).toBe("ORACLE_PERSIST_INVALID_ARGUMENT");
+        expect(err.code).toBe("CRUCIBLE_PERSIST_INVALID_ARGUMENT");
     });
 });
 

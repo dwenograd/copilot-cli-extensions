@@ -1,6 +1,6 @@
-// Extension: oracle-v3
+// Extension: crucible
 //
-// Production thin Copilot extension for the clean-break Oracle v3. This file is
+// Production thin Copilot extension for the clean-break Crucible. This file is
 // intentionally almost pure registration: it wires the four public tools built
 // from the single-source schema/handler layer under ./api and hands them to the
 // SDK. All logic lives in ./api (schema.mjs, environment.mjs, handlers.mjs).
@@ -11,10 +11,10 @@
 // routed through session.log — this extension never writes to stdout.
 //
 // Tool surface (four tools, no more):
-//   oracle_start  — freeze a contract, ingest validation cases, start the runner
-//   oracle_status — read-only progress + supervisor health (never a result)
-//   oracle_stop   — request a resumable pause (never manufactures a terminal)
-//   oracle_result — the ONLY tool that may emit a terminal result
+//   crucible_start  — freeze a contract, ingest validation cases, start the runner
+//   crucible_status — read-only progress + supervisor health (never a result)
+//   crucible_stop   — request a resumable pause (never manufactures a terminal)
+//   crucible_result — the ONLY tool that may emit a terminal result
 
 import { joinSession } from "@github/copilot-sdk/extension";
 import { buildRegistration } from "./api/handlers.mjs";

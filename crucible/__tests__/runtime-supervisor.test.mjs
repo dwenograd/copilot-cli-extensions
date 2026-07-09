@@ -85,7 +85,7 @@ function childResultSpawner(sequence) {
     };
 }
 
-describe("Oracle v3 supervisor", () => {
+describe("Crucible supervisor", () => {
     it("enforces one live supervisor lock per investigation", () => {
         const root = makeRoot("singleton");
         const config = normalizeSupervisorConfig(rawConfig(root));

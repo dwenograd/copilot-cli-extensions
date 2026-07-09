@@ -1,4 +1,4 @@
-// oracle-v3/__tests__/measurement-allowlist.test.mjs
+// crucible/__tests__/measurement-allowlist.test.mjs
 //
 // Verifies the HarnessAllowlist loader + verify-before-run flow.
 
@@ -40,7 +40,7 @@ describe("loadHarnessAllowlist", () => {
         expect(entry.executable).toBe(NODE_EXE);
         expect(entry.executesCandidateCode).toBe(false);
         expect(list.getEntryHash("echo-passer")).toMatch(new RegExp(`^${ENTRY_HASH_ALGORITHM}:[a-f0-9]{64}$`));
-        expect(list.contentHash).toMatch(/^sha256:oracle-measurement-allowlist-v1:[a-f0-9]{64}$/);
+        expect(list.contentHash).toMatch(/^sha256:crucible-measurement-allowlist-v1:[a-f0-9]{64}$/);
     });
 
     it("rejects unknown top-level keys and wrong version", () => {
@@ -168,7 +168,7 @@ describe("verifyEntry (re-verify before every run)", () => {
     it("cannot be forged with the legacy global Symbol brand and the public index exports no brand", async () => {
         const forged = Object.freeze({
             entry: {},
-            __brand: Symbol.for("oracle-v3.measurement.VerifiedHarnessEntry"),
+            __brand: Symbol.for("crucible.measurement.VerifiedHarnessEntry"),
         });
         expect(isVerifiedHarnessEntry(forged)).toBe(false);
         const publicApi = await import("../measurement/index.mjs");

@@ -1,13 +1,13 @@
-// oracle-v3/api/handlers.mjs
+// crucible/api/handlers.mjs
 //
-// The four Oracle v3 tool handlers plus the single SDK error boundary and the
+// The four Crucible tool handlers plus the single SDK error boundary and the
 // production runtime wiring. Design rules enforced here:
 //
 //   * Internal handlers THROW typed errors; only `runToolBoundary` catches, at
 //     the SDK edge, converting to a structured `{ textResultForLlm, resultType }`.
 //   * All environment/state resolution goes through api/environment.mjs; no tool
 //     argument ever selects a filesystem path, harness allowlist, or CLI.
-//   * Domain scoring/policy is never recomputed for results: oracle_result reads
+//   * Domain scoring/policy is never recomputed for results: crucible_result reads
 //     the persisted terminal decision and reports it (or redacts a non-result).
 //   * Diagnostics go only through the injected `log` (session.log), never stdout.
 //
@@ -64,7 +64,7 @@ import {
     InvestigationNotResumableError,
     InvestigationNotFoundError,
     OperationalResetRequiredError,
-    OracleApiError,
+    CrucibleApiError,
     ValidationCasePathError,
 } from "./errors.mjs";
 
@@ -180,7 +180,7 @@ function ingestValidationCases(store, projectRoot, cases, env) {
 
 function openInvestigationForRead(deps, investigationId, eventsDbPath) {
     if (!fs.existsSync(eventsDbPath)) {
-        throw new InvestigationNotFoundError("no Oracle v3 investigation with this id", {
+        throw new InvestigationNotFoundError("no Crucible investigation with this id", {
             investigationId,
         });
     }
@@ -201,7 +201,7 @@ function openInvestigationForRead(deps, investigationId, eventsDbPath) {
     }
 }
 
-// --- oracle_start -----------------------------------------------------------
+// --- crucible_start -----------------------------------------------------------
 
 function operationalRecoveryPolicy(operationalNonResult, args) {
     if (operationalNonResult === null) return null;
@@ -216,17 +216,17 @@ function operationalRecoveryPolicy(operationalNonResult, args) {
             || !Number.isFinite(requestedDeadline)
             || requestedDeadline <= previousDeadline) {
             throw new OperationalResetRequiredError(
-                "A deadline non-result requires oracle_start with an explicit later deadline_iso",
+                "A deadline non-result requires crucible_start with an explicit later deadline_iso",
                 { code, previousDeadline, requestedDeadline: Number.isFinite(requestedDeadline) ? requestedDeadline : null },
             );
         }
         return {
             policy: "later_deadline",
-            reason: "Explicit oracle_start supplied a later wall-clock deadline.",
+            reason: "Explicit crucible_start supplied a later wall-clock deadline.",
             details: { previousDeadline, requestedDeadline },
         };
     }
-    if (code === "ORACLE_V3_RUNTIME_CIRCUIT_OPEN") {
+    if (code === "CRUCIBLE_RUNTIME_CIRCUIT_OPEN") {
         if (args.reset_policy !== "circuit_open") {
             throw new OperationalResetRequiredError(
                 "A circuit-open non-result requires reset_policy='circuit_open'",
@@ -235,14 +235,14 @@ function operationalRecoveryPolicy(operationalNonResult, args) {
         }
         return {
             policy: "circuit_open",
-            reason: "Explicit oracle_start reset the persisted circuit breaker.",
+            reason: "Explicit crucible_start reset the persisted circuit breaker.",
             details: null,
         };
     }
     if (payload.details?.recoverable === true) {
         return {
             policy: "recoverable_reattach",
-            reason: "Explicit oracle_start reattached after a recoverable operational failure.",
+            reason: "Explicit crucible_start reattached after a recoverable operational failure.",
             details: null,
         };
     }
@@ -254,7 +254,7 @@ function operationalRecoveryPolicy(operationalNonResult, args) {
     }
     return {
         policy: "failed",
-        reason: "Explicit oracle_start reset a persisted failed operational outcome.",
+        reason: "Explicit crucible_start reset a persisted failed operational outcome.",
         details: null,
     };
 }
@@ -421,7 +421,7 @@ export function startInvestigation(args, deps) {
     const statusPath = supervisorPaths(paths.stateDir, investigationId).statusPath;
 
     deps.log?.(
-        `[oracle-v3] oracle_start ${investigationId} (${opened.idempotent ? "idempotent" : "new"}); `
+        `[crucible] crucible_start ${investigationId} (${opened.idempotent ? "idempotent" : "new"}); `
         + `supervisor=${summarizeSupervisorAction(supervisor).action}`,
     );
 
@@ -438,12 +438,12 @@ export function startInvestigation(args, deps) {
         artifact_root: paths.artifactRoot,
         supervisor: summarizeSupervisorAction(supervisor),
         message: opened.idempotent
-            ? "Investigation already open with an identical contract; re-attached and ensured supervisor. Poll oracle_status."
-            : "Investigation started. Poll oracle_status; only oracle_result may report a terminal decision.",
+            ? "Investigation already open with an identical contract; re-attached and ensured supervisor. Poll crucible_status."
+            : "Investigation started. Poll crucible_status; only crucible_result may report a terminal decision.",
     };
 }
 
-// --- oracle_status ----------------------------------------------------------
+// --- crucible_status ----------------------------------------------------------
 
 function summarizeRecommendation(recommendation) {
     if (recommendation === null || typeof recommendation !== "object") {
@@ -527,7 +527,7 @@ function tryRestartSupervisor(deps, env, paths, investigationId) {
         const result = deps.ensureSupervisor(config, { env });
         return summarizeSupervisorAction(result);
     } catch (error) {
-        deps.log?.(`[oracle-v3] oracle_status supervisor restart failed: ${error?.message ?? String(error)}`);
+        deps.log?.(`[crucible] crucible_status supervisor restart failed: ${error?.message ?? String(error)}`);
         return { action: "restart-failed", code: error?.code ?? null, error: error?.message ?? String(error) };
     }
 }
@@ -595,14 +595,14 @@ export function statusInvestigation(args, deps) {
         supervisor_health: { ...health, ensure_action: ensureAction },
         next_recommendation: recommendation,
         note: aggregate.terminal !== null
-            ? "A terminal decision is recorded — call oracle_result to obtain it."
+            ? "A terminal decision is recorded — call crucible_result to obtain it."
             : operationalNonResult !== null
-                ? "An operational non-result is recorded; call oracle_start under the explicit recovery policy to retry."
+                ? "An operational non-result is recorded; call crucible_start under the explicit recovery policy to retry."
             : "In progress or paused. This status is not a result.",
     };
 }
 
-// --- oracle_stop ------------------------------------------------------------
+// --- crucible_stop ------------------------------------------------------------
 
 export function stopInvestigation(args, deps) {
     const env = deps.env;
@@ -611,7 +611,7 @@ export function stopInvestigation(args, deps) {
     const paths = resolveInvestigationPaths(stateRoot, investigationId);
 
     if (!fs.existsSync(paths.eventsDbPath)) {
-        throw new InvestigationNotFoundError("no Oracle v3 investigation with this id", {
+        throw new InvestigationNotFoundError("no Crucible investigation with this id", {
             investigationId,
         });
     }
@@ -621,7 +621,7 @@ export function stopInvestigation(args, deps) {
         investigationId,
         reason: typeof args.reason === "string" && args.reason.length > 0
             ? args.reason
-            : "Pause requested via oracle_stop.",
+            : "Pause requested via crucible_stop.",
         pauseRequested: true,
     });
     const aggregate = result?.aggregate ?? null;
@@ -646,12 +646,12 @@ export function stopInvestigation(args, deps) {
         message: alreadyTerminal
             ? "Investigation is already terminal; no pause was requested."
             : resumable
-                ? "Pause persisted; the investigation may be resumed by an identical oracle_start reattach."
+                ? "Pause persisted; the investigation may be resumed by an identical crucible_start reattach."
                 : "Pause was not yet persisted, so resumability is not claimed.",
     };
 }
 
-// --- oracle_result ----------------------------------------------------------
+// --- crucible_result ----------------------------------------------------------
 
 function describeNonResult(aggregate, operationalNonResult) {
     if (operationalNonResult !== null) {
@@ -721,10 +721,10 @@ export function resultInvestigation(args, deps) {
 // --- SDK boundary + registration -------------------------------------------
 
 const HANDLERS = Object.freeze({
-    oracle_start: startInvestigation,
-    oracle_status: statusInvestigation,
-    oracle_stop: stopInvestigation,
-    oracle_result: resultInvestigation,
+    crucible_start: startInvestigation,
+    crucible_status: statusInvestigation,
+    crucible_stop: stopInvestigation,
+    crucible_result: resultInvestigation,
 });
 
 export function runToolBoundary(spec, handler, rawArgs, deps) {
@@ -733,9 +733,9 @@ export function runToolBoundary(spec, handler, rawArgs, deps) {
         const payload = handler(args, deps);
         return success(payload);
     } catch (error) {
-        const code = error instanceof OracleApiError ? error.code : (error?.code ?? null);
+        const code = error instanceof CrucibleApiError ? error.code : (error?.code ?? null);
         deps.log?.(
-            `[oracle-v3] ${spec.name} failed (${code ?? "ERROR"}): ${error?.message ?? String(error)}`,
+            `[crucible] ${spec.name} failed (${code ?? "ERROR"}): ${error?.message ?? String(error)}`,
         );
         return failure(error?.message ?? String(error), { code, tool: spec.name });
     }

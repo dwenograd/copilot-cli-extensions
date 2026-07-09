@@ -1,6 +1,6 @@
-// oracle-v3/tools/configure-harness.mjs
+// crucible/tools/configure-harness.mjs
 //
-// Production operator CLI: create or update an Oracle v3 harness allowlist
+// Production operator CLI: create or update an Crucible harness allowlist
 // entry BEFORE any investigation starts. This is the only supported way to
 // author the operator-owned allowlist that measurement/allowlist.mjs later
 // loads fail-closed; the extension process never writes it.
@@ -14,14 +14,14 @@
 //   * computes SHA-256 for the executable and every declared dependency;
 //   * ingests each validation-case source directory through a *temporary*
 //     local ArtifactStore purely to compute the deterministic content-address
-//     snapshot id `oracle_start` will later recompute — the temporary store is
+//     snapshot id `crucible_start` will later recompute — the temporary store is
 //     never retained;
 //   * preserves every unrelated existing entry (after a strict parse of the
 //     current allowlist), refusing to overwrite an entry whose executable
 //     changed unless `--replace` is given;
 //   * writes schema version 1 with `validationCases` keyed by id holding
 //     `{ snapshotHash, description? }`. Accept/reject expectations are NOT
-//     written here — they live in the frozen `oracle_start` contract, and the
+//     written here — they live in the frozen `crucible_start` contract, and the
 //     allowlist schema deliberately does not carry them;
 //   * installs the replacement atomically (temp file, fsync, backup of the
 //     previous file next to the allowlist, atomic rename) and re-validates the
@@ -31,7 +31,7 @@
 // failure it prints one JSON error object to stderr and exits non-zero. It
 // never prompts.
 //
-// No third-party dependencies — only node: builtins and sibling oracle-v3
+// No third-party dependencies — only node: builtins and sibling crucible
 // modules.
 
 import fs from "node:fs";
@@ -50,20 +50,20 @@ import { assertLocalDatabasePath, openArtifactStore } from "../persistence/index
 export const CONFIGURE_SCHEMA_VERSION = 1;
 
 export const CONFIGURE_ERROR_CODES = Object.freeze({
-    USAGE: "ORACLE_CONFIGURE_USAGE",
-    CONFIG_NOT_FOUND: "ORACLE_CONFIGURE_CONFIG_NOT_FOUND",
-    CONFIG_TOO_LARGE: "ORACLE_CONFIGURE_CONFIG_TOO_LARGE",
-    CONFIG_INVALID_JSON: "ORACLE_CONFIGURE_CONFIG_INVALID_JSON",
-    CONFIG_INVALID: "ORACLE_CONFIGURE_CONFIG_INVALID",
-    ALLOWLIST_PATH_INVALID: "ORACLE_CONFIGURE_ALLOWLIST_PATH_INVALID",
-    EXECUTABLE_INVALID: "ORACLE_CONFIGURE_EXECUTABLE_INVALID",
-    DEPENDENCY_INVALID: "ORACLE_CONFIGURE_DEPENDENCY_INVALID",
-    SOURCE_DIR_INVALID: "ORACLE_CONFIGURE_SOURCE_DIR_INVALID",
-    VALIDATION_INGEST_FAILED: "ORACLE_CONFIGURE_VALIDATION_INGEST_FAILED",
-    EXISTING_ALLOWLIST_INVALID: "ORACLE_CONFIGURE_EXISTING_ALLOWLIST_INVALID",
-    ENTRY_CONFLICT: "ORACLE_CONFIGURE_ENTRY_CONFLICT",
-    RESULT_INVALID: "ORACLE_CONFIGURE_RESULT_INVALID",
-    WRITE_FAILED: "ORACLE_CONFIGURE_WRITE_FAILED",
+    USAGE: "CRUCIBLE_CONFIGURE_USAGE",
+    CONFIG_NOT_FOUND: "CRUCIBLE_CONFIGURE_CONFIG_NOT_FOUND",
+    CONFIG_TOO_LARGE: "CRUCIBLE_CONFIGURE_CONFIG_TOO_LARGE",
+    CONFIG_INVALID_JSON: "CRUCIBLE_CONFIGURE_CONFIG_INVALID_JSON",
+    CONFIG_INVALID: "CRUCIBLE_CONFIGURE_CONFIG_INVALID",
+    ALLOWLIST_PATH_INVALID: "CRUCIBLE_CONFIGURE_ALLOWLIST_PATH_INVALID",
+    EXECUTABLE_INVALID: "CRUCIBLE_CONFIGURE_EXECUTABLE_INVALID",
+    DEPENDENCY_INVALID: "CRUCIBLE_CONFIGURE_DEPENDENCY_INVALID",
+    SOURCE_DIR_INVALID: "CRUCIBLE_CONFIGURE_SOURCE_DIR_INVALID",
+    VALIDATION_INGEST_FAILED: "CRUCIBLE_CONFIGURE_VALIDATION_INGEST_FAILED",
+    EXISTING_ALLOWLIST_INVALID: "CRUCIBLE_CONFIGURE_EXISTING_ALLOWLIST_INVALID",
+    ENTRY_CONFLICT: "CRUCIBLE_CONFIGURE_ENTRY_CONFLICT",
+    RESULT_INVALID: "CRUCIBLE_CONFIGURE_RESULT_INVALID",
+    WRITE_FAILED: "CRUCIBLE_CONFIGURE_WRITE_FAILED",
 });
 
 export class ConfigureHarnessError extends Error {
@@ -81,7 +81,7 @@ export class ConfigureHarnessError extends Error {
 // rejected by the loader later.
 const SAFE_ID = /^[a-z0-9][a-z0-9._-]{0,127}$/u;
 const ENV_KEY = /^[A-Z_][A-Z0-9_]{0,127}$/u;
-const DEFAULT_ROOT_DIRNAME = "OracleV3";
+const DEFAULT_ROOT_DIRNAME = "Crucible";
 const DEFAULT_ALLOWLIST_FILENAME = "harnesses.json";
 const MAX_CONFIG_BYTES = 1 * 1024 * 1024;
 const SNAPSHOT_ID_RE = /^sha256:[a-f0-9]{64}$/u;
@@ -642,7 +642,7 @@ export function configureHarness(options = {}) {
     });
 
     // Ingest each validation source directory through a throwaway local store.
-    const storeRoot = path.join(allowlistDir, `.oracle-configure-store-${randomBytes(10).toString("hex")}`);
+    const storeRoot = path.join(allowlistDir, `.crucible-configure-store-${randomBytes(10).toString("hex")}`);
     const validationCaseSnapshots = {};
     let entryHash = null;
     let contentHash = null;
@@ -816,13 +816,13 @@ export function parseArgs(argv) {
 
 const USAGE = `Usage: node tools/configure-harness.mjs --config <path> [--allowlist <path>] [--replace]
 
-Creates or updates an Oracle v3 operator harness allowlist entry from a strict
+Creates or updates an Crucible operator harness allowlist entry from a strict
 JSON config file, computing executable/dependency SHA-256 digests and the
-deterministic validation-case snapshot ids oracle_start will recompute.
+deterministic validation-case snapshot ids crucible_start will recompute.
 
 Options:
   --config <path>     Strict JSON harness config (required).
-  --allowlist <path>  Output allowlist path (default %LOCALAPPDATA%\\OracleV3\\harnesses.json).
+  --allowlist <path>  Output allowlist path (default %LOCALAPPDATA%\\Crucible\\harnesses.json).
   --replace           Allow overwriting an entry whose executable changed.
   -h, --help          Show this help.`;
 
@@ -861,7 +861,7 @@ function errorPayload(err) {
     return {
         ok: false,
         error: {
-            code: err?.code ?? "ORACLE_CONFIGURE_UNKNOWN",
+            code: err?.code ?? "CRUCIBLE_CONFIGURE_UNKNOWN",
             message: err?.message ?? String(err),
             ...(err?.details ? { details: err.details } : {}),
         },

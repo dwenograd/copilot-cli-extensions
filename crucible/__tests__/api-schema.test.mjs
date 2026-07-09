@@ -1,4 +1,4 @@
-// oracle-v3/__tests__/api-schema.test.mjs
+// crucible/__tests__/api-schema.test.mjs
 //
 // Proves the single-source schema/spec builder produces a Copilot JSON Schema
 // and a runtime parser that are in lock-step (generation/parsing parity): the
@@ -12,10 +12,10 @@ import { SchemaValidationError } from "../api/schema.mjs";
 import {
     PUBLIC_TOOL_NAMES,
     TOOL_SPECS,
-    oracleResultSpec,
-    oracleStartSpec,
-    oracleStatusSpec,
-    oracleStopSpec,
+    crucibleResultSpec,
+    crucibleStartSpec,
+    crucibleStatusSpec,
+    crucibleStopSpec,
 } from "../api/schema.mjs";
 
 function validStartArgs(overrides = {}) {
@@ -37,19 +37,19 @@ function validStartArgs(overrides = {}) {
 }
 
 const VALID_ARGS = {
-    oracle_start: validStartArgs(),
-    oracle_status: { investigation_id: "inv-abc123" },
-    oracle_stop: { investigation_id: "inv-abc123" },
-    oracle_result: { investigation_id: "inv-abc123" },
+    crucible_start: validStartArgs(),
+    crucible_status: { investigation_id: "inv-abc123" },
+    crucible_stop: { investigation_id: "inv-abc123" },
+    crucible_result: { investigation_id: "inv-abc123" },
 };
 
-describe("oracle-v3 API schema (single source)", () => {
+describe("crucible API schema (single source)", () => {
     it("exposes exactly the four public tools", () => {
         expect(PUBLIC_TOOL_NAMES).toEqual([
-            "oracle_start",
-            "oracle_status",
-            "oracle_stop",
-            "oracle_result",
+            "crucible_start",
+            "crucible_status",
+            "crucible_stop",
+            "crucible_result",
         ]);
         expect(TOOL_SPECS).toHaveLength(4);
     });
@@ -94,45 +94,45 @@ describe("oracle-v3 API schema (single source)", () => {
     );
 
     it("rejects unknown arguments", () => {
-        expect(() => oracleStatusSpec.parse({ investigation_id: "inv-1", extra: 1 }))
+        expect(() => crucibleStatusSpec.parse({ investigation_id: "inv-1", extra: 1 }))
             .toThrow(SchemaValidationError);
-        expect(() => oracleStartSpec.parse(validStartArgs({ surprise: true })))
+        expect(() => crucibleStartSpec.parse(validStartArgs({ surprise: true })))
             .toThrow(SchemaValidationError);
     });
 
     it("rejects a non-object argument payload", () => {
-        expect(() => oracleStatusSpec.parse(null)).toThrow(SchemaValidationError);
-        expect(() => oracleStatusSpec.parse("nope")).toThrow(SchemaValidationError);
-        expect(() => oracleStatusSpec.parse([])).toThrow(SchemaValidationError);
+        expect(() => crucibleStatusSpec.parse(null)).toThrow(SchemaValidationError);
+        expect(() => crucibleStatusSpec.parse("nope")).toThrow(SchemaValidationError);
+        expect(() => crucibleStatusSpec.parse([])).toThrow(SchemaValidationError);
     });
 
     it("applies the metrics default and preserves it as an empty array", () => {
-        const parsed = oracleStartSpec.parse(validStartArgs());
+        const parsed = crucibleStartSpec.parse(validStartArgs());
         expect(parsed.metrics).toEqual([]);
         // Default is cloned, not shared.
         parsed.metrics.push({ key: "x", direction: "max" });
-        expect(oracleStartSpec.parse(validStartArgs()).metrics).toEqual([]);
+        expect(crucibleStartSpec.parse(validStartArgs()).metrics).toEqual([]);
     });
 
     it("normalizes nested metric objects and rejects bad enums/ranges", () => {
-        const parsed = oracleStartSpec.parse(validStartArgs({
+        const parsed = crucibleStartSpec.parse(validStartArgs({
             metrics: [{ key: "score", direction: "max", epsilon: 0.5 }],
         }));
         expect(parsed.metrics).toEqual([{ key: "score", direction: "max", epsilon: 0.5 }]);
 
-        expect(() => oracleStartSpec.parse(validStartArgs({
+        expect(() => crucibleStartSpec.parse(validStartArgs({
             metrics: [{ key: "score", direction: "sideways" }],
         }))).toThrow(SchemaValidationError);
-        expect(() => oracleStartSpec.parse(validStartArgs({
+        expect(() => crucibleStartSpec.parse(validStartArgs({
             metrics: [{ key: "score", direction: "max", epsilon: -1 }],
         }))).toThrow(SchemaValidationError);
     });
 
     it("enforces validation_cases minItems and item shape", () => {
-        expect(() => oracleStartSpec.parse(validStartArgs({
+        expect(() => crucibleStartSpec.parse(validStartArgs({
             validation_cases: [{ id: "only", expectation: "accept", path: "cases/only" }],
         }))).toThrow(SchemaValidationError);
-        expect(() => oracleStartSpec.parse(validStartArgs({
+        expect(() => crucibleStartSpec.parse(validStartArgs({
             validation_cases: [
                 { id: "good", expectation: "maybe", path: "cases/good" },
                 { id: "bad", expectation: "reject", path: "cases/bad" },
@@ -141,32 +141,32 @@ describe("oracle-v3 API schema (single source)", () => {
     });
 
     it("enforces worker_models uniqueness and bounds", () => {
-        expect(() => oracleStartSpec.parse(validStartArgs({ worker_models: ["dup", "dup"] })))
+        expect(() => crucibleStartSpec.parse(validStartArgs({ worker_models: ["dup", "dup"] })))
             .toThrow(SchemaValidationError);
-        expect(() => oracleStartSpec.parse(validStartArgs({ worker_models: [] })))
+        expect(() => crucibleStartSpec.parse(validStartArgs({ worker_models: [] })))
             .toThrow(SchemaValidationError);
     });
 
     it("enforces integer ranges for candidates_per_round and max_rounds", () => {
-        expect(() => oracleStartSpec.parse(validStartArgs({ candidates_per_round: 0 })))
+        expect(() => crucibleStartSpec.parse(validStartArgs({ candidates_per_round: 0 })))
             .toThrow(SchemaValidationError);
-        expect(() => oracleStartSpec.parse(validStartArgs({ candidates_per_round: 9 })))
+        expect(() => crucibleStartSpec.parse(validStartArgs({ candidates_per_round: 9 })))
             .toThrow(SchemaValidationError);
-        expect(() => oracleStartSpec.parse(validStartArgs({ max_rounds: 0 })))
+        expect(() => crucibleStartSpec.parse(validStartArgs({ max_rounds: 0 })))
             .toThrow(SchemaValidationError);
-        expect(() => oracleStartSpec.parse(validStartArgs({ candidates_per_round: 2.5 })))
+        expect(() => crucibleStartSpec.parse(validStartArgs({ candidates_per_round: 2.5 })))
             .toThrow(SchemaValidationError);
     });
 
     it("rejects a harness_id that looks like a filesystem path", () => {
-        expect(() => oracleStartSpec.parse(validStartArgs({ harness_id: "../escape" })))
+        expect(() => crucibleStartSpec.parse(validStartArgs({ harness_id: "../escape" })))
             .toThrow(SchemaValidationError);
-        expect(() => oracleStartSpec.parse(validStartArgs({ harness_id: "a/b" })))
+        expect(() => crucibleStartSpec.parse(validStartArgs({ harness_id: "a/b" })))
             .toThrow(SchemaValidationError);
     });
 
     it("accepts optional bounded_candidate_ids, deadline_iso, and reset_policy", () => {
-        const parsed = oracleStartSpec.parse(validStartArgs({
+        const parsed = crucibleStartSpec.parse(validStartArgs({
             bounded_candidate_ids: ["cand-a", "cand-b"],
             deadline_iso: "2026-07-10T09:00:00.000Z",
             reset_policy: "circuit_open",
@@ -174,23 +174,23 @@ describe("oracle-v3 API schema (single source)", () => {
         expect(parsed.bounded_candidate_ids).toEqual(["cand-a", "cand-b"]);
         expect(parsed.deadline_iso).toBe("2026-07-10T09:00:00.000Z");
         expect(parsed.reset_policy).toBe("circuit_open");
-        expect(() => oracleStartSpec.parse(validStartArgs({ reset_policy: "anything" })))
+        expect(() => crucibleStartSpec.parse(validStartArgs({ reset_policy: "anything" })))
             .toThrow(SchemaValidationError);
     });
 
     it("carries the acceptance_predicate object through unchanged", () => {
         const predicate = { kind: "all", predicates: [{ kind: "harness_pass" }] };
-        const parsed = oracleStartSpec.parse(validStartArgs({ acceptance_predicate: predicate }));
+        const parsed = crucibleStartSpec.parse(validStartArgs({ acceptance_predicate: predicate }));
         expect(parsed.acceptance_predicate).toEqual(predicate);
-        expect(() => oracleStartSpec.parse(validStartArgs({ acceptance_predicate: [] })))
+        expect(() => crucibleStartSpec.parse(validStartArgs({ acceptance_predicate: [] })))
             .toThrow(SchemaValidationError);
     });
 
-    it("keeps oracle_status/stop/result minimal (only investigation_id, plus optional reason)", () => {
-        expect(oracleStatusSpec.parameters.required).toEqual(["investigation_id"]);
-        expect(oracleResultSpec.parameters.required).toEqual(["investigation_id"]);
-        expect(oracleStopSpec.parameters.required).toEqual(["investigation_id"]);
-        expect(Object.keys(oracleStopSpec.parameters.properties).sort())
+    it("keeps crucible_status/stop/result minimal (only investigation_id, plus optional reason)", () => {
+        expect(crucibleStatusSpec.parameters.required).toEqual(["investigation_id"]);
+        expect(crucibleResultSpec.parameters.required).toEqual(["investigation_id"]);
+        expect(crucibleStopSpec.parameters.required).toEqual(["investigation_id"]);
+        expect(Object.keys(crucibleStopSpec.parameters.properties).sort())
             .toEqual(["investigation_id", "reason"]);
     });
 });

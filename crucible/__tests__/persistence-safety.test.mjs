@@ -1,4 +1,4 @@
-// oracle-v3/__tests__/persistence-safety.test.mjs
+// crucible/__tests__/persistence-safety.test.mjs
 //
 // Cross-cutting safety guarantees: read-only queries never mutate state,
 // local-file-only path rejection, and explicit schema-version fail-closed.
@@ -163,7 +163,7 @@ describe("local-file-only path rejection", () => {
     });
 
     it("rejects known cloud-sync roots", () => {
-        const err = catchCode(() => assertLocalDatabasePath("C:/Users/Someone/OneDrive/oracle/db.sqlite"));
+        const err = catchCode(() => assertLocalDatabasePath("C:/Users/Someone/OneDrive/crucible/db.sqlite"));
         expect(err.code).toBe(ERROR_CODES.LOCAL_PATH_REQUIRED);
         expect(err.details.reason).toBe("cloud-sync");
     });

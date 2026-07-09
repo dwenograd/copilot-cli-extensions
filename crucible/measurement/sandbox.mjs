@@ -1,4 +1,4 @@
-// oracle-v3/measurement/sandbox.mjs
+// crucible/measurement/sandbox.mjs
 //
 // SandboxProvider is the *interface only* between the measurement executor
 // and whatever real isolation mechanism the operator wires up (WSL2 rootfs,

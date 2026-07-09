@@ -1,4 +1,4 @@
-// oracle-v3/__tests__/measurement-parser.test.mjs
+// crucible/__tests__/measurement-parser.test.mjs
 //
 // Verifies the strict JSON result parser rejects everything it should.
 
@@ -33,7 +33,7 @@ describe("parseHarnessResult — happy paths", () => {
             metrics: { latencyMs: 42.5, throughput: 1000, exact: 0 },
             validationCases: { "case-a": true, "case-b": false },
             searchSpaceExhausted: true,
-            impossibilityCertificateHash: "sha256:oracle-impossibility-v1:" + "a".repeat(64),
+            impossibilityCertificateHash: "sha256:crucible-impossibility-v1:" + "a".repeat(64),
         };
         const r = parseHarnessResult(JSON.stringify(doc));
         expect(r.pass).toBe(false);

@@ -1,4 +1,4 @@
-// oracle-v3/persistence/canonical.mjs
+// crucible/persistence/canonical.mjs
 //
 // Canonical JSON serialization + the event-hash chain primitive.
 //
@@ -80,7 +80,7 @@ export function computeEventHash({
         evidenceKind,
         createdAt,
     });
-    return createHash("sha256").update("oracle-v3-event:").update(envelope).digest("hex");
+    return createHash("sha256").update("crucible-event:").update(envelope).digest("hex");
 }
 
 // SHA-256 of arbitrary bytes (used for inline artifact self-description).

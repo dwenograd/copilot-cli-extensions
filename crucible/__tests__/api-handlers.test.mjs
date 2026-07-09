@@ -1,6 +1,6 @@
-// oracle-v3/__tests__/api-handlers.test.mjs
+// crucible/__tests__/api-handlers.test.mjs
 //
-// Handler tests for the Oracle v3 four-tool API, driven with injected
+// Handler tests for the Crucible four-tool API, driven with injected
 // environment + runtime functions (fake supervisor, controllable pid liveness)
 // so nothing spawns a real process. Real domain / persistence / artifact-store /
 // measurement modules are used end-to-end. Covers: path/state resolution,
@@ -91,8 +91,8 @@ function makeWorkspace(label) {
     }, null, 2));
 
     const env = {
-        ORACLE_V3_ALLOWLIST_PATH: allowlistPath,
-        ORACLE_V3_STATE_ROOT: stateRoot,
+        CRUCIBLE_ALLOWLIST_PATH: allowlistPath,
+        CRUCIBLE_STATE_ROOT: stateRoot,
         COPILOT_SDK_PATH: path.join(root, "sdk"),
         COPILOT_CLI_PATH: path.join(root, "cli.exe"),
     };
@@ -460,9 +460,9 @@ describe("environment: path + state resolution", () => {
     });
 });
 
-// --- oracle_start ----------------------------------------------------------
+// --- crucible_start ----------------------------------------------------------
 
-describe("oracle_start", () => {
+describe("crucible_start", () => {
     it("freezes a contract, ingests validation cases, and starts the supervisor", () => {
         const workspace = makeWorkspace("start");
         const { deps, calls } = makeDeps(workspace.env);
@@ -470,7 +470,7 @@ describe("oracle_start", () => {
 
         expect(result.is_result).toBe(false);
         expect(result.idempotent).toBe(false);
-        expect(result.contract_hash).toMatch(/^sha256:oracle-contract-v1:[a-f0-9]{64}$/u);
+        expect(result.contract_hash).toMatch(/^sha256:crucible-contract-v1:[a-f0-9]{64}$/u);
 
         const expectedId = deriveInvestigationId({
             objective: "find a candidate scoring at least 90",
@@ -519,7 +519,7 @@ describe("oracle_start", () => {
         expect(aggregate.lastSeq).toBe(1);
     });
 
-    it("resumes a persisted pause on identical oracle_start reattach and ensures the supervisor", () => {
+    it("resumes a persisted pause on identical crucible_start reattach and ensures the supervisor", () => {
         const workspace = makeWorkspace("resume");
         const { deps, calls } = makeDeps(workspace.env);
         const args = startArgs(workspace.projectDir);
@@ -587,7 +587,7 @@ describe("oracle_start", () => {
 
         recordOperationalNonResult(workspace.stateRoot, started.investigation_id, {
             attemptId: "circuit-attempt",
-            code: "ORACLE_V3_RUNTIME_CIRCUIT_OPEN",
+            code: "CRUCIBLE_RUNTIME_CIRCUIT_OPEN",
             reason: "circuit open",
             details: { recoverable: false },
         });
@@ -655,7 +655,7 @@ describe("oracle_start", () => {
     });
 });
 
-describe("oracle_status", () => {
+describe("crucible_status", () => {
     it("reports nonterminal progress, contract hash, event head, and a recommendation", () => {
         const workspace = makeWorkspace("status");
         const { deps } = makeDeps(workspace.env);
@@ -798,9 +798,9 @@ describe("oracle_status", () => {
     });
 });
 
-// --- oracle_stop -----------------------------------------------------------
+// --- crucible_stop -----------------------------------------------------------
 
-describe("oracle_stop", () => {
+describe("crucible_stop", () => {
     it("does not claim resumability until the pause transition is persisted", () => {
         const workspace = makeWorkspace("stop");
         const { deps } = makeDeps(workspace.env);
@@ -861,9 +861,9 @@ describe("oracle_stop", () => {
     });
 });
 
-// --- oracle_result ---------------------------------------------------------
+// --- crucible_result ---------------------------------------------------------
 
-describe("oracle_result", () => {
+describe("crucible_result", () => {
     it("returns is_result:true with the verified terminal decision + hashes", () => {
         const workspace = makeWorkspace("result-verified");
         seedVerifiedResult(workspace.stateRoot, "verified-inv");
@@ -875,7 +875,7 @@ describe("oracle_result", () => {
         expect(result.decision).toBe("VERIFIED_RESULT");
         expect(result.candidate_id).toBe("cand-a");
         expect(result.evidence_hash).toMatch(/^sha256:/u);
-        expect(result.contract_hash).toMatch(/^sha256:oracle-contract-v1:/u);
+        expect(result.contract_hash).toMatch(/^sha256:crucible-contract-v1:/u);
         expect(typeof result.terminal_event_hash).toBe("string");
         expect(result.message).toContain("VERIFIED_RESULT");
     });

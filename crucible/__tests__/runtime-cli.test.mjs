@@ -8,7 +8,7 @@ import {
 import { mainRunnerCli } from "../runtime/runner-cli.mjs";
 import { mainSupervisorCli } from "../runtime/supervisor-cli.mjs";
 
-describe("Oracle v3 strict runtime CLIs", () => {
+describe("Crucible strict runtime CLIs", () => {
     it("rejects anything other than --config with an absolute JSON path", async () => {
         const runner = await mainRunnerCli(["--command", "node evil.js"], {
             stderr: { write() {} },
@@ -24,7 +24,7 @@ describe("Oracle v3 strict runtime CLIs", () => {
     });
 
     it("rejects unknown config fields and result paths outside stateDir", () => {
-        const root = path.resolve("C:\\oracle-runtime-config-test");
+        const root = path.resolve("C:\\crucible-runtime-config-test");
         const base = {
             investigationId: "inv",
             stateDir: path.join(root, "state"),

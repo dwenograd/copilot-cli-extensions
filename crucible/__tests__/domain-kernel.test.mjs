@@ -230,7 +230,7 @@ function forgeEvent(aggregate, type, payload) {
     };
 }
 
-describe("Oracle v3 event-sourced domain kernel", () => {
+describe("Crucible event-sourced domain kernel", () => {
     it("replays deterministically and verifies the event chain", () => {
         const context = commitCandidate(validateInvestigation(openInvestigation()));
         expect(context.aggregate.evidence["candidate-evidence"]).toMatchObject({

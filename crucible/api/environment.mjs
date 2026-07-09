@@ -1,6 +1,6 @@
-// oracle-v3/api/environment.mjs
+// crucible/api/environment.mjs
 //
-// Environment, configuration and local-state resolution for the Oracle v3 thin
+// Environment, configuration and local-state resolution for the Crucible thin
 // extension. Every path the extension touches is derived here from operator-
 // owned environment variables (never from tool arguments) and validated to be
 // on a trusted local filesystem. All failures are typed EnvironmentErrors so
@@ -21,10 +21,10 @@ import { EnvironmentError } from "./errors.mjs";
 // Fixed contract defaults the tool surface does not expose as arguments. These
 // are part of the frozen contract identity but are not operator-tunable knobs
 // at the thin-extension layer.
-export const POLICY_VERSION = "oracle-v3-policy-1";
+export const POLICY_VERSION = "crucible-policy-1";
 export const CRITICALITY = "standard";
 
-const DEFAULT_ROOT_DIRNAME = "OracleV3";
+const DEFAULT_ROOT_DIRNAME = "Crucible";
 const DEFAULT_ALLOWLIST_FILENAME = "harnesses.json";
 const DEFAULT_INVESTIGATIONS_DIRNAME = "investigations";
 const IDENTIFIER_RE = /^[A-Za-z0-9][A-Za-z0-9._@-]{0,127}$/u;
@@ -54,29 +54,29 @@ function localAppData(env) {
     const value = env?.LOCALAPPDATA;
     if (!hasText(value)) {
         throw new EnvironmentError(
-            "LOCALAPPDATA is not set; set ORACLE_V3_ALLOWLIST_PATH and ORACLE_V3_STATE_ROOT explicitly",
+            "LOCALAPPDATA is not set; set CRUCIBLE_ALLOWLIST_PATH and CRUCIBLE_STATE_ROOT explicitly",
             { variable: "LOCALAPPDATA" },
         );
     }
     return value;
 }
 
-// Operator-owned harness allowlist path: ORACLE_V3_ALLOWLIST_PATH, else the
+// Operator-owned harness allowlist path: CRUCIBLE_ALLOWLIST_PATH, else the
 // per-user default under %LOCALAPPDATA%. Never taken from tool arguments.
 export function resolveAllowlistPath(env) {
-    const raw = hasText(env?.ORACLE_V3_ALLOWLIST_PATH)
-        ? env.ORACLE_V3_ALLOWLIST_PATH
+    const raw = hasText(env?.CRUCIBLE_ALLOWLIST_PATH)
+        ? env.CRUCIBLE_ALLOWLIST_PATH
         : path.join(localAppData(env), DEFAULT_ROOT_DIRNAME, DEFAULT_ALLOWLIST_FILENAME);
-    return requireAbsoluteLocalPath(raw, "ORACLE_V3_ALLOWLIST_PATH", env);
+    return requireAbsoluteLocalPath(raw, "CRUCIBLE_ALLOWLIST_PATH", env);
 }
 
-// Local investigation state root: ORACLE_V3_STATE_ROOT, else default under
+// Local investigation state root: CRUCIBLE_STATE_ROOT, else default under
 // %LOCALAPPDATA%.
 export function resolveStateRoot(env) {
-    const raw = hasText(env?.ORACLE_V3_STATE_ROOT)
-        ? env.ORACLE_V3_STATE_ROOT
+    const raw = hasText(env?.CRUCIBLE_STATE_ROOT)
+        ? env.CRUCIBLE_STATE_ROOT
         : path.join(localAppData(env), DEFAULT_ROOT_DIRNAME, DEFAULT_INVESTIGATIONS_DIRNAME);
-    return requireAbsoluteLocalPath(raw, "ORACLE_V3_STATE_ROOT", env);
+    return requireAbsoluteLocalPath(raw, "CRUCIBLE_STATE_ROOT", env);
 }
 
 // Copilot SDK path: COPILOT_SDK_PATH (required, no default).
@@ -87,10 +87,10 @@ export function resolveSdkPath(env) {
     return requireAbsoluteLocalPath(env.COPILOT_SDK_PATH, "COPILOT_SDK_PATH", env);
 }
 
-// CLI executable: ORACLE_V3_CLI_PATH, else the environment-supplied strict local
+// CLI executable: CRUCIBLE_CLI_PATH, else the environment-supplied strict local
 // absolute default COPILOT_CLI_PATH. Required — fail clearly if neither exists.
 export function resolveCliPath(env) {
-    let raw = hasText(env?.ORACLE_V3_CLI_PATH) ? env.ORACLE_V3_CLI_PATH : env?.COPILOT_CLI_PATH;
+    let raw = hasText(env?.CRUCIBLE_CLI_PATH) ? env.CRUCIBLE_CLI_PATH : env?.COPILOT_CLI_PATH;
     if (!hasText(raw)) {
         try {
             const output = execFileSync(
@@ -110,14 +110,14 @@ export function resolveCliPath(env) {
     }
     if (!hasText(raw)) {
         throw new EnvironmentError(
-            "CLI executable path is required (set ORACLE_V3_CLI_PATH/COPILOT_CLI_PATH or place copilot on PATH)",
-            { variable: "ORACLE_V3_CLI_PATH" },
+            "CLI executable path is required (set CRUCIBLE_CLI_PATH/COPILOT_CLI_PATH or place copilot on PATH)",
+            { variable: "CRUCIBLE_CLI_PATH" },
         );
     }
-    return requireAbsoluteLocalPath(raw, "ORACLE_V3_CLI_PATH", env);
+    return requireAbsoluteLocalPath(raw, "CRUCIBLE_CLI_PATH", env);
 }
 
-// Resolve every runtime path oracle_start needs in one place, failing clearly
+// Resolve every runtime path crucible_start needs in one place, failing clearly
 // if any required environment configuration is unavailable.
 export function resolveStartEnvironment(env) {
     return Object.freeze({
@@ -170,7 +170,7 @@ export function deriveInvestigationId({ objective, projectDir, harnessId }) {
         throw new EnvironmentError("harness_id must be a safe identifier", { field: "harness_id" });
     }
     const material = [
-        "oracle-v3-investigation-v1",
+        "crucible-investigation-v1",
         harnessId,
         canonicalObj,
         normalizeProjectDirForHash(projectDir),

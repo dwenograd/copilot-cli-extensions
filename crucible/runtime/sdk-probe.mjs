@@ -17,7 +17,7 @@ const { CopilotClient, RuntimeConnection } = await import(pathToFileURL(path.joi
 const client = new CopilotClient({
     connection: RuntimeConnection.forStdio({ path: cliPath }),
     mode: "empty",
-    baseDirectory: process.env.ORACLE_PROBE_HOME,
+    baseDirectory: process.env.CRUCIBLE_PROBE_HOME,
     workingDirectory: process.cwd(),
     logLevel: "error",
 });
@@ -34,14 +34,14 @@ try {
 
         const session = await client.createSession({
             sessionId,
-            clientName: "oracle-v3-runtime-probe",
+            clientName: "crucible-runtime-probe",
             model: "gpt-5.4-mini",
             reasoningEffort: "low",
-            availableTools: ["custom:oracle_worker_identity"],
+            availableTools: ["custom:crucible_worker_identity"],
             skipCustomInstructions: true,
             tools: [{
-                name: "oracle_worker_identity",
-                description: "Return the code-stamped identity for this Oracle worker.",
+                name: "crucible_worker_identity",
+                description: "Return the code-stamped identity for this Crucible worker.",
                 defer: "never",
                 skipPermission: true,
                 parameters: {
@@ -64,7 +64,7 @@ try {
         });
 
         const response = await session.sendAndWait({
-            prompt: `Call oracle_worker_identity exactly once with nonce "${nonce}". Return only its JSON result.`,
+            prompt: `Call crucible_worker_identity exactly once with nonce "${nonce}". Return only its JSON result.`,
         }, 60_000);
 
         await session.disconnect();

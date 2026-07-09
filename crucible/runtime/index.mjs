@@ -1,6 +1,6 @@
 export {
     RUNTIME_ERROR_CODES,
-    OracleRuntimeError,
+    CrucibleRuntimeError,
     RuntimeConfigError,
     RuntimeIntegrityError,
     WorkerProtocolError,

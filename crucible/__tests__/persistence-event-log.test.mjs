@@ -1,4 +1,4 @@
-// oracle-v3/__tests__/persistence-event-log.test.mjs
+// crucible/__tests__/persistence-event-log.test.mjs
 //
 // Event-log behaviour: CAS conflict under concurrency, idempotent commutative
 // evidence, single-terminal enforcement, transactional rollback, and structural

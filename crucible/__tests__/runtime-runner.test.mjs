@@ -228,7 +228,7 @@ function runnerDependencies(workerPool, extra = {}) {
     };
 }
 
-describe("Oracle v3 autonomous runner", () => {
+describe("Crucible autonomous runner", () => {
     it("validates both frozen sides, measures concurrent proposals, and verifies unattended", async () => {
         const setup = setupInvestigation("positive", {
             candidatesPerRound: 2,
@@ -257,7 +257,7 @@ describe("Oracle v3 autonomous runner", () => {
         const replayed = replaySetup(setup);
         expect(replayed.aggregate.terminal.decision).toBe("VERIFIED_RESULT");
         expect(replayed.aggregate.capabilityEpochs["runner-epoch-1"].capabilities)
-            .toContain("oracle-v3-autonomous-runtime");
+            .toContain("crucible-autonomous-runtime");
         expect(replayed.aggregate.commandOrder.every((commandId) =>
             replayed.aggregate.commands[commandId].capabilityEpochId === "runner-epoch-1"))
             .toBe(true);
@@ -270,7 +270,7 @@ describe("Oracle v3 autonomous runner", () => {
             "known-bad": { expectation: "reject", outcome: "reject", matched: true },
         });
         expect(validationObservation.data.compositeReceiptHash).toMatch(
-            /^sha256:oracle-runtime-validation-receipts-v1:[a-f0-9]{64}$/,
+            /^sha256:crucible-runtime-validation-receipts-v1:[a-f0-9]{64}$/,
         );
         expect(harnessCandidateEvidenceItems(replayed.aggregate)).toHaveLength(2);
 
@@ -406,7 +406,7 @@ describe("Oracle v3 autonomous runner", () => {
                 },
             }),
         )).rejects.toMatchObject({
-            code: "ORACLE_V3_RUNTIME_INJECTED_CRASH",
+            code: "CRUCIBLE_RUNTIME_INJECTED_CRASH",
         });
         expect(fs.readdirSync(path.join(setup.stateDir, "runtime-temp"))).toEqual([]);
 

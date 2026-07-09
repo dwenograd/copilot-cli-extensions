@@ -1,4 +1,4 @@
-// oracle-v3/measurement/receipt.mjs
+// crucible/measurement/receipt.mjs
 //
 // A measurement receipt is the tamper-evident record of one attempt to run
 // a harness inside the trusted boundary. It contains every input that
@@ -33,9 +33,9 @@ import {
     immutableCanonical,
 } from "../domain/canonical.mjs";
 
-export const RECEIPT_HASH_ALGORITHM = "sha256:oracle-measurement-receipt-v1";
-export const ARGV_HASH_ALGORITHM = "sha256:oracle-measurement-argv-v1";
-export const ENV_HASH_ALGORITHM = "sha256:oracle-measurement-env-v1";
+export const RECEIPT_HASH_ALGORITHM = "sha256:crucible-measurement-receipt-v1";
+export const ARGV_HASH_ALGORITHM = "sha256:crucible-measurement-argv-v1";
+export const ENV_HASH_ALGORITHM = "sha256:crucible-measurement-env-v1";
 export const RECEIPT_VERSION = 2;
 
 // Keys within the receipt that are input-derived (deterministic given the

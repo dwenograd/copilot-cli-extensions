@@ -1,28 +1,28 @@
-# Oracle v3
+# Crucible
 
-Oracle v3 is a fully automated local investigation runner. Model workers may
+Crucible is a fully automated local investigation runner. Model workers may
 propose candidate file sets, but they receive only one custom submission tool
 and cannot execute commands. A deterministic operator-allowlisted harness is
 the only authority that can establish correctness.
 
 ## Public tools
 
-- `oracle_start` freezes a contract, ingests two-sided validation cases, and
+- `crucible_start` freezes a contract, ingests two-sided validation cases, and
   launches the detached supervisor.
-- `oracle_status` reports progress and whether a terminal result is available.
+- `crucible_status` reports progress and whether a terminal result is available.
   It never reveals the decision.
-- `oracle_stop` requests a persisted resumable pause.
-- `oracle_result` is the only tool that may return `VERIFIED_RESULT` or
+- `crucible_stop` requests a persisted resumable pause.
+- `crucible_result` is the only tool that may return `VERIFIED_RESULT` or
   `TARGET_UNREACHABLE`.
 
 ## Harness allowlist
 
 The allowlist defaults to:
 
-`%LOCALAPPDATA%\OracleV3\harnesses.json`
+`%LOCALAPPDATA%\Crucible\harnesses.json`
 
-Override it with `ORACLE_V3_ALLOWLIST_PATH`. Investigation state defaults to
-`%LOCALAPPDATA%\OracleV3\investigations`.
+Override it with `CRUCIBLE_ALLOWLIST_PATH`. Investigation state defaults to
+`%LOCALAPPDATA%\Crucible\investigations`.
 
 Do not hand-edit this file. Author it with the operator CLI
 (`tools/configure-harness.mjs`, described below), which computes every content
@@ -38,13 +38,13 @@ Example:
       "executable": "C:\\Program Files\\nodejs\\node.exe",
       "executableSha256": "<sha256 hex>",
       "argvTemplate": [
-        "C:\\trusted\\oracle-harness.mjs",
+        "C:\\trusted\\crucible-harness.mjs",
         "{{candidatePath}}",
         "{{attemptId}}"
       ],
       "dependencies": [
         {
-          "path": "C:\\trusted\\oracle-harness.mjs",
+          "path": "C:\\trusted\\crucible-harness.mjs",
           "sha256": "<sha256 hex>",
           "role": "script"
         }
@@ -72,7 +72,7 @@ Each `validationCases[<id>].snapshotHash` is an ArtifactStore snapshot id
 (`sha256:<64 hex>`) — the deterministic content address of a validation-case
 directory. The allowlist stores **only** the snapshot id (and an optional
 description); the accept/reject **expectation** lives in the frozen
-`oracle_start` contract, never here.
+`crucible_start` contract, never here.
 
 The harness must emit exactly one JSON object:
 
@@ -110,8 +110,8 @@ node tools/configure-harness.mjs --config <config.json> [--allowlist <path>] [--
 - `--config <path>` — a strict JSON harness config (required). Unknown keys are
   rejected.
 - `--allowlist <path>` — output allowlist path. Defaults to
-  `%LOCALAPPDATA%\OracleV3\harnesses.json`. If you overrode the extension's
-  allowlist with `ORACLE_V3_ALLOWLIST_PATH`, pass that same path here so both
+  `%LOCALAPPDATA%\Crucible\harnesses.json`. If you overrode the extension's
+  allowlist with `CRUCIBLE_ALLOWLIST_PATH`, pass that same path here so both
   point at one file.
 - `--replace` — allow overwriting an entry whose `executable` changed. Without
   it, a differing-executable overwrite is refused (same-executable updates are
@@ -123,8 +123,8 @@ The config lists **paths**, not hashes — the tool computes them:
 {
   "id": "example-harness",
   "executable": "C:\\Program Files\\nodejs\\node.exe",
-  "argvTemplate": ["C:\\trusted\\oracle-harness.mjs", "{{candidatePath}}", "{{attemptId}}"],
-  "dependencies": [{ "path": "C:\\trusted\\oracle-harness.mjs", "role": "script" }],
+  "argvTemplate": ["C:\\trusted\\crucible-harness.mjs", "{{candidatePath}}", "{{attemptId}}"],
+  "dependencies": [{ "path": "C:\\trusted\\crucible-harness.mjs", "role": "script" }],
   "allowedEnv": {},
   "timeoutMs": 30000,
   "maxStdoutBytes": 1048576,
@@ -156,21 +156,21 @@ What the tool does, fail-closed, in one pass:
    file to `<allowlist>.bak` → atomic rename), after re-validating the exact
    bytes through the real loader.
 
-### Deterministic snapshot ids must match `oracle_start`
+### Deterministic snapshot ids must match `crucible_start`
 
 The snapshot id the tool records is the content address of the `sourceDir`
-contents, computed the same way `oracle_start` computes it when it ingests the
+contents, computed the same way `crucible_start` computes it when it ingests the
 validation-case directory into the per-investigation `ArtifactStore`. It is a
 pure function of the directory's files (sorted relative posix paths + per-file
 SHA-256), independent of the store location, so a throwaway store here yields
-the identical id `oracle_start` recomputes later.
+the identical id `crucible_start` recomputes later.
 
-For validation to line up, the directory `oracle_start` ingests
+For validation to line up, the directory `crucible_start` ingests
 (`project_dir` + the case `path`) must have **byte-for-byte identical contents**
 to the `sourceDir` configured here. If the contents differ, the ingested
 snapshot id will differ from the pinned `snapshotHash` and the case will not
 match the allowlisted set. Freeze the case directories before configuring the
-harness and keep them unchanged through `oracle_start`.
+harness and keep them unchanged through `crucible_start`.
 
 
 ## State model
@@ -178,6 +178,6 @@ harness and keep them unchanged through `oracle_start`.
 Each investigation uses a local SQLite WAL event store plus a content-addressed
 artifact store. Domain decisions are replayable from an append-only hash chain.
 External effects use fenced reservations, and terminal decisions are unique
-database-constrained events. `oracle_result` reports only persisted terminal
+database-constrained events. `crucible_result` reports only persisted terminal
 events; deadlines, pauses, failures, and budget exhaustion remain explicit
 non-results.

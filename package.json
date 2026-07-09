@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Eight Copilot CLI extensions: five multi-model orchestrators; Oracle v3, an autonomous evidence-judged investigation runner; zerotrust-sourcecheck, a 32-role source security council with hardened runtime wrappers; and mcp-autoreload for stale MCP recovery.",
+  "description": "Eight Copilot CLI extensions: five multi-model orchestrators; Crucible, an autonomous evidence-judged investigation runner; zerotrust-sourcecheck, a 32-role source security council with hardened runtime wrappers; and mcp-autoreload for stale MCP recovery.",
   "license": "MIT",
   "repository": {
     "type": "git",

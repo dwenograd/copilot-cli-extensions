@@ -1,7 +1,7 @@
-// oracle-v3/persistence/schema.mjs
+// crucible/persistence/schema.mjs
 //
 // Schema definition, explicit version stamping, and connection configuration
-// for the Oracle v3 event repository.
+// for the Crucible event repository.
 //
 // Versioning is explicit and fail-closed: the schema version is stamped both in
 // `PRAGMA user_version` and in the `schema_meta` table. Opening a database

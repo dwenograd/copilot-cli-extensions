@@ -9,7 +9,7 @@ Eight interrelated Copilot CLI extensions for autonomous investigation, multi-mo
 | **triple-plan** | 3 planning agents in parallel → merged plan with consensus + alternatives + contested decisions |
 | **debate** | 2 debaters arguing opposing positions + 1 independent judge |
 | **duck-council** | 6 role-specialized rubber-ducks (security/stability/perf/maintainer/skeptic/user) + 1 judge synthesis pass |
-| **oracle-v3** | Fully automated evidence-judged investigation runner. Model workers propose candidates through a single restricted tool; an operator-allowlisted deterministic harness owns correctness. Exposes `oracle_start`, `oracle_status`, `oracle_stop`, and `oracle_result`. |
+| **crucible** | Fully automated evidence-judged investigation runner. Model workers propose candidates through a single restricted tool; an operator-allowlisted deterministic harness owns correctness. Exposes `crucible_start`, `crucible_status`, `crucible_stop`, and `crucible_result`. |
 | **zerotrust-sourcecheck** | 32-role multi-model security council against a GitHub URL OR an on-disk local directory. API-direct for URL audits (no source bytes on disk); local-source mode for already-downloaded repos via `view`/`grep`/`glob` with path containment. Build-mode wrappers (clone/install/build) for runtime verification. Section 9b walks the operator through defang / delete-project / keep-as-is per HIGH/CRITICAL finding when any on-disk content was produced. |
 | **mcp-autoreload** | Auto-reloads a stale MCP server connection when an MCP tool fails with a transport error, verifies it reconnected, then asks the agent to retry; escalates to the user if a reload doesn't recover. Exposes a manual `mcp_reload_now` tool. (Hook-based utility — does not use `_shared`.) |
 
@@ -39,7 +39,7 @@ npm install
 # Restart Copilot CLI (or run `extensions_reload` from inside it).
 ```
 
-After restart, the orchestrator/audit tools plus Oracle's four-tool lifecycle become invokable in any session.
+After restart, the orchestrator/audit tools plus Crucible's four-tool lifecycle become invokable in any session.
 
 > **Already have a `~/.copilot/extensions/` directory?** Back it up first; the clone needs to write into an empty path. Existing extensions can be moved alongside (the workspace's `_shared/` is namespaced under `_shared/`, and each extension lives in its own subdirectory).
 
@@ -68,7 +68,7 @@ extensions/
 ├── triple-plan/                # same structure
 ├── debate/                     # same structure
 ├── duck-council/               # same structure (+ AGENTS.md no-`git diff` reminder)
-├── oracle-v3/                  # autonomous event-sourced investigation runner
+├── crucible/                  # autonomous event-sourced investigation runner
 │   ├── extension.mjs           # four-tool thin SDK adapter
 │   ├── api/                    # generated schemas + start/status/stop/result handlers
 │   ├── domain/                 # pure reducer, decisions, contracts, evidence ranking
@@ -129,7 +129,7 @@ npm install   # one-time
 npm test
 ```
 
-`npm test` runs both test runners in sequence: `vitest` for the orchestrators, Oracle v3, and `_shared/`, then `node --test` for `zerotrust-sourcecheck/`.
+`npm test` runs both test runners in sequence: `vitest` for the orchestrators, Crucible, and `_shared/`, then `node --test` for `zerotrust-sourcecheck/`.
 
 If you change a packet wording deliberately in any orchestrator extension, regenerate vitest snapshots once with `npm run test:update`. The zerotrust suite has no snapshots — its tests are explicit assertions.
 

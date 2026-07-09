@@ -121,7 +121,7 @@ function request(candidateId = "candidate-a") {
     };
 }
 
-describe("Oracle v3 SDK worker pool", () => {
+describe("Crucible SDK worker pool", () => {
     it("uses one non-deferred custom tool and code-stamps worker identity", async () => {
         const { pool, captured } = await makePool("valid");
         const proposal = await pool.propose(request());
@@ -133,10 +133,10 @@ describe("Oracle v3 SDK worker pool", () => {
             challengeNonce: "challenge-1",
         });
         expect(proposal.identity.promptHash).toMatch(
-            /^sha256:oracle-runtime-worker-prompt-v1:[a-f0-9]{64}$/,
+            /^sha256:crucible-runtime-worker-prompt-v1:[a-f0-9]{64}$/,
         );
         expect(proposal.identity.payloadHash).toMatch(
-            /^sha256:oracle-runtime-candidate-payload-v1:[a-f0-9]{64}$/,
+            /^sha256:crucible-runtime-candidate-payload-v1:[a-f0-9]{64}$/,
         );
 
         const config = captured.configs[0];

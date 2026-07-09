@@ -1,6 +1,6 @@
-// oracle-v3/persistence/artifact-store.mjs
+// crucible/persistence/artifact-store.mjs
 //
-// Immutable content-addressed artifact store (CAS) for the Oracle v3 audit
+// Immutable content-addressed artifact store (CAS) for the Crucible audit
 // trail. This is the filesystem durability layer that the event repository
 // deliberately does NOT implement: the repository only tracks artifact
 // *metadata* and refuses to reference an external artifact until a caller has
@@ -38,7 +38,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { createHash, randomBytes } from "node:crypto";
 
-import { OraclePersistenceError, InvalidArgumentError } from "./errors.mjs";
+import { CruciblePersistenceError, InvalidArgumentError } from "./errors.mjs";
 import { assertLocalDatabasePath } from "./paths.mjs";
 import { canonicalize } from "./canonical.mjs";
 
@@ -48,7 +48,7 @@ const ALGO = "sha256";
 const HEX_LEN = 64;
 const OBJECT_ID_RE = /^([a-z0-9]+):([0-9a-f]+)$/u;
 const HEX64_RE = /^[0-9a-f]{64}$/u;
-const SNAPSHOT_TYPE = "oracle-v3-snapshot";
+const SNAPSHOT_TYPE = "crucible-snapshot";
 const SNAPSHOT_VERSION = 1;
 const STAGE_CHUNK = 1 << 16;
 
@@ -63,20 +63,20 @@ const DEFAULT_LIMITS = Object.freeze({
 // --- typed errors ---------------------------------------------------------
 
 export const ARTIFACT_STORE_ERROR_CODES = Object.freeze({
-    INVALID_ARGUMENT: "ORACLE_CAS_INVALID_ARGUMENT",
-    STORE_ROOT_INVALID: "ORACLE_CAS_STORE_ROOT_INVALID",
-    UNSAFE_PATH: "ORACLE_CAS_UNSAFE_PATH",
-    SYMLINK_REJECTED: "ORACLE_CAS_SYMLINK_REJECTED",
-    LIMIT_EXCEEDED: "ORACLE_CAS_LIMIT_EXCEEDED",
-    OBJECT_NOT_FOUND: "ORACLE_CAS_OBJECT_NOT_FOUND",
-    OBJECT_CORRUPT: "ORACLE_CAS_OBJECT_CORRUPT",
-    DESTINATION_EXISTS: "ORACLE_CAS_DESTINATION_EXISTS",
-    SNAPSHOT_INVALID: "ORACLE_CAS_SNAPSHOT_INVALID",
-    SOURCE_CHANGED: "ORACLE_CAS_SOURCE_CHANGED",
-    IO_ERROR: "ORACLE_CAS_IO_ERROR",
+    INVALID_ARGUMENT: "CRUCIBLE_CAS_INVALID_ARGUMENT",
+    STORE_ROOT_INVALID: "CRUCIBLE_CAS_STORE_ROOT_INVALID",
+    UNSAFE_PATH: "CRUCIBLE_CAS_UNSAFE_PATH",
+    SYMLINK_REJECTED: "CRUCIBLE_CAS_SYMLINK_REJECTED",
+    LIMIT_EXCEEDED: "CRUCIBLE_CAS_LIMIT_EXCEEDED",
+    OBJECT_NOT_FOUND: "CRUCIBLE_CAS_OBJECT_NOT_FOUND",
+    OBJECT_CORRUPT: "CRUCIBLE_CAS_OBJECT_CORRUPT",
+    DESTINATION_EXISTS: "CRUCIBLE_CAS_DESTINATION_EXISTS",
+    SNAPSHOT_INVALID: "CRUCIBLE_CAS_SNAPSHOT_INVALID",
+    SOURCE_CHANGED: "CRUCIBLE_CAS_SOURCE_CHANGED",
+    IO_ERROR: "CRUCIBLE_CAS_IO_ERROR",
 });
 
-export class ArtifactStoreError extends OraclePersistenceError {
+export class ArtifactStoreError extends CruciblePersistenceError {
     constructor(code, message, details) {
         super(code, message, details);
         this.name = "ArtifactStoreError";
@@ -321,7 +321,7 @@ export class ArtifactStore {
             // fsync-semantics problems as a WAL database there.
             resolved = assertLocalDatabasePath(root, { denyRoots, env });
         } catch (err) {
-            if (err instanceof OraclePersistenceError && err.code !== ARTIFACT_STORE_ERROR_CODES.INVALID_ARGUMENT) {
+            if (err instanceof CruciblePersistenceError && err.code !== ARTIFACT_STORE_ERROR_CODES.INVALID_ARGUMENT) {
                 throw err;
             }
             throw new ArtifactStoreError(
@@ -736,7 +736,7 @@ export class ArtifactStore {
         try {
             resolvedRoot = assertLocalDatabasePath(sourceDir, { denyRoots, env });
         } catch (err) {
-            if (err instanceof OraclePersistenceError && err.code !== ARTIFACT_STORE_ERROR_CODES.INVALID_ARGUMENT) {
+            if (err instanceof CruciblePersistenceError && err.code !== ARTIFACT_STORE_ERROR_CODES.INVALID_ARGUMENT) {
                 throw err;
             }
             throw new InvalidArgumentError(`invalid sourceDir: ${err.message}`, { sourceDir });
@@ -784,7 +784,7 @@ export class ArtifactStore {
             entries,
         };
         const manifestBytes = Buffer.from(canonicalize(manifest), "utf8");
-        const manifestMeta = this.putBytes(manifestBytes, { contentType: "application/vnd.oracle-v3.snapshot+json" });
+        const manifestMeta = this.putBytes(manifestBytes, { contentType: "application/vnd.crucible.snapshot+json" });
 
         return {
             snapshot: manifestMeta.id,

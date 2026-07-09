@@ -52,9 +52,9 @@ function resolveNodeExecutable(env, explicitPath) {
     if (typeof explicitPath === "string" && path.isAbsolute(explicitPath)) {
         return explicitPath;
     }
-    if (typeof env?.ORACLE_V3_NODE_PATH === "string"
-        && path.isAbsolute(env.ORACLE_V3_NODE_PATH)) {
-        return env.ORACLE_V3_NODE_PATH;
+    if (typeof env?.CRUCIBLE_NODE_PATH === "string"
+        && path.isAbsolute(env.CRUCIBLE_NODE_PATH)) {
+        return env.CRUCIBLE_NODE_PATH;
     }
     if (/^node(?:\.exe)?$/iu.test(path.basename(process.execPath))) {
         return process.execPath;
@@ -77,7 +77,7 @@ function resolveNodeExecutable(env, explicitPath) {
     } catch {
         // Fall through to the typed configuration error below.
     }
-    throw new Error("Oracle v3 supervisor requires Node on PATH or ORACLE_V3_NODE_PATH");
+    throw new Error("Crucible supervisor requires Node on PATH or CRUCIBLE_NODE_PATH");
 }
 
 export function startSupervisor(input, dependencies = {}) {
@@ -122,7 +122,7 @@ export function readStatus({ stateDir, investigationId }) {
 export function requestStop({
     stateDir,
     investigationId,
-    reason = "Stop requested by the Oracle v3 extension adapter.",
+    reason = "Stop requested by the Crucible extension adapter.",
     pauseRequested = true,
     requestId = null,
     repositoryFactory = openRepository,

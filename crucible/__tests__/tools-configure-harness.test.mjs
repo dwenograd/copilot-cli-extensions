@@ -1,4 +1,4 @@
-// oracle-v3/__tests__/tools-configure-harness.test.mjs
+// crucible/__tests__/tools-configure-harness.test.mjs
 //
 // Verifies the operator harness-allowlist configuration CLI
 // (tools/configure-harness.mjs): first create, preservation of unrelated
@@ -62,7 +62,7 @@ function workspace(label) {
     const executable = writeFile(path.join(root, "harness.bin"), "#!fake harness\n");
     const acceptDir = makeDir(path.join(root, "cases", "accept"), { "a.txt": "accept-content" });
     const rejectDir = makeDir(path.join(root, "cases", "reject"), { "b.txt": "reject-content" });
-    const allowlistPath = path.join(root, "OracleV3", "harnesses.json");
+    const allowlistPath = path.join(root, "Crucible", "harnesses.json");
     const env = { LOCALAPPDATA: path.join(root, "localappdata") };
     return { root, executable, acceptDir, rejectDir, allowlistPath, env };
 }
@@ -108,7 +108,7 @@ describe("configureHarness — first create", () => {
         expect(result.schemaVersion).toBe(1);
         expect(result.allowlistPath).toBe(ws.allowlistPath);
         expect(result.entryId).toBe("example-harness");
-        expect(result.entryHash).toMatch(/^sha256:oracle-measurement-entry-v1:[a-f0-9]{64}$/);
+        expect(result.entryHash).toMatch(/^sha256:crucible-measurement-entry-v1:[a-f0-9]{64}$/);
         expect(result.executableSha256).toMatch(/^[a-f0-9]{64}$/);
         expect(result.backupPath).toBeNull();
         expect(result.replaced).toBe(false);
@@ -127,7 +127,7 @@ describe("configureHarness — first create", () => {
         expect(entry.validationCases.bad.snapshotHash).toBe(result.validationSnapshots.bad);
 
         // Expectations are NEVER written to the allowlist — they belong to the
-        // frozen oracle_start contract.
+        // frozen crucible_start contract.
         const raw = JSON.parse(fs.readFileSync(ws.allowlistPath, "utf8"));
         const rawCase = raw.entries["example-harness"].validationCases.good;
         expect(rawCase).not.toHaveProperty("expectation");
@@ -216,7 +216,7 @@ describe("configureHarness — replacement refusal / allow", () => {
 });
 
 describe("configureHarness — deterministic snapshot hashes", () => {
-    it("produces the same snapshot id a fresh ArtifactStore would compute (matches oracle_start)", () => {
+    it("produces the same snapshot id a fresh ArtifactStore would compute (matches crucible_start)", () => {
         const ws = workspace("determ");
         const result = configureHarness({ config: baseConfig(ws), allowlistPath: ws.allowlistPath, env: ws.env });
 
@@ -402,7 +402,7 @@ describe("configureHarness — throwaway store cleanup", () => {
         const ws = workspace("cleanup");
         configureHarness({ config: baseConfig(ws), allowlistPath: ws.allowlistPath, env: ws.env });
         const leftovers = fs.readdirSync(path.dirname(ws.allowlistPath))
-            .filter((name) => name.startsWith(".oracle-configure-store-"));
+            .filter((name) => name.startsWith(".crucible-configure-store-"));
         expect(leftovers).toEqual([]);
     });
 
@@ -416,17 +416,17 @@ describe("configureHarness — throwaway store cleanup", () => {
         // allowlistDir may not exist if we failed very early; guard the read.
         const dir = path.dirname(ws.allowlistPath);
         const leftovers = fs.existsSync(dir)
-            ? fs.readdirSync(dir).filter((name) => name.startsWith(".oracle-configure-store-"))
+            ? fs.readdirSync(dir).filter((name) => name.startsWith(".crucible-configure-store-"))
             : [];
         expect(leftovers).toEqual([]);
     });
 });
 
 describe("resolveOutputAllowlistPath", () => {
-    it("defaults to %LOCALAPPDATA%\\OracleV3\\harnesses.json", () => {
+    it("defaults to %LOCALAPPDATA%\\Crucible\\harnesses.json", () => {
         const ws = workspace("default");
         const resolved = resolveOutputAllowlistPath(undefined, { LOCALAPPDATA: ws.root });
-        expect(resolved).toBe(path.join(ws.root, "OracleV3", "harnesses.json"));
+        expect(resolved).toBe(path.join(ws.root, "Crucible", "harnesses.json"));
     });
 
     it("prefers an explicit path over the default", () => {

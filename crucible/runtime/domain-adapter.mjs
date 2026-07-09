@@ -17,7 +17,7 @@ import {
     openRepository,
 } from "../persistence/index.mjs";
 import {
-    OracleRuntimeError,
+    CrucibleRuntimeError,
     RUNTIME_ERROR_CODES,
     RuntimeConfigError,
     RuntimeIntegrityError,
@@ -74,7 +74,7 @@ function assertRepositoryDomainRow(row) {
     }
     const domainEvent = row.payload.domainEvent;
     if (row.seq !== domainEvent?.seq) {
-        throw new OracleRuntimeError(
+        throw new CrucibleRuntimeError(
             RUNTIME_ERROR_CODES.DOMAIN_SEQUENCE_MISMATCH,
             "Persistence sequence does not equal domain sequence",
             { persistenceSeq: row.seq, domainSeq: domainEvent?.seq ?? null },
@@ -115,12 +115,12 @@ export class DomainRepositoryAdapter {
         if (ensure) {
             this.#repository.ensureInvestigation({
                 investigationId: this.#investigationId,
-                metadata: { role: "oracle-v3-domain" },
+                metadata: { role: "crucible-domain" },
             });
             this.#repository.ensureInvestigation({
                 investigationId: this.#operationalInvestigationId,
                 metadata: {
-                    role: "oracle-v3-runtime-evidence",
+                    role: "crucible-runtime-evidence",
                     domainInvestigationId: this.#investigationId,
                 },
             });
@@ -179,7 +179,7 @@ export class DomainRepositoryAdapter {
     openInvestigation(contract) {
         const current = this.replay();
         if (current.domainEvents.length !== 0) {
-            throw new OracleRuntimeError(
+            throw new CrucibleRuntimeError(
                 RUNTIME_ERROR_CODES.DOMAIN_EVENT_INVALID,
                 "Investigation already has domain events",
                 { investigationId: this.#investigationId },
@@ -198,7 +198,7 @@ export class DomainRepositoryAdapter {
         if ((aggregate.pause !== null
                 && domainEvent?.type !== EVENT_TYPES.INVESTIGATION_RESUMED)
             || aggregate.nonResults.length > 0) {
-            throw new OracleRuntimeError(
+            throw new CrucibleRuntimeError(
                 RUNTIME_ERROR_CODES.DOMAIN_EVENT_INVALID,
                 "Paused investigations accept only resume; non-result investigations reject all subsequent domain events",
                 {
@@ -211,7 +211,7 @@ export class DomainRepositoryAdapter {
         try {
             nextAggregate = reduceEvent(aggregate, domainEvent);
         } catch (error) {
-            throw new OracleRuntimeError(
+            throw new CrucibleRuntimeError(
                 RUNTIME_ERROR_CODES.DOMAIN_EVENT_INVALID,
                 `Domain event was rejected before persistence: ${error.message}`,
                 { code: error?.code ?? null, type: domainEvent?.type ?? null },
@@ -220,7 +220,7 @@ export class DomainRepositoryAdapter {
         }
         const head = this.#repository.getHead(this.#investigationId);
         if (head.seq + 1 !== domainEvent.seq) {
-            throw new OracleRuntimeError(
+            throw new CrucibleRuntimeError(
                 RUNTIME_ERROR_CODES.DOMAIN_SEQUENCE_MISMATCH,
                 "Repository head cannot preserve persistence seq == domain seq",
                 {
@@ -241,7 +241,7 @@ export class DomainRepositoryAdapter {
         });
         const row = result.events[0];
         if (row.seq !== domainEvent.seq) {
-            throw new OracleRuntimeError(
+            throw new CrucibleRuntimeError(
                 RUNTIME_ERROR_CODES.DOMAIN_SEQUENCE_MISMATCH,
                 "Persistence assigned a sequence different from the domain event",
                 { persistenceSeq: row.seq, domainSeq: domainEvent.seq },

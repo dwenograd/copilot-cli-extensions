@@ -1,12 +1,12 @@
-// oracle-v3/persistence/index.mjs
+// crucible/persistence/index.mjs
 //
-// Public surface of the Oracle v3 persistence layer.
+// Public surface of the Crucible persistence layer.
 
 export { EventRepository, openRepository } from "./repository.mjs";
 export {
     ERROR_CODES,
     SQLITE_ERRCODE,
-    OraclePersistenceError,
+    CruciblePersistenceError,
     LocalPathError,
     SchemaVersionError,
     InvalidArgumentError,

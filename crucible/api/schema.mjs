@@ -1,6 +1,6 @@
-// oracle-v3/api/schema.mjs
+// crucible/api/schema.mjs
 //
-// Single-source declarative schema/spec builder for the Oracle v3 four-tool
+// Single-source declarative schema/spec builder for the Crucible four-tool
 // API. Each field is described ONCE as a small descriptor that knows how to
 // (a) emit a Copilot JSON Schema fragment and (b) parse + normalize a runtime
 // value. Tool argument objects compose those descriptors, so the JSON Schema
@@ -329,13 +329,13 @@ export function defineTool({ name, description, args }) {
 
 const investigationIdField = identifier({
     description:
-        "The investigationId returned by oracle_start. Deterministic slug + SHA-256 suffix; resolves to local state under the Oracle v3 state root.",
+        "The investigationId returned by crucible_start. Deterministic slug + SHA-256 suffix; resolves to local state under the Crucible state root.",
 });
 
-export const oracleStartSpec = defineTool({
-    name: "oracle_start",
+export const crucibleStartSpec = defineTool({
+    name: "crucible_start",
     description:
-        "Start (or idempotently re-attach to) a persistent Oracle v3 investigation: freeze an immutable contract, ingest the validation-case directories into the content-addressed ArtifactStore, and launch the detached supervisor/runner. Returns the investigationId, contractHash, and local state/status paths. This is NOT a result — poll oracle_status and only oracle_result may emit a terminal decision.",
+        "Start (or idempotently re-attach to) a persistent Crucible investigation: freeze an immutable contract, ingest the validation-case directories into the content-addressed ArtifactStore, and launch the detached supervisor/runner. Returns the investigationId, contractHash, and local state/status paths. This is NOT a result — poll crucible_status and only crucible_result may emit a terminal decision.",
     args: object({
         objective: string({
             description: "The falsifiable objective under investigation. Part of the deterministic investigationId.",
@@ -425,15 +425,15 @@ export const oracleStartSpec = defineTool({
     }),
 });
 
-export const oracleStatusSpec = defineTool({
-    name: "oracle_status",
+export const crucibleStatusSpec = defineTool({
+    name: "crucible_status",
     description:
-        "Read-only progress for an Oracle v3 investigation. Replays and integrity-checks domain plus operational evidence, exposes only terminal_available for terminal state (never the decision/winner/evidence), and restarts a missing supervisor only when no terminal or non-result blocks recovery. Never a result.",
+        "Read-only progress for an Crucible investigation. Replays and integrity-checks domain plus operational evidence, exposes only terminal_available for terminal state (never the decision/winner/evidence), and restarts a missing supervisor only when no terminal or non-result blocks recovery. Never a result.",
     args: object({ investigation_id: investigationIdField }),
 });
 
-export const oracleStopSpec = defineTool({
-    name: "oracle_stop",
+export const crucibleStopSpec = defineTool({
+    name: "crucible_stop",
     description:
         "Request a PAUSE through the runtime. Reports resumable:true only after the kernel-owned pause transition is durably persisted; terminal/non-result calls remain non-resumable. It never manufactures a terminal decision.",
     args: object({
@@ -446,18 +446,18 @@ export const oracleStopSpec = defineTool({
     }),
 });
 
-export const oracleResultSpec = defineTool({
-    name: "oracle_result",
+export const crucibleResultSpec = defineTool({
+    name: "crucible_result",
     description:
-        "The ONLY tool that may emit a terminal Oracle v3 result. Replays and verifies repository/domain integrity. If a VERIFIED_RESULT or TARGET_UNREACHABLE decision is persisted it returns is_result:true with the exact terminal decision and hashes behind a prominent banner. For every other state it returns is_result:false and 'NOT A RESULT — DO NOT REPORT AS COMPLETE' with no winner payload. It never recomputes scoring or policy.",
+        "The ONLY tool that may emit a terminal Crucible result. Replays and verifies repository/domain integrity. If a VERIFIED_RESULT or TARGET_UNREACHABLE decision is persisted it returns is_result:true with the exact terminal decision and hashes behind a prominent banner. For every other state it returns is_result:false and 'NOT A RESULT — DO NOT REPORT AS COMPLETE' with no winner payload. It never recomputes scoring or policy.",
     args: object({ investigation_id: investigationIdField }),
 });
 
 export const TOOL_SPECS = Object.freeze([
-    oracleStartSpec,
-    oracleStatusSpec,
-    oracleStopSpec,
-    oracleResultSpec,
+    crucibleStartSpec,
+    crucibleStatusSpec,
+    crucibleStopSpec,
+    crucibleResultSpec,
 ]);
 
 export const PUBLIC_TOOL_NAMES = Object.freeze(TOOL_SPECS.map((spec) => spec.name));

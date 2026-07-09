@@ -1,4 +1,4 @@
-// oracle-v3/__tests__/persistence-bundle.test.mjs
+// crucible/__tests__/persistence-bundle.test.mjs
 //
 // Self-contained audit bundle: deterministic directory export (DB online
 // backup + referenced CAS objects + manifest + SHA-256 inventory) and a verified
@@ -87,7 +87,7 @@ describe("export", () => {
         expect(res.objectCount).toBe(4);
 
         const manifest = readBundleManifest(destDir);
-        expect(manifest.type).toBe("oracle-v3-audit-bundle");
+        expect(manifest.type).toBe("crucible-audit-bundle");
         expect(manifest.database.path).toBe("db/database.sqlite");
         expect(manifest.snapshots).toContain(snap.snapshot);
         expect(manifest.objects.map((o) => o.id)).toContain(extraObject.id);

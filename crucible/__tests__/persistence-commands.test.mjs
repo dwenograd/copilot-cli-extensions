@@ -1,4 +1,4 @@
-// oracle-v3/__tests__/persistence-commands.test.mjs
+// crucible/__tests__/persistence-commands.test.mjs
 //
 // Durable command lifecycle: reserved -> dispatched -> observed -> committed,
 // illegal-transition rejection, and fencing-token / lease-ownership checks at

@@ -8,7 +8,7 @@ import { openRepository } from "../persistence/index.mjs";
 import { coerceSupervisorConfig, supervisorPaths } from "./config.mjs";
 import { createDomainRepositoryAdapter } from "./domain-adapter.mjs";
 import {
-    OracleRuntimeError,
+    CrucibleRuntimeError,
     RUNTIME_ERROR_CODES,
     RuntimeConfigError,
     SupervisorLockError,
@@ -678,7 +678,7 @@ export async function runSupervisor(input, dependencies = {}) {
                 return {
                     kind: "CIRCUIT_OPEN",
                     status,
-                    error: new OracleRuntimeError(
+                    error: new CrucibleRuntimeError(
                         RUNTIME_ERROR_CODES.CIRCUIT_OPEN,
                         reason,
                     ),

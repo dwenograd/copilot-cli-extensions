@@ -1,4 +1,4 @@
-// oracle-v3/persistence/sqlite.mjs
+// crucible/persistence/sqlite.mjs
 //
 // Loader shim for the Node 24 built-in `node:sqlite` module.
 //

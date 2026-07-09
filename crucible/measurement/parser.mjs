@@ -1,4 +1,4 @@
-// oracle-v3/measurement/parser.mjs
+// crucible/measurement/parser.mjs
 //
 // Strict, bounded parser for a harness's single JSON result.
 //
@@ -15,7 +15,7 @@ import {
 } from "./errors.mjs";
 import { isAlgorithmTaggedSha256 } from "../domain/canonical.mjs";
 
-export const PARSER_VERSION = "oracle-measurement-parser-v1";
+export const PARSER_VERSION = "crucible-measurement-parser-v1";
 
 // Absolute upper bound on parseable stdout, in bytes. This is a defensive
 // second wall behind the per-entry maxStdoutBytes cap enforced during

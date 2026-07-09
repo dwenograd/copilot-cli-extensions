@@ -1,4 +1,4 @@
-// oracle-v3/__tests__/measurement-adversarial.test.mjs
+// crucible/__tests__/measurement-adversarial.test.mjs
 //
 // Adversarial tests for the trusted-measurement boundary:
 //   - candidate-code refusal (no sandbox)

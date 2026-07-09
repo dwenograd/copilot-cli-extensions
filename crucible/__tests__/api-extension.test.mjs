@@ -1,4 +1,4 @@
-// oracle-v3/__tests__/api-extension.test.mjs
+// crucible/__tests__/api-extension.test.mjs
 //
 // Registration/static test for the thin extension: the SDK registration payload
 // exposes EXACTLY the four public tools and NO hooks, each tool carries a
@@ -16,16 +16,16 @@ import { PUBLIC_TOOL_NAMES } from "../api/schema.mjs";
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const EXTENSION_PATH = path.join(HERE, "..", "extension.mjs");
 
-describe("oracle-v3 thin extension registration", () => {
+describe("crucible thin extension registration", () => {
     it("registers exactly four tools and no hooks", () => {
         const registration = buildRegistration({ env: {}, log: () => {} });
         expect(Object.keys(registration)).toEqual(["tools"]);
         expect(registration.tools).toHaveLength(4);
         expect(registration.tools.map((tool) => tool.name)).toEqual([
-            "oracle_start",
-            "oracle_status",
-            "oracle_stop",
-            "oracle_result",
+            "crucible_start",
+            "crucible_status",
+            "crucible_stop",
+            "crucible_result",
         ]);
         expect(registration.tools.map((tool) => tool.name)).toEqual([...PUBLIC_TOOL_NAMES]);
         // No hooks under any key.
@@ -65,15 +65,15 @@ describe("oracle-v3 thin extension registration", () => {
             loadSupervisorConfig: trap,
         };
         const registration = buildRegistration({ deps });
-        const statusTool = registration.tools.find((tool) => tool.name === "oracle_status");
+        const statusTool = registration.tools.find((tool) => tool.name === "crucible_status");
 
         const result = statusTool.handler({});
         expect(result.resultType).toBe("failure");
         const parsed = JSON.parse(result.textResultForLlm);
         expect(parsed.ok).toBe(false);
         expect(parsed.is_result).toBe(false);
-        expect(parsed.code).toBe("ORACLE_V3_API_SCHEMA_INVALID");
-        expect(parsed.tool).toBe("oracle_status");
+        expect(parsed.code).toBe("CRUCIBLE_API_SCHEMA_INVALID");
+        expect(parsed.tool).toBe("crucible_status");
     });
 
     it("keeps extension.mjs thin: registration only, no hooks, no stdout", () => {

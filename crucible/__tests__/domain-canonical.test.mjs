@@ -6,7 +6,7 @@ import {
     hashCanonical,
 } from "../domain/index.mjs";
 
-describe("Oracle v3 canonical JSON", () => {
+describe("Crucible canonical JSON", () => {
     it("orders object keys recursively and produces algorithm-tagged SHA-256 hashes", () => {
         const left = {
             z: 1,

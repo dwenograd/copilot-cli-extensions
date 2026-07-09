@@ -1,4 +1,4 @@
-// oracle-v3/__tests__/measurement-fixtures.mjs
+// crucible/__tests__/measurement-fixtures.mjs
 //
 // Shared support code for the measurement test suites. Not a *.test.mjs
 // file so vitest does not collect it as a suite. Depends only on stdlib.
@@ -55,7 +55,7 @@ export function rmTempRoot(root) {
     if (root) fs.rmSync(root, { recursive: true, force: true });
 }
 
-// Write a tiny .mjs script that behaves as an oracle harness. `body` is a
+// Write a tiny .mjs script that behaves as an crucible harness. `body` is a
 // snippet of JS that runs inside the script (after node imports fs). It
 // must eventually call process.exit or print to stdout and let the script
 // finish. Returns the absolute path of the created script.
@@ -108,7 +108,7 @@ export function materializeCandidateSnapshot(root, name, bytes) {
     const hash = createHash("sha256").update(buf).digest("hex");
     return Object.freeze({
         path: p,
-        hash: `sha256:oracle-measurement-snapshot-v1:${hash}`,
+        hash: `sha256:crucible-measurement-snapshot-v1:${hash}`,
     });
 }
 

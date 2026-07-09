@@ -1,4 +1,4 @@
-// oracle-v3/persistence/paths.mjs
+// crucible/persistence/paths.mjs
 //
 // Local-file-only safety gate for the event repository.
 //
@@ -8,7 +8,7 @@
 // SQLite WAL databases because their locking and fsync semantics are not the
 // POSIX/Win32 semantics SQLite assumes. We therefore refuse to open a database
 // on any location we can *determine* to be non-local, and we express that
-// refusal as a typed `LocalPathError` (code ORACLE_PERSIST_LOCAL_PATH_REQUIRED)
+// refusal as a typed `LocalPathError` (code CRUCIBLE_PERSIST_LOCAL_PATH_REQUIRED)
 // rather than a silent comment or best-effort warning.
 //
 // "When determinable" is deliberate: we cannot always prove a drive letter is
@@ -126,7 +126,7 @@ function nearestExistingRealpath(absPath) {
 }
 
 function envDenyRoots(env) {
-    const raw = env?.ORACLE_PERSIST_DENY_ROOTS;
+    const raw = env?.CRUCIBLE_PERSIST_DENY_ROOTS;
     if (typeof raw !== "string" || raw.trim().length === 0) {
         return [];
     }

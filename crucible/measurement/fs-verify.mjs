@@ -1,4 +1,4 @@
-// oracle-v3/measurement/fs-verify.mjs
+// crucible/measurement/fs-verify.mjs
 //
 // File-system verification for the trusted-measurement boundary.
 //
@@ -31,8 +31,8 @@ import {
 // Algorithm tags used for measurement-scoped file digests. Different tags for
 // different domains prevent cross-domain hash confusion (a stdout hash cannot
 // be mistaken for a file hash even if the underlying hex happens to collide).
-export const FILE_HASH_ALGORITHM = "sha256:oracle-measurement-file-v1";
-export const STREAM_HASH_ALGORITHM = "sha256:oracle-measurement-stream-v1";
+export const FILE_HASH_ALGORITHM = "sha256:crucible-measurement-file-v1";
+export const STREAM_HASH_ALGORITHM = "sha256:crucible-measurement-stream-v1";
 
 const HEX64 = /^[a-f0-9]{64}$/u;
 const TAGGED_HASH = /^sha256:[a-z0-9][a-z0-9._-]*:[a-f0-9]{64}$/u;

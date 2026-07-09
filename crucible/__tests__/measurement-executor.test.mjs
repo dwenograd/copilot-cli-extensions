@@ -1,4 +1,4 @@
-// oracle-v3/__tests__/measurement-executor.test.mjs
+// crucible/__tests__/measurement-executor.test.mjs
 //
 // Happy-path / structural tests for the MeasurementExecutor:
 // spawn a real trusted fixture (Node running a scripted harness), verify the
@@ -85,10 +85,10 @@ describe("MeasurementExecutor happy path", () => {
         expect(rec.sandbox).toBeNull();
         expect(rec.exit).toEqual({ code: 0, signal: null, timedOut: false });
         expect(rec.parsed).toEqual(result.parsed);
-        expect(rec.argvHash).toMatch(/^sha256:oracle-measurement-argv-v1:[a-f0-9]{64}$/);
-        expect(rec.envHash).toMatch(/^sha256:oracle-measurement-env-v1:[a-f0-9]{64}$/);
-        expect(rec.stdoutHash).toMatch(/^sha256:oracle-measurement-stream-v1:[a-f0-9]{64}$/);
-        expect(rec.stderrHash).toMatch(/^sha256:oracle-measurement-stream-v1:[a-f0-9]{64}$/);
+        expect(rec.argvHash).toMatch(/^sha256:crucible-measurement-argv-v1:[a-f0-9]{64}$/);
+        expect(rec.envHash).toMatch(/^sha256:crucible-measurement-env-v1:[a-f0-9]{64}$/);
+        expect(rec.stdoutHash).toMatch(/^sha256:crucible-measurement-stream-v1:[a-f0-9]{64}$/);
+        expect(rec.stderrHash).toMatch(/^sha256:crucible-measurement-stream-v1:[a-f0-9]{64}$/);
     });
 
     it("passes the candidate snapshot path via env AND via the argv placeholder", async () => {
@@ -98,8 +98,8 @@ describe("MeasurementExecutor happy path", () => {
             script: `
                 const argPath = process.argv[2];
                 const envPath = process.env.CANDIDATE_SNAPSHOT_PATH;
-                const attempt = process.env.ORACLE_ATTEMPT_ID;
-                const epoch = process.env.ORACLE_RUNNER_EPOCH_ID;
+                const attempt = process.env.CRUCIBLE_ATTEMPT_ID;
+                const epoch = process.env.CRUCIBLE_RUNNER_EPOCH_ID;
                 const bytes = fs.readFileSync(argPath, "utf8");
                 const same = argPath === envPath;
                 process.stdout.write(JSON.stringify({
@@ -155,12 +155,12 @@ describe("MeasurementExecutor happy path", () => {
     it("only exposes allowedEnv + fixed platform keys to the child process", async () => {
         const root = tmp("env");
         const secret = "SHOULD_NOT_APPEAR_IN_CHILD_ENV";
-        process.env.ORACLE_MEASURE_SECRET_TEST_ONLY = secret;
+        process.env.CRUCIBLE_MEASURE_SECRET_TEST_ONLY = secret;
         try {
             const { result } = await runOnce({
                 root, entryId: "envcheck",
                 script: `
-                    const leaked = Object.hasOwn(process.env, "ORACLE_MEASURE_SECRET_TEST_ONLY");
+                    const leaked = Object.hasOwn(process.env, "CRUCIBLE_MEASURE_SECRET_TEST_ONLY");
                     process.stdout.write(JSON.stringify({ pass: !leaked, metrics: { leaked: leaked ? 1 : 0 } }));
                 `,
                 entryOverrides: { allowedEnv: { EXPECTED_VAR: "yes" } },
@@ -168,7 +168,7 @@ describe("MeasurementExecutor happy path", () => {
             expect(result.parsed.pass).toBe(true);
             expect(result.parsed.metrics).toEqual({ leaked: 0 });
         } finally {
-            delete process.env.ORACLE_MEASURE_SECRET_TEST_ONLY;
+            delete process.env.CRUCIBLE_MEASURE_SECRET_TEST_ONLY;
         }
     });
 
@@ -207,8 +207,8 @@ describe("MeasurementExecutor happy path", () => {
         expect(result.parsed.pass).toBe(true);
         expect(spawnCall.executable).not.toBe(NODE_EXE);
         expect(spawnCall.argv[0]).not.toBe(scriptPath);
-        expect(spawnCall.executable).toContain(`${path.sep}.oracle-stage-att-0001${path.sep}`);
-        expect(spawnCall.argv[0]).toContain(`${path.sep}.oracle-stage-att-0001${path.sep}`);
+        expect(spawnCall.executable).toContain(`${path.sep}.crucible-stage-att-0001${path.sep}`);
+        expect(spawnCall.argv[0]).toContain(`${path.sep}.crucible-stage-att-0001${path.sep}`);
         expect(fs.existsSync(path.dirname(path.dirname(spawnCall.executable)))).toBe(false);
         expect(result.receipt.stagedExecutableHash).toBe(result.receipt.executableHash);
         expect(result.receipt.stagedDependencyHashes[0].sha256)

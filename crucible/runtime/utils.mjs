@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { createHash, randomBytes } from "node:crypto";
 
-import { RuntimeConfigError, RUNTIME_ERROR_CODES, OracleRuntimeError } from "./errors.mjs";
+import { RuntimeConfigError, RUNTIME_ERROR_CODES, CrucibleRuntimeError } from "./errors.mjs";
 
 const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f]/u;
 const SAFE_IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._@-]{0,127}$/u;
@@ -129,7 +129,7 @@ export function assertNoLinkComponents(target) {
             throw error;
         }
         if (stat.isSymbolicLink()) {
-            throw new OracleRuntimeError(
+            throw new CrucibleRuntimeError(
                 RUNTIME_ERROR_CODES.PATH_ESCAPE,
                 "Assigned runtime paths cannot traverse a symlink or junction",
                 { target: resolved, link: current },
@@ -148,7 +148,7 @@ export function assertPathInside(candidate, root, field = "path") {
     const resolved = path.resolve(candidate);
     const resolvedRoot = path.resolve(root);
     if (!isPathInside(resolved, resolvedRoot)) {
-        throw new OracleRuntimeError(
+        throw new CrucibleRuntimeError(
             RUNTIME_ERROR_CODES.PATH_ESCAPE,
             `${field} escapes its assigned root`,
             { field, path: resolved, root: resolvedRoot },
@@ -252,7 +252,7 @@ export function snapshotObjectHex(snapshotId) {
 }
 
 export function measurementSnapshotHash(snapshotId) {
-    return `sha256:oracle-measurement-snapshot-v1:${snapshotObjectHex(snapshotId)}`;
+    return `sha256:crucible-measurement-snapshot-v1:${snapshotObjectHex(snapshotId)}`;
 }
 
 export function safeFileToken(value) {
@@ -270,7 +270,7 @@ export function makeUniqueDirectory(root, prefix) {
 export function removeTreeInside(target, root) {
     const resolved = assertPathInside(target, root, "cleanup target");
     if (path.resolve(resolved) === path.resolve(root)) {
-        throw new OracleRuntimeError(
+        throw new CrucibleRuntimeError(
             RUNTIME_ERROR_CODES.PATH_ESCAPE,
             "Refusing to remove the assigned root itself",
             { target: resolved, root: path.resolve(root) },
