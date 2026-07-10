@@ -560,6 +560,12 @@ export function createSandboxProvider(definition) {
     provider = Object.freeze({
         providerId,
         providerVersion,
+        describePolicyIdentity() {
+            if (typeof definition.describePolicyIdentity !== "function") {
+                return null;
+            }
+            return definition.describePolicyIdentity();
+        },
         admitAndPrepare(request) {
             return invokeProvider(provider, request);
         },
@@ -567,6 +573,7 @@ export function createSandboxProvider(definition) {
     PROVIDER_RECORDS.set(provider, {
         providerId,
         providerVersion,
+        describePolicyIdentity: definition.describePolicyIdentity ?? null,
         admitAndPrepare: definition.admitAndPrepare,
     });
     return provider;
@@ -580,6 +587,27 @@ export function isSandboxProvider(value) {
 
 export function isSandboxRefusal(value) {
     return normalizeRefusal(value) !== null;
+}
+
+export async function describeSandboxProviderPolicy(provider) {
+    if (!isSandboxProvider(provider)) {
+        throw new MeasurementError(
+            MEASUREMENT_ERROR_CODES.INVALID_ARGUMENT,
+            "describeSandboxProviderPolicy requires a registered SandboxProvider",
+        );
+    }
+    const record = PROVIDER_RECORDS.get(provider);
+    if (typeof record.describePolicyIdentity !== "function") {
+        return null;
+    }
+    const identity = await record.describePolicyIdentity();
+    if (identity === null || typeof identity !== "object" || Array.isArray(identity)) {
+        throw capabilityError(
+            MEASUREMENT_ERROR_CODES.SANDBOX_CAPABILITY_INVALID,
+            "SandboxProvider policy identity must be an object",
+        );
+    }
+    return Object.freeze({ ...identity });
 }
 
 export function describeSandboxCapability(capability, expected) {

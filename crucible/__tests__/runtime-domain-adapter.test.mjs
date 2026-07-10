@@ -30,6 +30,7 @@ import {
     createDomainRepositoryAdapter,
     formatAttemptCommand,
 } from "../runtime/index.mjs";
+import { fakeHarnessIdentity } from "./harness-identity-fixture.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const roots = [];
@@ -131,6 +132,10 @@ function contractInput(overrides = {}) {
         criticality: "high",
         policyVersion: "policy-v1",
         parserVersion: PARSER_VERSION,
+        harnessIdentity: fakeHarnessIdentity({
+            harnessId: "fixture-harness",
+            parserVersion: PARSER_VERSION,
+        }),
         workerModels: ["model-a"],
         candidatesPerRound: 1,
         maxRounds: 2,

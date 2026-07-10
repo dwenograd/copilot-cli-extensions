@@ -8,6 +8,7 @@ import {
     RUNTIME_ERROR_CODES,
     acquireSupervisorLock,
     ensureSupervisor,
+    normalizeStartDeadline,
     normalizeRunnerConfig,
     normalizeSupervisorConfig,
     releaseSupervisorLock,
@@ -120,9 +121,31 @@ function childResultSpawner(sequence) {
             } else {
                 fs.rmSync(config.paths.childResultPath, { force: true });
             }
+
             child.emit("close", spec.code ?? 0, spec.signal ?? null);
         }, 0);
         return { child, resultPath: config.paths.childResultPath };
+    };
+}
+
+function successfulOutcome(state, nonResultCode = null) {
+    return {
+        version: 1,
+        ok: true,
+        state,
+        terminal_available: state === "terminal",
+        non_result_code: state === "terminal" ? null : nonResultCode,
+    };
+}
+
+function failedOutcome(code, recoverable) {
+    return {
+        version: 1,
+        ok: false,
+        state: "failed",
+        terminal_available: false,
+        non_result_code: code,
+        recoverable,
     };
 }
 
@@ -165,6 +188,23 @@ function writeGenerationRecord(directory, generation, nonce, pid) {
 }
 
 describe("Crucible supervisor", () => {
+    it("normalizes only valid future ISO deadlines and enforces later recovery deadlines", () => {
+        const now = Date.parse("2030-01-01T00:00:00.000Z");
+        expect(normalizeStartDeadline("2030-01-01T02:00:00+01:00", { now }))
+            .toEqual({
+                deadlineIso: "2030-01-01T01:00:00.000Z",
+                deadlineMs: now + 60 * 60 * 1000,
+            });
+        expect(() => normalizeStartDeadline("2030-02-30T00:00:00.000Z", { now }))
+            .toThrow(expect.objectContaining({ code: RUNTIME_ERROR_CODES.INVALID_CONFIG }));
+        expect(() => normalizeStartDeadline("2029-12-31T23:59:59.999Z", { now }))
+            .toThrow(expect.objectContaining({ code: RUNTIME_ERROR_CODES.INVALID_CONFIG }));
+        expect(() => normalizeStartDeadline("2030-01-02T00:00:00.000Z", {
+            now,
+            afterMs: Date.parse("2030-01-03T00:00:00.000Z"),
+        })).toThrow(expect.objectContaining({ code: RUNTIME_ERROR_CODES.INVALID_CONFIG }));
+    });
+
     it("requires staleLockMs to exceed heartbeat plus jitter and operation margin", () => {
         const root = makeRoot("heartbeat-margin");
         expect(() => normalizeSupervisorConfig(rawConfig(root, {
@@ -182,6 +222,20 @@ describe("Crucible supervisor", () => {
             heartbeatIntervalMs: 1_000,
             staleLockMs: 2_001,
         })).staleLockMs).toBe(2_001);
+    });
+
+    it("requires the supervisor backoff ceiling to cover the base backoff", () => {
+        const root = makeRoot("backoff-order");
+        expect(() => normalizeSupervisorConfig(rawConfig(root, {
+            baseBackoffMs: 2_000,
+            maxBackoffMs: 1_000,
+        }))).toThrow(expect.objectContaining({
+            code: RUNTIME_ERROR_CODES.INVALID_CONFIG,
+            details: expect.objectContaining({
+                baseBackoffMs: 2_000,
+                maxBackoffMs: 1_000,
+            }),
+        }));
     });
 
     it("allocates a durable monotonic generation for each acquired supervisor", () => {
@@ -282,24 +336,14 @@ describe("Crucible supervisor", () => {
             spawnRunner: childResultSpawner([
                 {
                     code: 75,
-                    envelope: {
-                        ok: false,
-                        error: {
-                            code: "TRANSIENT",
-                            message: "transient crash",
-                            recoverable: true,
-                        },
-                    },
+                    envelope: failedOutcome("TRANSIENT", true),
                 },
                 {
                     code: 0,
-                    envelope: {
-                        ok: true,
-                        result: {
-                            kind: "NON_RESULT",
-                            code: "BUDGET_EXHAUSTED_INCONCLUSIVE",
-                        },
-                    },
+                    envelope: successfulOutcome(
+                        "non_result",
+                        "BUDGET_EXHAUSTED_INCONCLUSIVE",
+                    ),
                 },
             ]),
         });
@@ -406,13 +450,10 @@ describe("Crucible supervisor", () => {
                         setImmediate(() => {
                             fs.writeFileSync(
                                 launchConfig.paths.childResultPath,
-                                `${JSON.stringify({
-                                    ok: true,
-                                    result: {
-                                        kind: "NON_RESULT",
-                                        code: "INCARNATION_ROTATED",
-                                    },
-                                })}\n`,
+                                `${JSON.stringify(successfulOutcome(
+                                    "non_result",
+                                    "INCARNATION_ROTATED",
+                                ))}\n`,
                             );
                             child.emit("close", 0, null);
                         });
@@ -496,13 +537,10 @@ describe("Crucible supervisor", () => {
                 { code: 75 },
                 {
                     code: 0,
-                    envelope: {
-                        ok: true,
-                        result: {
-                            kind: "NON_RESULT",
-                            code: "DEADLINE_EXCEEDED",
-                        },
-                    },
+                    envelope: successfulOutcome(
+                        "non_result",
+                        "DEADLINE_EXCEEDED",
+                    ),
                 },
             ]),
         });
@@ -531,10 +569,7 @@ describe("Crucible supervisor", () => {
                 { code: 75 },
                 {
                     code: 0,
-                    envelope: {
-                        ok: true,
-                        result: { kind: "NON_RESULT", code: "DONE" },
-                    },
+                    envelope: successfulOutcome("non_result", "DONE"),
                 },
             ]),
         });
@@ -564,8 +599,10 @@ describe("Crucible supervisor", () => {
         expect(status).toMatchObject({
             state: "circuit_open",
             restartCount: 1,
+            terminal_available: false,
+            non_result_code: RUNTIME_ERROR_CODES.CIRCUIT_OPEN,
         });
-        expect(status.circuit.crashesInWindow).toBe(2);
+        expect(status).not.toHaveProperty("circuit");
         expect(operational).toHaveLength(1);
         expect(operational[0]).toMatchObject({
             code: RUNTIME_ERROR_CODES.CIRCUIT_OPEN,
@@ -589,23 +626,91 @@ describe("Crucible supervisor", () => {
             recordOperationalNonResult: (input) => operational.push(input),
             spawnRunner: childResultSpawner([{
                 code: 1,
-                envelope: {
-                    ok: false,
-                    error: {
-                        code: "FATAL_RUNNER",
-                        message: "runner cannot continue",
-                        recoverable: false,
-                    },
-                },
+                envelope: failedOutcome("FATAL_RUNNER", false),
             }]),
         });
         expect(result.kind).toBe("FAILED");
         expect(operational).toEqual([
             expect.objectContaining({
                 code: "FATAL_RUNNER",
-                reason: "runner cannot continue",
+                reason: "Runner reported an opaque failure outcome",
             }),
         ]);
+    });
+
+    it("keeps every supervisor file opaque and deletes the consumed child outcome", async () => {
+        const root = makeRoot("opaque-files");
+        const config = normalizeSupervisorConfig(rawConfig(root));
+        startSupervisor(rawConfig(root), {
+            spawnProcess: () => ({ pid: 9991, unref() {} }),
+        });
+        const result = await runSupervisor(config, {
+            pid: 9992,
+            idFactory: () => "opaque-files-nonce",
+            isPidAlive: () => false,
+            spawnRunner: async (launchConfig, context) => {
+                fs.writeFileSync(
+                    launchConfig.paths.childConfigPath,
+                    JSON.stringify(context.runnerConfig),
+                );
+                const child = new EventEmitter();
+                child.pid = 9993;
+                setImmediate(() => {
+                    fs.writeFileSync(
+                        launchConfig.paths.childResultPath,
+                        JSON.stringify(successfulOutcome("terminal")),
+                    );
+                    child.emit("close", 0, null);
+                });
+                return {
+                    child,
+                    resultPath: launchConfig.paths.childResultPath,
+                };
+            },
+        });
+
+        expect(result).toMatchObject({
+            kind: "TERMINAL",
+            terminalAvailable: true,
+            nonResultCode: null,
+        });
+        expect(result).not.toHaveProperty("result");
+        const jsonFiles = fs.readdirSync(config.paths.directory)
+            .filter((name) => name.endsWith(".json"))
+            .map((name) => path.join(config.paths.directory, name));
+        expect(jsonFiles.some((file) => file.includes("runner-result"))).toBe(false);
+        const forbidden = new Set([
+            "basis",
+            "candidateId",
+            "candidate_id",
+            "closure",
+            "decision",
+            "eventHash",
+            "event_hash",
+            "evidenceClosure",
+            "evidenceHash",
+            "evidenceId",
+            "evidence_closure",
+            "evidence_hash",
+            "evidence_id",
+            "result",
+            "winner",
+        ]);
+        const visit = (value) => {
+            if (Array.isArray(value)) {
+                value.forEach(visit);
+                return;
+            }
+            if (value === null || typeof value !== "object") return;
+            for (const [key, nested] of Object.entries(value)) {
+                expect(forbidden.has(key)).toBe(false);
+                visit(nested);
+            }
+        };
+        for (const file of jsonFiles) {
+            const document = JSON.parse(fs.readFileSync(file, "utf8"));
+            visit(document);
+        }
     });
 
     it("starts detached with argv arrays and shell disabled", () => {
@@ -831,13 +936,10 @@ describe("Crucible supervisor", () => {
                    setImmediate(() => {
                        fs.writeFileSync(
                            ownedConfig.paths.childResultPath,
-                           `${JSON.stringify({
-                               ok: true,
-                               result: {
-                                   kind: "NON_RESULT",
-                                   code: "TAKEOVER_COMPLETE",
-                               },
-                           })}\n`,
+                           `${JSON.stringify(successfulOutcome(
+                               "non_result",
+                               "TAKEOVER_COMPLETE",
+                           ))}\n`,
                        );
                        child.emit("close", 0, null);
                    });

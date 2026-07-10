@@ -10,6 +10,7 @@ import {
     hashCanonical,
     selectAdaptiveOperator,
 } from "../domain/index.mjs";
+import { fakeHarnessIdentity } from "./harness-identity-fixture.mjs";
 
 function artifactHash(character) {
     return `sha256:${character.repeat(64)}`;
@@ -47,6 +48,10 @@ function contract(searchPolicy = policy()) {
         criticality: "high",
         policyVersion: "policy-v2",
         parserVersion: "parser-v2",
+        harnessIdentity: fakeHarnessIdentity({
+            harnessId: "harness",
+            parserVersion: "parser-v2",
+        }),
         workerModels: ["model-a"],
         candidatesPerRound: 1,
         maxRounds: 10,

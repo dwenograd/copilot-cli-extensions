@@ -10,8 +10,9 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { buildRegistration } from "../api/handlers.mjs";
-import { PUBLIC_TOOL_NAMES } from "../api/schema.mjs";
+import { buildRegistration, runToolBoundary } from "../api/handlers.mjs";
+import { PUBLIC_TOOL_NAMES, crucibleStartSpec } from "../api/schema.mjs";
+import { SandboxUnavailableApiError } from "../api/errors.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const EXTENSION_PATH = path.join(HERE, "..", "extension.mjs");
@@ -74,6 +75,35 @@ describe("crucible thin extension registration", () => {
         expect(parsed.is_result).toBe(false);
         expect(parsed.code).toBe("CRUCIBLE_API_SCHEMA_INVALID");
         expect(parsed.tool).toBe("crucible_status");
+    });
+
+    it("converts asynchronous start preflight failures at the SDK boundary", async () => {
+        const deps = { log: () => {} };
+        const result = await runToolBoundary(
+            crucibleStartSpec,
+            () => Promise.reject(new SandboxUnavailableApiError("sandbox unavailable")),
+            {
+                objective: "test objective",
+                project_dir: "C:\\project",
+                harness_id: "harness",
+                acceptance_predicate: { kind: "harness_pass" },
+                hypothesis_topology: "finite_enumerable",
+                validation_cases: [
+                    { id: "good", expectation: "accept", path: "cases/good" },
+                    { id: "bad", expectation: "reject", path: "cases/bad" },
+                ],
+                worker_models: ["model-a"],
+                candidates_per_round: 1,
+                max_rounds: 1,
+            },
+            deps,
+        );
+        expect(result.resultType).toBe("failure");
+        expect(JSON.parse(result.textResultForLlm)).toMatchObject({
+            ok: false,
+            code: "CRUCIBLE_API_SANDBOX_UNAVAILABLE",
+            tool: "crucible_start",
+        });
     });
 
     it("keeps extension.mjs thin: registration only, no hooks, no stdout", () => {

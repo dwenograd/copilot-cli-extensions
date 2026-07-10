@@ -15,19 +15,35 @@ terminal decision or an explicit non-result.
 The public surface is **unchanged** by the domain-v2 redesign — still exactly
 four tools, and only `crucible_result` may ever report a terminal decision:
 
-- `crucible_start` freezes a contract (including the canonical search policy),
-  ingests two-sided validation cases, and launches the detached supervisor.
+- `crucible_start` has two mutually exclusive forms. A new investigation supplies
+  the complete contract/project/case inputs; preflight stages and publishes the
+  validation snapshots, freezes the harness identity, and launches the detached
+  supervisor. A reattach supplies only `investigation_id` plus an optional later
+  `deadline_iso`/required `reset_policy`; it loads and verifies the persisted
+  contract, supervisor config, and snapshots, so the original project and case
+  directories are not needed. Admission completes before resume is persisted,
+  and a launch failure is compensated back to a durable retryable pause.
 - `crucible_status` reports adaptive progress and whether a terminal result is
   available. It never reveals the decision, candidate identifiers, metric
-  values, or evidence identifiers/hashes — only aggregate signals: evaluation
-  and round/slot counters, plateau/escape phase, operator mix, archive counts,
-  duplicate count, and a `passing_incumbent_available` boolean.
+  values, contract/event hashes, or evidence identifiers/hashes — only aggregate
+  signals: evaluation and round/slot counters, plateau/escape phase, operator
+  mix, archive counts, duplicate count, and a
+  `passing_incumbent_available` boolean.
 - `crucible_stop` requests a persisted resumable pause. Resumability is claimed
   only once the kernel-owned pause transition is actually persisted; a bare
-  in-flight stop request is honest that the pause is not yet durable.
+  in-flight stop request is honest that the pause is not yet durable. Its
+  `stop_state` distinguishes terminal, operational/domain non-result, persisted
+  pause, and requested/in-flight pause outcomes.
 - `crucible_result` is the only tool that may return `VERIFIED_RESULT` or
   `TARGET_UNREACHABLE`, always with its terminal evidence closure. It reads the
   persisted terminal decision and never recomputes policy.
+
+Supervisor status/config/outcome files contain only opaque lifecycle state,
+terminal availability, non-result codes, and generation/PID health. Runner
+outcome files never carry a decision, winner, candidate/evidence identifiers or
+hashes, event hashes, or closures, and the supervisor deletes each outcome file
+immediately after consuming it. Full terminal repository/domain/artifact
+verification is performed only by `crucible_result`.
 
 ## Harness allowlist
 
@@ -41,6 +57,17 @@ Override it with `CRUCIBLE_ALLOWLIST_PATH`. Investigation state defaults to
 Do not hand-edit this file. Author it with the operator CLI
 (`tools/configure-harness.mjs`, described below), which computes every content
 hash for you and re-validates the exact bytes it installs.
+
+Every new contract freezes the canonical allowlist-entry hash, raw allowlist
+file hash/version, executable and dependency hashes, argv-template hash,
+allowed-environment hash, trusted parser version/source hashes,
+`executesCandidateCode`, and the required sandbox policy identity/digest. The
+allowlist entry hash is also part of the deterministic investigation identity.
+The runner re-verifies the exact frozen identity before every measurement.
+Replacing an entry under the same id, or changing the allowlist, executable,
+dependency, environment policy, parser, or sandbox policy, therefore fails an
+existing investigation closed. Intentional harness changes require a new
+investigation identity.
 
 Example:
 
@@ -209,11 +236,11 @@ What the tool does, fail-closed, in one pass:
 ### Deterministic snapshot ids must match `crucible_start`
 
 The snapshot id the tool records is the content address of the `sourceDir`
-contents, computed the same way `crucible_start` computes it when it ingests the
-validation-case directory into the per-investigation `ArtifactStore`. It is a
-pure function of the directory's files (sorted relative posix paths + per-file
-SHA-256), independent of the store location, so a throwaway store here yields
-the identical id `crucible_start` recomputes later.
+contents, computed the same way `crucible_start` stages it in an isolated
+preflight `ArtifactStore` before publishing the verified bytes into the
+per-investigation store. It is a pure function of the directory's files (sorted
+relative posix paths + per-file SHA-256), independent of the store location, so
+a throwaway store here yields the identical id `crucible_start` recomputes.
 
 For validation to line up, the directory `crucible_start` ingests
 (`project_dir` + the case `path`) must have **byte-for-byte identical contents**

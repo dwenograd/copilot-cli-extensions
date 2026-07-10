@@ -7,6 +7,7 @@ import { createDefaultProcessAdapter } from "../measurement/windows-adapter.mjs"
 import { openRepository } from "../persistence/index.mjs";
 import { coerceSupervisorConfig, supervisorPaths } from "./config.mjs";
 import { createDomainRepositoryAdapter } from "./domain-adapter.mjs";
+import { normalizeRunnerOutcomeEnvelope } from "./outcome.mjs";
 import {
     CrucibleRuntimeError,
     RUNTIME_ERROR_CODES,
@@ -1020,25 +1021,25 @@ function defaultSpawnRunner(config, context) {
     return { child, resultPath: config.paths.childResultPath };
 }
 
-function readChildEnvelope(resultPath) {
+function consumeChildEnvelope(resultPath) {
     if (!fs.existsSync(resultPath)) {
         return null;
     }
-    const value = readJsonFile(resultPath, "runner result");
-    if (!isPlainObject(value) || typeof value.ok !== "boolean") {
-        throw new RuntimeConfigError("Runner result envelope is malformed", { resultPath });
+    try {
+        return normalizeRunnerOutcomeEnvelope(
+            readJsonFile(resultPath, "runner outcome"),
+        );
+    } finally {
+        fs.rmSync(resultPath, { force: true });
     }
-    return value;
 }
 
-function classifySuccessfulResult(result) {
-    switch (result?.kind) {
-        case "TERMINAL":
-            return "terminal";
-        case "NON_RESULT":
-            return "non_result";
-        case "PAUSE":
-            return "pause";
+function classifySuccessfulResult(envelope) {
+    switch (envelope?.state) {
+        case "terminal":
+        case "non_result":
+        case "pause":
+            return envelope.state;
         default:
             return null;
     }
@@ -1188,9 +1189,14 @@ export async function runSupervisor(input, dependencies = {}) {
 
     const writeStatus = (state, extra = {}) => {
         assertOwnership(`${state} owner status write`);
+        const terminalAvailable = state === "terminal"
+            || extra.terminal_available === true;
+        const nonResultCode = typeof extra.non_result_code === "string"
+            && extra.non_result_code.length > 0
+            ? extra.non_result_code
+            : null;
         const nextStatus = {
-            ...extra,
-            version: 2,
+            version: 3,
             investigationId: config.runner.investigationId,
             supervisorEpochId: config.supervisorEpochId,
             pid: lock.pid,
@@ -1203,6 +1209,8 @@ export async function runSupervisor(input, dependencies = {}) {
             childPid: currentChildPid,
             runnerIncarnation: currentRunnerIncarnation,
             statusRevision: statusRevision + 1,
+            terminal_available: terminalAvailable,
+            non_result_code: nonResultCode,
         };
         atomicWriteJson(ownedConfig.paths.statusPath, nextStatus, {
             token: `status:${lock.supervisorGeneration}:${lock.nonce}:${nextStatus.statusRevision}`,
@@ -1221,7 +1229,8 @@ export async function runSupervisor(input, dependencies = {}) {
         heartbeatTimer = timers.setInterval(() => {
             try {
                 writeStatus(status?.state ?? "running", {
-                    ...(status ?? {}),
+                    terminal_available: status?.terminal_available === true,
+                    non_result_code: status?.non_result_code ?? null,
                 });
             } catch (error) {
                 if (isOwnershipLostError(error)) {
@@ -1443,13 +1452,12 @@ export async function runSupervisor(input, dependencies = {}) {
                     return {
                         kind: "STOPPED",
                         status,
-                        result: null,
                         ownershipLost: true,
                         shutdown: shutdownRequest,
                     };
                 }
                 writeStatus("stopped", { shutdown: shutdownRequest });
-                return { kind: "STOPPED", status, result: null };
+                return { kind: "STOPPED", status };
             }
             let launched;
             let launchConfig = ownedConfig;
@@ -1542,14 +1550,13 @@ export async function runSupervisor(input, dependencies = {}) {
                         return {
                             kind: "STOPPED",
                             status,
-                            result: null,
                             ownershipLost: true,
                             shutdown: completed.request,
                             exit,
                         };
                     }
                     writeStatus("stopped", { shutdown: completed.request, exit });
-                    return { kind: "STOPPED", status, result: null };
+                    return { kind: "STOPPED", status };
                 }
                 const exit = completed.exit;
                 currentChild = null;
@@ -1562,7 +1569,7 @@ export async function runSupervisor(input, dependencies = {}) {
                 let envelopeError = null;
                 try {
                     assertOwnership("runner result read");
-                    envelope = readChildEnvelope(
+                    envelope = consumeChildEnvelope(
                         launched.resultPath ?? launchConfig.paths.childResultPath,
                     );
                 } catch (error) {
@@ -1573,26 +1580,29 @@ export async function runSupervisor(input, dependencies = {}) {
                 }
 
                 if (envelope?.ok === true) {
-                    const finalState = classifySuccessfulResult(envelope.result);
+                    const finalState = classifySuccessfulResult(envelope);
                     if (finalState === null) {
                         const reason = "Runner returned an unsupported result kind";
                         persistSupervisorNonResult(config, lock, dependencies, {
                             code: RUNTIME_ERROR_CODES.RESULT_MISSING,
                             reason,
                             restartCount,
-                            details: { exit, result: envelope.result ?? null, recoverable: false },
+                            details: { exit, recoverable: false },
                         }, assertOwnership);
                         writeStatus("failed", {
-                            lastError: {
-                                code: RUNTIME_ERROR_CODES.RESULT_MISSING,
-                                message: reason,
-                                recoverable: false,
-                            },
-                            exit,
+                            non_result_code: RUNTIME_ERROR_CODES.RESULT_MISSING,
                         });
-                        return { kind: "FAILED", status, result: envelope.result };
+                        return {
+                            kind: "FAILED",
+                            status,
+                            terminalAvailable: false,
+                            nonResultCode: RUNTIME_ERROR_CODES.RESULT_MISSING,
+                        };
                     }
-                    writeStatus(finalState, { result: envelope.result, exit });
+                    writeStatus(finalState, {
+                        terminal_available: envelope.terminal_available,
+                        non_result_code: envelope.non_result_code,
+                    });
                     return {
                         kind: finalState === "terminal"
                             ? "TERMINAL"
@@ -1600,20 +1610,25 @@ export async function runSupervisor(input, dependencies = {}) {
                                 ? "PAUSE"
                                 : "NON_RESULT",
                         status,
-                        result: envelope.result,
+                        terminalAvailable: envelope.terminal_available,
+                        nonResultCode: envelope.non_result_code,
                     };
                 }
 
                 const recoverable = envelope?.ok === false
-                    ? envelope.error?.recoverable === true
+                    ? envelope.recoverable === true
                     : envelopeError === null
                         && exit.code !== 64
                         && exit.code !== 65;
-                const lastError = envelope?.error ?? {
-                    code: envelopeError?.code ?? RUNTIME_ERROR_CODES.RESULT_MISSING,
-                    message: envelopeError?.message
-                        ?? exit.error?.message
-                        ?? "Runner exited without a result envelope",
+                const lastError = {
+                    code: envelope?.non_result_code
+                        ?? envelopeError?.code
+                        ?? RUNTIME_ERROR_CODES.RESULT_MISSING,
+                    message: envelope?.ok === false
+                        ? "Runner reported an opaque failure outcome"
+                        : envelopeError?.message
+                            ?? exit.error?.message
+                            ?? "Runner exited without an outcome envelope",
                     recoverable,
                 };
                 if (!recoverable) {
@@ -1623,11 +1638,11 @@ export async function runSupervisor(input, dependencies = {}) {
                         restartCount,
                         details: { exit, recoverable: false },
                     }, assertOwnership);
-                    writeStatus("failed", { lastError, exit });
+                    writeStatus("failed", { non_result_code: lastError.code });
                     return { kind: "FAILED", status, error: lastError };
                 }
                 crashes.push(clock.now());
-                writeStatus("crashed", { lastError, exit });
+                writeStatus("crashed");
             }
 
             const cutoff = clock.now() - config.circuitWindowMs;
@@ -1647,7 +1662,9 @@ export async function runSupervisor(input, dependencies = {}) {
                     restartCount,
                     details: { circuit, recoverable: false },
                 }, assertOwnership);
-                writeStatus("circuit_open", { circuit });
+                writeStatus("circuit_open", {
+                    non_result_code: RUNTIME_ERROR_CODES.CIRCUIT_OPEN,
+                });
                 return {
                     kind: "CIRCUIT_OPEN",
                     status,
@@ -1681,13 +1698,12 @@ export async function runSupervisor(input, dependencies = {}) {
                     return {
                         kind: "STOPPED",
                         status,
-                        result: null,
                         ownershipLost: true,
                         shutdown: completed.request,
                     };
                 }
                 writeStatus("stopped", { shutdown: completed.request });
-                return { kind: "STOPPED", status, result: null };
+                return { kind: "STOPPED", status };
             }
         }
     } catch (error) {
@@ -1699,7 +1715,6 @@ export async function runSupervisor(input, dependencies = {}) {
         return {
             kind: "STOPPED",
             status,
-            result: null,
             ownershipLost: true,
             shutdown: shutdownRequest,
             exit,

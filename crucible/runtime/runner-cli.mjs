@@ -4,10 +4,12 @@ import { fileURLToPath } from "node:url";
 import { loadRunnerConfig } from "./config.mjs";
 import {
     RUNTIME_ERROR_CODES,
-    isRecoverableRuntimeError,
-    serializeRuntimeError,
 } from "./errors.mjs";
 import { AutonomousRunner } from "./runner.mjs";
+import {
+    projectRunnerFailure,
+    projectRunnerOutcome,
+} from "./outcome.mjs";
 import {
     atomicWriteJson,
     parseConfigArgv,
@@ -31,15 +33,14 @@ export async function mainRunnerCli(argv = process.argv.slice(2), dependencies =
             options: config.options,
         }, dependencies);
         const result = await runner.run();
-        const envelope = { ok: true, result };
+        const envelope = projectRunnerOutcome(result);
         if (config.resultPath !== null) {
             atomicWriteJson(config.resultPath, envelope);
         }
         dependencies.stdout?.write?.(`${JSON.stringify(envelope)}\n`);
         return { exitCode: 0, envelope };
     } catch (error) {
-        const serialized = serializeRuntimeError(error);
-        const envelope = { ok: false, error: serialized };
+        const envelope = projectRunnerFailure(error);
         if (config?.resultPath !== null && config?.resultPath !== undefined) {
             try {
                 atomicWriteJson(config.resultPath, envelope);
@@ -52,7 +53,7 @@ export async function mainRunnerCli(argv = process.argv.slice(2), dependencies =
             ? 64
             : error?.code === RUNTIME_ERROR_CODES.INTEGRITY_FAILURE
                 ? 65
-                : isRecoverableRuntimeError(error)
+                : envelope.recoverable
                     ? 75
                     : 1;
         return { exitCode, envelope };

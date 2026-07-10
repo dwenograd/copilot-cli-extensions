@@ -797,6 +797,17 @@ export function createWindowsSandboxProvider(options = {}) {
     return createSandboxProvider({
         providerId: PROVIDER_ID,
         providerVersion: PROVIDER_VERSION,
+        async describePolicyIdentity() {
+            const available = requireAvailability(await availability());
+            verifyHelper(available.helper);
+            return Object.freeze({
+                required: true,
+                primitive: WINDOWS_SANDBOX_PRIMITIVE,
+                policyId: WINDOWS_SANDBOX_POLICY_ID,
+                helperSourceHash: available.helperSourceHash,
+                helperBinaryHash: available.helperBinaryHash,
+            });
+        },
         async admitAndPrepare(request, issueLaunchCapability) {
             const available = requireAvailability(await availability());
             const budgetStartedAtMs = Date.now();

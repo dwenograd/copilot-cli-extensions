@@ -411,4 +411,59 @@ export function buildPromptContext(input = {}) {
     return { context, hash };
 }
 
+export function assertPromptContractCoreFits(
+    contract,
+    { byteCap = DEFAULT_PROMPT_CONTEXT_BYTE_CAP } = {},
+) {
+    requirePlainObject(contract, "contract");
+    const normalizedCap = normalizeByteCap(byteCap);
+    const workerModels = asArray(contract.workerModels)
+        .filter((model) => typeof model === "string" && model.length > 0);
+    const boundedCandidateIds = asArray(contract.boundedCandidateIds)
+        .filter((candidateId) => typeof candidateId === "string" && candidateId.length > 0);
+    const longest = (values, fallback) => values.reduce(
+        (current, value) => (value.length > current.length ? value : current),
+        fallback,
+    );
+    const candidateId = longest(
+        boundedCandidateIds,
+        "candidate-r999999-s007-retry-999",
+    );
+    const model = longest(workerModels, "worker");
+    const { context } = buildPromptContext({
+        contract,
+        archive: {},
+        slot: {
+            operator: "adversarial",
+            round: Number.isSafeInteger(contract.maxRounds) ? contract.maxRounds : 1,
+            slotIndex: Number.isSafeInteger(contract.candidatesPerRound)
+                ? Math.max(0, contract.candidatesPerRound - 1)
+                : 0,
+            candidateId,
+            model,
+            seed: 0x7fffffff,
+            parentEvidenceIds: [],
+            promptContextRefs: [],
+            ...(boundedCandidateIds.length === 0 ? {} : { boundedCandidateId: candidateId }),
+        },
+        plateau: {
+            phase: "mandatory_escape",
+            escapeRoundsCompleted: 0,
+            escapeRoundsRequired:
+                contract.searchPolicy?.mandatoryEscapeRounds ?? 0,
+            escapeComplete: false,
+            triggerRound: contract.searchPolicy?.minRoundsBeforePlateau ?? null,
+        },
+        byteCap: normalizedCap,
+    });
+    const coreBytes = byteLength(context);
+    if (coreBytes > normalizedCap) {
+        throw new RuntimeConfigError(
+            "The objective, acceptance predicate, metrics, and required prompt metadata exceed the runtime prompt-context byte cap",
+            { coreBytes, byteCap: normalizedCap },
+        );
+    }
+    return Object.freeze({ coreBytes, byteCap: normalizedCap });
+}
+
 export const createPromptContext = buildPromptContext;

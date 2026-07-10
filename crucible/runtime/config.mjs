@@ -3,6 +3,7 @@ import { fileURLToPath } from "node:url";
 
 import { assertLocalDatabasePath } from "../persistence/index.mjs";
 import { RuntimeConfigError } from "./errors.mjs";
+import { validateSupervisorTimingConstraints } from "./config-validation.mjs";
 import {
     assertPathInside,
     isPathInside,
@@ -10,6 +11,7 @@ import {
     readJsonFile,
     rejectUnknownKeys,
     requireAbsolutePath,
+    requireIdentifier,
     requireLowerIdentifier,
     requirePlainObject,
     requirePositiveInteger,
@@ -67,8 +69,6 @@ const CANDIDATE_LIMIT_MAXIMA = Object.freeze({
     maxFileBytes: 256 * 1024,
     maxTotalBytes: 1024 * 1024,
 });
-
-const SUPERVISOR_HEARTBEAT_OPERATION_MARGIN_MS = 1_000;
 
 const SUPERVISOR_KEYS = new Set([
     "runner",
@@ -154,13 +154,7 @@ function normalizeSupervisorAuthority(value, field = "options.supervisorAuthorit
 
 export function normalizeRunnerConfig(input, { env = process.env } = {}) {
     rejectUnknownKeys(input, RUNNER_KEYS, "runner config");
-    const investigationId = requireString(input.investigationId, "investigationId", { max: 128 });
-    if (/[/\\:\u0000-\u001f]/u.test(investigationId)
-        || investigationId === "."
-        || investigationId === ".."
-        || investigationId.includes("..")) {
-        throw new RuntimeConfigError("investigationId must be identifier-like and filesystem-safe");
-    }
+    const investigationId = requireIdentifier(input.investigationId, "investigationId");
     const stateDir = requireLocalAbsolutePath(input.stateDir, "stateDir", env);
     const artifactRoot = requireLocalAbsolutePath(input.artifactRoot, "artifactRoot", env);
     const allowlistPath = requireLocalAbsolutePath(input.allowlistPath, "allowlistPath", env);
@@ -349,22 +343,24 @@ export function normalizeSupervisorConfig(input, options = {}) {
         30_000,
         24 * 60 * 60 * 1000,
     );
-    const jitterOperationMarginMs = Math.max(
-        SUPERVISOR_HEARTBEAT_OPERATION_MARGIN_MS,
-        Math.ceil(heartbeatIntervalMs / 2),
+    const baseBackoffMs = optionalPositiveInteger(
+        input.baseBackoffMs,
+        "baseBackoffMs",
+        250,
+        60 * 1000,
     );
-    const minimumExclusiveStaleLockMs = heartbeatIntervalMs + jitterOperationMarginMs;
-    if (staleLockMs <= minimumExclusiveStaleLockMs) {
-        throw new RuntimeConfigError(
-            "staleLockMs must exceed heartbeatIntervalMs plus the supervisor jitter/operation margin",
-            {
-                heartbeatIntervalMs,
-                staleLockMs,
-                jitterOperationMarginMs,
-                minimumExclusiveStaleLockMs,
-            },
-        );
-    }
+    const maxBackoffMs = optionalPositiveInteger(
+        input.maxBackoffMs,
+        "maxBackoffMs",
+        30_000,
+        10 * 60 * 1000,
+    );
+    validateSupervisorTimingConstraints({
+        heartbeatIntervalMs,
+        staleLockMs,
+        baseBackoffMs,
+        maxBackoffMs,
+    });
     return Object.freeze({
         runner,
         runnerCliPath,
@@ -374,18 +370,8 @@ export function normalizeSupervisorConfig(input, options = {}) {
         maxRestarts: input.maxRestarts === undefined
             ? 3
             : requireNonNegativeInteger(input.maxRestarts, "maxRestarts", 100),
-        baseBackoffMs: optionalPositiveInteger(
-            input.baseBackoffMs,
-            "baseBackoffMs",
-            250,
-            60 * 1000,
-        ),
-        maxBackoffMs: optionalPositiveInteger(
-            input.maxBackoffMs,
-            "maxBackoffMs",
-            30_000,
-            10 * 60 * 1000,
-        ),
+        baseBackoffMs,
+        maxBackoffMs,
         heartbeatIntervalMs,
         staleLockMs,
         circuitWindowMs: optionalPositiveInteger(

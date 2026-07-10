@@ -27,10 +27,20 @@ export {
 
 export {
     ALLOWLIST_HASH_ALGORITHM,
+    ALLOWED_ENV_HASH_ALGORITHM,
     ARGV_PLACEHOLDERS,
+    ARGV_TEMPLATE_HASH_ALGORITHM,
     ENTRY_HASH_ALGORITHM,
+    HARNESS_IDENTITY_VERSION,
+    PARSER_SOURCE_HASH_ALGORITHM,
+    PARSER_VERSION_HASH_ALGORITHM,
+    SANDBOX_POLICY_IDENTITY_HASH_ALGORITHM,
+    buildFrozenHarnessIdentity,
     isVerifiedHarnessEntry,
     loadHarnessAllowlist,
+    validateHarnessValidationCases,
+    verifyFrozenHarnessIdentity,
+    verifyHarnessPreflight,
 } from "./allowlist.mjs";
 
 export {
@@ -53,7 +63,10 @@ export {
     projectDeterministicReceipt,
 } from "./receipt.mjs";
 
-export { createSandboxProvider } from "./sandbox.mjs";
+export {
+    createSandboxProvider,
+    describeSandboxProviderPolicy,
+} from "./sandbox.mjs";
 
 export { createDefaultProcessAdapter } from "./windows-adapter.mjs";
 

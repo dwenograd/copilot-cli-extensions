@@ -14,13 +14,13 @@ describe("Crucible strict runtime CLIs", () => {
             stderr: { write() {} },
         });
         expect(runner.exitCode).toBe(64);
-        expect(runner.envelope.error.code).toBe(RUNTIME_ERROR_CODES.INVALID_CONFIG);
+        expect(runner.envelope.non_result_code).toBe(RUNTIME_ERROR_CODES.INVALID_CONFIG);
 
         const supervisor = await mainSupervisorCli(["relative.json"], {
             stderr: { write() {} },
         });
         expect(supervisor.exitCode).toBe(1);
-        expect(supervisor.envelope.error.code).toBe(RUNTIME_ERROR_CODES.INVALID_CONFIG);
+        expect(supervisor.envelope.non_result_code).toBe(RUNTIME_ERROR_CODES.INVALID_CONFIG);
     });
 
     it("rejects unknown config fields and result paths outside stateDir", () => {

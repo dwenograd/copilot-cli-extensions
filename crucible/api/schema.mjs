@@ -7,13 +7,15 @@
 // advertised to Copilot and the runtime parser can never drift apart — there
 // is no hand-maintained duplicate JSON Schema or Zod schema anywhere.
 //
-// Dependency-free: this module imports only shared domain constants and the
-// API's own typed error. It never touches I/O.
+// This module imports only pure domain/runtime constants and the API's own
+// typed error. It never touches I/O.
 
 import {
     DEFAULT_SEARCH_POLICY,
     HYPOTHESIS_TOPOLOGIES,
 } from "../domain/constants.mjs";
+import { STRICT_ISO_TIMESTAMP_PATTERN_SOURCE } from "../runtime/config-validation.mjs";
+import { DEFAULT_PROMPT_CONTEXT_BYTE_CAP } from "../runtime/prompt-context.mjs";
 import { SchemaValidationError } from "./errors.mjs";
 
 // Re-exported so the schema module's public surface includes the error its
@@ -21,8 +23,13 @@ import { SchemaValidationError } from "./errors.mjs";
 export { SchemaValidationError };
 export { DEFAULT_SEARCH_POLICY };
 
-const IDENTIFIER_PATTERN = "^[A-Za-z0-9][A-Za-z0-9._@-]{0,127}$";
-const IDENTIFIER_RE = /^[A-Za-z0-9][A-Za-z0-9._@-]{0,127}$/u;
+export const MAX_OBJECTIVE_CHARACTERS = 4096;
+export const MAX_ACCEPTANCE_PREDICATE_BYTES = DEFAULT_PROMPT_CONTEXT_BYTE_CAP;
+
+const IDENTIFIER_PATTERN = "^(?!.*\\.\\.)[A-Za-z0-9][A-Za-z0-9._@-]{0,127}$";
+const IDENTIFIER_RE = /^(?!.*\.\.)[A-Za-z0-9][A-Za-z0-9._@-]{0,127}$/u;
+const LOWER_IDENTIFIER_PATTERN = "^(?!.*\\.\\.)[a-z0-9][a-z0-9._-]{0,127}$";
+const LOWER_IDENTIFIER_RE = /^(?!.*\.\.)[a-z0-9][a-z0-9._-]{0,127}$/u;
 
 function fail(pathLabel, message, extra = {}) {
     throw new SchemaValidationError(`${pathLabel}: ${message}`, { path: pathLabel, ...extra });
@@ -58,6 +65,7 @@ export function string({
     minLength = 1,
     maxLength = 4096,
     pattern,
+    format,
     optional = false,
     default: defaultValue,
 } = {}) {
@@ -67,6 +75,7 @@ export function string({
             minLength,
             maxLength,
             ...(pattern === undefined ? {} : { pattern }),
+            ...(format === undefined ? {} : { format }),
         },
         { description },
     );
@@ -99,8 +108,24 @@ export function identifier({ description, optional = false } = {}) {
         ),
         optional,
         parse(value, pathLabel) {
-            if (typeof value !== "string" || !IDENTIFIER_RE.test(value) || value.includes("..")) {
+            if (typeof value !== "string" || !IDENTIFIER_RE.test(value)) {
                 fail(pathLabel, "must be a safe identifier (not a filesystem path)");
+            }
+            return value;
+        },
+    });
+}
+
+export function lowerIdentifier({ description, optional = false } = {}) {
+    return makeField({
+        jsonSchema: commonOptions(
+            { type: "string", minLength: 1, maxLength: 128, pattern: LOWER_IDENTIFIER_PATTERN },
+            { description },
+        ),
+        optional,
+        parse(value, pathLabel) {
+            if (typeof value !== "string" || !LOWER_IDENTIFIER_RE.test(value)) {
+                fail(pathLabel, "must be a lowercase safe identifier (not a filesystem path)");
             }
             return value;
         },
@@ -217,6 +242,7 @@ export function array(item, {
     minItems,
     maxItems,
     uniqueItems = false,
+    uniqueBy,
     optional = false,
     default: defaultValue,
 } = {}) {
@@ -226,7 +252,7 @@ export function array(item, {
             items: item.jsonSchema,
             ...(minItems === undefined ? {} : { minItems }),
             ...(maxItems === undefined ? {} : { maxItems }),
-            ...(uniqueItems ? { uniqueItems: true } : {}),
+            ...(uniqueItems || uniqueBy !== undefined ? { uniqueItems: true } : {}),
         },
         { description },
     );
@@ -246,12 +272,19 @@ export function array(item, {
                 fail(pathLabel, `must contain at most ${maxItems} item(s)`);
             }
             const parsed = value.map((entry, index) => item.parse(entry, `${pathLabel}[${index}]`));
-            if (uniqueItems) {
+            if (uniqueItems || uniqueBy !== undefined) {
                 const seen = new Set();
                 for (let index = 0; index < parsed.length; index += 1) {
-                    const key = JSON.stringify(parsed[index]);
+                    const key = uniqueBy === undefined
+                        ? JSON.stringify(parsed[index])
+                        : parsed[index]?.[uniqueBy];
                     if (seen.has(key)) {
-                        fail(`${pathLabel}[${index}]`, "must be unique");
+                        fail(
+                            `${pathLabel}[${index}]`,
+                            uniqueBy === undefined
+                                ? "must be unique"
+                                : `${uniqueBy} must be unique`,
+                        );
                     }
                     seen.add(key);
                 }
@@ -266,13 +299,29 @@ export function array(item, {
 // asserts "an object" and the parser only guards against non-objects and
 // prototype pollution. The single source of truth for the nested shape stays
 // in the domain, not duplicated here.
-export function rawObject({ description, optional = false } = {}) {
+export function rawObject({
+    description,
+    optional = false,
+    maxBytes = Number.MAX_SAFE_INTEGER,
+} = {}) {
     return makeField({
         jsonSchema: commonOptions({ type: "object", additionalProperties: true }, { description }),
         optional,
         parse(value, pathLabel) {
             if (!isPlainObject(value)) {
                 fail(pathLabel, "must be a JSON object");
+            }
+            let bytes;
+            try {
+                bytes = Buffer.byteLength(JSON.stringify(value), "utf8");
+            } catch {
+                fail(pathLabel, "must be JSON-serializable");
+            }
+            if (bytes > maxBytes) {
+                fail(pathLabel, `must serialize to at most ${maxBytes} UTF-8 bytes`, {
+                    bytes,
+                    maxBytes,
+                });
             }
             return value;
         },
@@ -351,6 +400,41 @@ export function defineTool({ name, description, args }) {
         parameters: args.toJsonSchema(),
         parse(rawArgs) {
             return args.parse(rawArgs);
+        },
+    });
+}
+
+function discriminatedObjectUnion({
+    discriminant,
+    present,
+    absent,
+    description,
+}) {
+    const mergedProperties = {
+        ...absent.jsonSchema.properties,
+        ...present.jsonSchema.properties,
+    };
+    const jsonSchema = {
+        type: "object",
+        additionalProperties: false,
+        ...(description === undefined ? {} : { description }),
+        properties: mergedProperties,
+        required: [],
+        oneOf: [
+            absent.jsonSchema,
+            present.jsonSchema,
+        ],
+    };
+    return Object.freeze({
+        jsonSchema,
+        toJsonSchema: () => structuredClone(jsonSchema),
+        parse(rawArgs, pathLabel = "args") {
+            if (!isPlainObject(rawArgs)) {
+                fail(pathLabel, "must be a JSON object");
+            }
+            return Object.hasOwn(rawArgs, discriminant)
+                ? present.parse(rawArgs, pathLabel)
+                : absent.parse(rawArgs, pathLabel);
         },
     });
 }
@@ -459,45 +543,76 @@ const investigationIdField = identifier({
         "The investigationId returned by crucible_start. Deterministic slug + SHA-256 suffix; resolves to local state under the Crucible state root.",
 });
 
-export const crucibleStartSpec = defineTool({
-    name: "crucible_start",
+const validationCaseShape = object({
+    id: lowerIdentifier({ description: "Stable lowercase id for this validation case." }),
+    expectation: enumField(["accept", "reject"], {
+        description: "Whether the harness must accept or reject this case.",
+    }),
+    path: string({
+        description: "Local directory path (inside project_dir) staged immutably during preflight; only its content hash enters the contract.",
+        maxLength: 32767,
+    }),
+});
+
+const validationCasesArray = array(validationCaseShape, {
     description:
-        "Start (or idempotently re-attach to) a persistent Crucible investigation: freeze an immutable contract, ingest the validation-case directories into the content-addressed ArtifactStore, and launch the detached supervisor/runner. Returns the investigationId, contractHash, and local state/status paths. This is NOT a result — poll crucible_status and only crucible_result may emit a terminal decision.",
-    args: object({
+        "At least one accept and one reject case. Paths are snapshot-staged in an isolated preflight store; symlinks/traversal are refused.",
+    minItems: 2,
+    maxItems: 4096,
+    uniqueBy: "id",
+});
+
+const validationCasesField = makeField({
+    jsonSchema: {
+        ...validationCasesArray.jsonSchema,
+        allOf: [
+            {
+                contains: {
+                    type: "object",
+                    properties: { expectation: { const: "accept" } },
+                    required: ["expectation"],
+                },
+            },
+            {
+                contains: {
+                    type: "object",
+                    properties: { expectation: { const: "reject" } },
+                    required: ["expectation"],
+                },
+            },
+        ],
+    },
+    parse(value, pathLabel) {
+        const parsed = validationCasesArray.parse(value, pathLabel);
+        const expectations = new Set(parsed.map((item) => item.expectation));
+        if (!expectations.has("accept") || !expectations.has("reject")) {
+            fail(pathLabel, "must contain at least one accept and one reject case");
+        }
+        return parsed;
+    },
+});
+
+const newInvestigationStartArgs = object({
         objective: string({
             description: "The falsifiable objective under investigation. Part of the deterministic investigationId.",
-            maxLength: 8192,
+            maxLength: MAX_OBJECTIVE_CHARACTERS,
         }),
         project_dir: string({
             description: "Absolute local project directory. Validation-case paths must resolve inside it. Part of the deterministic investigationId.",
             maxLength: 32767,
         }),
-        harness_id: identifier({
+        harness_id: lowerIdentifier({
             description: "Id of an operator-owned harness allowlist entry (the terminal measurement authority). Must already exist in the allowlist; never a path or command.",
         }),
         acceptance_predicate: rawObject({
             description: "Acceptance-predicate grammar object (harness_pass / metric_compare / field_equals / all / any / not ...). Validated by the domain contract.",
+            maxBytes: MAX_ACCEPTANCE_PREDICATE_BYTES,
         }),
         hypothesis_topology: enumField(HYPOTHESIS_TOPOLOGIES, {
             description:
                 "Search topology. finite_enumerable/bounded_parameterized require bounded_candidate_ids for exhaustive TARGET_UNREACHABLE. open_generative can never emit TARGET_UNREACHABLE. certified_impossibility runs the same allowlisted harness in verifier mode only after validation and every frozen search slot complete without an accepted candidate; the harness must recognize crucible-impossibility-request.json and return a certificate verdict.",
         }),
-        validation_cases: array(
-            object({
-                id: identifier({ description: "Stable id for this validation case." }),
-                expectation: enumField(["accept", "reject"], {
-                    description: "Whether the harness must accept or reject this case.",
-                }),
-                path: string({
-                    description: "Local directory path (inside project_dir) ingested immutably into the ArtifactStore; only its content hash enters the contract.",
-                    maxLength: 32767,
-                }),
-            }),
-            {
-                description: "At least one accept and one reject case. Each path is ingested immediately; symlinks/traversal are refused.",
-                minItems: 2,
-            },
-        ),
+        validation_cases: validationCasesField,
         metrics: array(
             object({
                 key: identifier({ description: "Metric key as emitted by the harness." }),
@@ -510,7 +625,12 @@ export const crucibleStartSpec = defineTool({
                     optional: true,
                 }),
             }),
-            { description: "Ranking metrics the harness emits. Order = priority.", default: [] },
+            {
+                description: "Ranking metrics the harness emits. Order = priority.",
+                maxItems: 4096,
+                uniqueBy: "key",
+                default: [],
+            },
         ),
         worker_models: array(
             identifier({ description: "A proposer/worker model id." }),
@@ -545,14 +665,42 @@ export const crucibleStartSpec = defineTool({
         deadline_iso: string({
             description: "Optional wall-clock ISO-8601 deadline for the run.",
             maxLength: 64,
+            pattern: STRICT_ISO_TIMESTAMP_PATTERN_SOURCE,
+            format: "date-time",
             optional: true,
         }),
-        reset_policy: enumField(["circuit_open", "failed"], {
-            description:
-                "Explicit operational reset for an idempotent reattach. circuit_open resets a persisted circuit breaker; failed resets a non-recoverable failed supervisor. It never resumes a terminal/domain non-result.",
-            optional: true,
-        }),
+    });
+
+const reattachStartArgs = object({
+    investigation_id: investigationIdField,
+    deadline_iso: string({
+        description:
+            "Optional later wall-clock ISO-8601 deadline. It must be in the future and later than the persisted deadline/recovery deadline.",
+        maxLength: 64,
+        pattern: STRICT_ISO_TIMESTAMP_PATTERN_SOURCE,
+        format: "date-time",
+        optional: true,
     }),
+    reset_policy: enumField(["circuit_open", "failed"], {
+        description:
+            "Explicit operational reset for a reattach. circuit_open resets a persisted circuit breaker; failed resets a non-recoverable failed supervisor. It never resumes a terminal/domain non-result.",
+        optional: true,
+    }),
+});
+
+const crucibleStartArgs = discriminatedObjectUnion({
+    discriminant: "investigation_id",
+    absent: newInvestigationStartArgs,
+    present: reattachStartArgs,
+    description:
+        "Exactly one form is accepted: a complete new-investigation contract, or an investigation_id reattach with only an optional later deadline/reset policy.",
+});
+
+export const crucibleStartSpec = defineTool({
+    name: "crucible_start",
+    description:
+        "Start a new persistent Crucible investigation, or reattach/resume one by investigation_id using its persisted contract/config/snapshots. All admission and harness checks complete before durable mutation. This is NOT a result — poll crucible_status and only crucible_result may emit a terminal decision.",
+    args: crucibleStartArgs,
 });
 
 export const crucibleStatusSpec = defineTool({

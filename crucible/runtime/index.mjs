@@ -20,6 +20,12 @@ export {
 } from "./config.mjs";
 
 export {
+    STRICT_ISO_TIMESTAMP_PATTERN_SOURCE,
+    normalizeStartDeadline,
+    validateSupervisorTimingConstraints,
+} from "./config-validation.mjs";
+
+export {
     SUBMIT_CANDIDATE_TOOL_NAME,
     READ_PARENT_ARTIFACT_TOOL_NAME,
     DEFAULT_CANDIDATE_LIMITS,
@@ -35,6 +41,7 @@ export {
     PROMPT_CONTEXT_VERSION,
     PROMPT_CONTEXT_HASH_ALGORITHM,
     DEFAULT_PROMPT_CONTEXT_BYTE_CAP,
+    assertPromptContractCoreFits,
     buildPromptContext,
     createPromptContext,
 } from "./prompt-context.mjs";
@@ -67,4 +74,5 @@ export {
     requestStop,
     ensureSupervisor,
     terminateSupervisor,
+    validateSupervisorAdmission,
 } from "./extension-adapter.mjs";

@@ -9,8 +9,10 @@ import path from "node:path";
 import {
     ENTRY_HASH_ALGORITHM,
     MEASUREMENT_ERROR_CODES,
+    PARSER_VERSION,
     isVerifiedHarnessEntry,
     loadHarnessAllowlist,
+    verifyHarnessPreflight,
 } from "../measurement/index.mjs";
 
 import {
@@ -78,6 +80,21 @@ describe("loadHarnessAllowlist", () => {
         const p = writeAllowlist(root, "GOOD");   // uppercase → not SAFE_ID
         const err = catchIt(() => loadHarnessAllowlist(p));
         expect(err.code).toBe(MEASUREMENT_ERROR_CODES.ALLOWLIST_INVALID);
+    });
+
+    it("rejects dot-dot sequences in entry and validation-case ids", () => {
+        const root = tmp("dotDotId");
+        const badEntry = writeAllowlist(root, "bad..entry");
+        expect(catchIt(() => loadHarnessAllowlist(badEntry)).code)
+            .toBe(MEASUREMENT_ERROR_CODES.ALLOWLIST_INVALID);
+
+        const badCase = writeAllowlist(root, "safe-entry", {
+            validationCases: {
+                "bad..case": { snapshotHash: `sha256:${"a".repeat(64)}` },
+            },
+        }, { fileName: "bad-case.json" });
+        expect(catchIt(() => loadHarnessAllowlist(badCase)).code)
+            .toBe(MEASUREMENT_ERROR_CODES.ALLOWLIST_INVALID);
     });
 
     it("rejects a non-absolute executable path", () => {
@@ -208,6 +225,47 @@ describe("verifyEntry (re-verify before every run)", () => {
         const list = loadHarnessAllowlist(p);
         const err = catchIt(() => list.verifyEntry("does-not-exist"));
         expect(err.code).toBe(MEASUREMENT_ERROR_CODES.ALLOWLIST_ENTRY_NOT_FOUND);
+    });
+
+    it("returns a read-only preflight identity only when requested snapshots match", () => {
+        const root = tmp("preflight");
+        const good = `sha256:${"a".repeat(64)}`;
+        const bad = `sha256:${"b".repeat(64)}`;
+        const p = writeAllowlist(root, "e1", {
+            allowedEnv: { CRUCIBLE_MODE: "strict" },
+            validationCases: {
+                good: { snapshotHash: good },
+                bad: { snapshotHash: bad },
+            },
+        });
+        const list = loadHarnessAllowlist(p);
+        const verified = verifyHarnessPreflight(list, "e1", {
+            parserVersion: PARSER_VERSION,
+            validationCases: [
+                { id: "good", expectation: "accept", artifactHash: good },
+                { id: "bad", expectation: "reject", artifactHash: bad },
+            ],
+        });
+        expect(verified.executableHash)
+            .toMatch(/^sha256:crucible-measurement-file-v1:[a-f0-9]{64}$/u);
+        expect(verified.argvTemplateHash)
+            .toMatch(/^sha256:crucible-measurement-argv-template-v1:[a-f0-9]{64}$/u);
+        expect(verified.allowedEnvHash)
+            .toMatch(/^sha256:crucible-measurement-env-policy-v1:[a-f0-9]{64}$/u);
+        expect(verified.parserSourceHash)
+            .toMatch(/^sha256:crucible-measurement-parser-source-v1:[a-f0-9]{64}$/u);
+
+        const mismatch = catchIt(() => verifyHarnessPreflight(list, "e1", {
+            parserVersion: PARSER_VERSION,
+            validationCases: [
+                {
+                    id: "good",
+                    expectation: "accept",
+                    artifactHash: `sha256:${"c".repeat(64)}`,
+                },
+            ],
+        }));
+        expect(mismatch.code).toBe(MEASUREMENT_ERROR_CODES.ALLOWLIST_INVALID);
     });
 });
 

@@ -11,6 +11,7 @@
 // all state/artifact directories live under the local state root — never under
 // the project, a NAS mount, or a cloud-sync folder.
 
+import fs from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
@@ -29,6 +30,8 @@ const DEFAULT_ROOT_DIRNAME = "Crucible";
 const DEFAULT_ALLOWLIST_FILENAME = "harnesses.json";
 const DEFAULT_INVESTIGATIONS_DIRNAME = "investigations";
 const IDENTIFIER_RE = /^[A-Za-z0-9][A-Za-z0-9._@-]{0,127}$/u;
+const MAX_OBJECTIVE_CHARACTERS = 4096;
+const PREFLIGHT_WORKSPACES = new WeakSet();
 
 function hasText(value) {
     return typeof value === "string" && value.trim().length > 0;
@@ -144,6 +147,12 @@ export function canonicalObjective(objective) {
     if (normalized.length === 0) {
         throw new EnvironmentError("objective must be a non-empty string", { field: "objective" });
     }
+    if (normalized.length > MAX_OBJECTIVE_CHARACTERS) {
+        throw new EnvironmentError(
+            `objective must be at most ${MAX_OBJECTIVE_CHARACTERS} characters`,
+            { field: "objective", length: normalized.length },
+        );
+    }
     return normalized;
 }
 
@@ -162,18 +171,35 @@ function slugify(text) {
 
 // Deterministic, filesystem-safe investigationId: safe slug of the objective
 // plus a SHA-256 suffix over domain version + canonical objective + projectDir
-// + harnessId. A domain-version change must never reopen an older identity.
-export function deriveInvestigationId({ objective, projectDir, harnessId }) {
+// + harness id + canonical allowlist-entry hash. Replacing an entry under the
+// same id therefore creates a new investigation identity instead of silently
+// changing the measurement authority of an existing investigation.
+export function deriveInvestigationId({
+    objective,
+    projectDir,
+    harnessId,
+    harnessEntryHash,
+}) {
     const canonicalObj = canonicalObjective(objective);
     if (!hasText(projectDir)) {
         throw new EnvironmentError("project_dir must be a non-empty string", { field: "project_dir" });
     }
-    if (typeof harnessId !== "string" || !IDENTIFIER_RE.test(harnessId)) {
+    if (typeof harnessId !== "string"
+        || !IDENTIFIER_RE.test(harnessId)
+        || harnessId.includes("..")) {
         throw new EnvironmentError("harness_id must be a safe identifier", { field: "harness_id" });
+    }
+    if (typeof harnessEntryHash !== "string"
+        || !/^sha256:[a-z0-9][a-z0-9._-]*:[a-f0-9]{64}$/u.test(harnessEntryHash)) {
+        throw new EnvironmentError(
+            "harness entry hash must be an algorithm-tagged SHA-256",
+            { field: "harnessEntryHash" },
+        );
     }
     const material = [
         `crucible-investigation-domain-v${DOMAIN_VERSION}`,
         harnessId,
+        harnessEntryHash,
         canonicalObj,
         normalizeProjectDirForHash(projectDir),
     ].join("\u0000");
@@ -195,11 +221,87 @@ export function deriveRunnerEpochId(investigationId) {
 
 // Local state/artifact layout for one investigation, all under the state root.
 export function resolveInvestigationPaths(stateRoot, investigationId) {
+    if (typeof stateRoot !== "string" || !path.isAbsolute(stateRoot)) {
+        throw new EnvironmentError("state root must be an absolute path", { stateRoot });
+    }
+    if (typeof investigationId !== "string"
+        || !IDENTIFIER_RE.test(investigationId)
+        || investigationId.includes("..")) {
+        throw new EnvironmentError("investigationId must be filesystem-safe", { investigationId });
+    }
     const investigationDir = path.join(stateRoot, investigationId);
     const stateDir = path.join(investigationDir, "state");
     const artifactRoot = path.join(investigationDir, "artifacts");
     const eventsDbPath = path.join(stateDir, "events.sqlite");
     return Object.freeze({ investigationDir, stateDir, artifactRoot, eventsDbPath });
+}
+
+function nearestExistingDirectory(candidate) {
+    let current = path.resolve(candidate);
+    while (!fs.existsSync(current)) {
+        const parent = path.dirname(current);
+        if (parent === current) {
+            throw new EnvironmentError("no existing local directory is available for preflight staging", {
+                candidate,
+            });
+        }
+        current = parent;
+    }
+    if (!fs.statSync(current).isDirectory()) {
+        current = path.dirname(current);
+    }
+    return current;
+}
+
+export function createPreflightWorkspace({
+    stateRoot,
+    investigationId,
+    env,
+}) {
+    const preferredParent = fs.existsSync(stateRoot) ? stateRoot : path.dirname(stateRoot);
+    const existingParent = nearestExistingDirectory(preferredParent);
+    let localParent;
+    try {
+        localParent = assertLocalDatabasePath(existingParent, { env });
+    } catch (error) {
+        throw new EnvironmentError(
+            `preflight staging must be on a trusted local filesystem: ${error?.message ?? String(error)}`,
+            { existingParent, reason: error?.details?.reason ?? error?.code ?? null },
+        );
+    }
+    const prefix = `.crucible-preflight-${investigationId.slice(-16)}-`;
+    let root;
+    try {
+        root = fs.mkdtempSync(path.join(localParent, prefix));
+    } catch (error) {
+        throw new EnvironmentError(
+            `unable to create isolated preflight workspace: ${error?.message ?? String(error)}`,
+            { localParent, cause: error?.code ?? null },
+        );
+    }
+    const workspace = Object.freeze({
+        root,
+        snapshotStoreRoot: path.join(root, "snapshot-store"),
+        sandboxControlRoot: path.join(root, "sandbox-control"),
+    });
+    PREFLIGHT_WORKSPACES.add(workspace);
+    return workspace;
+}
+
+export function removePreflightWorkspace(workspace) {
+    if (workspace === null
+        || typeof workspace !== "object"
+        || !PREFLIGHT_WORKSPACES.has(workspace)) {
+        throw new EnvironmentError("invalid preflight workspace cleanup request");
+    }
+    fs.rmSync(workspace.root, {
+        recursive: true,
+        force: true,
+        maxRetries: 5,
+        retryDelay: 50,
+    });
+    PREFLIGHT_WORKSPACES.delete(workspace);
+    return !fs.existsSync(workspace.root);
 }
 
 // Build the raw supervisor config input (the actual runtime API then

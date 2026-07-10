@@ -14,7 +14,10 @@ import {
 } from "../domain/index.mjs";
 import {
     PARSER_VERSION,
+    buildFrozenHarnessIdentity,
     createSandboxProvider,
+    loadHarnessAllowlist,
+    verifyHarnessPreflight,
 } from "../measurement/index.mjs";
 import {
     ERROR_CODES as PERSISTENCE_ERROR_CODES,
@@ -24,6 +27,7 @@ import {
 import {
     InjectedCrashError,
     READ_PARENT_ARTIFACT_TOOL_NAME,
+    RUNTIME_ERROR_CODES,
     SUBMIT_CANDIDATE_TOOL_NAME,
     createDomainRepositoryAdapter,
     requestStop,
@@ -103,6 +107,7 @@ function makeContract({
     maxRounds = 4,
     maxCommands = 20,
     searchPolicy = {},
+    harnessIdentity,
 } = {}) {
     return createInvestigationContract({
         objective: "Find a candidate whose trusted score is at least 90",
@@ -125,6 +130,7 @@ function makeContract({
         criticality: "high",
         policyVersion: "policy-v1",
         parserVersion: PARSER_VERSION,
+        harnessIdentity,
         workerModels: ["model-a", "model-b"],
         candidatesPerRound,
         maxRounds,
@@ -148,6 +154,18 @@ function makeContract({
         },
         declaredLimits: { maxCommands },
     });
+}
+
+function runnerSandboxIdentity() {
+    return {
+        required: true,
+        primitive: "fixture-containment",
+        policyId: "runner-fixture-policy",
+        helperSourceHash:
+            `sha256:runner-fixture-helper-source-v1:${"a".repeat(64)}`,
+        helperBinaryHash:
+            `sha256:crucible-measurement-file-v1:${"b".repeat(64)}`,
+    };
 }
 
 function deterministicIds() {
@@ -253,9 +271,27 @@ function setupInvestigation(label, contractOptions = {}, {
         "known-good": goodSnapshot,
         "known-bad": badSnapshot,
     }, executesCandidateCode);
+    const allowlist = loadHarnessAllowlist(allowlistPath);
+    const harnessVerification = verifyHarnessPreflight(
+        allowlist,
+        "score-harness",
+        {
+            validationCases: [
+                { id: "known-good", artifactHash: goodSnapshot },
+                { id: "known-bad", artifactHash: badSnapshot },
+            ],
+            parserVersion: PARSER_VERSION,
+        },
+    );
+    const harnessIdentity = buildFrozenHarnessIdentity(harnessVerification, {
+        sandbox: executesCandidateCode
+            ? runnerSandboxIdentity()
+            : { required: false },
+    });
     const contract = makeContract({
         goodSnapshot,
         badSnapshot,
+        harnessIdentity,
         ...contractOptions,
     });
     const repository = openRepository({ file: path.join(stateDir, "events.sqlite") });
@@ -285,6 +321,7 @@ function setupInvestigation(label, contractOptions = {}, {
         stateDir,
         artifactRoot,
         allowlistPath,
+        scriptPath,
         harnessCounterPath,
         contract,
         config,
@@ -339,11 +376,15 @@ function runnerDependencies(workerPool, extra = {}) {
     };
 }
 
-function createRunnerContainmentProvider(calls) {
+function createRunnerContainmentProvider(
+    calls,
+    { describePolicyIdentity = runnerSandboxIdentity } = {},
+) {
     let nextCapability = 0;
     return createSandboxProvider({
         providerId: "runner-fixture-containment",
         providerVersion: "v1",
+        describePolicyIdentity,
         admitAndPrepare(request, issueLaunchCapability) {
             calls.admissions.push(request);
             let child = null;
@@ -391,6 +432,7 @@ describe("Crucible autonomous runner", () => {
             candidatesPerRound: 2,
             maxRounds: 2,
         });
+
         const pool = new FakeWorkerPool([95, 80, 96, 70]);
         const result = await runAutonomousInvestigation(
             setup.config,
@@ -530,6 +572,116 @@ describe("Crucible autonomous runner", () => {
         expect(fs.existsSync(tempRoot)).toBe(true);
         expect(fs.readdirSync(tempRoot)).toEqual([]);
     }, 60_000);
+
+    it.each([
+        [
+            "allowlist file",
+            (setup) => {
+                const allowlist = JSON.parse(fs.readFileSync(setup.allowlistPath, "utf8"));
+                allowlist.description = "mutated after the first measurement";
+                fs.writeFileSync(setup.allowlistPath, JSON.stringify(allowlist));
+            },
+        ],
+        [
+            "same-id harness entry",
+            (setup) => {
+                const allowlist = JSON.parse(fs.readFileSync(setup.allowlistPath, "utf8"));
+                allowlist.entries["score-harness"].timeoutMs += 1;
+                fs.writeFileSync(setup.allowlistPath, JSON.stringify(allowlist));
+            },
+        ],
+        [
+            "harness executable binding",
+            (setup) => {
+                const allowlist = JSON.parse(fs.readFileSync(setup.allowlistPath, "utf8"));
+                allowlist.entries["score-harness"].executableSha256 = "0".repeat(64);
+                fs.writeFileSync(setup.allowlistPath, JSON.stringify(allowlist));
+            },
+        ],
+        [
+            "dependency bytes",
+            (setup) => {
+                fs.appendFileSync(setup.scriptPath, "\n// mutated after start\n");
+            },
+        ],
+        [
+            "allowed environment",
+            (setup) => {
+                const allowlist = JSON.parse(fs.readFileSync(setup.allowlistPath, "utf8"));
+                allowlist.entries["score-harness"].allowedEnv = {
+                    CRUCIBLE_MUTATED: "1",
+                };
+                fs.writeFileSync(setup.allowlistPath, JSON.stringify(allowlist));
+            },
+        ],
+    ])("fails closed when %s changes between measurements", async (_label, mutate) => {
+        const setup = setupInvestigation(`identity-${_label.replaceAll(" ", "-")}`, {
+            candidatesPerRound: 1,
+            maxRounds: 1,
+            searchPolicy: { stopOnFirstAccept: true },
+        });
+        let mutated = false;
+        await expect(runAutonomousInvestigation(
+            setup.config,
+            runnerDependencies(new FakeWorkerPool([95]), {
+                faultInjector(point) {
+                    if (!mutated && point === "after_measurement_execution") {
+                        mutated = true;
+                        mutate(setup);
+                    }
+                },
+            }),
+        )).rejects.toMatchObject({
+            code: RUNTIME_ERROR_CODES.HARNESS_CONFIGURATION_INVALID,
+        });
+        expect(mutated).toBe(true);
+    }, 30_000);
+
+    it("fails closed when the required sandbox policy identity changes", async () => {
+        const setup = setupInvestigation(
+            "sandbox-policy-identity-mutation",
+            {
+                candidatesPerRound: 1,
+                maxRounds: 1,
+                searchPolicy: { stopOnFirstAccept: true },
+            },
+            { executesCandidateCode: true },
+        );
+        const calls = {
+            admissions: [],
+            launches: [],
+            terminations: [],
+            cleanups: [],
+        };
+        let mutated = false;
+        const sandboxProvider = createRunnerContainmentProvider(calls, {
+            describePolicyIdentity() {
+                const identity = runnerSandboxIdentity();
+                return mutated
+                    ? {
+                        ...identity,
+                        helperBinaryHash:
+                            `sha256:crucible-measurement-file-v1:${"f".repeat(64)}`,
+                    }
+                    : identity;
+            },
+        });
+
+        await expect(runAutonomousInvestigation(
+            setup.config,
+            runnerDependencies(new FakeWorkerPool([95]), {
+                sandboxProvider,
+                faultInjector(point) {
+                    if (!mutated && point === "after_measurement_execution") {
+                        mutated = true;
+                    }
+                },
+            }),
+        )).rejects.toMatchObject({
+            code: RUNTIME_ERROR_CODES.HARNESS_CONFIGURATION_INVALID,
+        });
+        expect(mutated).toBe(true);
+    }, 30_000);
 
     it("configures and persists capability-launched measurements from the Windows provider factory", async () => {
         const setup = setupInvestigation(

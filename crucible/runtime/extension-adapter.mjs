@@ -80,10 +80,24 @@ function resolveNodeExecutable(env, explicitPath) {
     throw new Error("Crucible supervisor requires Node on PATH or CRUCIBLE_NODE_PATH");
 }
 
-export function startSupervisor(input, dependencies = {}) {
+export function validateSupervisorAdmission(input, dependencies = {}) {
     const config = coerceSupervisorConfig(input, {
         env: dependencies.env ?? process.env,
     });
+    const nodeExecutable = resolveNodeExecutable(
+        dependencies.env ?? process.env,
+        dependencies.nodeExecutable,
+    );
+    if (!fs.existsSync(config.runnerCliPath)
+        || !fs.statSync(config.runnerCliPath).isFile()) {
+        throw new Error("Crucible supervisor runner CLI is not an existing regular file");
+    }
+    return Object.freeze({ config, nodeExecutable });
+}
+
+export function startSupervisor(input, dependencies = {}) {
+    const admission = validateSupervisorAdmission(input, dependencies);
+    const { config, nodeExecutable } = admission;
     ensureDirectory(config.paths.directory);
     atomicWriteJson(config.paths.configPath, rawSupervisorConfig(config));
     const supervisorCliPath = path.join(
@@ -91,10 +105,6 @@ export function startSupervisor(input, dependencies = {}) {
         "supervisor-cli.mjs",
     );
     const spawnProcess = dependencies.spawnProcess ?? spawn;
-    const nodeExecutable = resolveNodeExecutable(
-        dependencies.env ?? process.env,
-        dependencies.nodeExecutable,
-    );
     const child = spawnProcess(
         nodeExecutable,
         [supervisorCliPath, "--config", config.paths.configPath],

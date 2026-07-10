@@ -16,6 +16,37 @@ import { ContractError, ERROR_CODES } from "./errors.mjs";
 const COMPARISON_OPERATORS = Object.freeze(["<", "<=", "==", ">=", ">"]);
 const VALIDATION_EXPECTATIONS = Object.freeze(["accept", "reject"]);
 const METRIC_DIRECTIONS = Object.freeze(["min", "max"]);
+const TAGGED_SHA256 = /^sha256:[a-z0-9][a-z0-9._-]*:[a-f0-9]{64}$/u;
+const HARNESS_IDENTITY_KEYS = Object.freeze([
+    "allowedEnvHash",
+    "allowlistFileHash",
+    "allowlistVersion",
+    "argvTemplateHash",
+    "dependencyHashes",
+    "executesCandidateCode",
+    "executableHash",
+    "harnessEntryHash",
+    "harnessId",
+    "parserSourceHash",
+    "parserVersion",
+    "parserVersionHash",
+    "sandbox",
+    "version",
+]);
+const HARNESS_DEPENDENCY_KEYS = Object.freeze(["path", "role", "sha256"]);
+const HARNESS_SANDBOX_KEYS = Object.freeze([
+    "policyDigest",
+    "policyIdentity",
+    "required",
+]);
+const HARNESS_SANDBOX_IDENTITY_KEYS = Object.freeze([
+    "helperBinaryHash",
+    "helperSourceHash",
+    "policyId",
+    "primitive",
+]);
+const SANDBOX_POLICY_IDENTITY_HASH_ALGORITHM =
+    "sha256:crucible-measurement-sandbox-policy-identity-v1";
 const SEARCH_POLICY_KEYS = Object.freeze([
     "archiveCaps",
     "dedupPolicy",
@@ -121,6 +152,170 @@ function requireArtifactHash(value, field) {
         });
     }
     return value;
+}
+
+function requireTaggedSha256(value, field) {
+    if (typeof value !== "string" || !TAGGED_SHA256.test(value)) {
+        throw new ContractError(`${field} must be an algorithm-tagged SHA-256`, {
+            field,
+            value,
+        });
+    }
+    return value;
+}
+
+function normalizeHarnessDependencies(value) {
+        if (!Array.isArray(value) || value.length > 64) {
+            throw new ContractError("harnessIdentity.dependencyHashes must be an array of at most 64 items");
+        }
+        const paths = new Set();
+        return value.map((dependency, index) => {
+            const field = `harnessIdentity.dependencyHashes[${index}]`;
+            requireExactObjectKeys(dependency, field, HARNESS_DEPENDENCY_KEYS);
+            const dependencyPath = requireNonEmptyString(dependency.path, `${field}.path`, 32767);
+            const pathKey = process.platform === "win32"
+                ? dependencyPath.toLowerCase()
+                : dependencyPath;
+            if (paths.has(pathKey)) {
+                throw new ContractError("harnessIdentity.dependencyHashes paths must be unique", {
+                    path: dependencyPath,
+                });
+            }
+            paths.add(pathKey);
+            return {
+                path: dependencyPath,
+                role: requireNonEmptyString(dependency.role, `${field}.role`, 64),
+                sha256: requireTaggedSha256(dependency.sha256, `${field}.sha256`),
+            };
+        });
+}
+
+function normalizeHarnessSandbox(value, executesCandidateCode) {
+        requireExactObjectKeys(value, "harnessIdentity.sandbox", HARNESS_SANDBOX_KEYS);
+        if (typeof value.required !== "boolean") {
+            throw new ContractError("harnessIdentity.sandbox.required must be boolean");
+        }
+        if (value.required !== executesCandidateCode) {
+            throw new ContractError(
+                "harnessIdentity.sandbox.required must match executesCandidateCode",
+            );
+        }
+        if (!value.required) {
+            if (value.policyIdentity !== null || value.policyDigest !== null) {
+                throw new ContractError(
+                    "A non-executing harness must freeze a null sandbox policy identity/digest",
+                );
+            }
+            return {
+                required: false,
+                policyIdentity: null,
+                policyDigest: null,
+            };
+        }
+        requireExactObjectKeys(
+            value.policyIdentity,
+            "harnessIdentity.sandbox.policyIdentity",
+            HARNESS_SANDBOX_IDENTITY_KEYS,
+        );
+        const policyIdentity = {
+            primitive: requireNonEmptyString(
+                value.policyIdentity.primitive,
+                "harnessIdentity.sandbox.policyIdentity.primitive",
+                128,
+            ),
+            policyId: requireIdentifier(
+                value.policyIdentity.policyId,
+                "harnessIdentity.sandbox.policyIdentity.policyId",
+            ),
+            helperSourceHash: requireTaggedSha256(
+                value.policyIdentity.helperSourceHash,
+                "harnessIdentity.sandbox.policyIdentity.helperSourceHash",
+            ),
+            helperBinaryHash: requireTaggedSha256(
+                value.policyIdentity.helperBinaryHash,
+                "harnessIdentity.sandbox.policyIdentity.helperBinaryHash",
+            ),
+        };
+        const policyDigest = requireTaggedSha256(
+            value.policyDigest,
+            "harnessIdentity.sandbox.policyDigest",
+        );
+        const expectedDigest = hashCanonical(
+            policyIdentity,
+            SANDBOX_POLICY_IDENTITY_HASH_ALGORITHM,
+        );
+        if (policyDigest !== expectedDigest) {
+            throw new ContractError(
+                "harnessIdentity.sandbox.policyDigest must match the canonical policy identity",
+                { expected: expectedDigest, actual: policyDigest },
+            );
+        }
+        return {
+            required: true,
+            policyIdentity,
+            policyDigest,
+        };
+}
+
+function normalizeHarnessIdentity(value, harnessId, parserVersion) {
+        requireExactObjectKeys(value, "harnessIdentity", HARNESS_IDENTITY_KEYS);
+        if (value.version !== 1) {
+            throw new ContractError("harnessIdentity.version must be 1");
+        }
+        if (value.allowlistVersion !== 1) {
+            throw new ContractError("harnessIdentity.allowlistVersion must be 1");
+        }
+        const frozenHarnessId = requireIdentifier(value.harnessId, "harnessIdentity.harnessId");
+        if (frozenHarnessId !== harnessId) {
+            throw new ContractError("harnessIdentity.harnessId must match harnessId");
+        }
+        const frozenParserVersion = requireIdentifier(
+            value.parserVersion,
+            "harnessIdentity.parserVersion",
+        );
+        if (frozenParserVersion !== parserVersion) {
+            throw new ContractError("harnessIdentity.parserVersion must match parserVersion");
+        }
+        if (typeof value.executesCandidateCode !== "boolean") {
+            throw new ContractError("harnessIdentity.executesCandidateCode must be boolean");
+        }
+        return {
+            version: 1,
+            harnessId: frozenHarnessId,
+            allowlistVersion: 1,
+            allowlistFileHash: requireTaggedSha256(
+                value.allowlistFileHash,
+                "harnessIdentity.allowlistFileHash",
+            ),
+            harnessEntryHash: requireTaggedSha256(
+                value.harnessEntryHash,
+                "harnessIdentity.harnessEntryHash",
+            ),
+            executableHash: requireTaggedSha256(
+                value.executableHash,
+                "harnessIdentity.executableHash",
+            ),
+            dependencyHashes: normalizeHarnessDependencies(value.dependencyHashes),
+            argvTemplateHash: requireTaggedSha256(
+                value.argvTemplateHash,
+                "harnessIdentity.argvTemplateHash",
+            ),
+            allowedEnvHash: requireTaggedSha256(
+                value.allowedEnvHash,
+                "harnessIdentity.allowedEnvHash",
+            ),
+            parserVersion: frozenParserVersion,
+            parserVersionHash: requireTaggedSha256(
+                value.parserVersionHash,
+                "harnessIdentity.parserVersionHash",
+            ),
+            parserSourceHash: requireTaggedSha256(
+                value.parserSourceHash,
+                "harnessIdentity.parserSourceHash",
+            ),
+            executesCandidateCode: value.executesCandidateCode,
+            sandbox: normalizeHarnessSandbox(value.sandbox, value.executesCandidateCode),
+        };
 }
 
 function normalizePath(path, field) {
@@ -721,6 +916,7 @@ export function createInvestigationContract(input) {
         input.impossibilityPolicy,
         input.hypothesisTopology,
     );
+    const parserVersion = requireIdentifier(input.parserVersion, "parserVersion");
     const contract = {
         objective,
         acceptancePredicate: normalizePredicate(input.acceptancePredicate),
@@ -729,7 +925,12 @@ export function createInvestigationContract(input) {
         hypothesisTopology: input.hypothesisTopology,
         criticality: requireNonEmptyString(input.criticality, "criticality", 64),
         policyVersion: requireIdentifier(input.policyVersion, "policyVersion"),
-        parserVersion: requireIdentifier(input.parserVersion, "parserVersion"),
+        parserVersion,
+        harnessIdentity: normalizeHarnessIdentity(
+            input.harnessIdentity,
+            harnessId,
+            parserVersion,
+        ),
         workerModels: search.workerModels,
         candidatesPerRound: search.candidatesPerRound,
         maxRounds: search.maxRounds,

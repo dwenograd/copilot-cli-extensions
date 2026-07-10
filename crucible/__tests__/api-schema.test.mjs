@@ -64,12 +64,19 @@ describe("crucible API schema (single source)", () => {
             expect(Object.keys(spec.parameters.properties).length).toBeGreaterThan(0);
             expect(Array.isArray(spec.parameters.required)).toBe(true);
         }
+        expect(crucibleStartSpec.parameters.oneOf).toHaveLength(2);
+        for (const branch of crucibleStartSpec.parameters.oneOf) {
+            expect(branch.type).toBe("object");
+            expect(branch.additionalProperties).toBe(false);
+        }
     });
 
     // The core parity property: the JSON Schema `required` array is exactly the
     // set of keys the runtime parser rejects when missing, and every property
     // NOT listed as required parses fine when omitted.
-    it.each(TOOL_SPECS.map((spec) => [spec.name, spec]))(
+    it.each(TOOL_SPECS
+        .filter((spec) => spec !== crucibleStartSpec)
+        .map((spec) => [spec.name, spec]))(
         "%s: JSON Schema required list matches the parser",
         (name, spec) => {
             const properties = Object.keys(spec.parameters.properties);
@@ -95,6 +102,39 @@ describe("crucible API schema (single source)", () => {
             }
         },
     );
+
+    it("keeps both crucible_start oneOf branches in parser/schema parity", () => {
+        const [newBranch, reattachBranch] = crucibleStartSpec.parameters.oneOf;
+        expect(new Set(newBranch.required)).toEqual(new Set([
+            "objective",
+            "project_dir",
+            "harness_id",
+            "acceptance_predicate",
+            "hypothesis_topology",
+            "validation_cases",
+            "worker_models",
+            "candidates_per_round",
+            "max_rounds",
+        ]));
+        expect(reattachBranch.required).toEqual(["investigation_id"]);
+        expect(() => crucibleStartSpec.parse(validStartArgs())).not.toThrow();
+        expect(() => crucibleStartSpec.parse({
+            investigation_id: "inv-abc123",
+            deadline_iso: "2026-07-10T09:00:00.000Z",
+            reset_policy: "failed",
+        })).not.toThrow();
+    });
+
+    it("rejects mixed new-investigation and reattach arguments", () => {
+        expect(() => crucibleStartSpec.parse({
+            ...validStartArgs(),
+            investigation_id: "inv-abc123",
+        })).toThrow(SchemaValidationError);
+        expect(() => crucibleStartSpec.parse({
+            investigation_id: "inv-abc123",
+            project_dir: "C:\\proj",
+        })).toThrow(SchemaValidationError);
+    });
 
     it("rejects unknown arguments", () => {
         expect(() => crucibleStatusSpec.parse({ investigation_id: "inv-1", extra: 1 }))
@@ -181,6 +221,12 @@ describe("crucible API schema (single source)", () => {
         expect(() => crucibleStartSpec.parse(validStartArgs({
             metrics: [{ key: "score", direction: "max", epsilon: -1 }],
         }))).toThrow(SchemaValidationError);
+        expect(() => crucibleStartSpec.parse(validStartArgs({
+            metrics: [
+                { key: "score", direction: "max" },
+                { key: "score", direction: "min" },
+            ],
+        }))).toThrow(SchemaValidationError);
     });
 
     it("enforces validation_cases minItems and item shape", () => {
@@ -191,6 +237,18 @@ describe("crucible API schema (single source)", () => {
             validation_cases: [
                 { id: "good", expectation: "maybe", path: "cases/good" },
                 { id: "bad", expectation: "reject", path: "cases/bad" },
+            ],
+        }))).toThrow(SchemaValidationError);
+        expect(() => crucibleStartSpec.parse(validStartArgs({
+            validation_cases: [
+                { id: "good", expectation: "accept", path: "cases/good" },
+                { id: "bad", expectation: "accept", path: "cases/bad" },
+            ],
+        }))).toThrow(SchemaValidationError);
+        expect(() => crucibleStartSpec.parse(validStartArgs({
+            validation_cases: [
+                { id: "same", expectation: "accept", path: "cases/good" },
+                { id: "same", expectation: "reject", path: "cases/bad" },
             ],
         }))).toThrow(SchemaValidationError);
     });
@@ -218,18 +276,46 @@ describe("crucible API schema (single source)", () => {
             .toThrow(SchemaValidationError);
         expect(() => crucibleStartSpec.parse(validStartArgs({ harness_id: "a/b" })))
             .toThrow(SchemaValidationError);
+        expect(() => crucibleStartSpec.parse(validStartArgs({ harness_id: "a..b" })))
+            .toThrow(SchemaValidationError);
+        expect(() => crucibleStatusSpec.parse({ investigation_id: "inv..escape" }))
+            .toThrow(SchemaValidationError);
     });
 
-    it("accepts optional bounded_candidate_ids, deadline_iso, and reset_policy", () => {
+    it("aligns objective/predicate/deadline limits with preflight", () => {
+        expect(crucibleStartSpec.parameters.properties.objective.maxLength).toBe(4096);
+        expect(crucibleStartSpec.parameters.properties.deadline_iso.format).toBe("date-time");
+        expect(() => crucibleStartSpec.parse(validStartArgs({
+            objective: "x".repeat(4097),
+        }))).toThrow(SchemaValidationError);
+        expect(() => crucibleStartSpec.parse(validStartArgs({
+            acceptance_predicate: {
+                kind: "field_equals",
+                path: "payload",
+                value: "x".repeat(17 * 1024),
+            },
+        }))).toThrow(SchemaValidationError);
+        expect(() => crucibleStartSpec.parse(validStartArgs({
+            deadline_iso: "2026-07-10",
+        }))).toThrow(SchemaValidationError);
+    });
+
+    it("accepts optional bounded_candidate_ids/deadline for new starts and reset on reattach", () => {
         const parsed = crucibleStartSpec.parse(validStartArgs({
             bounded_candidate_ids: ["cand-a", "cand-b"],
             deadline_iso: "2026-07-10T09:00:00.000Z",
-            reset_policy: "circuit_open",
         }));
         expect(parsed.bounded_candidate_ids).toEqual(["cand-a", "cand-b"]);
         expect(parsed.deadline_iso).toBe("2026-07-10T09:00:00.000Z");
-        expect(parsed.reset_policy).toBe("circuit_open");
-        expect(() => crucibleStartSpec.parse(validStartArgs({ reset_policy: "anything" })))
+        const reattach = crucibleStartSpec.parse({
+            investigation_id: "inv-abc123",
+            reset_policy: "circuit_open",
+        });
+        expect(reattach.reset_policy).toBe("circuit_open");
+        expect(() => crucibleStartSpec.parse({
+            investigation_id: "inv-abc123",
+            reset_policy: "anything",
+        }))
             .toThrow(SchemaValidationError);
     });
 

@@ -20,8 +20,10 @@
 import fs from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
+import { fileURLToPath } from "node:url";
 
 import {
+    canonicalEqual,
     hashCanonical,
     immutableCanonical,
 } from "../domain/canonical.mjs";
@@ -35,16 +37,29 @@ import {
     closeVerifiedFileHandle,
     normalizeExpectedHash,
     openVerifiedFileHandle,
+    sha256File,
     stageVerifiedFileHandle,
     verifyAndHashFile,
     verifyLocalRegularFile,
 } from "./fs-verify.mjs";
+import { PARSER_VERSION } from "./parser.mjs";
 
 // Algorithm tag for canonical-JSON hashes of allowlist entries. Kept distinct
 // from the generic domain canonical hash so an entry hash cannot be silently
 // confused with, e.g., a contract hash even if the bytes happened to match.
 export const ENTRY_HASH_ALGORITHM = "sha256:crucible-measurement-entry-v1";
 export const ALLOWLIST_HASH_ALGORITHM = "sha256:crucible-measurement-allowlist-v1";
+export const ARGV_TEMPLATE_HASH_ALGORITHM =
+    "sha256:crucible-measurement-argv-template-v1";
+export const ALLOWED_ENV_HASH_ALGORITHM =
+    "sha256:crucible-measurement-env-policy-v1";
+export const PARSER_VERSION_HASH_ALGORITHM =
+    "sha256:crucible-measurement-parser-version-v1";
+export const PARSER_SOURCE_HASH_ALGORITHM =
+    "sha256:crucible-measurement-parser-source-v1";
+export const SANDBOX_POLICY_IDENTITY_HASH_ALGORITHM =
+    "sha256:crucible-measurement-sandbox-policy-identity-v1";
+export const HARNESS_IDENTITY_VERSION = 1;
 
 // Maximum sizes chosen defensively. The allowlist is small operator-owned
 // JSON — 1 MiB is generous; anything larger is almost certainly wrong.
@@ -55,7 +70,7 @@ const MAX_ALLOWLIST_BYTES = 1 * 1024 * 1024;
 // new placeholder cannot be silently misused as opaque data.
 export const ARGV_PLACEHOLDERS = Object.freeze(["candidatePath", "attemptId"]);
 
-const SAFE_ID = /^[a-z0-9][a-z0-9._-]{0,127}$/u;
+const SAFE_ID = /^(?!.*\.\.)[a-z0-9][a-z0-9._-]{0,127}$/u;
 const ENV_KEY = /^[A-Z_][A-Z0-9_]{0,127}$/u;
 const PLACEHOLDER_ANY = /\{\{([^}]*)\}\}/gu;
 const STATIC_FILE_EXTENSION = /\.(?:bat|cmd|com|dll|exe|json|mjs|cjs|js|jsx|ps1|py|pyw|rb|sh|ts|tsx|wasm|yaml|yml)$/iu;
@@ -521,6 +536,7 @@ export function loadHarnessAllowlist(allowlistPath) {
     });
 
     const allowlist = Object.freeze({
+        version: state.version,
         allowlistPath: state.allowlistPath,
         allowlistFileHash: state.allowlistFileHash,
         contentHash: state.contentHash,
@@ -603,6 +619,245 @@ export function isVerifiedHarnessEntry(value) {
 
 export function isLoadedHarnessAllowlist(value) {
     return value !== null && typeof value === "object" && loadedAllowlists.has(value);
+}
+
+export function validateHarnessValidationCases(entry, validationCases) {
+    if (entry === null || typeof entry !== "object" || Array.isArray(entry)) {
+        throw new MeasurementError(
+            MEASUREMENT_ERROR_CODES.INVALID_ARGUMENT,
+            "entry must be a normalized harness allowlist entry",
+        );
+    }
+    if (!Array.isArray(validationCases) || validationCases.length === 0) {
+        throw new MeasurementError(
+            MEASUREMENT_ERROR_CODES.INVALID_ARGUMENT,
+            "validationCases must be a non-empty array",
+        );
+    }
+    if (entry.validationCases === null) {
+        invalid(`entries.${entry.id}.validationCases must pin every requested validation case`);
+    }
+    const seen = new Set();
+    for (const validationCase of validationCases) {
+        const caseId = validationCase?.id;
+        const snapshotHash = validationCase?.artifactHash;
+        if (typeof caseId !== "string" || !SAFE_ID.test(caseId) || seen.has(caseId)) {
+            invalid(`requested validation case id ${JSON.stringify(caseId)} is invalid or duplicated`);
+        }
+        seen.add(caseId);
+        if (typeof snapshotHash !== "string" || !/^sha256:[a-f0-9]{64}$/u.test(snapshotHash)) {
+            invalid(`requested validation case ${JSON.stringify(caseId)} has an invalid snapshot id`);
+        }
+        const pinned = entry.validationCases[caseId];
+        if (pinned === undefined) {
+            invalid(
+                `entries.${entry.id}.validationCases is missing requested case ${JSON.stringify(caseId)}`,
+                { harnessId: entry.id, caseId, requestedSnapshotHash: snapshotHash },
+            );
+        }
+        if (pinned.snapshotHash !== snapshotHash) {
+            invalid(
+                `entries.${entry.id}.validationCases[${caseId}].snapshotHash does not match the requested input snapshot`,
+                {
+                    harnessId: entry.id,
+                    caseId,
+                    requestedSnapshotHash: snapshotHash,
+                    allowlistedSnapshotHash: pinned.snapshotHash,
+                },
+            );
+        }
+    }
+    return true;
+}
+
+export function verifyHarnessPreflight(
+    allowlist,
+    harnessId,
+    {
+        validationCases,
+        parserVersion = PARSER_VERSION,
+    } = {},
+) {
+    if (!isLoadedHarnessAllowlist(allowlist)) {
+        throw new MeasurementError(
+            MEASUREMENT_ERROR_CODES.INVALID_ARGUMENT,
+            "allowlist must be a loaded HarnessAllowlist instance",
+        );
+    }
+    if (parserVersion !== PARSER_VERSION) {
+        invalid("trusted parser version does not match the requested contract parser", {
+            requestedParserVersion: parserVersion,
+            trustedParserVersion: PARSER_VERSION,
+        });
+    }
+    const verifiedEntry = allowlist.verifyEntry(harnessId);
+    validateHarnessValidationCases(verifiedEntry.entry, validationCases);
+    const parserPath = fileURLToPath(new URL("./parser.mjs", import.meta.url));
+    const parserSourceHash = sha256File(parserPath, PARSER_SOURCE_HASH_ALGORITHM);
+    allowlist.reverifyAllowlistFile();
+    return Object.freeze({
+        verifiedEntry,
+        entry: verifiedEntry.entry,
+        allowlistVersion: allowlist.version,
+        allowlistFileHash: verifiedEntry.allowlistFileHash,
+        harnessEntryHash: verifiedEntry.entryHash,
+        executableHash: verifiedEntry.executableHash,
+        dependencyHashes: Object.freeze(verifiedEntry.dependencies.map((dependency) =>
+            Object.freeze({
+                path: dependency.path,
+                role: dependency.role,
+                sha256: dependency.sha256,
+            }))),
+        argvTemplateHash: hashCanonical(
+            verifiedEntry.entry.argvTemplate,
+            ARGV_TEMPLATE_HASH_ALGORITHM,
+        ),
+        allowedEnvHash: hashCanonical(
+            verifiedEntry.entry.allowedEnv,
+            ALLOWED_ENV_HASH_ALGORITHM,
+        ),
+        parserVersion,
+        parserVersionHash: hashCanonical(
+            { parserVersion },
+            PARSER_VERSION_HASH_ALGORITHM,
+        ),
+        parserSourceHash,
+    });
+}
+
+function requireFrozenHash(value, field) {
+    if (typeof value !== "string"
+        || !/^sha256:[a-z0-9][a-z0-9._-]*:[a-f0-9]{64}$/u.test(value)) {
+        invalid(`${field} must be an algorithm-tagged SHA-256`, { field, value });
+    }
+    return value;
+}
+
+function frozenSandboxIdentity(sandbox, executesCandidateCode) {
+    if (!executesCandidateCode) {
+        return Object.freeze({
+            required: false,
+            policyIdentity: null,
+            policyDigest: null,
+        });
+    }
+    if (sandbox?.required !== true) {
+        invalid("A candidate-code harness requires a frozen sandbox policy identity");
+    }
+    const policyIdentity = immutableCanonical({
+        primitive: requireString(
+            sandbox.primitive,
+            "sandbox.primitive",
+            { maxLength: 128 },
+        ),
+        policyId: requireString(
+            sandbox.policyId,
+            "sandbox.policyId",
+            { maxLength: 128 },
+        ),
+        helperSourceHash: requireFrozenHash(
+            sandbox.helperSourceHash,
+            "sandbox.helperSourceHash",
+        ),
+        helperBinaryHash: requireFrozenHash(
+            sandbox.helperBinaryHash,
+            "sandbox.helperBinaryHash",
+        ),
+    });
+    const policyDigest = hashCanonical(
+        policyIdentity,
+        SANDBOX_POLICY_IDENTITY_HASH_ALGORITHM,
+    );
+    if (sandbox.policyDigest !== undefined
+        && sandbox.policyDigest !== null
+        && sandbox.policyDigest !== policyDigest) {
+        invalid("Sandbox policy identity digest does not match its canonical identity", {
+            expected: policyDigest,
+            actual: sandbox.policyDigest,
+        });
+    }
+    return Object.freeze({
+        required: true,
+        policyIdentity,
+        policyDigest,
+    });
+}
+
+export function buildFrozenHarnessIdentity(
+    verification,
+    { sandbox = { required: false } } = {},
+) {
+    if (verification === null
+        || typeof verification !== "object"
+        || verification.verifiedEntry === undefined) {
+        throw new MeasurementError(
+            MEASUREMENT_ERROR_CODES.INVALID_ARGUMENT,
+            "buildFrozenHarnessIdentity requires verifyHarnessPreflight output",
+        );
+    }
+    const dependencyHashes = verification.dependencyHashes
+        .map((dependency) => ({
+            path: dependency.path,
+            role: dependency.role,
+            sha256: dependency.sha256,
+        }))
+        .sort((left, right) => left.path.localeCompare(right.path));
+    return immutableCanonical({
+        version: HARNESS_IDENTITY_VERSION,
+        harnessId: verification.entry.id,
+        allowlistVersion: verification.allowlistVersion,
+        allowlistFileHash: verification.allowlistFileHash,
+        harnessEntryHash: verification.harnessEntryHash,
+        executableHash: verification.executableHash,
+        dependencyHashes,
+        argvTemplateHash: verification.argvTemplateHash,
+        allowedEnvHash: verification.allowedEnvHash,
+        parserVersion: verification.parserVersion,
+        parserVersionHash: verification.parserVersionHash,
+        parserSourceHash: verification.parserSourceHash,
+        executesCandidateCode: verification.entry.executesCandidateCode,
+        sandbox: frozenSandboxIdentity(
+            sandbox,
+            verification.entry.executesCandidateCode,
+        ),
+    });
+}
+
+export function verifyFrozenHarnessIdentity(
+    allowlist,
+    frozenIdentity,
+    {
+        validationCases,
+        sandbox = { required: false },
+    } = {},
+) {
+    if (frozenIdentity === null
+        || typeof frozenIdentity !== "object"
+        || Array.isArray(frozenIdentity)
+        || typeof frozenIdentity.harnessId !== "string"
+        || typeof frozenIdentity.parserVersion !== "string") {
+        throw new MeasurementError(
+            MEASUREMENT_ERROR_CODES.INVALID_ARGUMENT,
+            "frozenIdentity must be a canonical harness identity",
+        );
+    }
+    const verification = verifyHarnessPreflight(
+        allowlist,
+        frozenIdentity.harnessId,
+        {
+            validationCases,
+            parserVersion: frozenIdentity.parserVersion,
+        },
+    );
+    const actualIdentity = buildFrozenHarnessIdentity(verification, { sandbox });
+    if (!canonicalEqual(actualIdentity, frozenIdentity)) {
+        invalid("Current harness identity does not match the frozen investigation contract", {
+            harnessId: frozenIdentity.harnessId,
+            expected: frozenIdentity,
+            actual: actualIdentity,
+        });
+    }
+    return Object.freeze({ verification, identity: actualIdentity });
 }
 
 function closeLeaseState(state) {

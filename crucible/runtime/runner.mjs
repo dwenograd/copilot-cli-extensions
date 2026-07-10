@@ -36,12 +36,15 @@ import {
     createMeasurementExecutor,
     createDefaultProcessAdapter,
     createWindowsSandboxProvider,
+    describeSandboxProviderPolicy,
     hashReceipt,
     loadHarnessAllowlist,
     sha256Bytes,
+    verifyFrozenHarnessIdentity,
 } from "../measurement/index.mjs";
 import { normalizeRunnerConfig } from "./config.mjs";
 import { createDomainRepositoryAdapter, formatAttemptCommand } from "./domain-adapter.mjs";
+import { projectRunnerOutcome } from "./outcome.mjs";
 import {
     CrucibleRuntimeError,
     RUNTIME_ERROR_CODES,
@@ -343,6 +346,9 @@ export class AutonomousRunner {
     #adapter = null;
     #artifactStore = null;
     #allowlist = null;
+    #contract = null;
+    #sandboxProvider = null;
+    #sandboxIdentity = Object.freeze({ required: false });
     #executor = null;
     #workerPool = null;
     #lease = null;
@@ -378,7 +384,7 @@ export class AutonomousRunner {
         let result;
         let thrown = null;
         try {
-            this.#initialize();
+            await this.#initialize();
             result = await this.#runLoop();
         } catch (error) {
             if (this.#isDeadlineError(error) && this.#adapter !== null) {
@@ -435,7 +441,7 @@ export class AutonomousRunner {
         };
     }
 
-    #initialize() {
+    async #initialize() {
         const stateDir = ensureDirectory(this.#config.stateDir);
         const artifactRoot = ensureDirectory(this.#config.artifactRoot);
 
@@ -512,8 +518,7 @@ export class AutonomousRunner {
         this.#writeRuntimeTempOwnerMarker();
         const allowlistLoader = this.#dependencies.allowlistLoader ?? loadHarnessAllowlist;
         this.#allowlist = allowlistLoader(this.#config.allowlistPath);
-        this.#validateHarnessContract(opened.aggregate.contract);
-        this.#recordCapabilityEpoch(opened.aggregate);
+        this.#contract = opened.aggregate.contract;
 
         const baseProcessAdapter = this.#dependencies.processAdapter
             ?? createDefaultProcessAdapter();
@@ -533,6 +538,27 @@ export class AutonomousRunner {
                     "windows-sandbox-control",
                 ),
             });
+        this.#sandboxProvider = sandboxProvider;
+        if (this.#contract.harnessIdentity.sandbox.required) {
+            if (sandboxProvider === null) {
+                throw new CrucibleRuntimeError(
+                    RUNTIME_ERROR_CODES.HARNESS_CONFIGURATION_INVALID,
+                    "Frozen harness identity requires a sandbox provider",
+                );
+            }
+            const describePolicy = this.#dependencies.describeSandboxProviderPolicy
+                ?? describeSandboxProviderPolicy;
+            const sandboxIdentity = await describePolicy(sandboxProvider);
+            if (sandboxIdentity === null) {
+                throw new CrucibleRuntimeError(
+                    RUNTIME_ERROR_CODES.HARNESS_CONFIGURATION_INVALID,
+                    "Sandbox provider did not attest its frozen policy identity",
+                );
+            }
+            this.#sandboxIdentity = sandboxIdentity;
+        }
+        this.#validateHarnessContract(this.#contract);
+        this.#recordCapabilityEpoch(opened.aggregate);
         this.#executor = this.#dependencies.executor
             ?? (this.#dependencies.executorFactory ?? createMeasurementExecutor)({
                 allowlist: this.#allowlist,
@@ -613,29 +639,42 @@ export class AutonomousRunner {
                 { contract: contract.parserVersion, runtime: PARSER_VERSION },
             );
         }
-        const entry = this.#allowlist.getEntry(contract.harnessId);
-        if (entry.validationCases === null) {
+        try {
+            return verifyFrozenHarnessIdentity(
+                this.#allowlist,
+                contract.harnessIdentity,
+                {
+                    validationCases: contract.validationCases,
+                    sandbox: this.#sandboxIdentity,
+                },
+            ).verification;
+        } catch (error) {
             throw new CrucibleRuntimeError(
                 RUNTIME_ERROR_CODES.HARNESS_CONFIGURATION_INVALID,
-                "Allowlist entry must pin every frozen validation case",
-                { harnessId: contract.harnessId },
+                `Frozen harness identity no longer matches runtime inputs: ${error?.message ?? String(error)}`,
+                {
+                    harnessId: contract.harnessId,
+                    cause: error?.code ?? null,
+                },
+                { cause: error },
             );
         }
-        for (const validationCase of contract.validationCases) {
-            const allowlisted = entry.validationCases[validationCase.id];
-            if (allowlisted === undefined
-                || allowlisted.snapshotHash !== validationCase.artifactHash) {
+    }
+
+    async #verifiedHarnessForMeasurement() {
+        if (this.#contract.harnessIdentity.sandbox.required) {
+            const describePolicy = this.#dependencies.describeSandboxProviderPolicy
+                ?? describeSandboxProviderPolicy;
+            const current = await describePolicy(this.#sandboxProvider);
+            if (current === null) {
                 throw new CrucibleRuntimeError(
                     RUNTIME_ERROR_CODES.HARNESS_CONFIGURATION_INVALID,
-                    "Allowlist validation snapshot does not match the immutable contract",
-                    {
-                        caseId: validationCase.id,
-                        contractArtifactHash: validationCase.artifactHash,
-                        allowlistSnapshotHash: allowlisted?.snapshotHash ?? null,
-                    },
+                    "Sandbox provider stopped attesting its frozen policy identity",
                 );
             }
+            this.#sandboxIdentity = current;
         }
+        return this.#validateHarnessContract(this.#contract).verifiedEntry;
     }
 
     #idFactory() {
@@ -936,8 +975,10 @@ export class AutonomousRunner {
     async #runHarnessMeasurement(input) {
         let measurement;
         try {
+            const verifiedEntry = await this.#verifiedHarnessForMeasurement();
             measurement = await this.#executor.run({
                 ...input,
+                verifiedEntry,
                 deadlineMs: this.#config.deadlineMs,
             });
         } catch (error) {
@@ -1928,7 +1969,9 @@ export class AutonomousRunner {
                 { logicalEffectKey, snapshotId, snapshotStatus },
             );
         }
-        const verifiedEntry = this.#allowlist.verifyEntry(aggregate.contract.harnessId);
+        const verifiedEntry = this.#validateHarnessContract(
+            aggregate.contract,
+        ).verifiedEntry;
         const expectedDependencies = verifiedEntry.dependencies
             .map((dependency) => ({
                 path: dependency.path,
@@ -2243,9 +2286,7 @@ export class AutonomousRunner {
                 const effect = await this.#executeEffect(
                     command,
                     async (attemptId) => {
-                        const verifiedEntry = this.#allowlist.verifyEntry(contract.harnessId);
                         return this.#runHarnessMeasurement({
-                            verifiedEntry,
                             candidateSnapshot: materialized.candidateSnapshot,
                             attemptId,
                             runnerEpochId: this.#config.runnerEpochId,
@@ -2585,9 +2626,7 @@ export class AutonomousRunner {
                     snapshot: requestSnapshot.snapshot,
                 },
                 async (attemptId) => {
-                    const verifiedEntry = this.#allowlist.verifyEntry(command.harnessId);
                     const executed = await this.#runHarnessMeasurement({
-                        verifiedEntry,
                         candidateSnapshot: materialized.candidateSnapshot,
                         attemptId,
                         runnerEpochId: this.#config.runnerEpochId,
@@ -2834,11 +2873,7 @@ export class AutonomousRunner {
                         snapshot: snapshot.snapshot,
                     },
                     async (attemptId) => {
-                        const verifiedEntry = this.#allowlist.verifyEntry(
-                            aggregate.contract.harnessId,
-                        );
                         return this.#runHarnessMeasurement({
-                            verifiedEntry,
                             candidateSnapshot: materialized.candidateSnapshot,
                             attemptId,
                             runnerEpochId: this.#config.runnerEpochId,
@@ -3070,7 +3105,9 @@ export class AutonomousRunner {
             return null;
         }
 
-        const verifiedEntry = this.#allowlist.verifyEntry(aggregate.contract.harnessId);
+        const verifiedEntry = this.#validateHarnessContract(
+            aggregate.contract,
+        ).verifiedEntry;
         const expectedDependencies = verifiedEntry.dependencies
             .map((dependency) => ({
                 path: dependency.path,
@@ -3871,7 +3908,7 @@ export async function runAutonomousInvestigation(config, dependencies = {}) {
     const runner = new AutonomousRunner(config, dependencies);
     const result = await runner.run();
     if (runner.config.resultPath !== null) {
-        atomicWriteJson(runner.config.resultPath, { ok: true, result });
+        atomicWriteJson(runner.config.resultPath, projectRunnerOutcome(result));
     }
     return result;
 }

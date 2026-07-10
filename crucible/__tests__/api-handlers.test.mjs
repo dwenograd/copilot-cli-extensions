@@ -43,6 +43,7 @@ import {
     PROMPT_CONTEXT_HASH_ALGORITHM,
     createDomainRepositoryAdapter,
     loadSupervisorConfig,
+    normalizeSupervisorConfig,
     readSupervisorLock,
     readStatus,
     requestStop,
@@ -75,12 +76,16 @@ import {
 import {
     ContractConflictError,
     EnvironmentError,
+    HarnessConfigurationError,
     HarnessNotAllowlistedError,
     InvestigationNotResumableError,
     InvestigationNotFoundError,
     OperationalResetRequiredError,
+    StartFailedError,
+    StartPreflightError,
     ValidationCasePathError,
 } from "../api/errors.mjs";
+import { fakeHarnessIdentity } from "./harness-identity-fixture.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const roots = [];
@@ -104,18 +109,34 @@ function makeWorkspace(label) {
     fs.writeFileSync(path.join(goodDir, "input.txt"), "good-case");
     fs.writeFileSync(path.join(badDir, "input.txt"), "bad-case");
 
+    const snapshotStoreRoot = path.join(root, "allowlist-snapshot-staging");
+    const snapshotStore = openArtifactStore({ root: snapshotStoreRoot });
+    const goodSnapshot = snapshotStore.ingestDirectory({ sourceDir: goodDir }).snapshot;
+    const badSnapshot = snapshotStore.ingestDirectory({ sourceDir: badDir }).snapshot;
+    fs.rmSync(snapshotStoreRoot, { recursive: true, force: true });
+    const harnessExecutable = path.join(root, "trusted-harness.exe");
+    fs.writeFileSync(harnessExecutable, "trusted harness fixture");
+    const harnessExecutableSha256 = createHash("sha256")
+        .update(fs.readFileSync(harnessExecutable))
+        .digest("hex");
+
     const allowlistPath = path.join(root, "harnesses.json");
     fs.writeFileSync(allowlistPath, JSON.stringify({
         version: 1,
         entries: {
             "primary-harness": {
-                executable: "C:\\fake\\harness.exe",
-                executableSha256: "a".repeat(64),
+                executable: harnessExecutable,
+                executableSha256: harnessExecutableSha256,
                 argvTemplate: [],
+                allowedEnv: {},
                 timeoutMs: 15000,
                 maxStdoutBytes: 1048576,
                 maxStderrBytes: 262144,
                 executesCandidateCode: false,
+                validationCases: {
+                    good: { snapshotHash: goodSnapshot },
+                    bad: { snapshotHash: badSnapshot },
+                },
             },
         },
     }, null, 2));
@@ -129,13 +150,40 @@ function makeWorkspace(label) {
     return { root, stateRoot, projectDir, allowlistPath, env };
 }
 
+function persistSupervisorConfig(config) {
+    fs.mkdirSync(config.paths.directory, { recursive: true });
+    fs.writeFileSync(config.paths.configPath, JSON.stringify({
+        runner: {
+            investigationId: config.runner.investigationId,
+            stateDir: config.runner.stateDir,
+            artifactRoot: config.runner.artifactRoot,
+            allowlistPath: config.runner.allowlistPath,
+            copilotSdkPath: config.runner.sdkPath,
+            copilotCliPath: config.runner.cliPath,
+            runnerEpochId: config.runner.runnerEpochId,
+            deadline: config.runner.deadlineMs,
+            options: config.runner.options,
+        },
+        runnerCliPath: config.runnerCliPath,
+        supervisorEpochId: config.supervisorEpochId,
+        maxRestarts: config.maxRestarts,
+        baseBackoffMs: config.baseBackoffMs,
+        maxBackoffMs: config.maxBackoffMs,
+        heartbeatIntervalMs: config.heartbeatIntervalMs,
+        staleLockMs: config.staleLockMs,
+        circuitWindowMs: config.circuitWindowMs,
+    }));
+}
+
 function makeDeps(env, overrides = {}) {
     const calls = { ensure: [] };
     const deps = {
         env,
         log: () => {},
+        clock: { now: () => Date.parse("2026-07-09T00:00:00.000Z") },
         isPidAlive: () => false,
         loadHarnessAllowlist,
+        probeSandboxAvailability: () => ({ available: true }),
         openRepository,
         openRepositoryReadOnly,
         openArtifactStore,
@@ -143,10 +191,12 @@ function makeDeps(env, overrides = {}) {
         createDomainRepositoryAdapter,
         ensureSupervisor: (input, opts) => {
             calls.ensure.push({ input, opts });
+            persistSupervisorConfig(input);
             return { action: "started", pid: 4242, statusPath: "status" };
         },
         readStatus,
         requestStop,
+        normalizeSupervisorConfig,
         loadSupervisorConfig,
         readSupervisorLock,
         ...overrides,
@@ -182,6 +232,8 @@ function startArgs(projectDir, overrides = {}) {
 // --- domain seeding for terminal-state result tests ------------------------
 
 const seedArtifactHash = (character) => `sha256:${character.repeat(64)}`;
+const fixtureHarnessEntryHash = (character = "a") =>
+    `sha256:crucible-measurement-entry-v1:${character.repeat(64)}`;
 
 // Canonical version-2 search policy, optionally overridden. The domain requires
 // searchPolicy to already be in canonical kernel form, so overrides are merged
@@ -762,6 +814,10 @@ function baseSeedContract(overrides = {}) {
         criticality: "standard",
         policyVersion: "policy-v1",
         parserVersion: "parser-v1",
+        harnessIdentity: fakeHarnessIdentity({
+            harnessId: "primary-harness",
+            parserVersion: "parser-v1",
+        }),
         metrics: [{ key: "score", direction: "max", epsilon: 0 }],
         searchPolicy: searchPolicy(),
         declaredLimits: {},
@@ -1224,11 +1280,13 @@ describe("environment: path + state resolution", () => {
             objective: "  find   a  candidate ",
             projectDir: "C:\\proj",
             harnessId: "h1",
+            harnessEntryHash: fixtureHarnessEntryHash(),
         });
         const id2 = deriveInvestigationId({
             objective: "find a candidate",
             projectDir: "C:\\proj\\",
             harnessId: "h1",
+            harnessEntryHash: fixtureHarnessEntryHash(),
         });
         expect(id1).toBe(id2); // whitespace + trailing-slash canonicalized
         expect(id1).toMatch(/^[A-Za-z0-9][A-Za-z0-9._@-]{0,127}$/u);
@@ -1238,20 +1296,30 @@ describe("environment: path + state resolution", () => {
             objective: "find another candidate",
             projectDir: "C:\\proj",
             harnessId: "h1",
+            harnessEntryHash: fixtureHarnessEntryHash(),
         });
         const differentHarness = deriveInvestigationId({
             objective: "find a candidate",
             projectDir: "C:\\proj",
             harnessId: "h2",
+            harnessEntryHash: fixtureHarnessEntryHash(),
+        });
+        const differentEntry = deriveInvestigationId({
+            objective: "find a candidate",
+            projectDir: "C:\\proj",
+            harnessId: "h1",
+            harnessEntryHash: fixtureHarnessEntryHash("b"),
         });
         expect(differentObjective).not.toBe(id1);
         expect(differentHarness).not.toBe(id1);
+        expect(differentEntry).not.toBe(id1);
     });
 
     it("namespaces investigation identity by DOMAIN_VERSION instead of reopening v1", () => {
         const objective = "find a candidate";
         const projectDir = "C:\\proj";
         const harnessId = "h1";
+        const harnessEntryHash = fixtureHarnessEntryHash();
         const legacyMaterial = [
             "crucible-investigation-v1",
             harnessId,
@@ -1263,11 +1331,21 @@ describe("environment: path + state resolution", () => {
             .digest("hex")
             .slice(0, 16);
         const legacyId = `find-a-candidate-${legacySuffix}`;
-        const currentId = deriveInvestigationId({ objective, projectDir, harnessId });
+        const currentId = deriveInvestigationId({
+            objective,
+            projectDir,
+            harnessId,
+            harnessEntryHash,
+        });
 
         expect(DOMAIN_VERSION).toBe(3);
         expect(currentId).not.toBe(legacyId);
-        expect(currentId).toBe(deriveInvestigationId({ objective, projectDir, harnessId }));
+        expect(currentId).toBe(deriveInvestigationId({
+            objective,
+            projectDir,
+            harnessId,
+            harnessEntryHash,
+        }));
     });
 
     it("resolves investigation paths under the state root", () => {
@@ -1304,6 +1382,9 @@ describe("crucible_start", () => {
             objective: "find a candidate scoring at least 90",
             projectDir: fs.realpathSync.native(workspace.projectDir),
             harnessId: "primary-harness",
+            harnessEntryHash:
+                loadHarnessAllowlist(workspace.allowlistPath)
+                    .getEntryHash("primary-harness"),
         });
         expect(result.investigation_id).toBe(expectedId);
 
@@ -1319,13 +1400,36 @@ describe("crucible_start", () => {
         expect(runner.stateDir).toBe(paths.stateDir);
         expect(runner.artifactRoot).toBe(paths.artifactRoot);
         expect(runner.allowlistPath).toBe(path.resolve(workspace.allowlistPath));
-        expect(path.isAbsolute(runner.copilotSdkPath)).toBe(true);
-        expect(path.isAbsolute(runner.copilotCliPath)).toBe(true);
+        expect(path.isAbsolute(runner.sdkPath)).toBe(true);
+        expect(path.isAbsolute(runner.cliPath)).toBe(true);
         expect(runner.runnerEpochId).toMatch(/^epoch-[a-f0-9]{16}$/u);
         expect(result.supervisor.action).toBe("started");
 
         // Only immutable content hashes entered the contract.
         const aggregate = replayAggregate(resolveStateRoot(workspace.env), expectedId);
+        expect(aggregate.contract.harnessIdentity).toMatchObject({
+            version: 1,
+            harnessId: "primary-harness",
+            allowlistVersion: 1,
+            executesCandidateCode: false,
+            sandbox: {
+                required: false,
+                policyIdentity: null,
+                policyDigest: null,
+            },
+        });
+        for (const field of [
+            "allowlistFileHash",
+            "harnessEntryHash",
+            "executableHash",
+            "argvTemplateHash",
+            "allowedEnvHash",
+            "parserVersionHash",
+            "parserSourceHash",
+        ]) {
+            expect(aggregate.contract.harnessIdentity[field])
+                .toMatch(/^sha256:[a-z0-9._-]+:[a-f0-9]{64}$/u);
+        }
         for (const validationCase of aggregate.contract.validationCases) {
             expect(validationCase.artifactHash).toMatch(/^sha256:[a-f0-9]{64}$/u);
             expect(validationCase).not.toHaveProperty("path");
@@ -1409,7 +1513,9 @@ describe("crucible_start", () => {
         expect(stopped.pause_persisted).toBe(true);
         expect(stopped.resumable).toBe(true);
 
-        const resumed = startInvestigation(args, deps);
+        const resumed = startInvestigation({
+            investigation_id: started.investigation_id,
+        }, deps);
         expect(resumed.idempotent).toBe(true);
         expect(resumed.resumed).toBe(true);
         expect(calls.ensure.at(-1).opts.resetOperationalState).toBe(true);
@@ -1417,6 +1523,123 @@ describe("crucible_start", () => {
         expect(aggregate.pause).toBeNull();
         expect(aggregate.status).toBe("active");
         expect(aggregate.pauseHistory).toHaveLength(1);
+    });
+
+    it("resumes by investigation id after the original project and case directories are deleted", () => {
+        const workspace = makeWorkspace("resume-without-project");
+        const { deps } = makeDeps(workspace.env);
+        const started = startInvestigation(startArgs(workspace.projectDir), deps);
+        persistPauseForStarted(workspace, started);
+        const stopped = stopInvestigation({
+            investigation_id: started.investigation_id,
+            reason: "pause before removing source inputs",
+        }, deps);
+        expect(stopped.resumable).toBe(true);
+
+        fs.rmSync(workspace.projectDir, { recursive: true, force: true });
+        delete deps.env.CRUCIBLE_ALLOWLIST_PATH;
+        delete deps.env.COPILOT_SDK_PATH;
+        delete deps.env.COPILOT_CLI_PATH;
+        const resumed = startInvestigation({
+            investigation_id: started.investigation_id,
+        }, deps);
+
+        expect(resumed).toMatchObject({
+            investigation_id: started.investigation_id,
+            reattached_by_id: true,
+            resumed: true,
+        });
+        expect(replayAggregate(workspace.stateRoot, started.investigation_id).pause)
+            .toBeNull();
+    });
+
+    it("rejects invalid persisted resume configuration without mutating paused state", () => {
+        const workspace = makeWorkspace("resume-invalid-config");
+        const { deps, calls } = makeDeps(workspace.env);
+        const started = startInvestigation(startArgs(workspace.projectDir), deps);
+        persistPauseForStarted(workspace, started);
+        stopInvestigation({ investigation_id: started.investigation_id }, deps);
+        const before = replayAggregate(workspace.stateRoot, started.investigation_id);
+        const configPath = supervisorPaths(
+            resolveInvestigationPaths(
+                workspace.stateRoot,
+                started.investigation_id,
+            ).stateDir,
+            started.investigation_id,
+        ).configPath;
+        const persisted = JSON.parse(fs.readFileSync(configPath, "utf8"));
+        persisted.maxBackoffMs = 1;
+        persisted.baseBackoffMs = 2;
+        fs.writeFileSync(configPath, JSON.stringify(persisted));
+
+        expect(() => startInvestigation({
+            investigation_id: started.investigation_id,
+        }, deps)).toThrow(StartPreflightError);
+
+        const after = replayAggregate(workspace.stateRoot, started.investigation_id);
+        expect(after.lastSeq).toBe(before.lastSeq);
+        expect(after.pause).toEqual(before.pause);
+        expect(calls.ensure).toHaveLength(1);
+    });
+
+    it("compensates a failed supervisor resume back to a durable retryable pause", () => {
+        const workspace = makeWorkspace("resume-supervisor-failure");
+        const { deps } = makeDeps(workspace.env);
+        const started = startInvestigation(startArgs(workspace.projectDir), deps);
+        persistPauseForStarted(workspace, started);
+        stopInvestigation({ investigation_id: started.investigation_id }, deps);
+        const workingEnsure = deps.ensureSupervisor;
+        deps.ensureSupervisor = () => {
+            throw new Error("injected resume launch failure");
+        };
+
+        expect(() => startInvestigation({
+            investigation_id: started.investigation_id,
+        }, deps)).toThrow(StartFailedError);
+
+        const compensated = replayAggregate(workspace.stateRoot, started.investigation_id);
+        expect(compensated.pause).not.toBeNull();
+        expect(compensated.terminal).toBeNull();
+        expect(compensated.nonResults).toHaveLength(0);
+
+        deps.ensureSupervisor = workingEnsure;
+        const retried = startInvestigation({
+            investigation_id: started.investigation_id,
+        }, deps);
+        expect(retried.resumed).toBe(true);
+        expect(replayAggregate(workspace.stateRoot, started.investigation_id).pause)
+            .toBeNull();
+    });
+
+    it("preflights a reattach before recording recovery/resume or ensuring the supervisor", () => {
+        const workspace = makeWorkspace("resume-preflight");
+        const { deps, calls } = makeDeps(workspace.env);
+        const args = startArgs(workspace.projectDir);
+        const started = startInvestigation(args, deps);
+        persistPauseForStarted(workspace, started);
+        const stopped = stopInvestigation({
+            investigation_id: started.investigation_id,
+            reason: "persist pause",
+        }, deps);
+        expect(stopped.pause_persisted).toBe(true);
+        const before = replayAggregate(workspace.stateRoot, started.investigation_id);
+        const allowlist = JSON.parse(fs.readFileSync(workspace.allowlistPath, "utf8"));
+        allowlist.entries["primary-harness"].validationCases.good.snapshotHash =
+            `sha256:${"0".repeat(64)}`;
+        fs.writeFileSync(workspace.allowlistPath, JSON.stringify(allowlist));
+
+        expect(() => startInvestigation({
+            investigation_id: started.investigation_id,
+        }, deps)).toThrow(HarnessConfigurationError);
+
+        const after = replayAggregate(workspace.stateRoot, started.investigation_id);
+        expect(after.lastSeq).toBe(before.lastSeq);
+        expect(after.pause).toEqual(before.pause);
+        expect(calls.ensure).toHaveLength(1);
+        expect(
+            fs.readdirSync(workspace.root)
+                .filter((name) => name.startsWith(".crucible-preflight-")),
+        ).toEqual([]);
     });
 
     it("does not resume terminal investigations without a new identity", () => {
@@ -1440,13 +1663,49 @@ describe("crucible_start", () => {
         } finally {
             repository.close();
         }
-        expect(() => startInvestigation(args, deps))
+        expect(() => startInvestigation({
+            investigation_id: started.investigation_id,
+        }, deps))
             .toThrow(InvestigationNotResumableError);
+    });
+
+    it("does not resume persisted domain non-results", () => {
+        const workspace = makeWorkspace("domain-non-result-reattach");
+        const { deps } = makeDeps(workspace.env);
+        const started = startInvestigation(startArgs(workspace.projectDir, {
+            hypothesis_topology: "certified_impossibility",
+            max_rounds: 1,
+        }), deps);
+        const paths = resolveInvestigationPaths(workspace.stateRoot, started.investigation_id);
+        const store = openArtifactStore({ root: paths.artifactRoot });
+        const repository = openRepository({ file: paths.eventsDbPath });
+        try {
+            const adapter = createDomainRepositoryAdapter({
+                repository,
+                investigationId: started.investigation_id,
+            });
+            const aggregate = driveToTerminal(adapter, store, [
+                { data: { pass: false, metrics: { score: 20 } } },
+                {
+                    certificateFacts: {
+                        pass: false,
+                        searchSpaceExhausted: true,
+                    },
+                },
+            ]);
+            expect(aggregate.nonResults).toHaveLength(1);
+        } finally {
+            repository.close();
+        }
+
+        expect(() => startInvestigation({
+            investigation_id: started.investigation_id,
+        }, deps)).toThrow(InvestigationNotResumableError);
     });
 
     it("requires explicit operational recovery policy and accepts a later deadline", () => {
         const workspace = makeWorkspace("operational-recovery");
-        const { deps } = makeDeps(workspace.env);
+        const { deps, calls } = makeDeps(workspace.env);
         const args = startArgs(workspace.projectDir, {
             deadline_iso: "2026-07-10T00:00:00.000Z",
         });
@@ -1457,10 +1716,23 @@ describe("crucible_start", () => {
             reason: "deadline elapsed",
             details: { deadlineMs: Date.parse(args.deadline_iso), recoverable: false },
         });
-        expect(() => startInvestigation(args, deps))
+        const beforeRejectedReattach = replayAggregate(
+            workspace.stateRoot,
+            started.investigation_id,
+        );
+        expect(() => startInvestigation({
+            investigation_id: started.investigation_id,
+        }, deps))
             .toThrow(OperationalResetRequiredError);
+        expect(replayAggregate(workspace.stateRoot, started.investigation_id).lastSeq)
+            .toBe(beforeRejectedReattach.lastSeq);
+        expect(calls.ensure).toHaveLength(1);
+        expect(
+            fs.readdirSync(workspace.root)
+                .filter((name) => name.startsWith(".crucible-preflight-")),
+        ).toEqual([]);
         const recovered = startInvestigation({
-            ...args,
+            investigation_id: started.investigation_id,
             deadline_iso: "2026-07-11T00:00:00.000Z",
         }, deps);
         expect(recovered.operational_recovery).toBe("later_deadline");
@@ -1472,11 +1744,11 @@ describe("crucible_start", () => {
             details: { recoverable: false },
         });
         expect(() => startInvestigation({
-            ...args,
+            investigation_id: started.investigation_id,
             deadline_iso: "2026-07-12T00:00:00.000Z",
         }, deps)).toThrow(OperationalResetRequiredError);
         const reset = startInvestigation({
-            ...args,
+            investigation_id: started.investigation_id,
             deadline_iso: "2026-07-12T00:00:00.000Z",
             reset_policy: "circuit_open",
         }, deps);
@@ -1544,9 +1816,8 @@ describe("crucible_status", () => {
         const status = statusInvestigation({ investigation_id: started.investigation_id }, deps);
         expect(status.is_result).toBe(false);
         expect(status.terminal_available).toBe(false);
-        expect(status.contract_hash).toBe(started.contract_hash);
-        expect(status.event_head.seq).toBe(1);
-        expect(typeof status.event_head.event_hash).toBe("string");
+        expect(status).not.toHaveProperty("contract_hash");
+        expect(status).not.toHaveProperty("event_head");
         expect(status.progress.open).toBe(true);
         expect(status.next_recommendation.kind).toBeTruthy();
     });
@@ -1639,7 +1910,7 @@ describe("crucible_status", () => {
         expect(status).not.toHaveProperty("terminal");
         expect(status).not.toHaveProperty("terminal_decision");
         expect(status.next_recommendation).toBeNull();
-        expect(status.event_head.event_hash).toBeNull();
+        expect(status).not.toHaveProperty("event_head");
         const serialized = JSON.stringify(status);
         expect(serialized).not.toContain("VERIFIED_RESULT");
         expect(serialized).not.toContain("TARGET_UNREACHABLE");
@@ -1665,7 +1936,6 @@ describe("crucible_status", () => {
             terminal_available: false,
             non_result: true,
             non_result_code: "DEADLINE_EXCEEDED",
-            non_result_reason: "The deadline expired before a result.",
         });
         expect(status.note).not.toContain("In progress");
     });
@@ -1692,6 +1962,8 @@ describe("crucible_stop", () => {
         const stop = stopInvestigation({ investigation_id: started.investigation_id, reason: "operator pause" }, deps);
         expect(stop.is_result).toBe(false);
         expect(stop.pause_requested).toBe(true);
+        expect(stop.stop_state).toBe("pause_requested");
+        expect(stop.pause_in_flight).toBe(true);
         expect(stop.resumable).toBe(false);
         expect(stop.appended).toBe(true);
         expect(stop.already_terminal).toBe(false);
@@ -1714,7 +1986,9 @@ describe("crucible_stop", () => {
             reason: "pause now",
         }, deps);
         expect(stop).toMatchObject({
+            stop_state: "pause_persisted",
             pause_requested: true,
+            pause_in_flight: false,
             pause_persisted: true,
             resumable: true,
             already_terminal: false,
@@ -1729,10 +2003,67 @@ describe("crucible_stop", () => {
         const { deps } = makeDeps(workspace.env);
         const stop = stopInvestigation({ investigation_id: "verified-inv" }, deps);
         expect(stop).toMatchObject({
+            stop_state: "already_terminal",
             appended: false,
             pause_persisted: false,
             resumable: false,
             already_terminal: true,
+        });
+    });
+
+    it.each([
+        [
+            "operational_non_result",
+            (aggregate) => ({
+                appended: false,
+                aggregate,
+                pausePersisted: false,
+                operationalNonResult: {
+                    payload: {
+                        code: "DEADLINE_EXCEEDED",
+                        reason: "deadline expired",
+                    },
+                },
+            }),
+            "DEADLINE_EXCEEDED",
+        ],
+        [
+            "domain_non_result",
+            (aggregate) => ({
+                appended: false,
+                aggregate: {
+                    ...aggregate,
+                    nonResults: [{
+                        code: "VALIDATION_INCONCLUSIVE",
+                        reason: "validation inconclusive",
+                    }],
+                },
+                pausePersisted: false,
+                operationalNonResult: null,
+            }),
+            "VALIDATION_INCONCLUSIVE",
+        ],
+    ])("reports %s as a distinct non-resumable stop state", (
+        expectedState,
+        buildResult,
+        expectedCode,
+    ) => {
+        const workspace = makeWorkspace(`stop-${expectedState}`);
+        const { deps } = makeDeps(workspace.env);
+        const started = startInvestigation(startArgs(workspace.projectDir), deps);
+        const aggregate = replayAggregate(workspace.stateRoot, started.investigation_id);
+        deps.requestStop = () => buildResult(aggregate);
+
+        const stopped = stopInvestigation({
+            investigation_id: started.investigation_id,
+        }, deps);
+        expect(stopped).toMatchObject({
+            stop_state: expectedState,
+            pause_persisted: false,
+            pause_in_flight: false,
+            resumable: false,
+            non_result: true,
+            non_result_code: expectedCode,
         });
     });
 
@@ -1996,7 +2327,7 @@ describe("crucible_result", () => {
         }, deps));
     });
 
-    it("status exposes only integrity_blocked when terminal artifacts are corrupt", () => {
+    it("status exposes only terminal availability while result alone verifies artifacts", () => {
         const workspace = makeWorkspace("status-integrity-blocked");
         seedVerifiedResult(workspace.stateRoot, "verified-inv");
         const { artifacts } = terminalArtifactClasses(
@@ -2015,14 +2346,17 @@ describe("crucible_result", () => {
         }, deps);
         expect(status).toMatchObject({
             is_result: false,
-            integrity_blocked: true,
-            terminal_available: false,
-            status: "integrity_blocked",
+            integrity_blocked: false,
+            terminal_available: true,
+            status: "terminal",
         });
         expect(JSON.stringify(status)).not.toContain("VERIFIED_RESULT");
         expect(status).not.toHaveProperty("decision");
         expect(status).not.toHaveProperty("candidate_id");
         expect(status).not.toHaveProperty("evidence_id");
+        expectIntegrityBlocked(resultInvestigation({
+            investigation_id: "verified-inv",
+        }, deps));
     });
 
     it("keeps an inconclusive certificate behind the strict non-result boundary", () => {
