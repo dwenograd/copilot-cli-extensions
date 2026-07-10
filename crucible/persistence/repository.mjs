@@ -33,17 +33,25 @@ import {
     FenceRejectedError,
     AttemptIdentityError,
     ArtifactNotDurableError,
-    SchemaVersionError,
     StorageError,
 } from "./errors.mjs";
 import { assertLocalDatabasePath } from "./paths.mjs";
-import { canonicalize, computeEventHash, sha256Hex, GENESIS_PREV_HASH } from "./canonical.mjs";
+import {
+    canonicalize,
+    computeEventHash,
+    inspectCanonicalJson,
+    parseCanonicalJson,
+    sha256Hex,
+    GENESIS_PREV_HASH,
+} from "./canonical.mjs";
 import {
     SCHEMA_VERSION,
     COMMAND_STATES,
     TERMINAL_KINDS,
     configureConnection,
+    configureReadOnlyConnection,
     applySchema,
+    verifySchema,
 } from "./schema.mjs";
 
 const DEFAULT_BUSY_TIMEOUT_MS = 5000;
@@ -158,36 +166,20 @@ export class EventRepository {
 
         try {
             if (readOnly === true) {
-                db.exec(`PRAGMA query_only = ON; PRAGMA busy_timeout = ${Number(busyTimeoutMs)};`);
-                const userVersion = Number(db.prepare("PRAGMA user_version;").get()?.user_version ?? 0);
-                const schemaTable = db.prepare(
-                    "SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = 'schema_meta'",
-                ).get();
-                const metaVersion = schemaTable
-                    ? Number(db.prepare(
-                        "SELECT value FROM schema_meta WHERE key = 'schema_version'",
-                    ).get()?.value ?? Number.NaN)
-                    : Number.NaN;
-                const compatibleLegacyRead =
-                    (userVersion === 2 && metaVersion === 2)
-                    || (userVersion === 3 && metaVersion === 3);
-                if (!compatibleLegacyRead
-                    && (userVersion !== SCHEMA_VERSION || metaVersion !== SCHEMA_VERSION)) {
-                    throw new SchemaVersionError(
-                        `schema version mismatch: file has user_version=${userVersion}, schema_meta=${Number.isNaN(metaVersion) ? "<none>" : metaVersion}, expected ${SCHEMA_VERSION}`,
-                        {
-                            fileUserVersion: userVersion,
-                            fileMetaVersion: Number.isNaN(metaVersion) ? null : metaVersion,
-                            expected: SCHEMA_VERSION,
-                        },
-                    );
-                }
+                configureReadOnlyConnection(db, { busyTimeoutMs });
+                verifySchema(db, { busyTimeoutMs });
             } else {
                 configureConnection(db, { busyTimeoutMs });
-                applySchema(db);
+                applySchema(db, { busyTimeoutMs });
             }
         } catch (err) {
             db.close();
+            if (!(err instanceof CruciblePersistenceError) && isSqliteError(err)) {
+                throw new StorageError(
+                    `failed to initialize database at ${resolved}: ${err.message}`,
+                    err,
+                );
+            }
             throw err;
         }
 
@@ -341,7 +333,10 @@ export class EventRepository {
             prevHash: row.prev_hash,
             eventHash: row.event_hash,
             kind: row.kind,
-            payload: JSON.parse(row.payload),
+            payload: parseCanonicalJson(row.payload, {
+                investigationId: row.investigation_id,
+                seq: Number(row.seq),
+            }),
             isTerminal: row.is_terminal === 1,
             terminalKind: row.terminal_kind ?? null,
             attemptId: row.attempt_id ?? null,
@@ -2349,23 +2344,39 @@ export class EventRepository {
                     detail: `prev_hash does not chain to predecessor`,
                 });
             }
-            const recomputed = computeEventHash({
-                investigationId,
-                seq,
-                prevHash: row.prev_hash,
-                kind: row.kind,
-                payloadCanonical: row.payload,
-                isTerminal: row.is_terminal,
-                terminalKind: row.terminal_kind,
-                attemptId: row.attempt_id,
-                evidenceKind: row.evidence_kind,
-                createdAt: row.created_at,
-            });
-            if (recomputed !== row.event_hash) {
+            const inspectedPayload = inspectCanonicalJson(row.payload);
+            if (!inspectedPayload.ok) {
+                violations.push({
+                    code: ERROR_CODES.EVENT_PAYLOAD_NOT_CANONICAL,
+                    seq,
+                    detail: inspectedPayload.reason,
+                });
+            }
+            try {
+                const recomputed = computeEventHash({
+                    investigationId,
+                    seq,
+                    prevHash: row.prev_hash,
+                    kind: row.kind,
+                    payloadCanonical: row.payload,
+                    isTerminal: row.is_terminal,
+                    terminalKind: row.terminal_kind,
+                    attemptId: row.attempt_id,
+                    evidenceKind: row.evidence_kind,
+                    createdAt: row.created_at,
+                });
+                if (recomputed !== row.event_hash) {
+                    violations.push({
+                        code: ERROR_CODES.EVENT_HASH_MISMATCH,
+                        seq,
+                        detail: `stored event_hash does not match recomputation (tamper?)`,
+                    });
+                }
+            } catch (err) {
                 violations.push({
                     code: ERROR_CODES.EVENT_HASH_MISMATCH,
                     seq,
-                    detail: `stored event_hash does not match recomputation (tamper?)`,
+                    detail: `event hash could not be recomputed: ${err.message}`,
                 });
             }
             if (row.is_terminal === 1) {

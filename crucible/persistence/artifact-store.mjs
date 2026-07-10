@@ -14,10 +14,10 @@
 //     content is a no-op that verifies the existing bytes rather than replacing
 //     them.
 //
-//   * Every write goes through a unique staging file that is fsync'd before it
-//     is atomically installed via hard-link (link never overwrites: it fails
-//     with EEXIST, which is exactly the "safe against duplicate writers"
-//     semantics we want). Parent directories are fsync'd best-effort.
+//   * Every write goes through a unique staging file and a durable private
+//     installation journal. An object is not reported durable until its bytes,
+//     parent directory, and installed-state marker have all crossed an fsync
+//     barrier. A later trusted reconciliation advances installed -> referenced.
 //
 //   * Ingesting a directory produces an immutable canonical snapshot: a sorted,
 //     symlink-free, traversal-checked recursive walk whose per-file hashes are
@@ -62,6 +62,37 @@ const SNAPSHOT_ENTRY_KEYS = Object.freeze(["object", "path", "size"]);
 const WINDOWS_RESERVED_DEVICE_RE =
     /^(?:aux|clock\$|com[1-9¹²³]|con|conin\$|conout\$|lpt[1-9¹²³]|nul|prn)(?:\..*)?$/iu;
 const STAGE_CHUNK = 1 << 16;
+const STORE_METADATA_DIR = ".crucible";
+const JOURNAL_TYPE = "crucible-cas-installation";
+const JOURNAL_VERSION = 1;
+const JOURNAL_STATES = Object.freeze({
+    STAGING: "staging",
+    INSTALLED: "installed",
+    REFERENCED: "referenced",
+});
+const STAGING_RECORD_KEYS = Object.freeze([
+    "algo",
+    "createdAt",
+    "object",
+    "size",
+    "staging",
+    "state",
+    "transaction",
+    "type",
+    "version",
+]);
+const STATE_MARKER_KEYS = Object.freeze([
+    "algo",
+    "object",
+    "size",
+    "state",
+    "type",
+    "version",
+]);
+const TRANSACTION_RE = /^[0-9a-z]+-[0-9a-z]+-[0-9a-f]{24}$/u;
+const JOURNAL_FILE_RE = /^([0-9a-z]+-[0-9a-z]+-[0-9a-f]{24})\.json$/u;
+const STATE_MARKER_FILE_RE = /^([0-9a-f]{64})\.(installed|referenced)\.json$/u;
+const DIRECTORY_BARRIER_FILE = ".crucible-dirsync";
 
 const DEFAULT_LIMITS = Object.freeze({
     maxFiles: 100_000,
@@ -84,6 +115,7 @@ export const ARTIFACT_STORE_ERROR_CODES = Object.freeze({
     DESTINATION_EXISTS: "CRUCIBLE_CAS_DESTINATION_EXISTS",
     SNAPSHOT_INVALID: "CRUCIBLE_CAS_SNAPSHOT_INVALID",
     SOURCE_CHANGED: "CRUCIBLE_CAS_SOURCE_CHANGED",
+    JOURNAL_CORRUPT: "CRUCIBLE_CAS_JOURNAL_CORRUPT",
     IO_ERROR: "CRUCIBLE_CAS_IO_ERROR",
 });
 
@@ -147,6 +179,13 @@ export class SourceChangedError extends ArtifactStoreError {
     constructor(message, details) {
         super(ARTIFACT_STORE_ERROR_CODES.SOURCE_CHANGED, message, details);
         this.name = "SourceChangedError";
+    }
+}
+
+export class JournalCorruptError extends ArtifactStoreError {
+    constructor(message, details) {
+        super(ARTIFACT_STORE_ERROR_CODES.JOURNAL_CORRUPT, message, details);
+        this.name = "JournalCorruptError";
     }
 }
 
@@ -436,28 +475,167 @@ function validateSnapshotManifest(manifest, options = {}) {
     return validated;
 }
 
+function parseCanonicalJson(bytes, context) {
+    let value;
+    try {
+        value = JSON.parse(bytes.toString("utf8"));
+    } catch (err) {
+        throw new JournalCorruptError(`${context} is not valid JSON`, {
+            cause: err.message,
+        });
+    }
+    const canonicalBytes = Buffer.from(canonicalize(value), "utf8");
+    if (!bytes.equals(canonicalBytes)) {
+        throw new JournalCorruptError(`${context} is not canonical JSON`);
+    }
+    return value;
+}
+
+function validateStagingRecord(value, options = {}) {
+    const { rawBytes = null, fileName = null, limits = DEFAULT_LIMITS } = options;
+    if (!hasExactKeys(value, STAGING_RECORD_KEYS)
+        || value.type !== JOURNAL_TYPE
+        || value.version !== JOURNAL_VERSION
+        || value.state !== JOURNAL_STATES.STAGING
+        || value.algo !== ALGO
+        || typeof value.createdAt !== "string"
+        || !TRANSACTION_RE.test(value.transaction)
+        || value.staging !== `${value.transaction}.tmp`
+        || !Number.isSafeInteger(value.size)
+        || value.size < 0
+        || value.size > limits.maxFileBytes) {
+        throw new JournalCorruptError("installation staging record has an invalid schema", {
+            fileName,
+        });
+    }
+    let parsed;
+    try {
+        parsed = parseObjectId(value.object);
+    } catch (err) {
+        throw new JournalCorruptError("installation staging record has an invalid object id", {
+            fileName,
+            object: value.object,
+            cause: err.message,
+        });
+    }
+    if (parsed.algo !== ALGO || value.object !== objectIdFor(parsed.hex)) {
+        throw new JournalCorruptError("installation staging record object id is not canonical", {
+            fileName,
+            object: value.object,
+        });
+    }
+    if (fileName !== null) {
+        const match = JOURNAL_FILE_RE.exec(fileName);
+        if (!match || match[1] !== value.transaction) {
+            throw new JournalCorruptError("installation staging record filename disagrees with its transaction", {
+                fileName,
+                transaction: value.transaction,
+            });
+        }
+    }
+    if (rawBytes !== null) {
+        const source = Buffer.isBuffer(rawBytes) ? rawBytes : Buffer.from(rawBytes);
+        if (!source.equals(Buffer.from(canonicalize(value), "utf8"))) {
+            throw new JournalCorruptError("installation staging record bytes are not canonical", {
+                fileName,
+            });
+        }
+    }
+    const validated = { ...value };
+    Object.defineProperty(validated, "hash", {
+        value: parsed.hex,
+        enumerable: false,
+    });
+    return Object.freeze(validated);
+}
+
+function stateMarkerValue(hash, size, state) {
+    return {
+        type: JOURNAL_TYPE,
+        version: JOURNAL_VERSION,
+        state,
+        algo: ALGO,
+        object: objectIdFor(hash),
+        size,
+    };
+}
+
+function validateStateMarker(value, options = {}) {
+    const {
+        rawBytes = null,
+        fileName = null,
+        expectedState = null,
+        limits = DEFAULT_LIMITS,
+    } = options;
+    if (!hasExactKeys(value, STATE_MARKER_KEYS)
+        || value.type !== JOURNAL_TYPE
+        || value.version !== JOURNAL_VERSION
+        || value.algo !== ALGO
+        || (value.state !== JOURNAL_STATES.INSTALLED && value.state !== JOURNAL_STATES.REFERENCED)
+        || (expectedState !== null && value.state !== expectedState)
+        || !Number.isSafeInteger(value.size)
+        || value.size < 0
+        || value.size > limits.maxFileBytes) {
+        throw new JournalCorruptError("installation state marker has an invalid schema", {
+            fileName,
+            expectedState,
+        });
+    }
+    let parsed;
+    try {
+        parsed = parseObjectId(value.object);
+    } catch (err) {
+        throw new JournalCorruptError("installation state marker has an invalid object id", {
+            fileName,
+            object: value.object,
+            cause: err.message,
+        });
+    }
+    if (fileName !== null) {
+        const match = STATE_MARKER_FILE_RE.exec(fileName);
+        if (!match || match[1] !== parsed.hex || match[2] !== value.state) {
+            throw new JournalCorruptError("installation state marker filename disagrees with its contents", {
+                fileName,
+                object: value.object,
+                state: value.state,
+            });
+        }
+    }
+    if (rawBytes !== null) {
+        const source = Buffer.isBuffer(rawBytes) ? rawBytes : Buffer.from(rawBytes);
+        if (!source.equals(Buffer.from(canonicalize(value), "utf8"))) {
+            throw new JournalCorruptError("installation state marker bytes are not canonical", {
+                fileName,
+            });
+        }
+    }
+    const validated = { ...value };
+    Object.defineProperty(validated, "hash", {
+        value: parsed.hex,
+        enumerable: false,
+    });
+    return Object.freeze(validated);
+}
+
 function toPosix(p) {
     return p.split(path.sep).join("/");
 }
 
-function fsyncDirBestEffort(dirPath) {
-    // Directory fsync is not portable (Windows returns EPERM). We attempt it
-    // and swallow failures rather than pretending it succeeded.
-    let fd;
-    try {
-        fd = fs.openSync(dirPath, "r");
-        fs.fsyncSync(fd);
-    } catch {
-        // best-effort only
-    } finally {
-        if (fd !== undefined) {
-            try {
-                fs.closeSync(fd);
-            } catch {
-                // ignore
-            }
-        }
+function asIoError(action, err, details = {}) {
+    if (err instanceof CruciblePersistenceError) {
+        return err;
     }
+    const wrapped = new ArtifactStoreError(
+        ARTIFACT_STORE_ERROR_CODES.IO_ERROR,
+        `${action}: ${err?.message ?? String(err)}`,
+        {
+            ...details,
+            fsCode: err?.code,
+            syscall: err?.syscall,
+        },
+    );
+    wrapped.cause = err;
+    return wrapped;
 }
 
 function stableIdentity(stat, filePath) {
@@ -503,6 +681,315 @@ function sameCanonicalPath(left, right) {
         : left === right;
 }
 
+function compareStable(left, right) {
+    return left < right ? -1 : left > right ? 1 : 0;
+}
+
+function materializationAnchor(stat, filePath) {
+    const dev = stat?.dev;
+    const ino = stat?.ino;
+    if ((typeof dev !== "bigint" && typeof dev !== "number")
+        || (typeof ino !== "bigint" && typeof ino !== "number")
+        || BigInt(dev) <= 0n
+        || BigInt(ino) <= 0n) {
+        throw new SourceChangedError(
+            "filesystem does not expose stable destination identity; refusing materialization",
+            { path: filePath },
+        );
+    }
+    return Object.freeze({
+        dev: BigInt(dev).toString(),
+        ino: BigInt(ino).toString(),
+        mode: BigInt(stat.mode).toString(),
+        birthtimeNs: BigInt(stat.birthtimeNs ?? 0n).toString(),
+    });
+}
+
+function assertMaterializationAnchor(before, after, filePath) {
+    if (before.dev !== after.dev
+        || before.ino !== after.ino
+        || before.mode !== after.mode
+        || before.birthtimeNs !== after.birthtimeNs) {
+        throw new SourceChangedError("materialization directory was replaced during publication", {
+            path: filePath,
+            before,
+            after,
+        });
+    }
+}
+
+function materializationLstatOrNull(filePath) {
+    try {
+        return fs.lstatSync(filePath, { bigint: true });
+    } catch (err) {
+        if (err && err.code === "ENOENT") {
+            return null;
+        }
+        throw err;
+    }
+}
+
+function assertMaterializationPath(absPath, expectedType) {
+    const resolved = path.resolve(absPath);
+    const parsed = path.parse(resolved);
+    const relative = path.relative(parsed.root, resolved);
+    const segments = relative === "" ? [] : relative.split(path.sep);
+    let current = parsed.root;
+    for (let index = 0; index < segments.length; index += 1) {
+        const segment = segments[index];
+        assertSafeComponent(segment, resolved);
+        current = path.join(current, segment);
+        const stat = fs.lstatSync(current, { bigint: true });
+        if (stat.isSymbolicLink()) {
+            throw new SymlinkRejectedError(
+                "materialization path contains a symlink, junction, or reparse point",
+                { path: current },
+            );
+        }
+        const leaf = index === segments.length - 1;
+        if (!leaf && !stat.isDirectory()) {
+            throw new UnsafePathError("materialization path descends through a non-directory", {
+                path: current,
+            });
+        }
+        if (leaf && expectedType === "directory" && !stat.isDirectory()) {
+            throw new UnsafePathError("materialization path is not a directory", { path: current });
+        }
+        if (leaf && expectedType === "file" && !stat.isFile()) {
+            throw new UnsafePathError("materialization target is not a regular file", { path: current });
+        }
+        const real = fs.realpathSync.native(current);
+        if (!sameCanonicalPath(path.resolve(current), path.resolve(real))) {
+            throw new SymlinkRejectedError(
+                "materialization path resolves through a symlink, junction, or reparse point",
+                { path: current, real },
+            );
+        }
+    }
+    const stat = fs.lstatSync(resolved, { bigint: true });
+    return {
+        path: resolved,
+        real: fs.realpathSync.native(resolved),
+        stat,
+        anchor: materializationAnchor(stat, resolved),
+    };
+}
+
+function ensureMaterializationDirectory(absPath) {
+    const resolved = path.resolve(absPath);
+    const parsed = path.parse(resolved);
+    const relative = path.relative(parsed.root, resolved);
+    const segments = relative === "" ? [] : relative.split(path.sep);
+    let current = parsed.root;
+    for (const segment of segments) {
+        assertSafeComponent(segment, resolved);
+        current = path.join(current, segment);
+        let stat = materializationLstatOrNull(current);
+        if (stat === null) {
+            fs.mkdirSync(current, { recursive: false, mode: 0o700 });
+            try {
+                fs.chmodSync(current, 0o700);
+            } catch {
+                // Best available Windows permissions; identity checks stay mandatory.
+            }
+            stat = fs.lstatSync(current, { bigint: true });
+        }
+        if (stat.isSymbolicLink() || !stat.isDirectory()) {
+            throw new SymlinkRejectedError(
+                "materialization directory component is a link or non-directory",
+                { path: current },
+            );
+        }
+        const real = fs.realpathSync.native(current);
+        if (!sameCanonicalPath(path.resolve(current), path.resolve(real))) {
+            throw new SymlinkRejectedError(
+                "materialization directory resolves through a reparse point",
+                { path: current, real },
+            );
+        }
+    }
+    return assertMaterializationPath(resolved, "directory");
+}
+
+function assertMaterializationRoot(stagePath, stageAnchor, parentPath, parentAnchor) {
+    const parent = assertMaterializationPath(parentPath, "directory");
+    assertMaterializationAnchor(parentAnchor, parent.anchor, parentPath);
+    const stage = assertMaterializationPath(stagePath, "directory");
+    assertMaterializationAnchor(stageAnchor, stage.anchor, stagePath);
+    if (!isInsideDir(stage.real, parent.real)) {
+        throw new UnsafePathError("private materialization staging escaped its verified parent", {
+            stagePath,
+            real: stage.real,
+        });
+    }
+    return stage;
+}
+
+function removeMaterializationTree(rootPath, expectedAnchor = null) {
+    const stat = materializationLstatOrNull(rootPath);
+    if (stat === null) {
+        return;
+    }
+    if (stat.isSymbolicLink()) {
+        fs.unlinkSync(rootPath);
+        return;
+    }
+    if (!stat.isDirectory()) {
+        fs.unlinkSync(rootPath);
+        return;
+    }
+    if (expectedAnchor !== null) {
+        assertMaterializationAnchor(
+            expectedAnchor,
+            materializationAnchor(stat, rootPath),
+            rootPath,
+        );
+    }
+    const real = fs.realpathSync.native(rootPath);
+    if (!sameCanonicalPath(path.resolve(rootPath), path.resolve(real))) {
+        throw new SymlinkRejectedError("refusing to clean materialization staging through a reparse point", {
+            rootPath,
+            real,
+        });
+    }
+    for (const name of fs.readdirSync(rootPath)) {
+        assertSafeComponent(name, rootPath);
+        const child = path.join(rootPath, name);
+        const childStat = fs.lstatSync(child, { bigint: true });
+        if (childStat.isSymbolicLink()) {
+            fs.unlinkSync(child);
+        } else if (childStat.isDirectory()) {
+            removeMaterializationTree(child);
+        } else {
+            fs.unlinkSync(child);
+        }
+    }
+    fs.rmdirSync(rootPath);
+}
+
+function verifyMaterializationStage(stagePath, stageAnchor, parentPath, parentAnchor, manifest) {
+    assertMaterializationRoot(stagePath, stageAnchor, parentPath, parentAnchor);
+    const expected = new Map(manifest.entries.map((entry) => [entry.path, entry]));
+    const actualPaths = [];
+
+    const walk = (dirPath, relSegments) => {
+        const beforeStat = fs.lstatSync(dirPath, { bigint: true });
+        if (beforeStat.isSymbolicLink() || !beforeStat.isDirectory()) {
+            throw new SymlinkRejectedError(
+                "materialization staging directory changed into a link/non-directory",
+                { path: dirPath },
+            );
+        }
+        const before = stableIdentity(beforeStat, dirPath);
+        const dirReal = fs.realpathSync.native(dirPath);
+        if (!sameCanonicalPath(path.resolve(dirPath), path.resolve(dirReal))
+            || !isInsideDir(dirReal, stagePath)) {
+            throw new UnsafePathError("materialization staging directory escapes its root", {
+                path: dirPath,
+                real: dirReal,
+            });
+        }
+        const names = fs.readdirSync(dirPath).sort(compareStable);
+        for (const name of names) {
+            assertSafeComponent(name, dirPath);
+            const childPath = path.join(dirPath, name);
+            const childRel = [...relSegments, name];
+            const relPath = childRel.join("/");
+            const childStat = fs.lstatSync(childPath, { bigint: true });
+            if (childStat.isSymbolicLink()) {
+                throw new SymlinkRejectedError(
+                    "materialization staging contains a symlink, junction, or reparse entry",
+                    { relPath },
+                );
+            }
+            const childReal = fs.realpathSync.native(childPath);
+            if (!sameCanonicalPath(path.resolve(childPath), path.resolve(childReal))
+                || !isInsideDir(childReal, stagePath)) {
+                throw new UnsafePathError("materialization staging entry escapes its root", {
+                    relPath,
+                    real: childReal,
+                });
+            }
+            if (childStat.isDirectory()) {
+                walk(childPath, childRel);
+                continue;
+            }
+            if (!childStat.isFile()) {
+                throw new UnsafePathError("materialization staging contains a non-regular entry", {
+                    relPath,
+                });
+            }
+            const entry = expected.get(relPath);
+            if (!entry) {
+                throw new UnsafePathError("materialization staging contains an unmanifested file", {
+                    relPath,
+                });
+            }
+            const beforeFile = stableIdentity(childStat, childPath);
+            const fd = fs.openSync(childPath, "r");
+            const hash = createHash(ALGO);
+            const buffer = Buffer.allocUnsafe(STAGE_CHUNK);
+            let size = 0;
+            try {
+                const opened = fs.fstatSync(fd, { bigint: true });
+                assertStableIdentity(beforeFile, stableIdentity(opened, childPath), childPath);
+                for (;;) {
+                    const read = fs.readSync(fd, buffer, 0, buffer.length, null);
+                    if (read === 0) {
+                        break;
+                    }
+                    hash.update(buffer.subarray(0, read));
+                    size += read;
+                }
+                assertStableIdentity(
+                    beforeFile,
+                    stableIdentity(fs.fstatSync(fd, { bigint: true }), childPath),
+                    childPath,
+                );
+            } finally {
+                fs.closeSync(fd);
+            }
+            assertStableIdentity(
+                beforeFile,
+                stableIdentity(fs.lstatSync(childPath, { bigint: true }), childPath),
+                childPath,
+            );
+            const { hex } = parseObjectId(entry.object);
+            const actualHash = hash.digest("hex");
+            if (actualHash !== hex || size !== entry.size) {
+                throw new ObjectCorruptError(
+                    "materialized staging bytes disagree with the snapshot manifest",
+                    {
+                        relPath,
+                        object: entry.object,
+                        expectedSize: entry.size,
+                        actualSize: size,
+                        expectedHash: hex,
+                        actualHash,
+                    },
+                );
+            }
+            actualPaths.push(relPath);
+        }
+        assertStableIdentity(
+            before,
+            stableIdentity(fs.lstatSync(dirPath, { bigint: true }), dirPath),
+            dirPath,
+        );
+    };
+
+    walk(stagePath, []);
+    const expectedPaths = [...expected.keys()].sort(compareStable);
+    actualPaths.sort(compareStable);
+    if (canonicalize(actualPaths) !== canonicalize(expectedPaths)) {
+        throw new SnapshotInvalidError("materialization staging file set is incomplete", {
+            expected: expectedPaths,
+            actual: actualPaths,
+        });
+    }
+    assertMaterializationRoot(stagePath, stageAnchor, parentPath, parentAnchor);
+}
+
 function normalizeLimits(limits) {
     const merged = { ...DEFAULT_LIMITS, ...(limits ?? {}) };
     for (const key of Object.keys(DEFAULT_LIMITS)) {
@@ -520,19 +1007,27 @@ export class ArtifactStore {
     #root;
     #objectsRoot;
     #stagingRoot;
+    #metadataRoot;
+    #journalRoot;
+    #installationsRoot;
+    #quarantineRoot;
     #limits;
     #now;
-    #verifyExistingOnPut;
     #readOnly;
+    #faultInjector;
 
-    constructor({ root, now, limits, verifyExistingOnPut, readOnly = false }) {
+    constructor({ root, now, limits, readOnly = false, faultInjector = null }) {
         this.#root = root;
         this.#objectsRoot = path.join(root, "objects", ALGO);
         this.#stagingRoot = path.join(root, "staging");
+        this.#metadataRoot = path.join(root, STORE_METADATA_DIR);
+        this.#journalRoot = path.join(this.#metadataRoot, "journal");
+        this.#installationsRoot = path.join(this.#metadataRoot, "installations", ALGO);
+        this.#quarantineRoot = path.join(this.#metadataRoot, "quarantine");
         this.#limits = limits;
         this.#now = now;
-        this.#verifyExistingOnPut = verifyExistingOnPut;
         this.#readOnly = readOnly;
+        this.#faultInjector = faultInjector;
     }
 
     static open(options = {}) {
@@ -542,11 +1037,17 @@ export class ArtifactStore {
             env,
             limits,
             now = () => new Date().toISOString(),
-            verifyExistingOnPut = true,
             readOnly = false,
+            faultInjector = null,
         } = options;
         if (typeof root !== "string" || root.trim().length === 0) {
             throw new InvalidArgumentError("artifact store root must be a non-empty string", { root });
+        }
+        if (typeof now !== "function") {
+            throw new InvalidArgumentError("artifact store now option must be a function");
+        }
+        if (faultInjector !== null && typeof faultInjector !== "function") {
+            throw new InvalidArgumentError("artifact store faultInjector option must be a function or null");
         }
         let resolved;
         try {
@@ -568,8 +1069,8 @@ export class ArtifactStore {
             root: resolved,
             now,
             limits: normalizeLimits(limits),
-            verifyExistingOnPut: verifyExistingOnPut !== false,
             readOnly: readOnly === true,
+            faultInjector,
         });
         if (readOnly !== true) {
             store.#ensureLayout();
@@ -590,8 +1091,19 @@ export class ArtifactStore {
     }
 
     #ensureLayout() {
-        fs.mkdirSync(this.#objectsRoot, { recursive: true });
-        fs.mkdirSync(this.#stagingRoot, { recursive: true });
+        for (const dir of [
+            this.#objectsRoot,
+            this.#stagingRoot,
+            this.#journalRoot,
+            this.#installationsRoot,
+            this.#quarantineRoot,
+        ]) {
+            try {
+                fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+            } catch (err) {
+                throw asIoError("failed to create artifact store layout", err, { path: dir });
+            }
+        }
     }
 
     // --- object addressing -------------------------------------------------
@@ -624,10 +1136,325 @@ export class ArtifactStore {
         }
     }
 
-    #newStagingPath() {
+    #inject(point, details = {}) {
+        if (this.#faultInjector !== null) {
+            this.#faultInjector({ point, ...details });
+        }
+    }
+
+    #newStagingTarget() {
         this.#assertWritable();
-        const unique = `${Date.now().toString(36)}-${process.pid.toString(36)}-${randomBytes(12).toString("hex")}`;
-        return path.join(this.#stagingRoot, `${unique}.tmp`);
+        const transaction = `${Date.now().toString(36)}-${process.pid.toString(36)}-${randomBytes(12).toString("hex")}`;
+        return {
+            transaction,
+            stagingPath: path.join(this.#stagingRoot, `${transaction}.tmp`),
+        };
+    }
+
+    #journalPath(transaction) {
+        return path.join(this.#journalRoot, `${transaction}.json`);
+    }
+
+    #installationDir(hash) {
+        return path.join(this.#installationsRoot, hash.slice(0, 2));
+    }
+
+    #markerPath(hash, state) {
+        return path.join(this.#installationDir(hash), `${hash}.${state}.json`);
+    }
+
+    #candidatePath(record) {
+        return path.join(
+            this.#objectsRoot,
+            record.hash.slice(0, 2),
+            `.${record.hash}.${record.transaction}.installing`,
+        );
+    }
+
+    #closeFd(fd, action, details = {}) {
+        try {
+            fs.closeSync(fd);
+        } catch (err) {
+            throw asIoError(action, err, details);
+        }
+    }
+
+    #fsyncFd(fd, purpose, target) {
+        try {
+            this.#inject("before-file-fsync", { purpose, path: target });
+            fs.fsyncSync(fd);
+        } catch (err) {
+            throw asIoError(`failed to fsync ${purpose}`, err, { path: target, purpose });
+        }
+    }
+
+    #fsyncFilePath(filePath, purpose) {
+        let fd;
+        try {
+            fd = fs.openSync(filePath, "r+");
+            this.#fsyncFd(fd, purpose, filePath);
+        } catch (err) {
+            if (fd !== undefined) {
+                try {
+                    fs.closeSync(fd);
+                } catch {
+                    // Preserve the fsync/open failure.
+                }
+            }
+            throw asIoError(`failed to make ${purpose} durable`, err, { path: filePath, purpose });
+        }
+        this.#closeFd(fd, `failed to close ${purpose} after fsync`, { path: filePath, purpose });
+    }
+
+    #fsyncWindowsDirectoryBarrier(dirPath, purpose) {
+        const barrierPath = path.join(dirPath, DIRECTORY_BARRIER_FILE);
+        let fd;
+        try {
+            try {
+                fd = fs.openSync(barrierPath, "r+");
+            } catch (err) {
+                if (!err || err.code !== "ENOENT") {
+                    throw err;
+                }
+                try {
+                    fd = fs.openSync(barrierPath, "wx+", 0o600);
+                } catch (createErr) {
+                    if (!createErr || createErr.code !== "EEXIST") {
+                        throw createErr;
+                    }
+                    fd = fs.openSync(barrierPath, "r+");
+                }
+            }
+            const bytes = randomBytes(8);
+            let offset = 0;
+            while (offset < bytes.length) {
+                offset += fs.writeSync(fd, bytes, offset, bytes.length - offset, offset);
+            }
+            this.#fsyncFd(fd, `directory barrier (${purpose})`, barrierPath);
+        } catch (err) {
+            if (fd !== undefined) {
+                try {
+                    fs.closeSync(fd);
+                } catch {
+                    // Preserve the durability failure.
+                }
+            }
+            throw asIoError("failed to flush Windows directory barrier", err, {
+                path: dirPath,
+                barrierPath,
+                purpose,
+            });
+        }
+        this.#closeFd(fd, "failed to close Windows directory barrier", {
+            path: dirPath,
+            barrierPath,
+            purpose,
+        });
+    }
+
+    #fsyncDirectory(dirPath, purpose) {
+        let fd;
+        let failure = null;
+        try {
+            this.#inject("before-directory-fsync", { purpose, path: dirPath });
+            fd = fs.openSync(dirPath, "r");
+            fs.fsyncSync(fd);
+        } catch (err) {
+            failure = err;
+        }
+        if (fd !== undefined) {
+            try {
+                fs.closeSync(fd);
+            } catch (err) {
+                if (failure === null) {
+                    failure = err;
+                }
+            }
+        }
+        if (failure !== null) {
+            // Node's Windows backend cannot FlushFileBuffers on a directory
+            // handle (EPERM). A private, rewritten+fsync'd barrier file in that
+            // directory provides the available ordered durability barrier.
+            if (process.platform === "win32"
+                && failure.code === "EPERM"
+                && failure.syscall === "fsync") {
+                this.#fsyncWindowsDirectoryBarrier(dirPath, purpose);
+            } else {
+                throw asIoError(`failed to fsync directory for ${purpose}`, failure, {
+                    path: dirPath,
+                    purpose,
+                });
+            }
+        }
+        this.#inject("after-directory-fsync", { purpose, path: dirPath });
+    }
+
+    #unlinkPath(filePath, action) {
+        try {
+            fs.unlinkSync(filePath);
+            return true;
+        } catch (err) {
+            if (err && err.code === "ENOENT") {
+                return false;
+            }
+            throw asIoError(action, err, { path: filePath });
+        }
+    }
+
+    #writeImmutableRecord(finalPath, value, purpose, syncAncestor = null) {
+        const bytes = Buffer.from(canonicalize(value), "utf8");
+        const parent = path.dirname(finalPath);
+        try {
+            fs.mkdirSync(parent, { recursive: true, mode: 0o700 });
+        } catch (err) {
+            throw asIoError(`failed to create ${purpose} directory`, err, { path: parent });
+        }
+
+        const verifyExisting = () => {
+            let existing;
+            try {
+                existing = fs.readFileSync(finalPath);
+            } catch (err) {
+                throw asIoError(`failed to read existing ${purpose}`, err, { path: finalPath });
+            }
+            if (!existing.equals(bytes)) {
+                throw new JournalCorruptError(`existing ${purpose} disagrees with canonical state`, {
+                    path: finalPath,
+                });
+            }
+        };
+
+        if (fs.existsSync(finalPath)) {
+            verifyExisting();
+            this.#fsyncFilePath(finalPath, purpose);
+            this.#fsyncDirectory(parent, `${purpose} parent`);
+            if (syncAncestor !== null) {
+                this.#fsyncDirectory(syncAncestor, `${purpose} ancestor`);
+            }
+            return true;
+        }
+
+        const tempPath = path.join(
+            parent,
+            `.${path.basename(finalPath)}.${randomBytes(8).toString("hex")}.tmp`,
+        );
+        let fd;
+        try {
+            fd = fs.openSync(tempPath, "wx", 0o600);
+            let offset = 0;
+            while (offset < bytes.length) {
+                offset += fs.writeSync(fd, bytes, offset, bytes.length - offset);
+            }
+            this.#fsyncFd(fd, `${purpose} temporary file`, tempPath);
+            this.#closeFd(fd, `failed to close ${purpose} temporary file`, { path: tempPath });
+            fd = undefined;
+        } catch (err) {
+            if (fd !== undefined) {
+                try {
+                    fs.closeSync(fd);
+                } catch {
+                    // Preserve the write/fsync failure.
+                }
+            }
+            try {
+                this.#unlinkPath(tempPath, `failed to remove incomplete ${purpose} temporary file`);
+            } catch {
+                // Preserve the primary failure.
+            }
+            throw asIoError(`failed to write ${purpose}`, err, { path: finalPath });
+        }
+
+        let existed = false;
+        try {
+            fs.linkSync(tempPath, finalPath);
+        } catch (err) {
+            if (err && err.code === "EEXIST") {
+                existed = true;
+            } else if (err && (err.code === "EPERM"
+                || err.code === "ENOSYS"
+                || err.code === "EXDEV"
+                || err.code === "EMLINK")) {
+                try {
+                    fs.copyFileSync(tempPath, finalPath, fs.constants.COPYFILE_EXCL);
+                } catch (copyErr) {
+                    if (copyErr && copyErr.code === "EEXIST") {
+                        existed = true;
+                    } else {
+                        throw asIoError(`failed to install ${purpose}`, copyErr, { path: finalPath });
+                    }
+                }
+            } else {
+                throw asIoError(`failed to install ${purpose}`, err, { path: finalPath });
+            }
+        }
+
+        if (existed) {
+            verifyExisting();
+        }
+        this.#fsyncFilePath(finalPath, purpose);
+        this.#fsyncDirectory(parent, `${purpose} parent`);
+        if (syncAncestor !== null) {
+            this.#fsyncDirectory(syncAncestor, `${purpose} ancestor`);
+        }
+        const removedTemp = this.#unlinkPath(tempPath, `failed to remove ${purpose} temporary file`);
+        if (removedTemp) {
+            this.#fsyncDirectory(parent, `${purpose} temporary cleanup`);
+        }
+        return existed;
+    }
+
+    #writeStagingRecord(staged) {
+        const record = validateStagingRecord({
+            type: JOURNAL_TYPE,
+            version: JOURNAL_VERSION,
+            state: JOURNAL_STATES.STAGING,
+            algo: ALGO,
+            transaction: staged.transaction,
+            staging: path.basename(staged.stagingPath),
+            object: objectIdFor(staged.hash),
+            size: staged.size,
+            createdAt: String(this.#now()),
+        }, { limits: this.#limits });
+        this.#writeImmutableRecord(
+            this.#journalPath(record.transaction),
+            record,
+            "installation staging journal",
+            this.#metadataRoot,
+        );
+        this.#inject("staging-journal-durable", {
+            transaction: record.transaction,
+            object: record.object,
+        });
+        return record;
+    }
+
+    #writeStateMarker(record, state) {
+        const value = stateMarkerValue(record.hash, record.size, state);
+        this.#writeImmutableRecord(
+            this.#markerPath(record.hash, state),
+            value,
+            `${state} installation marker`,
+            this.#installationsRoot,
+        );
+        this.#inject(`${state}-marker-durable`, {
+            transaction: record.transaction ?? null,
+            object: record.object,
+        });
+        return value;
+    }
+
+    #prepareStaged(staged) {
+        this.#inject("stage-file-durable", {
+            transaction: staged.transaction,
+            object: objectIdFor(staged.hash),
+        });
+        this.#fsyncDirectory(this.#stagingRoot, "staging entry");
+        this.#inject("stage-directory-durable", {
+            transaction: staged.transaction,
+            object: objectIdFor(staged.hash),
+        });
+        const record = this.#writeStagingRecord(staged);
+        return { ...staged, record };
     }
 
     // Stream `bytes` into a unique fsync'd staging file, returning its hash+size.
@@ -639,22 +1466,33 @@ export class ArtifactStore {
                 maxFileBytes: this.#limits.maxFileBytes,
             });
         }
-        const stagingPath = this.#newStagingPath();
-        const fd = fs.openSync(stagingPath, "wx");
+        const { transaction, stagingPath } = this.#newStagingTarget();
+        let fd;
         try {
+            fd = fs.openSync(stagingPath, "wx", 0o600);
             let off = 0;
             while (off < buf.length) {
                 off += fs.writeSync(fd, buf, off, buf.length - off);
             }
-            fs.fsyncSync(fd);
+            this.#fsyncFd(fd, "staging object file", stagingPath);
         } catch (err) {
-            fs.closeSync(fd);
-            safeUnlink(stagingPath);
-            throw err;
+            if (fd !== undefined) {
+                try {
+                    fs.closeSync(fd);
+                } catch {
+                    // Preserve the staging failure.
+                }
+            }
+            try {
+                this.#unlinkPath(stagingPath, "failed to remove incomplete staging object");
+            } catch {
+                // Preserve the staging failure.
+            }
+            throw asIoError("failed to stage object bytes", err, { path: stagingPath });
         }
-        fs.closeSync(fd);
+        this.#closeFd(fd, "failed to close staged object", { path: stagingPath });
         const hash = createHash(ALGO).update(buf).digest("hex");
-        return { stagingPath, hash, size: buf.length };
+        return { transaction, stagingPath, hash, size: buf.length };
     }
 
     // Stream an existing source file into a unique fsync'd staging file while
@@ -677,7 +1515,7 @@ export class ArtifactStore {
             });
         }
         const pathBefore = stableIdentity(pathBeforeStat, srcPath);
-        const stagingPath = this.#newStagingPath();
+        const { transaction, stagingPath } = this.#newStagingTarget();
         const rfd = fs.openSync(srcPath, "r");
         let wfd;
         try {
@@ -690,7 +1528,7 @@ export class ArtifactStore {
             if (hook !== null) {
                 hook({ path: srcPath, fd: rfd });
             }
-            wfd = fs.openSync(stagingPath, "wx");
+            wfd = fs.openSync(stagingPath, "wx", 0o600);
         } catch (err) {
             fs.closeSync(rfd);
             safeUnlink(stagingPath);
@@ -718,7 +1556,7 @@ export class ArtifactStore {
                 }
                 hash.update(buf.subarray(0, n));
             }
-            fs.fsyncSync(wfd);
+            this.#fsyncFd(wfd, "staging object file", stagingPath);
             const handleAfter = stableIdentity(fs.fstatSync(rfd, { bigint: true }), srcPath);
             assertStableIdentity(pathBefore, handleAfter, srcPath);
             const pathAfterStat = fs.lstatSync(srcPath, { bigint: true });
@@ -746,98 +1584,215 @@ export class ArtifactStore {
         }
         fs.closeSync(rfd);
         fs.closeSync(wfd);
-        return { stagingPath, hash: hash.digest("hex"), size };
+        return { transaction, stagingPath, hash: hash.digest("hex"), size };
     }
 
-    // Install a fsync'd staging file at its content-addressed destination using
-    // link/rename semantics that never overwrite an existing object. Returns the
-    // durable metadata for the object.
-    #install(stagingPath, hash, size, contentType) {
-        const dir = path.join(this.#objectsRoot, hash.slice(0, 2));
-        fs.mkdirSync(dir, { recursive: true });
-        const dest = path.join(dir, hash);
+    #validateObjectSlot(dest, record) {
+        const check = this.#hashExisting(dest);
+        if (check === null) {
+            return { ok: false, reason: "missing" };
+        }
+        if (check.hash !== record.hash || check.size !== record.size) {
+            return {
+                ok: false,
+                reason: "corrupt",
+                actualHash: check.hash,
+                actualSize: check.size,
+            };
+        }
+        return { ok: true, size: check.size };
+    }
 
-        let existed;
+    #installObjectEntry(record, sourcePath) {
+        const dir = path.join(this.#objectsRoot, record.hash.slice(0, 2));
         try {
-            // Hard-link never clobbers: it fails EEXIST if the object already
-            // exists, which is precisely the duplicate-writer race we must
-            // survive without corrupting the winning object.
-            fs.linkSync(stagingPath, dest);
-            existed = false;
+            fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+        } catch (err) {
+            throw asIoError("failed to create object prefix directory", err, { path: dir });
+        }
+        const dest = path.join(dir, record.hash);
+        let existed = false;
+        let method = "link";
+
+        try {
+            this.#inject("before-object-link", {
+                transaction: record.transaction,
+                object: record.object,
+                sourcePath,
+                dest,
+            });
+            fs.linkSync(sourcePath, dest);
         } catch (err) {
             if (err && err.code === "EEXIST") {
                 existed = true;
             } else if (err && (err.code === "EPERM" || err.code === "ENOSYS" || err.code === "EXDEV" || err.code === "EMLINK")) {
-                // Filesystem cannot hard-link (rare on same-volume NTFS/ext4).
-                // Fall back to rename, but guard against overwrite first.
-                if (fs.existsSync(dest)) {
-                    existed = true;
-                } else {
+                method = "rename-copy";
+                const candidate = this.#candidatePath(record);
+                if (sourcePath !== candidate) {
                     try {
-                        fs.renameSync(stagingPath, dest);
-                        existed = false;
+                        this.#inject("before-object-rename", {
+                            transaction: record.transaction,
+                            object: record.object,
+                            sourcePath,
+                            candidate,
+                            dest,
+                        });
+                        fs.renameSync(sourcePath, candidate);
+                        sourcePath = candidate;
+                        this.#inject("object-renamed", {
+                            transaction: record.transaction,
+                            object: record.object,
+                            candidate,
+                        });
                     } catch (renameErr) {
-                        if (renameErr && (renameErr.code === "EEXIST" || renameErr.code === "EPERM" || renameErr.code === "ENOTEMPTY")) {
-                            existed = true;
+                        if (renameErr && renameErr.code === "EEXIST") {
+                            const candidateCheck = this.#validateObjectSlot(candidate, record);
+                            if (!candidateCheck.ok) {
+                                throw new ObjectCorruptError(
+                                    "fallback installation candidate does not match its journal",
+                                    {
+                                        object: record.object,
+                                        candidate,
+                                        reason: candidateCheck.reason,
+                                    },
+                                );
+                            }
+                            sourcePath = candidate;
                         } else {
-                            safeUnlink(stagingPath);
-                            throw new ArtifactStoreError(
-                                ARTIFACT_STORE_ERROR_CODES.IO_ERROR,
-                                `failed to install object: ${renameErr.message}`,
-                                { hash },
-                            );
+                            throw asIoError("failed to move staged object into installation directory", renameErr, {
+                                object: record.object,
+                                sourcePath,
+                                candidate,
+                            });
                         }
                     }
                 }
+                try {
+                    this.#inject("before-object-copy", {
+                        transaction: record.transaction,
+                        object: record.object,
+                        sourcePath,
+                        dest,
+                    });
+                    fs.copyFileSync(sourcePath, dest, fs.constants.COPYFILE_EXCL);
+                    this.#inject("object-copied", {
+                        transaction: record.transaction,
+                        object: record.object,
+                        dest,
+                    });
+                } catch (copyErr) {
+                    if (copyErr && copyErr.code === "EEXIST") {
+                        existed = true;
+                    } else {
+                        throw asIoError("failed to copy staged object into its no-clobber slot", copyErr, {
+                            object: record.object,
+                            sourcePath,
+                            dest,
+                        });
+                    }
+                }
             } else {
-                safeUnlink(stagingPath);
-                throw new ArtifactStoreError(
-                    ARTIFACT_STORE_ERROR_CODES.IO_ERROR,
-                    `failed to install object: ${err.message}`,
-                    { hash },
-                );
-            }
-        }
-
-        // Staging file is either linked (dest now shares the inode) or the
-        // object pre-existed; in both cases we remove the staging name.
-        safeUnlink(stagingPath);
-
-        if (existed && this.#verifyExistingOnPut) {
-            // We must never trust an existing slot blindly: verify the bytes
-            // already there match the id we intended to install.
-            const check = this.#hashExisting(dest);
-            if (check === null) {
-                // A concurrent reconcile could have removed it between link
-                // failure and here; re-install by rename of a fresh stage is
-                // out of scope — treat as corruption of the CAS invariant.
-                throw new ObjectCorruptError("object slot vanished during install verification", { hash });
-            }
-            if (check.hash !== hash || check.size !== size) {
-                throw new ObjectCorruptError("existing object bytes do not match their content address", {
-                    expectedHash: hash,
-                    actualHash: check.hash,
-                    expectedSize: size,
-                    actualSize: check.size,
+                throw asIoError("failed to link staged object into its no-clobber slot", err, {
+                    object: record.object,
+                    sourcePath,
+                    dest,
                 });
             }
         }
 
-        // Best-effort durability of the directory entries.
-        fsyncDirBestEffort(dir);
-        fsyncDirBestEffort(this.#objectsRoot);
+        this.#inject(existed ? "object-slot-existing" : "object-entry-installed", {
+            transaction: record.transaction,
+            object: record.object,
+            method,
+            dest,
+        });
+        const check = this.#validateObjectSlot(dest, record);
+        if (!check.ok) {
+            throw new ObjectCorruptError("installed object bytes do not match their content address", {
+                object: record.object,
+                expectedHash: record.hash,
+                expectedSize: record.size,
+                actualHash: check.actualHash,
+                actualSize: check.actualSize,
+                reason: check.reason,
+            });
+        }
+        return { dest, dir, existed, method, sourcePath };
+    }
 
+    #makeObjectDurable(record, dest, dir) {
+        this.#fsyncFilePath(dest, "installed object file");
+        this.#inject("object-file-durable", {
+            transaction: record.transaction,
+            object: record.object,
+            dest,
+        });
+        this.#fsyncDirectory(dir, "object parent");
+        this.#fsyncDirectory(this.#objectsRoot, "object prefix parent");
+        this.#inject("object-directory-durable", {
+            transaction: record.transaction,
+            object: record.object,
+            dest,
+        });
+    }
+
+    #cleanupTransaction(record) {
+        let objectDirChanged = false;
+        const stagingRemoved = this.#unlinkPath(
+            path.join(this.#stagingRoot, record.staging),
+            "failed to remove completed staging object",
+        );
+        objectDirChanged = this.#unlinkPath(
+            this.#candidatePath(record),
+            "failed to remove completed installation candidate",
+        ) || objectDirChanged;
+        if (stagingRemoved) {
+            this.#fsyncDirectory(this.#stagingRoot, "staging cleanup");
+        }
+        if (objectDirChanged) {
+            this.#fsyncDirectory(
+                path.join(this.#objectsRoot, record.hash.slice(0, 2)),
+                "installation candidate cleanup",
+            );
+        }
+        const journalRemoved = this.#unlinkPath(
+            this.#journalPath(record.transaction),
+            "failed to remove completed installation journal",
+        );
+        if (journalRemoved) {
+            this.#fsyncDirectory(this.#journalRoot, "installation journal cleanup");
+        }
+        this.#inject("transaction-cleaned", {
+            transaction: record.transaction,
+            object: record.object,
+        });
+    }
+
+    #finishInstall(record, contentType = null, sourcePath = null) {
+        const actualSource = sourcePath
+            ?? (fs.existsSync(this.#candidatePath(record))
+                ? this.#candidatePath(record)
+                : path.join(this.#stagingRoot, record.staging));
+        const installed = this.#installObjectEntry(record, actualSource);
+        this.#makeObjectDurable(record, installed.dest, installed.dir);
+        this.#writeStateMarker(record, JOURNAL_STATES.INSTALLED);
+        this.#cleanupTransaction(record);
         return {
-            id: objectIdFor(hash),
+            id: record.object,
             algo: ALGO,
-            hash,
-            size,
-            path: dest,
-            relativePath: objectRelPath(hash),
+            hash: record.hash,
+            size: record.size,
+            path: installed.dest,
+            relativePath: objectRelPath(record.hash),
             contentType: contentType ?? null,
-            existed,
+            existed: installed.existed,
             durable: true,
         };
+    }
+
+    #commitStaged(staged, contentType = null) {
+        const prepared = this.#prepareStaged(staged);
+        return this.#finishInstall(prepared.record, contentType, prepared.stagingPath);
     }
 
     // Streaming hash of an already-stored file; null if it does not exist.
@@ -875,8 +1830,7 @@ export class ArtifactStore {
     // second put of identical content returns { existed: true } without
     // overwriting the object.
     putBytes(input, options = {}) {
-        const { stagingPath, hash, size } = this.#stageBytes(input);
-        return this.#install(stagingPath, hash, size, options.contentType);
+        return this.#commitStaged(this.#stageBytes(input), options.contentType);
     }
 
     // Store the contents of an existing file (streamed, never fully buffered).
@@ -891,8 +1845,7 @@ export class ArtifactStore {
         if (!lst.isFile()) {
             throw new UnsafePathError("source is not a regular file", { srcPath });
         }
-        const { stagingPath, hash, size } = this.#stageFile(srcPath);
-        return this.#install(stagingPath, hash, size, options.contentType);
+        return this.#commitStaged(this.#stageFile(srcPath), options.contentType);
     }
 
     // Store bytes drained from a Node Readable stream.
@@ -900,11 +1853,12 @@ export class ArtifactStore {
         if (!readable || typeof readable[Symbol.asyncIterator] !== "function") {
             throw new InvalidArgumentError("putStream requires an async-iterable readable stream");
         }
-        const stagingPath = this.#newStagingPath();
-        const wfd = fs.openSync(stagingPath, "wx");
+        const { transaction, stagingPath } = this.#newStagingTarget();
+        let wfd;
         const hash = createHash(ALGO);
         let size = 0;
         try {
+            wfd = fs.openSync(stagingPath, "wx", 0o600);
             for await (const chunk of readable) {
                 const b = toBuffer(chunk);
                 size += b.length;
@@ -919,14 +1873,29 @@ export class ArtifactStore {
                 }
                 hash.update(b);
             }
-            fs.fsyncSync(wfd);
+            this.#fsyncFd(wfd, "staging object file", stagingPath);
         } catch (err) {
-            fs.closeSync(wfd);
-            safeUnlink(stagingPath);
-            throw err;
+            if (wfd !== undefined) {
+                try {
+                    fs.closeSync(wfd);
+                } catch {
+                    // Preserve the stream/staging failure.
+                }
+            }
+            try {
+                this.#unlinkPath(stagingPath, "failed to remove incomplete streamed staging object");
+            } catch {
+                // Preserve the stream/staging failure.
+            }
+            throw asIoError("failed to stage streamed object", err, { path: stagingPath });
         }
-        fs.closeSync(wfd);
-        return this.#install(stagingPath, hash.digest("hex"), size, options.contentType);
+        this.#closeFd(wfd, "failed to close streamed staging object", { path: stagingPath });
+        return this.#commitStaged({
+            transaction,
+            stagingPath,
+            hash: hash.digest("hex"),
+            size,
+        }, options.contentType);
     }
 
     // --- public read/verify API -------------------------------------------
@@ -1121,12 +2090,7 @@ export class ArtifactStore {
                     ? hooks.afterFileOpen
                     : null,
             });
-            const meta = this.#install(
-                staged.stagingPath,
-                staged.hash,
-                staged.size,
-                null,
-            );
+            const meta = this.#commitStaged(staged, null);
             counters.bytes += meta.size;
             if (counters.bytes > this.#limits.maxTotalBytes) {
                 throw new LimitExceededError("snapshot exceeds maximum total bytes", {
@@ -1168,16 +2132,24 @@ export class ArtifactStore {
         });
     }
 
-    // Materialize a snapshot read-only into a fresh destination directory by
-    // reading verified CAS objects. Refuses a pre-existing destination and any
-    // entry path that would escape it.
+    // Materialize through a private sibling directory, then atomically publish
+    // only the fully verified tree. Every path component is reparse-checked and
+    // rebound to a stable filesystem identity before writes and publication.
     materializeSnapshot(options = {}) {
-        const { snapshot, destDir, readOnly = true } = options;
+        const {
+            snapshot,
+            destDir,
+            readOnly = true,
+            hooks = null,
+        } = options;
         if (typeof destDir !== "string" || destDir.trim().length === 0) {
             throw new InvalidArgumentError("destDir must be a non-empty string", { destDir });
         }
-        const destResolved = path.resolve(destDir);
-        if (fs.existsSync(destResolved)) {
+        if (hooks !== null && (typeof hooks !== "object" || Array.isArray(hooks))) {
+            throw new InvalidArgumentError("materialization hooks must be an object or null");
+        }
+        const destResolved = assertLocalDatabasePath(destDir);
+        if (materializationLstatOrNull(destResolved) !== null) {
             throw new DestinationExistsError("destination already exists; refusing to materialize over it", {
                 destDir: destResolved,
             });
@@ -1188,44 +2160,244 @@ export class ArtifactStore {
             segments: entry.path.split("/"),
         }));
 
-        fs.mkdirSync(destResolved, { recursive: true });
-        const destReal = fs.realpathSync.native(destResolved);
-
-        let fileCount = 0;
-        let totalBytes = 0;
-        for (const { entry, segments } of resolvedEntries) {
-            const targetAbs = path.join(destReal, ...segments);
-            if (!isInsideDir(targetAbs, destReal)) {
-                throw new UnsafePathError("snapshot entry escapes destination", {
-                    relPath: entry.path,
-                    destDir: destReal,
-                });
-            }
-            // Read + verify the object against BOTH its own id and the manifest's
-            // recorded size (closure check).
-            const bytes = this.readObject(entry.object, { verify: true });
-            if (bytes.length !== entry.size) {
-                throw new ObjectCorruptError("object size disagrees with manifest", {
-                    relPath: entry.path,
-                    object: entry.object,
-                    expected: entry.size,
-                    actual: bytes.length,
-                });
-            }
-            fs.mkdirSync(path.dirname(targetAbs), { recursive: true });
-            fs.writeFileSync(targetAbs, bytes);
-            if (readOnly) {
+        const parentPath = path.dirname(destResolved);
+        if (parentPath === destResolved) {
+            throw new UnsafePathError("materialization destination cannot be a filesystem root", {
+                destDir: destResolved,
+            });
+        }
+        const parent = ensureMaterializationDirectory(parentPath);
+        let stagePath;
+        let stageAnchor;
+        for (let attempt = 0; attempt < 32; attempt += 1) {
+            const candidate = path.join(
+                parent.path,
+                `.crucible-materialize-${randomBytes(12).toString("hex")}.stage`,
+            );
+            try {
+                fs.mkdirSync(candidate, { recursive: false, mode: 0o700 });
                 try {
-                    fs.chmodSync(targetAbs, 0o444);
+                    fs.chmodSync(candidate, 0o700);
                 } catch {
-                    // best-effort read-only; Windows honours the read-only bit
+                    // Best available Windows permissions.
                 }
+                const stage = assertMaterializationPath(candidate, "directory");
+                assertMaterializationAnchor(
+                    parent.anchor,
+                    assertMaterializationPath(parent.path, "directory").anchor,
+                    parent.path,
+                );
+                stagePath = stage.path;
+                stageAnchor = stage.anchor;
+                break;
+            } catch (err) {
+                if (err && err.code === "EEXIST") {
+                    continue;
+                }
+                throw err;
             }
-            fileCount += 1;
-            totalBytes += bytes.length;
+        }
+        if (stagePath === undefined) {
+            throw new ArtifactStoreError(
+                ARTIFACT_STORE_ERROR_CODES.IO_ERROR,
+                "could not allocate private materialization staging",
+                { destDir: destResolved },
+            );
         }
 
-        return { dest: destReal, snapshot, fileCount, totalBytes };
+        let published = false;
+        let fileCount = 0;
+        let totalBytes = 0;
+        try {
+            for (const { entry, segments } of resolvedEntries) {
+                assertMaterializationRoot(stagePath, stageAnchor, parent.path, parent.anchor);
+                const bytes = this.readObject(entry.object, { verify: true });
+                if (bytes.length !== entry.size) {
+                    throw new ObjectCorruptError("object size disagrees with manifest", {
+                        relPath: entry.path,
+                        object: entry.object,
+                        expected: entry.size,
+                        actual: bytes.length,
+                    });
+                }
+
+                let targetParent = stagePath;
+                for (const segment of segments.slice(0, -1)) {
+                    assertSafeComponent(segment, entry.path);
+                    targetParent = path.join(targetParent, segment);
+                    let stat = materializationLstatOrNull(targetParent);
+                    if (stat === null) {
+                        fs.mkdirSync(targetParent, { recursive: false, mode: 0o700 });
+                        try {
+                            fs.chmodSync(targetParent, 0o700);
+                        } catch {
+                            // Best available Windows permissions.
+                        }
+                        stat = fs.lstatSync(targetParent, { bigint: true });
+                    }
+                    if (stat.isSymbolicLink() || !stat.isDirectory()) {
+                        throw new SymlinkRejectedError(
+                            "materialization staging component changed into a link/non-directory",
+                            { relPath: entry.path, path: targetParent },
+                        );
+                    }
+                    const real = fs.realpathSync.native(targetParent);
+                    if (!sameCanonicalPath(path.resolve(targetParent), path.resolve(real))
+                        || !isInsideDir(real, stagePath)) {
+                        throw new UnsafePathError("materialization staging component escapes its root", {
+                            relPath: entry.path,
+                            path: targetParent,
+                            real,
+                        });
+                    }
+                    assertMaterializationRoot(stagePath, stageAnchor, parent.path, parent.anchor);
+                }
+
+                const targetAbs = path.join(targetParent, segments.at(-1));
+                this.#inject("before-materialization-file-write", {
+                    snapshot,
+                    relPath: entry.path,
+                    path: targetAbs,
+                    stagingDir: stagePath,
+                    destDir: destResolved,
+                });
+                if (typeof hooks?.beforeFileWrite === "function") {
+                    hooks.beforeFileWrite({
+                        snapshot,
+                        relPath: entry.path,
+                        path: targetAbs,
+                        stagingDir: stagePath,
+                        destDir: destResolved,
+                    });
+                }
+                assertMaterializationRoot(stagePath, stageAnchor, parent.path, parent.anchor);
+                const checkedParent = assertMaterializationPath(targetParent, "directory");
+                if (!isInsideDir(checkedParent.real, stagePath)) {
+                    throw new UnsafePathError("materialization target parent escaped staging", {
+                        relPath: entry.path,
+                        real: checkedParent.real,
+                    });
+                }
+
+                const fd = fs.openSync(targetAbs, "wx", 0o600);
+                try {
+                    const opened = fs.fstatSync(fd, { bigint: true });
+                    const rebound = fs.lstatSync(targetAbs, { bigint: true });
+                    if (!opened.isFile() || rebound.isSymbolicLink() || !rebound.isFile()) {
+                        throw new UnsafePathError("materialization target is not a regular file", {
+                            relPath: entry.path,
+                        });
+                    }
+                    assertStableIdentity(
+                        stableIdentity(opened, targetAbs),
+                        stableIdentity(rebound, targetAbs),
+                        targetAbs,
+                    );
+                    const targetReal = fs.realpathSync.native(targetAbs);
+                    if (!sameCanonicalPath(path.resolve(targetAbs), path.resolve(targetReal))
+                        || !isInsideDir(targetReal, stagePath)) {
+                        throw new UnsafePathError("opened materialization target escapes staging", {
+                            relPath: entry.path,
+                            targetReal,
+                        });
+                    }
+                    let offset = 0;
+                    while (offset < bytes.length) {
+                        offset += fs.writeSync(fd, bytes, offset, bytes.length - offset);
+                    }
+                    fs.fsyncSync(fd);
+                } catch (err) {
+                    try {
+                        fs.closeSync(fd);
+                    } catch {
+                        // Preserve the binding/write failure.
+                    }
+                    try {
+                        fs.unlinkSync(targetAbs);
+                    } catch {
+                        // Preserve the binding/write failure.
+                    }
+                    throw err;
+                }
+                fs.closeSync(fd);
+                assertMaterializationRoot(stagePath, stageAnchor, parent.path, parent.anchor);
+                assertMaterializationPath(targetAbs, "file");
+                if (readOnly) {
+                    try {
+                        fs.chmodSync(targetAbs, 0o444);
+                    } catch {
+                        // Best-effort read-only; Windows honours the read-only bit.
+                    }
+                }
+                fileCount += 1;
+                totalBytes += bytes.length;
+            }
+
+            this.#inject("before-materialization-publish", {
+                snapshot,
+                stagingDir: stagePath,
+                destDir: destResolved,
+            });
+            if (typeof hooks?.beforePublish === "function") {
+                hooks.beforePublish({
+                    snapshot,
+                    stagingDir: stagePath,
+                    destDir: destResolved,
+                });
+            }
+            assertMaterializationRoot(stagePath, stageAnchor, parent.path, parent.anchor);
+            verifyMaterializationStage(
+                stagePath,
+                stageAnchor,
+                parent.path,
+                parent.anchor,
+                manifest,
+            );
+            if (materializationLstatOrNull(destResolved) !== null) {
+                throw new DestinationExistsError(
+                    "destination appeared before materialization publication",
+                    { destDir: destResolved },
+                );
+            }
+            fs.renameSync(stagePath, destResolved);
+            try {
+                const publishedDir = assertMaterializationPath(destResolved, "directory");
+                assertMaterializationAnchor(stageAnchor, publishedDir.anchor, destResolved);
+                assertMaterializationAnchor(
+                    parent.anchor,
+                    assertMaterializationPath(parent.path, "directory").anchor,
+                    parent.path,
+                );
+                if (!isInsideDir(publishedDir.real, parent.real)) {
+                    throw new UnsafePathError("published materialization escaped its verified parent", {
+                        destDir: destResolved,
+                        real: publishedDir.real,
+                    });
+                }
+                published = true;
+                return {
+                    dest: publishedDir.real,
+                    snapshot,
+                    fileCount,
+                    totalBytes,
+                };
+            } catch (err) {
+                try {
+                    removeMaterializationTree(destResolved, stageAnchor);
+                } catch {
+                    // Preserve the publication failure.
+                }
+                throw err;
+            }
+        } finally {
+            if (!published) {
+                try {
+                    removeMaterializationTree(stagePath, stageAnchor);
+                } catch {
+                    // Preserve the materialization failure.
+                }
+            }
+        }
     }
 
     // Verify a snapshot's object closure. Returns a non-throwing status report
@@ -1312,7 +2484,7 @@ export class ArtifactStore {
             throw err;
         }
         for (const f of files) {
-            if (!f.isFile()) {
+            if (!f.isFile() || f.name === DIRECTORY_BARRIER_FILE) {
                 continue;
             }
             const abs = path.join(this.#stagingRoot, f.name);
@@ -1328,11 +2500,352 @@ export class ArtifactStore {
         return out;
     }
 
-    // Reconcile the store against a TRUSTED reference set. Reports referenced
-    // objects that are missing or corrupt, and removes only unreferenced
-    // staging files and orphan objects older than `olderThanMs`. References are
-    // taken exclusively from the caller (explicit ids and/or verified snapshot
-    // closures); nothing is inferred from untrusted on-disk manifests.
+    #scanInstallationJournal() {
+        const records = [];
+        const corrupt = [];
+        const temporary = [];
+        let files;
+        try {
+            files = fs.readdirSync(this.#journalRoot, { withFileTypes: true });
+        } catch (err) {
+            if (err && err.code === "ENOENT") {
+                return { records, corrupt, temporary };
+            }
+            throw asIoError("failed to enumerate installation journal", err, { path: this.#journalRoot });
+        }
+        for (const file of files) {
+            if (!file.isFile() || file.name === DIRECTORY_BARRIER_FILE) {
+                continue;
+            }
+            const filePath = path.join(this.#journalRoot, file.name);
+            let stat;
+            try {
+                stat = fs.statSync(filePath);
+            } catch (err) {
+                if (err && err.code === "ENOENT") {
+                    continue;
+                }
+                throw asIoError("failed to stat installation journal entry", err, { path: filePath });
+            }
+            if (file.name.startsWith(".") && file.name.endsWith(".tmp")) {
+                temporary.push({ name: file.name, path: filePath, mtimeMs: stat.mtimeMs });
+                continue;
+            }
+            try {
+                const bytes = fs.readFileSync(filePath);
+                const value = parseCanonicalJson(bytes, "installation staging record");
+                const record = validateStagingRecord(value, {
+                    rawBytes: bytes,
+                    fileName: file.name,
+                    limits: this.#limits,
+                });
+                records.push({ record, path: filePath, mtimeMs: stat.mtimeMs });
+            } catch (err) {
+                corrupt.push({
+                    name: file.name,
+                    path: filePath,
+                    mtimeMs: stat.mtimeMs,
+                    error: err instanceof CruciblePersistenceError
+                        ? err
+                        : asIoError("failed to read installation journal entry", err, { path: filePath }),
+                });
+            }
+        }
+        records.sort((a, b) => a.record.transaction.localeCompare(b.record.transaction));
+        corrupt.sort((a, b) => a.name.localeCompare(b.name));
+        temporary.sort((a, b) => a.name.localeCompare(b.name));
+        return { records, corrupt, temporary };
+    }
+
+    #scanStateMarkers() {
+        const installed = new Map();
+        const referenced = new Map();
+        const corrupt = [];
+        const temporary = [];
+        const protectedIds = new Set();
+        const protectedPrefixes = new Set();
+        let prefixes;
+        try {
+            prefixes = fs.readdirSync(this.#installationsRoot, { withFileTypes: true });
+        } catch (err) {
+            if (err && err.code === "ENOENT") {
+                return { installed, referenced, corrupt, temporary, protectedIds, protectedPrefixes };
+            }
+            throw asIoError("failed to enumerate installation state markers", err, {
+                path: this.#installationsRoot,
+            });
+        }
+        prefixes.sort((a, b) => a.name.localeCompare(b.name));
+        for (const prefix of prefixes) {
+            if (!prefix.isDirectory() || !/^[0-9a-f]{2}$/u.test(prefix.name)) {
+                continue;
+            }
+            const prefixDir = path.join(this.#installationsRoot, prefix.name);
+            const files = fs.readdirSync(prefixDir, { withFileTypes: true })
+                .sort((a, b) => a.name.localeCompare(b.name));
+            for (const file of files) {
+                if (!file.isFile() || file.name === DIRECTORY_BARRIER_FILE) {
+                    continue;
+                }
+                const filePath = path.join(prefixDir, file.name);
+                if (file.name.startsWith(".") && file.name.endsWith(".tmp")) {
+                    const stat = fs.statSync(filePath);
+                    temporary.push({
+                        name: file.name,
+                        path: filePath,
+                        mtimeMs: stat.mtimeMs,
+                    });
+                    continue;
+                }
+                const match = STATE_MARKER_FILE_RE.exec(file.name);
+                if (!match || match[1].slice(0, 2) !== prefix.name) {
+                    protectedPrefixes.add(prefix.name);
+                    corrupt.push({
+                        name: file.name,
+                        path: filePath,
+                        error: new JournalCorruptError("installation state marker has an invalid filename", {
+                            path: filePath,
+                        }),
+                    });
+                    continue;
+                }
+                const [, hash, state] = match;
+                const id = objectIdFor(hash);
+                try {
+                    const stat = fs.statSync(filePath);
+                    const bytes = fs.readFileSync(filePath);
+                    const value = parseCanonicalJson(bytes, "installation state marker");
+                    const marker = validateStateMarker(value, {
+                        rawBytes: bytes,
+                        fileName: file.name,
+                        expectedState: state,
+                        limits: this.#limits,
+                    });
+                    const entry = { marker, path: filePath, mtimeMs: stat.mtimeMs };
+                    (state === JOURNAL_STATES.INSTALLED ? installed : referenced).set(id, entry);
+                } catch (err) {
+                    protectedIds.add(id);
+                    corrupt.push({
+                        name: file.name,
+                        path: filePath,
+                        object: id,
+                        error: err instanceof CruciblePersistenceError
+                            ? err
+                            : asIoError("failed to read installation state marker", err, { path: filePath }),
+                    });
+                }
+            }
+        }
+        temporary.sort((a, b) => a.path.localeCompare(b.path));
+        return { installed, referenced, corrupt, temporary, protectedIds, protectedPrefixes };
+    }
+
+    #listInstallationCandidates() {
+        const candidates = [];
+        let prefixes;
+        try {
+            prefixes = fs.readdirSync(this.#objectsRoot, { withFileTypes: true });
+        } catch (err) {
+            if (err && err.code === "ENOENT") {
+                return candidates;
+            }
+            throw asIoError("failed to enumerate object prefixes for installation candidates", err, {
+                path: this.#objectsRoot,
+            });
+        }
+        for (const prefix of prefixes) {
+            if (!prefix.isDirectory() || !/^[0-9a-f]{2}$/u.test(prefix.name)) {
+                continue;
+            }
+            const prefixDir = path.join(this.#objectsRoot, prefix.name);
+            for (const file of fs.readdirSync(prefixDir, { withFileTypes: true })) {
+                if (!file.isFile()) {
+                    continue;
+                }
+                const match = /^\.([0-9a-f]{64})\.([0-9a-z]+-[0-9a-z]+-[0-9a-f]{24})\.installing$/u.exec(file.name);
+                if (!match || match[1].slice(0, 2) !== prefix.name) {
+                    continue;
+                }
+                const filePath = path.join(prefixDir, file.name);
+                const stat = fs.statSync(filePath);
+                candidates.push({
+                    name: file.name,
+                    path: filePath,
+                    hash: match[1],
+                    transaction: match[2],
+                    mtimeMs: stat.mtimeMs,
+                });
+            }
+        }
+        candidates.sort((a, b) => a.path.localeCompare(b.path));
+        return candidates;
+    }
+
+    #recordSourceStatuses(record) {
+        const paths = [
+            path.join(this.#stagingRoot, record.staging),
+            this.#candidatePath(record),
+        ];
+        return paths.map((sourcePath) => ({
+            path: sourcePath,
+            status: this.#validateObjectSlot(sourcePath, record),
+        }));
+    }
+
+    #quarantineCorruptObject(record, dest) {
+        const quarantinePath = path.join(
+            this.#quarantineRoot,
+            `${record.hash}.${record.transaction}.corrupt`,
+        );
+        const before = this.#hashExisting(dest);
+        if (before === null) {
+            return null;
+        }
+        if (!fs.existsSync(quarantinePath)) {
+            try {
+                fs.copyFileSync(dest, quarantinePath, fs.constants.COPYFILE_EXCL);
+            } catch (err) {
+                if (!err || err.code !== "EEXIST") {
+                    throw asIoError("failed to quarantine corrupt object", err, {
+                        object: record.object,
+                        source: dest,
+                        quarantinePath,
+                    });
+                }
+            }
+            this.#fsyncFilePath(quarantinePath, "quarantined corrupt object");
+            this.#fsyncDirectory(this.#quarantineRoot, "corrupt-object quarantine");
+        }
+        const after = this.#hashExisting(dest);
+        if (after === null) {
+            return quarantinePath;
+        }
+        if (after.hash !== before.hash || after.size !== before.size) {
+            throw new ObjectCorruptError("corrupt object changed while reconciliation attempted recovery", {
+                object: record.object,
+                before,
+                after,
+            });
+        }
+        const removed = this.#unlinkPath(dest, "failed to remove quarantined corrupt object slot");
+        if (removed) {
+            this.#fsyncDirectory(path.dirname(dest), "corrupt object removal");
+        }
+        return quarantinePath;
+    }
+
+    #recoverJournalRecord(entry, options) {
+        const { olderThanMs, now, dryRun } = options;
+        const { record, mtimeMs } = entry;
+        const age = now - mtimeMs;
+        const dest = this.objectPath(record.object);
+        const destStatus = this.#validateObjectSlot(dest, record);
+        const sources = this.#recordSourceStatuses(record);
+        const validSource = sources.find((source) => source.status.ok);
+
+        if (age < olderThanMs) {
+            return { action: "pending", transaction: record.transaction, object: record.object };
+        }
+        if (destStatus.ok) {
+            if (!dryRun) {
+                this.#makeObjectDurable(record, dest, path.dirname(dest));
+                this.#writeStateMarker(record, JOURNAL_STATES.INSTALLED);
+                this.#cleanupTransaction(record);
+            }
+            return { action: "completed", transaction: record.transaction, object: record.object };
+        }
+        if (validSource !== undefined) {
+            if (!dryRun && destStatus.reason === "corrupt") {
+                const quarantinePath = this.#quarantineCorruptObject(record, dest);
+                this.#finishInstall(record, null, validSource.path);
+                if (quarantinePath !== null) {
+                    const removed = this.#unlinkPath(
+                        quarantinePath,
+                        "failed to remove recovered corrupt-object quarantine",
+                    );
+                    if (removed) {
+                        this.#fsyncDirectory(this.#quarantineRoot, "recovered quarantine cleanup");
+                    }
+                }
+            } else if (!dryRun) {
+                this.#finishInstall(record, null, validSource.path);
+            }
+            return {
+                action: destStatus.reason === "corrupt" ? "repaired" : "completed",
+                transaction: record.transaction,
+                object: record.object,
+            };
+        }
+        if (!dryRun) {
+            this.#cleanupTransaction(record);
+        }
+        return {
+            action: "abandoned",
+            transaction: record.transaction,
+            object: record.object,
+            reason: destStatus.reason,
+        };
+    }
+
+    #ensureReferencedState(id, size, markerScan, dryRun) {
+        const { hex } = parseObjectId(id);
+        const record = {
+            transaction: null,
+            object: id,
+            hash: hex,
+            size,
+        };
+        const installedEntry = markerScan.installed.get(id);
+        if (installedEntry !== undefined && installedEntry.marker.size !== size) {
+            throw new JournalCorruptError("installed marker size disagrees with verified object", {
+                object: id,
+                markerSize: installedEntry.marker.size,
+                objectSize: size,
+            });
+        }
+        const referencedEntry = markerScan.referenced.get(id);
+        if (referencedEntry !== undefined && referencedEntry.marker.size !== size) {
+            throw new JournalCorruptError("referenced marker size disagrees with verified object", {
+                object: id,
+                markerSize: referencedEntry.marker.size,
+                objectSize: size,
+            });
+        }
+        if (dryRun) {
+            return referencedEntry === undefined;
+        }
+        if (installedEntry === undefined) {
+            const dest = this.objectPath(id);
+            this.#makeObjectDurable(record, dest, path.dirname(dest));
+            this.#writeStateMarker(record, JOURNAL_STATES.INSTALLED);
+        }
+        if (referencedEntry === undefined) {
+            this.#writeStateMarker(record, JOURNAL_STATES.REFERENCED);
+            return true;
+        }
+        return false;
+    }
+
+    #removeObjectDurably(objectPath, purpose) {
+        const removed = this.#unlinkPath(objectPath, `failed to remove ${purpose}`);
+        if (removed) {
+            this.#fsyncDirectory(path.dirname(objectPath), `${purpose} parent`);
+        }
+        return removed;
+    }
+
+    #removeMarkerDurably(markerEntry, purpose) {
+        const removed = this.#unlinkPath(markerEntry.path, `failed to remove ${purpose}`);
+        if (removed) {
+            this.#fsyncDirectory(path.dirname(markerEntry.path), `${purpose} parent`);
+        }
+        return removed;
+    }
+
+    // Reconcile the store against trusted caller references plus the private,
+    // monotonic referenced markers. Incomplete journalled installs are resumed
+    // before reference classification; only aged, durable-unreferenced objects
+    // (or aged unjournalled leftovers) are removed.
     reconcile(options = {}) {
         this.#assertWritable();
         const { referenced = [], snapshots = [], olderThanMs, now = Date.now(), dryRun = false } = options;
@@ -1345,6 +2858,22 @@ export class ArtifactStore {
 
         const refSet = new Set();
         const referencedReport = { ok: [], missing: [], corrupt: [] };
+        const installationReport = {
+            completed: [],
+            repaired: [],
+            pending: [],
+            abandoned: [],
+            corruptRecords: [],
+            markedReferenced: [],
+            persistentReferenced: [],
+            durableOrphans: [],
+            unjournaledOrphans: [],
+            removedMarkers: [],
+            removedJournalEntries: [],
+            removedMetadataTemps: [],
+            removedCandidates: [],
+            removedQuarantine: [],
+        };
 
         const addRef = (id) => {
             const { hex } = parseObjectId(id);
@@ -1354,6 +2883,56 @@ export class ArtifactStore {
         for (const id of referenced) {
             addRef(id);
         }
+
+        // First settle aged incomplete transactions. This makes a journalled
+        // snapshot manifest available before we attempt to expand its closure.
+        let journalScan = this.#scanInstallationJournal();
+        for (const corrupt of journalScan.corrupt) {
+            installationReport.corruptRecords.push({
+                name: corrupt.name,
+                code: corrupt.error.code,
+                message: corrupt.error.message,
+            });
+            if (now - corrupt.mtimeMs >= olderThanMs) {
+                if (!dryRun) {
+                    const removed = this.#unlinkPath(
+                        corrupt.path,
+                        "failed to remove corrupt installation journal entry",
+                    );
+                    if (removed) {
+                        this.#fsyncDirectory(this.#journalRoot, "corrupt journal cleanup");
+                    }
+                }
+                installationReport.removedJournalEntries.push(corrupt.name);
+            }
+        }
+        for (const entry of journalScan.records) {
+            const result = this.#recoverJournalRecord(entry, {
+                olderThanMs,
+                now,
+                dryRun,
+            });
+            installationReport[result.action].push({
+                transaction: result.transaction,
+                object: result.object,
+                ...(result.reason === undefined ? {} : { reason: result.reason }),
+            });
+        }
+
+        let markerScan = this.#scanStateMarkers();
+        for (const corrupt of markerScan.corrupt) {
+            installationReport.corruptRecords.push({
+                name: corrupt.name,
+                object: corrupt.object,
+                code: corrupt.error.code,
+                message: corrupt.error.message,
+            });
+        }
+        for (const id of markerScan.referenced.keys()) {
+            addRef(id);
+            installationReport.persistentReferenced.push(id);
+        }
+
         // Expand caller-supplied snapshot ids by reading their hash-verified
         // manifests. The snapshot ids are trusted (caller-supplied); the
         // manifest bytes are trusted because they are content-addressed and
@@ -1383,6 +2962,24 @@ export class ArtifactStore {
             const r = this.verifyObject(id);
             if (r.ok) {
                 referencedReport.ok.push(id);
+                if (!markerScan.protectedIds.has(id)
+                    && !markerScan.protectedPrefixes.has(parseObjectId(id).hex.slice(0, 2))) {
+                    try {
+                        if (this.#ensureReferencedState(id, r.size, markerScan, dryRun)) {
+                            installationReport.markedReferenced.push(id);
+                        }
+                    } catch (err) {
+                        if (!(err instanceof JournalCorruptError)) {
+                            throw err;
+                        }
+                        markerScan.protectedIds.add(id);
+                        installationReport.corruptRecords.push({
+                            object: id,
+                            code: err.code,
+                            message: err.message,
+                        });
+                    }
+                }
             } else if (r.reason === "missing") {
                 if (!referencedReport.missing.includes(id)) {
                     referencedReport.missing.push(id);
@@ -1392,18 +2989,72 @@ export class ArtifactStore {
             }
         }
 
-        // Sweep orphan objects. NEVER delete a referenced object, even if it is
-        // corrupt (that is a finding to surface, not to silently erase).
+        // Re-read state after any installed/referenced markers created above.
+        markerScan = this.#scanStateMarkers();
+        for (const id of markerScan.referenced.keys()) {
+            refSet.add(id);
+            if (!installationReport.persistentReferenced.includes(id)) {
+                installationReport.persistentReferenced.push(id);
+            }
+        }
+
+        // Sweep durable unreferenced objects according to installed markers.
+        // A referenced marker is monotonic and permanently protects its object.
         const removedObjects = [];
         const keptOrphans = [];
-        for (const obj of this.listObjects()) {
-            if (refSet.has(obj.id)) {
+        const objects = this.listObjects();
+        const objectsById = new Map(objects.map((obj) => [obj.id, obj]));
+        for (const [id, installedEntry] of markerScan.installed) {
+            if (refSet.has(id)
+                || markerScan.referenced.has(id)
+                || markerScan.protectedIds.has(id)
+                || markerScan.protectedPrefixes.has(parseObjectId(id).hex.slice(0, 2))) {
                 continue;
             }
+            installationReport.durableOrphans.push(id);
+            const obj = objectsById.get(id);
+            if (obj !== undefined && installedEntry.marker.size !== obj.size) {
+                markerScan.protectedIds.add(id);
+                installationReport.corruptRecords.push({
+                    object: id,
+                    code: ARTIFACT_STORE_ERROR_CODES.JOURNAL_CORRUPT,
+                    message: "installed marker size disagrees with object slot",
+                });
+                continue;
+            }
+            const age = now - (obj?.mtimeMs ?? installedEntry.mtimeMs);
+            if (age >= olderThanMs) {
+                if (!dryRun) {
+                    if (obj !== undefined) {
+                        this.#removeObjectDurably(obj.path, "durable unreferenced object");
+                    }
+                    this.#removeMarkerDurably(installedEntry, "durable unreferenced installed marker");
+                }
+                if (obj !== undefined) {
+                    removedObjects.push(id);
+                }
+                installationReport.removedMarkers.push(id);
+            } else {
+                keptOrphans.push(id);
+            }
+        }
+
+        // Legacy/unjournalled objects are never promoted silently. They retain
+        // the old age-based sweep behavior unless protected by a trusted ref or
+        // suspicious metadata that makes deletion unsafe.
+        for (const obj of objects) {
+            const prefix = obj.hash.slice(0, 2);
+            if (markerScan.installed.has(obj.id)
+                || refSet.has(obj.id)
+                || markerScan.protectedIds.has(obj.id)
+                || markerScan.protectedPrefixes.has(prefix)) {
+                continue;
+            }
+            installationReport.unjournaledOrphans.push(obj.id);
             const age = now - obj.mtimeMs;
             if (age >= olderThanMs) {
                 if (!dryRun) {
-                    safeUnlink(obj.path);
+                    this.#removeObjectDurably(obj.path, "unjournalled orphan object");
                 }
                 removedObjects.push(obj.id);
             } else {
@@ -1411,26 +3062,128 @@ export class ArtifactStore {
             }
         }
 
-        // Sweep stale staging files (never referenced by construction).
+        // Sweep stale staging files only when no surviving valid journal record
+        // owns their name.
+        journalScan = this.#scanInstallationJournal();
+        const protectedStaging = new Set(journalScan.records.map((entry) => entry.record.staging));
+        const protectedTransactions = new Set(
+            journalScan.records.map((entry) => entry.record.transaction),
+        );
         const removedStaging = [];
         for (const s of this.#listStaging()) {
+            if (protectedStaging.has(s.name)) {
+                continue;
+            }
             const age = now - s.mtimeMs;
             if (age >= olderThanMs) {
                 if (!dryRun) {
-                    safeUnlink(s.path);
+                    const removed = this.#unlinkPath(s.path, "failed to remove stale staging file");
+                    if (removed) {
+                        this.#fsyncDirectory(this.#stagingRoot, "stale staging cleanup");
+                    }
                 }
                 removedStaging.push(s.name);
             }
         }
+
+        for (const temp of journalScan.temporary) {
+            if (now - temp.mtimeMs >= olderThanMs) {
+                if (!dryRun) {
+                    const removed = this.#unlinkPath(
+                        temp.path,
+                        "failed to remove stale journal temporary file",
+                    );
+                    if (removed) {
+                        this.#fsyncDirectory(this.#journalRoot, "journal temporary cleanup");
+                    }
+                }
+                installationReport.removedJournalEntries.push(temp.name);
+            }
+        }
+
+        markerScan = this.#scanStateMarkers();
+        for (const temp of markerScan.temporary) {
+            if (now - temp.mtimeMs >= olderThanMs) {
+                if (!dryRun) {
+                    const removed = this.#unlinkPath(
+                        temp.path,
+                        "failed to remove stale installation-marker temporary file",
+                    );
+                    if (removed) {
+                        this.#fsyncDirectory(path.dirname(temp.path), "installation-marker temporary cleanup");
+                    }
+                }
+                installationReport.removedMetadataTemps.push(temp.name);
+            }
+        }
+
+        for (const candidate of this.#listInstallationCandidates()) {
+            if (protectedTransactions.has(candidate.transaction)) {
+                continue;
+            }
+            if (now - candidate.mtimeMs >= olderThanMs) {
+                if (!dryRun) {
+                    this.#removeObjectDurably(candidate.path, "stale installation candidate");
+                }
+                installationReport.removedCandidates.push(candidate.name);
+            }
+        }
+
+        let quarantineFiles = [];
+        try {
+            quarantineFiles = fs.readdirSync(this.#quarantineRoot, { withFileTypes: true });
+        } catch (err) {
+            if (!err || err.code !== "ENOENT") {
+                throw asIoError("failed to enumerate corrupt-object quarantine", err, {
+                    path: this.#quarantineRoot,
+                });
+            }
+        }
+        for (const file of quarantineFiles.sort((a, b) => a.name.localeCompare(b.name))) {
+            if (!file.isFile() || file.name === DIRECTORY_BARRIER_FILE) {
+                continue;
+            }
+            const filePath = path.join(this.#quarantineRoot, file.name);
+            const stat = fs.statSync(filePath);
+            if (now - stat.mtimeMs >= olderThanMs) {
+                if (!dryRun) {
+                    const removed = this.#unlinkPath(filePath, "failed to remove stale corrupt-object quarantine");
+                    if (removed) {
+                        this.#fsyncDirectory(this.#quarantineRoot, "stale quarantine cleanup");
+                    }
+                }
+                installationReport.removedQuarantine.push(file.name);
+            }
+        }
+
+        const sortUnique = (values) => [...new Set(values)].sort();
+        referencedReport.ok = sortUnique(referencedReport.ok);
+        referencedReport.missing = sortUnique(referencedReport.missing);
+        referencedReport.corrupt = sortUnique(referencedReport.corrupt);
+        installationReport.markedReferenced = sortUnique(installationReport.markedReferenced);
+        installationReport.persistentReferenced = sortUnique(installationReport.persistentReferenced);
+        installationReport.durableOrphans = sortUnique(installationReport.durableOrphans);
+        installationReport.unjournaledOrphans = sortUnique(installationReport.unjournaledOrphans);
+        installationReport.removedMarkers = sortUnique(installationReport.removedMarkers);
+        installationReport.removedJournalEntries = sortUnique(installationReport.removedJournalEntries);
+        installationReport.removedMetadataTemps = sortUnique(installationReport.removedMetadataTemps);
+        installationReport.removedCandidates = sortUnique(installationReport.removedCandidates);
+        installationReport.removedQuarantine = sortUnique(installationReport.removedQuarantine);
+        for (const key of ["completed", "repaired", "pending", "abandoned"]) {
+            installationReport[key].sort((a, b) => a.transaction.localeCompare(b.transaction));
+        }
+        installationReport.corruptRecords.sort((a, b) =>
+            String(a.object ?? a.name ?? "").localeCompare(String(b.object ?? b.name ?? "")));
 
         return {
             now,
             olderThanMs,
             dryRun,
             referenced: referencedReport,
-            removedObjects,
-            keptOrphans,
-            removedStaging,
+            installations: installationReport,
+            removedObjects: sortUnique(removedObjects),
+            keptOrphans: sortUnique(keptOrphans),
+            removedStaging: sortUnique(removedStaging),
         };
     }
 }

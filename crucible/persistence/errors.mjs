@@ -23,6 +23,7 @@ export const ERROR_CODES = Object.freeze({
     SEQUENCE_CONFLICT: "CRUCIBLE_PERSIST_SEQUENCE_CONFLICT",
     PREV_HASH_MISMATCH: "CRUCIBLE_PERSIST_PREV_HASH_MISMATCH",
     EVENT_HASH_MISMATCH: "CRUCIBLE_PERSIST_EVENT_HASH_MISMATCH",
+    EVENT_PAYLOAD_NOT_CANONICAL: "CRUCIBLE_PERSIST_EVENT_PAYLOAD_NOT_CANONICAL",
     TERMINAL_EXISTS: "CRUCIBLE_PERSIST_TERMINAL_EXISTS",
     EVIDENCE_CONFLICT: "CRUCIBLE_PERSIST_EVIDENCE_CONFLICT",
 
@@ -38,6 +39,8 @@ export const ERROR_CODES = Object.freeze({
 
     // Integrity.
     INTEGRITY_VIOLATION: "CRUCIBLE_PERSIST_INTEGRITY_VIOLATION",
+    SCHEMA_INTEGRITY_VIOLATION: "CRUCIBLE_PERSIST_SCHEMA_INTEGRITY_VIOLATION",
+    DATABASE_INTEGRITY_VIOLATION: "CRUCIBLE_PERSIST_DATABASE_INTEGRITY_VIOLATION",
 
     // Wrapped storage/engine error we did not expect.
     STORAGE_ERROR: "CRUCIBLE_PERSIST_STORAGE_ERROR",
@@ -69,10 +72,31 @@ export class SchemaVersionError extends CruciblePersistenceError {
     }
 }
 
+export class SchemaIntegrityError extends CruciblePersistenceError {
+    constructor(message, details) {
+        super(ERROR_CODES.SCHEMA_INTEGRITY_VIOLATION, message, details);
+        this.name = "SchemaIntegrityError";
+    }
+}
+
+export class DatabaseIntegrityError extends CruciblePersistenceError {
+    constructor(message, details) {
+        super(ERROR_CODES.DATABASE_INTEGRITY_VIOLATION, message, details);
+        this.name = "DatabaseIntegrityError";
+    }
+}
+
 export class InvalidArgumentError extends CruciblePersistenceError {
     constructor(message, details) {
         super(ERROR_CODES.INVALID_ARGUMENT, message, details);
         this.name = "InvalidArgumentError";
+    }
+}
+
+export class CanonicalPayloadError extends CruciblePersistenceError {
+    constructor(message, details) {
+        super(ERROR_CODES.EVENT_PAYLOAD_NOT_CANONICAL, message, details);
+        this.name = "CanonicalPayloadError";
     }
 }
 

@@ -14,7 +14,7 @@
 
 import { createHash } from "node:crypto";
 
-import { InvalidArgumentError } from "./errors.mjs";
+import { CanonicalPayloadError, InvalidArgumentError } from "./errors.mjs";
 
 // The prev_hash of the first event in every investigation.
 export const GENESIS_PREV_HASH = "0".repeat(64);
@@ -23,6 +23,52 @@ export const GENESIS_PREV_HASH = "0".repeat(64);
 // cannot represent it and it would make the hash ambiguous).
 export function canonicalize(value) {
     return JSON.stringify(sortValue(value));
+}
+
+export function inspectCanonicalJson(text) {
+    if (typeof text !== "string") {
+        return {
+            ok: false,
+            reason: "payload is not text",
+            value: undefined,
+            canonical: undefined,
+        };
+    }
+    try {
+        const value = JSON.parse(text);
+        const canonical = canonicalize(value);
+        return {
+            ok: canonical === text,
+            reason: canonical === text ? null : "payload text is not canonical JSON",
+            value,
+            canonical,
+        };
+    } catch (err) {
+        return {
+            ok: false,
+            reason: `payload is not valid JSON: ${err.message}`,
+            value: undefined,
+            canonical: undefined,
+        };
+    }
+}
+
+export function parseCanonicalJson(text, details = undefined) {
+    const inspected = inspectCanonicalJson(text);
+    if (!inspected.ok) {
+        throw new CanonicalPayloadError(
+            "stored event payload is not exact canonical JSON",
+            {
+                ...details,
+                reason: inspected.reason,
+                storedLength: typeof text === "string" ? Buffer.byteLength(text, "utf8") : null,
+                canonicalLength: inspected.canonical === undefined
+                    ? null
+                    : Buffer.byteLength(inspected.canonical, "utf8"),
+            },
+        );
+    }
+    return inspected.value;
 }
 
 function sortValue(v) {
@@ -49,10 +95,47 @@ function sortValue(v) {
     return out;
 }
 
-// Compute the canonical event hash from the exact fields persisted with the
-// event. Any change to any field changes the hash; the caller-supplied
-// `payloadCanonical` must already be the canonical string that is stored.
+// Compute the event hash from the exact fields persisted with the event. The
+// payload is deliberately framed as raw canonical UTF-8 text rather than parsed
+// and reserialized, so whitespace, key order, and escape encoding are bound.
 export function computeEventHash({
+    investigationId,
+    seq,
+    prevHash,
+    kind,
+    payloadCanonical,
+    isTerminal = false,
+    terminalKind = null,
+    attemptId = null,
+    evidenceKind = null,
+    createdAt,
+}) {
+    if (typeof payloadCanonical !== "string") {
+        throw new InvalidArgumentError("payloadCanonical must be a string");
+    }
+    const header = canonicalize({
+        version: 2,
+        investigationId,
+        seq,
+        prevHash,
+        kind,
+        isTerminal: isTerminal === true || isTerminal === 1,
+        terminalKind,
+        attemptId,
+        evidenceKind,
+        createdAt,
+    });
+    return createHash("sha256")
+        .update("crucible-event:v2\0")
+        .update(header, "utf8")
+        .update("\0payload\0")
+        .update(payloadCanonical, "utf8")
+        .digest("hex");
+}
+
+// Version-1 hashing is retained only to authenticate existing databases before
+// the schema-5 migration rewrites their chains to the byte-binding format.
+export function computeLegacyEventHash({
     investigationId,
     seq,
     prevHash,

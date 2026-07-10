@@ -10,7 +10,11 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "../persistence/sqlite.mjs";
 
-import { openRepository, ERROR_CODES } from "../persistence/index.mjs";
+import {
+    openRepository,
+    computeEventHash,
+    ERROR_CODES,
+} from "../persistence/index.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 
@@ -224,6 +228,27 @@ describe("transactional rollback", () => {
 });
 
 describe("integrity verification & tamper detection", () => {
+    it("binds event hashes to the exact payload text bytes", () => {
+        const fields = {
+            investigationId: "inv-1",
+            seq: 1,
+            prevHash: "0".repeat(64),
+            kind: "opened",
+            isTerminal: false,
+            terminalKind: null,
+            attemptId: null,
+            evidenceKind: null,
+            createdAt: "2026-01-01T00:00:00.000Z",
+        };
+        expect(computeEventHash({
+            ...fields,
+            payloadCanonical: '{"a":1,"b":2}',
+        })).not.toBe(computeEventHash({
+            ...fields,
+            payloadCanonical: '{ "a": 1, "b": 2 }',
+        }));
+    });
+
     it("detects an out-of-band payload mutation via event-hash recomputation", () => {
         repo.appendEvents({
             investigationId: "inv-1",
@@ -247,6 +272,78 @@ describe("integrity verification & tamper detection", () => {
         const report = repo.verifyInvestigation("inv-1");
         expect(report.ok).toBe(false);
         expect(report.violations.some((v) => v.code === ERROR_CODES.EVENT_HASH_MISMATCH)).toBe(true);
+    });
+
+    it.each([
+        ["whitespace", '{ "a":1,"b":2,"text":"a"}'],
+        ["key order", '{"b":2,"a":1,"text":"a"}'],
+        ["alternate escape encoding", '{"a":1,"b":2,"text":"\\u0061"}'],
+    ])("rejects a payload %s mutation even when JSON semantics are unchanged", (_label, mutated) => {
+        repo.appendEvents({
+            investigationId: "inv-1",
+            expectedHead: null,
+            events: [{ kind: "opened", payload: { a: 1, b: 2, text: "a" } }],
+        });
+        const file = repo.databaseFile;
+        repo.close();
+
+        const raw = new DatabaseSync(file);
+        raw.prepare("UPDATE events SET payload = ? WHERE investigation_id = 'inv-1' AND seq = 1")
+            .run(mutated);
+        raw.close();
+
+        repo = openRepository({ file });
+        const report = repo.verifyInvestigation("inv-1");
+        expect(report.ok).toBe(false);
+        expect(report.violations.some(
+            (violation) => violation.code === ERROR_CODES.EVENT_PAYLOAD_NOT_CANONICAL,
+        )).toBe(true);
+        expect(report.violations.some(
+            (violation) => violation.code === ERROR_CODES.EVENT_HASH_MISMATCH,
+        )).toBe(true);
+        expect(catchCode(() => repo.getEvent("inv-1", 1)).code)
+            .toBe(ERROR_CODES.EVENT_PAYLOAD_NOT_CANONICAL);
+    });
+
+    it("rejects non-canonical payload text even when its exact-byte hash is rewritten", () => {
+        const appended = repo.appendEvents({
+            investigationId: "inv-1",
+            expectedHead: null,
+            events: [{ kind: "opened", payload: { a: 1, b: 2 } }],
+        }).events[0];
+        const mutated = '{"b":2,"a":1}';
+        const rewrittenHash = computeEventHash({
+            investigationId: appended.investigationId,
+            seq: appended.seq,
+            prevHash: appended.prevHash,
+            kind: appended.kind,
+            payloadCanonical: mutated,
+            isTerminal: appended.isTerminal,
+            terminalKind: appended.terminalKind,
+            attemptId: appended.attemptId,
+            evidenceKind: appended.evidenceKind,
+            createdAt: appended.createdAt,
+        });
+        const file = repo.databaseFile;
+        repo.close();
+
+        const raw = new DatabaseSync(file);
+        raw.prepare(`
+            UPDATE events
+            SET payload = ?, event_hash = ?
+            WHERE investigation_id = 'inv-1' AND seq = 1
+        `).run(mutated, rewrittenHash);
+        raw.close();
+
+        repo = openRepository({ file });
+        const report = repo.verifyInvestigation("inv-1");
+        expect(report.ok).toBe(false);
+        expect(report.violations.some(
+            (violation) => violation.code === ERROR_CODES.EVENT_PAYLOAD_NOT_CANONICAL,
+        )).toBe(true);
+        expect(report.violations.some(
+            (violation) => violation.code === ERROR_CODES.EVENT_HASH_MISMATCH,
+        )).toBe(false);
     });
 
     it("detects a broken prev_hash chain link", () => {

@@ -512,6 +512,85 @@ describe("materialization", () => {
             destDir: path.join(base, "wrong-size-out"),
         }));
         expect(err.code).toBe(ARTIFACT_STORE_ERROR_CODES.OBJECT_CORRUPT);
+        expect(fs.existsSync(path.join(base, "wrong-size-out"))).toBe(false);
+    });
+
+    it("rejects a junction swap before a staged file write and never escapes", () => {
+        const snap = seedAndSnapshot();
+        const outside = path.join(base, "outside");
+        fs.mkdirSync(outside);
+        const dest = path.join(base, "junction-out");
+        let injected = false;
+
+        const err = catchErr(() => store.materializeSnapshot({
+            snapshot: snap.snapshot,
+            destDir: dest,
+            hooks: {
+                beforeFileWrite(event) {
+                    if (!injected && event.relPath === "sub/b.txt") {
+                        injected = true;
+                        const parent = path.dirname(event.path);
+                        fs.rmdirSync(parent);
+                        fs.symlinkSync(outside, parent, "junction");
+                    }
+                },
+            },
+        }));
+
+        expect(injected).toBe(true);
+        expect(err.code).toBe(ARTIFACT_STORE_ERROR_CODES.SYMLINK_REJECTED);
+        expect(fs.existsSync(path.join(outside, "b.txt"))).toBe(false);
+        expect(fs.existsSync(dest)).toBe(false);
+        expect(fs.readdirSync(base).some((name) =>
+            name.startsWith(".crucible-materialize-") && name.endsWith(".stage"))).toBe(false);
+    });
+
+    it("cleans private staging after a partial materialization failure", () => {
+        const snap = seedAndSnapshot();
+        const dest = path.join(base, "partial-out");
+
+        expect(() => store.materializeSnapshot({
+            snapshot: snap.snapshot,
+            destDir: dest,
+            hooks: {
+                beforeFileWrite(event) {
+                    if (event.relPath === "sub/b.txt") {
+                        throw new Error("injected materialization failure");
+                    }
+                },
+            },
+        })).toThrow("injected materialization failure");
+
+        expect(fs.existsSync(dest)).toBe(false);
+        expect(fs.readdirSync(base).some((name) =>
+            name.startsWith(".crucible-materialize-") && name.endsWith(".stage"))).toBe(false);
+    });
+
+    it("re-verifies the complete staged tree after a pre-publication directory swap", () => {
+        const snap = seedAndSnapshot();
+        const outside = path.join(base, "publish-outside");
+        fs.mkdirSync(outside);
+        fs.writeFileSync(path.join(outside, "b.txt"), "outside");
+        const dest = path.join(base, "publish-swap-out");
+        let injected = false;
+
+        const err = catchErr(() => store.materializeSnapshot({
+            snapshot: snap.snapshot,
+            destDir: dest,
+            hooks: {
+                beforePublish(event) {
+                    injected = true;
+                    const sub = path.join(event.stagingDir, "sub");
+                    fs.rmSync(sub, { recursive: true });
+                    fs.symlinkSync(outside, sub, "junction");
+                },
+            },
+        }));
+
+        expect(injected).toBe(true);
+        expect(err.code).toBe(ARTIFACT_STORE_ERROR_CODES.SYMLINK_REJECTED);
+        expect(fs.readFileSync(path.join(outside, "b.txt"), "utf8")).toBe("outside");
+        expect(fs.existsSync(dest)).toBe(false);
     });
 
     it("verifySnapshot reports missing and corrupt closure members", () => {

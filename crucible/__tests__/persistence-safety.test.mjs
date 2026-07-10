@@ -11,10 +11,14 @@ import { DatabaseSync } from "../persistence/sqlite.mjs";
 
 import {
     openRepository,
+    openRepositoryReadOnly,
     assertLocalDatabasePath,
     ERROR_CODES,
+    SCHEMA_FINGERPRINT,
     SCHEMA_VERSION,
+    verifyDatabaseIntegrity,
 } from "../persistence/index.mjs";
+import { computeLegacyEventHash } from "../persistence/canonical.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 
@@ -150,6 +154,26 @@ describe("read-only queries do not mutate state", () => {
         expect(after).toBe(before);
         expect(repo.verifyInvestigation("inv-1").ok).toBe(false);
     });
+
+    it("opens and verifies a live WAL database through a read-only handle", () => {
+        repo.ensureInvestigation({ investigationId: "wal-inv" });
+        repo.appendEvents({
+            investigationId: "wal-inv",
+            expectedHead: null,
+            events: [{ kind: "opened", payload: { valid: true } }],
+        });
+
+        const readOnly = openRepositoryReadOnly({ file: repo.databaseFile });
+        try {
+            expect(readOnly.readOnly).toBe(true);
+            expect(readOnly.verifyInvestigation("wal-inv")).toMatchObject({
+                ok: true,
+                checkedEvents: 1,
+            });
+        } finally {
+            readOnly.close();
+        }
+    });
 });
 
 describe("local-file-only path rejection", () => {
@@ -208,6 +232,8 @@ describe("explicit schema versioning", () => {
             DROP TABLE runner_incarnations;
             ALTER TABLE command_attempts DROP COLUMN runner_incarnation;
             ALTER TABLE runner_leases DROP COLUMN runner_incarnation;
+            DELETE FROM schema_meta
+                WHERE key IN ('schema_fingerprint', 'event_hash_version');
             UPDATE schema_meta SET value = '3' WHERE key = 'schema_version';
             PRAGMA user_version = 3;
         `);
@@ -242,6 +268,46 @@ describe("explicit schema versioning", () => {
         }
     });
 
+    it("migrates an authenticated schema-4 event chain to byte-binding hashes", () => {
+        repo.ensureInvestigation({ investigationId: "legacy-v4" });
+        repo.appendEvents({
+            investigationId: "legacy-v4",
+            expectedHead: null,
+            events: [{ kind: "opened", payload: { b: 2, a: 1 } }],
+        });
+        const event = repo.getEvent("legacy-v4", 1);
+        const legacyHash = computeLegacyEventHash({
+            investigationId: event.investigationId,
+            seq: event.seq,
+            prevHash: event.prevHash,
+            kind: event.kind,
+            payloadCanonical: JSON.stringify({ a: 1, b: 2 }),
+            isTerminal: event.isTerminal,
+            terminalKind: event.terminalKind,
+            attemptId: event.attemptId,
+            evidenceKind: event.evidenceKind,
+            createdAt: event.createdAt,
+        });
+        const file = repo.databaseFile;
+        repo.close();
+        repo = null;
+
+        const raw = new DatabaseSync(file);
+        raw.prepare("UPDATE events SET event_hash = ? WHERE investigation_id = ? AND seq = 1")
+            .run(legacyHash, "legacy-v4");
+        raw.exec(`
+            DELETE FROM schema_meta
+                WHERE key IN ('schema_fingerprint', 'event_hash_version');
+            UPDATE schema_meta SET value = '4' WHERE key = 'schema_version';
+            PRAGMA user_version = 4;
+        `);
+        raw.close();
+
+        repo = openRepository({ file });
+        expect(repo.getEvent("legacy-v4", 1).eventHash).not.toBe(legacyHash);
+        expect(repo.verifyInvestigation("legacy-v4").ok).toBe(true);
+    });
+
     it("fails closed when the on-disk schema version does not match", () => {
         repo.ensureInvestigation({ investigationId: "inv-1" });
         repo.close();
@@ -262,5 +328,148 @@ describe("explicit schema versioning", () => {
         rawFix.prepare("UPDATE schema_meta SET value = ? WHERE key = 'schema_version'").run(String(SCHEMA_VERSION));
         rawFix.close();
         repo = openRepository({ file: repo.databaseFile });
+    });
+});
+
+describe("canonical schema fingerprint and database integrity", () => {
+    it("persists the compiled schema fingerprint and accepts a normal database", () => {
+        const stored = new DatabaseSync(repo.databaseFile, { readOnly: true });
+        try {
+            expect(stored.prepare(
+                "SELECT value FROM schema_meta WHERE key = 'schema_fingerprint'",
+            ).get()?.value).toBe(SCHEMA_FINGERPRINT);
+        } finally {
+            stored.close();
+        }
+        expect(repo.schemaVersion).toBe(SCHEMA_VERSION);
+    });
+
+    it("fails closed when the stored fingerprint is changed", () => {
+        const file = repo.databaseFile;
+        repo.close();
+        repo = null;
+        const raw = new DatabaseSync(file);
+        raw.prepare("UPDATE schema_meta SET value = ? WHERE key = 'schema_fingerprint'")
+            .run("0".repeat(64));
+        raw.close();
+
+        expect(catchCode(() => openRepository({ file })).code)
+            .toBe(ERROR_CODES.SCHEMA_INTEGRITY_VIOLATION);
+    });
+
+    it("detects removal of the active-reservation index without a version change", () => {
+        const file = repo.databaseFile;
+        repo.close();
+        repo = null;
+        const raw = new DatabaseSync(file);
+        raw.exec("DROP INDEX ux_active_reservation;");
+        raw.close();
+
+        expect(catchCode(() => openRepository({ file })).code)
+            .toBe(ERROR_CODES.SCHEMA_INTEGRITY_VIOLATION);
+    });
+
+    it("detects a changed active-reservation predicate without a version change", () => {
+        const file = repo.databaseFile;
+        repo.close();
+        repo = null;
+        const raw = new DatabaseSync(file);
+        raw.exec(`
+            DROP INDEX ux_active_reservation;
+            CREATE UNIQUE INDEX ux_active_reservation
+                ON command_attempts(investigation_id, command)
+                WHERE state <> 'committed';
+        `);
+        raw.close();
+
+        expect(catchCode(() => openRepository({ file })).code)
+            .toBe(ERROR_CODES.SCHEMA_INTEGRITY_VIOLATION);
+    });
+
+    it("detects an added column without a version change", () => {
+        const file = repo.databaseFile;
+        repo.close();
+        repo = null;
+        const raw = new DatabaseSync(file);
+        raw.exec("ALTER TABLE investigations ADD COLUMN tampered TEXT;");
+        raw.close();
+
+        expect(catchCode(() => openRepository({ file })).code)
+            .toBe(ERROR_CODES.SCHEMA_INTEGRITY_VIOLATION);
+    });
+
+    it("detects a changed CHECK constraint without a version change", () => {
+        const file = repo.databaseFile;
+        repo.close();
+        repo = null;
+        const raw = new DatabaseSync(file);
+        raw.exec(`
+            PRAGMA foreign_keys = OFF;
+            DROP INDEX ux_active_reservation;
+            ALTER TABLE command_attempts RENAME TO command_attempts_original;
+            CREATE TABLE command_attempts (
+                attempt_id TEXT PRIMARY KEY,
+                investigation_id TEXT NOT NULL REFERENCES investigations(investigation_id),
+                command TEXT NOT NULL,
+                state TEXT NOT NULL,
+                lease_id TEXT NOT NULL REFERENCES runner_leases(lease_id),
+                fencing_token INTEGER NOT NULL,
+                owner TEXT NOT NULL,
+                supervisor_generation INTEGER,
+                runner_incarnation TEXT,
+                reserved_at TEXT NOT NULL,
+                dispatched_at TEXT,
+                observed_at TEXT,
+                committed_at TEXT,
+                abandoned_at TEXT,
+                updated_at TEXT NOT NULL,
+                CHECK (state IN (
+                    'reserved', 'dispatched', 'observed', 'committed',
+                    'abandoned', 'tampered'
+                )),
+                CHECK (supervisor_generation IS NULL OR supervisor_generation > 0)
+            );
+            DROP TABLE command_attempts_original;
+            CREATE UNIQUE INDEX ux_active_reservation
+                ON command_attempts(investigation_id, command)
+                WHERE state NOT IN ('committed', 'abandoned');
+        `);
+        raw.close();
+
+        expect(catchCode(() => openRepository({ file })).code)
+            .toBe(ERROR_CODES.SCHEMA_INTEGRITY_VIOLATION);
+    });
+
+    it("fails closed on foreign-key corruption", () => {
+        const file = repo.databaseFile;
+        repo.close();
+        repo = null;
+        const raw = new DatabaseSync(file);
+        raw.exec("PRAGMA foreign_keys = OFF;");
+        raw.prepare(`
+            INSERT INTO runner_leases(
+                lease_id, investigation_id, owner, fencing_token,
+                acquired_at, released_at
+            ) VALUES(?, ?, ?, ?, ?, NULL)
+        `).run("orphan-lease", "missing-investigation", "runner", 1, new Date().toISOString());
+        raw.close();
+
+        expect(catchCode(() => openRepository({ file })).code)
+            .toBe(ERROR_CODES.DATABASE_INTEGRITY_VIOLATION);
+    });
+
+    it("fails closed on an injected non-ok quick_check response", () => {
+        const raw = new DatabaseSync(repo.databaseFile, { readOnly: true });
+        try {
+            const err = catchCode(() => verifyDatabaseIntegrity(raw, {
+                adapter: {
+                    quickCheck: () => [{ quick_check: "database disk image is malformed" }],
+                },
+            }));
+            expect(err.code).toBe(ERROR_CODES.DATABASE_INTEGRITY_VIOLATION);
+            expect(err.details.check).toBe("quick_check");
+        } finally {
+            raw.close();
+        }
     });
 });

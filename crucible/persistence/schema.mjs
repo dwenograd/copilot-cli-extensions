@@ -1,22 +1,109 @@
 // crucible/persistence/schema.mjs
 //
-// Schema definition, explicit version stamping, and connection configuration
-// for the Crucible event repository.
-//
-// Versioning is explicit and fail-closed: the schema version is stamped both in
-// `PRAGMA user_version` and in the `schema_meta` table. Opening a database
-// created by a newer/older incompatible schema throws SchemaVersionError rather
-// than silently migrating or corrupting data.
+// Canonical schema definition, migration, connection configuration, and
+// fail-closed verification for the Crucible event repository.
 
-import { SchemaVersionError, StorageError } from "./errors.mjs";
+import { createHash } from "node:crypto";
 
-export const SCHEMA_VERSION = 4;
+import { DatabaseSync } from "./sqlite.mjs";
+import {
+    canonicalize,
+    computeEventHash,
+    computeLegacyEventHash,
+    inspectCanonicalJson,
+    GENESIS_PREV_HASH,
+} from "./canonical.mjs";
+import {
+    CruciblePersistenceError,
+    DatabaseIntegrityError,
+    InvalidArgumentError,
+    SchemaIntegrityError,
+    SchemaVersionError,
+    StorageError,
+} from "./errors.mjs";
 
-// Terminal event kinds. At most one of these may exist per investigation.
+export const SCHEMA_VERSION = 5;
+export const EVENT_HASH_VERSION = 2;
+
 export const TERMINAL_KINDS = Object.freeze(["verified_result", "target_unreachable"]);
-
-// Command lifecycle states, in legal forward order.
 export const COMMAND_STATES = Object.freeze(["reserved", "dispatched", "observed", "committed", "abandoned"]);
+
+const FINGERPRINT_FORMAT_VERSION = 1;
+const EXPECTED_CONNECTION_PRAGMAS = Object.freeze({
+    foreignKeys: 1,
+    journalMode: "wal",
+    synchronous: 2,
+});
+
+const RUNNER_LEASE_INDEX_DDL =
+    "CREATE INDEX ix_leases_inv ON runner_leases(investigation_id, fencing_token);";
+const COMMAND_ATTEMPT_INDEX_DDL = `
+CREATE UNIQUE INDEX ux_active_reservation
+    ON command_attempts(investigation_id, command)
+    WHERE state NOT IN ('committed', 'abandoned');`;
+
+function runnerLeasesTableDdl(name, {
+    supervisorGeneration = true,
+    runnerIncarnation = true,
+    generationCheck = true,
+} = {}) {
+    const definitions = [
+        "lease_id TEXT PRIMARY KEY",
+        "investigation_id TEXT NOT NULL REFERENCES investigations(investigation_id)",
+        "owner TEXT NOT NULL",
+        "fencing_token INTEGER NOT NULL",
+    ];
+    if (supervisorGeneration) {
+        definitions.push("supervisor_generation INTEGER");
+    }
+    if (runnerIncarnation) {
+        definitions.push("runner_incarnation TEXT");
+    }
+    definitions.push(
+        "acquired_at TEXT NOT NULL",
+        "released_at TEXT",
+    );
+    if (supervisorGeneration && generationCheck) {
+        definitions.push("CHECK (supervisor_generation IS NULL OR supervisor_generation > 0)");
+    }
+    definitions.push("UNIQUE (investigation_id, fencing_token)");
+    return `CREATE TABLE ${name} (\n    ${definitions.join(",\n    ")}\n);`;
+}
+
+function commandAttemptsTableDdl(name, {
+    supervisorGeneration = true,
+    runnerIncarnation = true,
+    generationCheck = true,
+} = {}) {
+    const definitions = [
+        "attempt_id TEXT PRIMARY KEY",
+        "investigation_id TEXT NOT NULL REFERENCES investigations(investigation_id)",
+        "command TEXT NOT NULL",
+        "state TEXT NOT NULL",
+        "lease_id TEXT NOT NULL REFERENCES runner_leases(lease_id)",
+        "fencing_token INTEGER NOT NULL",
+        "owner TEXT NOT NULL",
+    ];
+    if (supervisorGeneration) {
+        definitions.push("supervisor_generation INTEGER");
+    }
+    if (runnerIncarnation) {
+        definitions.push("runner_incarnation TEXT");
+    }
+    definitions.push(
+        "reserved_at TEXT NOT NULL",
+        "dispatched_at TEXT",
+        "observed_at TEXT",
+        "committed_at TEXT",
+        "abandoned_at TEXT",
+        "updated_at TEXT NOT NULL",
+        "CHECK (state IN ('reserved', 'dispatched', 'observed', 'committed', 'abandoned'))",
+    );
+    if (supervisorGeneration && generationCheck) {
+        definitions.push("CHECK (supervisor_generation IS NULL OR supervisor_generation > 0)");
+    }
+    return `CREATE TABLE ${name} (\n    ${definitions.join(",\n    ")}\n);`;
+}
 
 const DDL = `
 CREATE TABLE schema_meta (
@@ -24,27 +111,23 @@ CREATE TABLE schema_meta (
     value TEXT NOT NULL
 );
 
--- One row per investigation. The event log below is partitioned by this id.
 CREATE TABLE investigations (
     investigation_id TEXT PRIMARY KEY,
     created_at       TEXT NOT NULL,
     metadata         TEXT NOT NULL DEFAULT '{}'
 );
 
--- Append-only event log. seq is 1-based and contiguous per investigation.
--- prev_hash links each event to its predecessor (GENESIS for the first).
--- event_hash is the repository-computed structural hash of the row.
 CREATE TABLE events (
     investigation_id TEXT    NOT NULL REFERENCES investigations(investigation_id),
     seq              INTEGER NOT NULL,
     prev_hash        TEXT    NOT NULL,
     event_hash       TEXT    NOT NULL,
     kind             TEXT    NOT NULL,
-    payload          TEXT    NOT NULL,          -- canonical JSON string
+    payload          TEXT    NOT NULL,
     is_terminal      INTEGER NOT NULL DEFAULT 0,
-    terminal_kind    TEXT,                      -- non-null iff is_terminal=1
-    attempt_id       TEXT,                      -- set for evidence events
-    evidence_kind    TEXT,                      -- set for evidence events
+    terminal_kind    TEXT,
+    attempt_id       TEXT,
+    evidence_kind    TEXT,
     created_at       TEXT    NOT NULL,
     PRIMARY KEY (investigation_id, seq),
     CHECK (is_terminal IN (0, 1)),
@@ -53,67 +136,19 @@ CREATE TABLE events (
     CHECK ((attempt_id IS NULL) = (evidence_kind IS NULL))
 );
 
--- Unique event hash per investigation (no two identical-content events).
 CREATE UNIQUE INDEX ux_events_hash ON events(investigation_id, event_hash);
-
--- At most one terminal event per investigation.
 CREATE UNIQUE INDEX ux_events_terminal ON events(investigation_id) WHERE is_terminal = 1;
-
--- Idempotent, commutative evidence: at most one event per
--- (investigation, attempt, evidence_kind).
 CREATE UNIQUE INDEX ux_events_evidence
     ON events(investigation_id, attempt_id, evidence_kind)
     WHERE evidence_kind IS NOT NULL;
-
 CREATE INDEX ix_events_kind ON events(investigation_id, kind);
 
--- Runner leases + monotonic fencing tokens. fencing_token increases per
--- investigation on each acquisition; the newest token is the valid one.
-CREATE TABLE runner_leases (
-    lease_id         TEXT    PRIMARY KEY,
-    investigation_id TEXT    NOT NULL REFERENCES investigations(investigation_id),
-    owner            TEXT    NOT NULL,
-    fencing_token    INTEGER NOT NULL,
-    supervisor_generation INTEGER,
-    runner_incarnation TEXT,
-    acquired_at      TEXT    NOT NULL,
-    released_at      TEXT,
-    CHECK (supervisor_generation IS NULL OR supervisor_generation > 0),
-    UNIQUE (investigation_id, fencing_token)
-);
+${runnerLeasesTableDdl("runner_leases")}
+${RUNNER_LEASE_INDEX_DDL}
 
-CREATE INDEX ix_leases_inv ON runner_leases(investigation_id, fencing_token);
+${commandAttemptsTableDdl("command_attempts")}
+${COMMAND_ATTEMPT_INDEX_DDL}
 
--- Durable command lifecycle. A reservation is a row in state 'reserved'.
-CREATE TABLE command_attempts (
-    attempt_id       TEXT    PRIMARY KEY,
-    investigation_id TEXT    NOT NULL REFERENCES investigations(investigation_id),
-    command          TEXT    NOT NULL,
-    state            TEXT    NOT NULL,
-    lease_id         TEXT    NOT NULL REFERENCES runner_leases(lease_id),
-    fencing_token    INTEGER NOT NULL,
-    owner            TEXT    NOT NULL,
-    supervisor_generation INTEGER,
-    runner_incarnation TEXT,
-    reserved_at      TEXT    NOT NULL,
-    dispatched_at    TEXT,
-    observed_at      TEXT,
-    committed_at     TEXT,
-    abandoned_at     TEXT,
-    updated_at       TEXT    NOT NULL,
-    CHECK (state IN ('reserved', 'dispatched', 'observed', 'committed', 'abandoned')),
-    CHECK (supervisor_generation IS NULL OR supervisor_generation > 0)
-);
-
--- At most one active (uncommitted) reservation per (investigation, command).
-CREATE UNIQUE INDEX ux_active_reservation
-    ON command_attempts(investigation_id, command)
-    WHERE state NOT IN ('committed', 'abandoned');
-
--- Durable supervisor generation authority and single-use runner launches.
--- The current generation is the authoritative high-water mark. Each launch
--- receives a globally unique incarnation which is consumed by exactly one
--- lease acquisition and retained for audit/recovery fencing.
 CREATE TABLE runner_incarnations (
     runner_incarnation    TEXT    PRIMARY KEY,
     investigation_id     TEXT    NOT NULL REFERENCES investigations(investigation_id),
@@ -140,18 +175,15 @@ CREATE TABLE supervisor_authority (
     CHECK (supervisor_generation > 0)
 );
 
--- Artifacts: either inline BLOB or an external algorithm-tagged hash.
--- External artifacts start non-durable (durable=0) and may only be referenced
--- once the caller marks them durable. Inline artifacts are durable by nature.
 CREATE TABLE artifacts (
     artifact_id      TEXT    PRIMARY KEY,
     investigation_id TEXT    NOT NULL REFERENCES investigations(investigation_id),
-    storage          TEXT    NOT NULL,          -- 'inline' | 'external'
+    storage          TEXT    NOT NULL,
     content_type     TEXT,
     size_bytes       INTEGER,
     inline_blob      BLOB,
-    hash_algo        TEXT,                       -- e.g. 'sha256' (external)
-    hash_value       TEXT,                       -- hex digest (external)
+    hash_algo        TEXT,
+    hash_value       TEXT,
     durable          INTEGER NOT NULL DEFAULT 0,
     created_at       TEXT    NOT NULL,
     CHECK (storage IN ('inline', 'external')),
@@ -170,8 +202,6 @@ CREATE TABLE artifacts (
     )
 );
 
--- References binding an artifact to (optionally) an event seq. Referencing an
--- external artifact requires durable=1 (enforced in the repository).
 CREATE TABLE artifact_refs (
     ref_id           INTEGER PRIMARY KEY AUTOINCREMENT,
     investigation_id TEXT    NOT NULL REFERENCES investigations(investigation_id),
@@ -181,7 +211,6 @@ CREATE TABLE artifact_refs (
     UNIQUE (artifact_id, seq)
 );
 
--- Projection / read-model checkpoints. '*' investigation_id = global.
 CREATE TABLE projection_metadata (
     projection_name  TEXT    NOT NULL,
     investigation_id TEXT    NOT NULL DEFAULT '*',
@@ -192,67 +221,785 @@ CREATE TABLE projection_metadata (
 );
 `;
 
-// Apply the pragmas that make this connection safe and durable. Called on every
-// open (pragmas are per-connection, not stored in the file).
+function normalizeBusyTimeout(value) {
+    const normalized = Number(value);
+    if (!Number.isSafeInteger(normalized) || normalized < 0) {
+        throw new InvalidArgumentError(
+            "busyTimeoutMs must be a non-negative safe integer",
+            { busyTimeoutMs: value },
+        );
+    }
+    return normalized;
+}
+
+function pragmaScalar(db, name) {
+    const row = db.prepare(`PRAGMA ${name};`).get();
+    return row ? Object.values(row)[0] : undefined;
+}
+
+function readObservedPragmas(db) {
+    return {
+        foreignKeys: Number(pragmaScalar(db, "foreign_keys")),
+        journalMode: String(pragmaScalar(db, "journal_mode") ?? "").toLowerCase(),
+        synchronous: Number(pragmaScalar(db, "synchronous")),
+        userVersion: Number(pragmaScalar(db, "user_version")),
+    };
+}
+
+function assertConnectionPragmas(db, { busyTimeoutMs, expectedVersion } = {}) {
+    const observed = readObservedPragmas(db);
+    const expected = {
+        ...EXPECTED_CONNECTION_PRAGMAS,
+        userVersion: expectedVersion,
+    };
+    if (canonicalize(observed) !== canonicalize(expected)) {
+        throw new SchemaIntegrityError(
+            "SQLite connection pragmas do not match the canonical persistence contract",
+            { expected, observed },
+        );
+    }
+    if (busyTimeoutMs !== undefined) {
+        const expectedTimeout = normalizeBusyTimeout(busyTimeoutMs);
+        const observedTimeout = Number(pragmaScalar(db, "busy_timeout"));
+        if (observedTimeout !== expectedTimeout) {
+            throw new SchemaIntegrityError(
+                "SQLite busy_timeout does not match the requested connection contract",
+                { expected: expectedTimeout, observed: observedTimeout },
+            );
+        }
+    }
+    return observed;
+}
+
 export function configureConnection(db, { busyTimeoutMs }) {
-    // Order matters: foreign_keys is per-connection and must be set explicitly.
+    const timeout = normalizeBusyTimeout(busyTimeoutMs);
     db.exec("PRAGMA foreign_keys = ON;");
-    // WAL is a persistent, file-level mode but we (re)assert it on open.
-    const jm = db.prepare("PRAGMA journal_mode = WAL;").get();
-    if (!jm || String(jm.journal_mode).toLowerCase() !== "wal") {
+    const journalMode = db.prepare("PRAGMA journal_mode = WAL;").get();
+    if (!journalMode || String(journalMode.journal_mode).toLowerCase() !== "wal") {
         throw new StorageError(
-            `failed to enable WAL journal mode (got ${JSON.stringify(jm)})`,
+            `failed to enable WAL journal mode (got ${JSON.stringify(journalMode)})`,
             null,
         );
     }
     db.exec("PRAGMA synchronous = FULL;");
-    db.exec(`PRAGMA busy_timeout = ${Number(busyTimeoutMs)};`);
+    db.exec(`PRAGMA busy_timeout = ${timeout};`);
 }
 
-function readUserVersion(db) {
-    const row = db.prepare("PRAGMA user_version;").get();
-    return row ? Number(row.user_version) : 0;
+export function configureReadOnlyConnection(db, { busyTimeoutMs }) {
+    const timeout = normalizeBusyTimeout(busyTimeoutMs);
+    db.exec(`
+        PRAGMA foreign_keys = ON;
+        PRAGMA synchronous = FULL;
+        PRAGMA busy_timeout = ${timeout};
+        PRAGMA query_only = ON;
+    `);
+    if (Number(pragmaScalar(db, "query_only")) !== 1) {
+        throw new StorageError("failed to enable SQLite query_only mode", null);
+    }
+}
+
+function sqlQuote(value) {
+    return `'${String(value).replaceAll("'", "''")}'`;
+}
+
+function pragmaRows(db, pragma, argument) {
+    return db.prepare(`PRAGMA ${pragma}(${sqlQuote(argument)});`).all();
+}
+
+function cleanSql(sql) {
+    const source = String(sql ?? "");
+    let output = "";
+    let quote = null;
+    let lineComment = false;
+    let blockComment = false;
+    let pendingSpace = false;
+
+    for (let index = 0; index < source.length; index += 1) {
+        const ch = source[index];
+        const next = source[index + 1];
+
+        if (lineComment) {
+            if (ch === "\n" || ch === "\r") {
+                lineComment = false;
+                pendingSpace = true;
+            }
+            continue;
+        }
+        if (blockComment) {
+            if (ch === "*" && next === "/") {
+                blockComment = false;
+                pendingSpace = true;
+                index += 1;
+            }
+            continue;
+        }
+        if (quote !== null) {
+            output += ch;
+            if (quote === "[") {
+                if (ch === "]") {
+                    quote = null;
+                }
+            } else if (ch === quote) {
+                if (next === quote) {
+                    output += next;
+                    index += 1;
+                } else {
+                    quote = null;
+                }
+            }
+            continue;
+        }
+        if (ch === "-" && next === "-") {
+            lineComment = true;
+            pendingSpace = true;
+            index += 1;
+            continue;
+        }
+        if (ch === "/" && next === "*") {
+            blockComment = true;
+            pendingSpace = true;
+            index += 1;
+            continue;
+        }
+        if (ch === "'" || ch === "\"" || ch === "`" || ch === "[") {
+            if (pendingSpace && output.length > 0 && !output.endsWith(" ")) {
+                output += " ";
+            }
+            pendingSpace = false;
+            quote = ch;
+            output += ch;
+            continue;
+        }
+        if (/\s/u.test(ch)) {
+            pendingSpace = true;
+            continue;
+        }
+        if (pendingSpace && output.length > 0 && !output.endsWith(" ")) {
+            output += " ";
+        }
+        pendingSpace = false;
+        output += ch;
+    }
+    return output.trim();
+}
+
+function tableBodyBounds(sql) {
+    let quote = null;
+    let depth = 0;
+    let open = -1;
+    for (let index = 0; index < sql.length; index += 1) {
+        const ch = sql[index];
+        const next = sql[index + 1];
+        if (quote !== null) {
+            if (quote === "[") {
+                if (ch === "]") {
+                    quote = null;
+                }
+            } else if (ch === quote) {
+                if (next === quote) {
+                    index += 1;
+                } else {
+                    quote = null;
+                }
+            }
+            continue;
+        }
+        if (ch === "'" || ch === "\"" || ch === "`" || ch === "[") {
+            quote = ch;
+            continue;
+        }
+        if (ch === "(") {
+            if (open === -1) {
+                open = index;
+            }
+            depth += 1;
+        } else if (ch === ")") {
+            depth -= 1;
+            if (open !== -1 && depth === 0) {
+                return { open, close: index };
+            }
+        }
+    }
+    return null;
+}
+
+function splitTopLevelClauses(body) {
+    const clauses = [];
+    let start = 0;
+    let quote = null;
+    let depth = 0;
+    for (let index = 0; index < body.length; index += 1) {
+        const ch = body[index];
+        const next = body[index + 1];
+        if (quote !== null) {
+            if (quote === "[") {
+                if (ch === "]") {
+                    quote = null;
+                }
+            } else if (ch === quote) {
+                if (next === quote) {
+                    index += 1;
+                } else {
+                    quote = null;
+                }
+            }
+            continue;
+        }
+        if (ch === "'" || ch === "\"" || ch === "`" || ch === "[") {
+            quote = ch;
+        } else if (ch === "(") {
+            depth += 1;
+        } else if (ch === ")") {
+            depth -= 1;
+        } else if (ch === "," && depth === 0) {
+            clauses.push(cleanSql(body.slice(start, index)));
+            start = index + 1;
+        }
+    }
+    clauses.push(cleanSql(body.slice(start)));
+    return clauses.filter((clause) => clause.length > 0).sort();
+}
+
+function canonicalTableDdl(sql) {
+    const cleaned = cleanSql(sql);
+    const bounds = tableBodyBounds(cleaned);
+    if (!bounds) {
+        return { clauses: [], suffix: cleaned };
+    }
+    return {
+        clauses: splitTopLevelClauses(cleaned.slice(bounds.open + 1, bounds.close)),
+        suffix: cleanSql(cleaned.slice(bounds.close + 1)),
+    };
+}
+
+function sortCanonical(values) {
+    return values.sort((left, right) =>
+        canonicalize(left).localeCompare(canonicalize(right)));
+}
+
+function buildSchemaManifest(db) {
+    const objects = db.prepare(`
+        SELECT type, name, tbl_name, sql
+        FROM sqlite_schema
+        WHERE type IN ('table', 'index', 'trigger', 'view')
+          AND name NOT LIKE 'sqlite_%'
+        ORDER BY type, name
+    `).all();
+
+    const tables = objects
+        .filter((object) => object.type === "table")
+        .map((object) => {
+            const columns = pragmaRows(db, "table_xinfo", object.name).map((row) => ({
+                name: String(row.name),
+                type: String(row.type ?? ""),
+                notNull: Number(row.notnull),
+                defaultValue: row.dflt_value ?? null,
+                primaryKeyPosition: Number(row.pk),
+                hidden: Number(row.hidden),
+            })).sort((left, right) => left.name.localeCompare(right.name));
+
+            const foreignKeys = sortCanonical(
+                pragmaRows(db, "foreign_key_list", object.name).map((row) => ({
+                    sequence: Number(row.seq),
+                    table: String(row.table),
+                    from: row.from ?? null,
+                    to: row.to ?? null,
+                    onUpdate: String(row.on_update),
+                    onDelete: String(row.on_delete),
+                    match: String(row.match),
+                })),
+            );
+
+            const indexes = sortCanonical(
+                pragmaRows(db, "index_list", object.name).map((row) => ({
+                    name: row.origin === "c" ? String(row.name) : null,
+                    unique: Number(row.unique),
+                    origin: String(row.origin),
+                    partial: Number(row.partial),
+                    columns: pragmaRows(db, "index_xinfo", row.name)
+                        .map((column) => ({
+                            sequence: Number(column.seqno),
+                            columnId: Number(column.cid),
+                            name: column.name ?? null,
+                            descending: Number(column.desc),
+                            collation: column.coll ?? null,
+                            key: Number(column.key),
+                        }))
+                        .sort((left, right) => left.sequence - right.sequence),
+                })),
+            );
+
+            return {
+                name: String(object.name),
+                ddl: canonicalTableDdl(object.sql),
+                columns,
+                foreignKeys,
+                indexes,
+            };
+        })
+        .sort((left, right) => left.name.localeCompare(right.name));
+
+    const ddlObjects = objects.map((object) => ({
+        type: String(object.type),
+        name: String(object.name),
+        table: String(object.tbl_name),
+        ddl: object.type === "table"
+            ? canonicalTableDdl(object.sql)
+            : cleanSql(object.sql),
+    }));
+
+    return { ddlObjects, tables };
+}
+
+function structuralFingerprint(manifest) {
+    return createHash("sha256")
+        .update(canonicalize({
+            formatVersion: FINGERPRINT_FORMAT_VERSION,
+            manifest,
+        }))
+        .digest("hex");
+}
+
+function schemaFingerprint(manifest, pragmas, schemaVersion, eventHashVersion) {
+    return createHash("sha256")
+        .update(canonicalize({
+            formatVersion: FINGERPRINT_FORMAT_VERSION,
+            schemaVersion,
+            eventHashVersion,
+            pragmas,
+            manifest,
+        }))
+        .digest("hex");
+}
+
+function replaceExpectedRunnerTables(db, options) {
+    db.exec(`
+        DROP TABLE command_attempts;
+        DROP TABLE runner_leases;
+        ${runnerLeasesTableDdl("runner_leases", options)}
+        ${RUNNER_LEASE_INDEX_DDL}
+        ${commandAttemptsTableDdl("command_attempts", options)}
+        ${COMMAND_ATTEMPT_INDEX_DDL}
+    `);
+}
+
+function expectedManifestForVariant(variant) {
+    const db = new DatabaseSync(":memory:");
+    try {
+        db.exec(DDL);
+        if (variant === "v2") {
+            db.exec("DROP TABLE supervisor_authority; DROP TABLE runner_incarnations;");
+            replaceExpectedRunnerTables(db, {
+                supervisorGeneration: false,
+                runnerIncarnation: false,
+                generationCheck: false,
+            });
+        } else if (variant === "v3-migrated") {
+            db.exec("DROP TABLE supervisor_authority; DROP TABLE runner_incarnations;");
+            replaceExpectedRunnerTables(db, {
+                supervisorGeneration: true,
+                runnerIncarnation: false,
+                generationCheck: false,
+            });
+        } else if (variant === "v3-current") {
+            db.exec(`
+                DROP TABLE supervisor_authority;
+                DROP TABLE runner_incarnations;
+                ALTER TABLE command_attempts DROP COLUMN runner_incarnation;
+                ALTER TABLE runner_leases DROP COLUMN runner_incarnation;
+            `);
+        } else if (variant === "v4-migrated") {
+            replaceExpectedRunnerTables(db, {
+                supervisorGeneration: true,
+                runnerIncarnation: true,
+                generationCheck: false,
+            });
+        } else if (variant !== "v4-current" && variant !== "v5-current") {
+            throw new Error(`unknown expected schema variant '${variant}'`);
+        }
+        return buildSchemaManifest(db);
+    } finally {
+        db.close();
+    }
+}
+
+const EXPECTED_VARIANTS = Object.freeze({
+    2: Object.freeze(["v2"]),
+    3: Object.freeze(["v3-migrated", "v3-current"]),
+    4: Object.freeze(["v4-migrated", "v4-current"]),
+    5: Object.freeze(["v5-current"]),
+});
+
+const EXPECTED_MANIFESTS = new Map();
+
+function getExpectedManifest(variant) {
+    if (!EXPECTED_MANIFESTS.has(variant)) {
+        EXPECTED_MANIFESTS.set(variant, expectedManifestForVariant(variant));
+    }
+    return EXPECTED_MANIFESTS.get(variant);
+}
+
+export const SCHEMA_FINGERPRINT = schemaFingerprint(
+    getExpectedManifest("v5-current"),
+    {
+        ...EXPECTED_CONNECTION_PRAGMAS,
+        userVersion: SCHEMA_VERSION,
+    },
+    SCHEMA_VERSION,
+    EVENT_HASH_VERSION,
+);
+
+function assertKnownSchemaStructure(db, version) {
+    const variants = EXPECTED_VARIANTS[version] ?? [];
+    const actualManifest = buildSchemaManifest(db);
+    const actualFingerprint = structuralFingerprint(actualManifest);
+    for (const variant of variants) {
+        const expectedFingerprint = structuralFingerprint(getExpectedManifest(variant));
+        if (actualFingerprint === expectedFingerprint) {
+            return { variant, manifest: actualManifest, fingerprint: actualFingerprint };
+        }
+    }
+    throw new SchemaIntegrityError(
+        `database schema does not match any accepted schema-${version} definition`,
+        {
+            schemaVersion: version,
+            actualFingerprint,
+            expectedFingerprints: variants.map((variant) => ({
+                variant,
+                fingerprint: structuralFingerprint(getExpectedManifest(variant)),
+            })),
+        },
+    );
 }
 
 function tableExists(db, name) {
-    const row = db
-        .prepare("SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = ?")
-        .get(name);
-    return Boolean(row);
+    return Boolean(db
+        .prepare("SELECT 1 AS present FROM sqlite_schema WHERE type = 'table' AND name = ?")
+        .get(name));
+}
+
+function readUserVersion(db) {
+    return Number(pragmaScalar(db, "user_version") ?? 0);
+}
+
+function readMetaValue(db, key) {
+    return db.prepare("SELECT value FROM schema_meta WHERE key = ?").get(key)?.value ?? null;
+}
+
+function readVersionPair(db) {
+    try {
+        const userVersion = readUserVersion(db);
+        const metaValue = readMetaValue(db, "schema_version");
+        const metaVersion = metaValue === null ? Number.NaN : Number(metaValue);
+        return { userVersion, metaValue, metaVersion };
+    } catch (err) {
+        if (err instanceof CruciblePersistenceError) {
+            throw err;
+        }
+        throw new SchemaIntegrityError(
+            "failed to read required schema metadata",
+            { sqliteCode: err?.code, message: err?.message },
+        );
+    }
+}
+
+function assertVersionPair(db, expected) {
+    const pair = readVersionPair(db);
+    if (pair.userVersion !== expected || pair.metaVersion !== expected) {
+        throw new SchemaVersionError(
+            `schema version mismatch: file has user_version=${pair.userVersion}, schema_meta=${pair.metaValue ?? "<none>"}, expected ${expected}`,
+            {
+                fileUserVersion: pair.userVersion,
+                fileMetaVersion: pair.metaValue,
+                expected,
+            },
+        );
+    }
+    return pair;
+}
+
+function assertLegacyMetadata(db) {
+    const reserved = db.prepare(`
+        SELECT key, value
+        FROM schema_meta
+        WHERE key IN ('schema_fingerprint', 'event_hash_version')
+        ORDER BY key
+    `).all();
+    if (reserved.length > 0) {
+        throw new SchemaIntegrityError(
+            "legacy schema contains unexpected future integrity metadata",
+            { reservedMetadata: reserved },
+        );
+    }
+}
+
+function adapterRows(adapter, method, fallback, db, check) {
+    try {
+        const fn = adapter?.[method];
+        return fn === undefined ? fallback(db) : fn(db);
+    } catch (err) {
+        if (err instanceof CruciblePersistenceError) {
+            throw err;
+        }
+        throw new DatabaseIntegrityError(
+            `failed to execute PRAGMA ${check}`,
+            { check, sqliteCode: err?.code, message: err?.message },
+        );
+    }
+}
+
+export function verifyDatabaseIntegrity(db, { adapter = undefined } = {}) {
+    const quickRows = adapterRows(
+        adapter,
+        "quickCheck",
+        (database) => database.prepare("PRAGMA quick_check;").all(),
+        db,
+        "quick_check",
+    );
+    const quickOk = Array.isArray(quickRows)
+        && quickRows.length === 1
+        && String(Object.values(quickRows[0] ?? {})[0] ?? "") === "ok";
+    if (!quickOk) {
+        throw new DatabaseIntegrityError(
+            "SQLite quick_check did not return exactly one 'ok' row",
+            { check: "quick_check", rows: quickRows },
+        );
+    }
+
+    const foreignKeyRows = adapterRows(
+        adapter,
+        "foreignKeyCheck",
+        (database) => database.prepare("PRAGMA foreign_key_check;").all(),
+        db,
+        "foreign_key_check",
+    );
+    if (!Array.isArray(foreignKeyRows) || foreignKeyRows.length !== 0) {
+        throw new DatabaseIntegrityError(
+            "SQLite foreign_key_check reported violations",
+            { check: "foreign_key_check", rows: foreignKeyRows },
+        );
+    }
+    return { quickCheck: "ok", foreignKeyViolations: 0 };
+}
+
+function validateLegacyEventLog(db) {
+    const rows = db.prepare(`
+        SELECT *
+        FROM events
+        ORDER BY investigation_id, seq
+    `).all();
+    const violations = [];
+    let currentInvestigation = null;
+    let expectedSeq = 1;
+    let expectedPrev = GENESIS_PREV_HASH;
+
+    for (const row of rows) {
+        if (row.investigation_id !== currentInvestigation) {
+            currentInvestigation = row.investigation_id;
+            expectedSeq = 1;
+            expectedPrev = GENESIS_PREV_HASH;
+        }
+        const seq = Number(row.seq);
+        const inspected = inspectCanonicalJson(row.payload);
+        if (!inspected.ok) {
+            violations.push({
+                investigationId: row.investigation_id,
+                seq,
+                kind: "payload_not_canonical",
+                detail: inspected.reason,
+            });
+        }
+        if (seq !== expectedSeq) {
+            violations.push({
+                investigationId: row.investigation_id,
+                seq,
+                kind: "sequence",
+                expected: expectedSeq,
+            });
+        }
+        if (row.prev_hash !== expectedPrev) {
+            violations.push({
+                investigationId: row.investigation_id,
+                seq,
+                kind: "prev_hash",
+                expected: expectedPrev,
+                actual: row.prev_hash,
+            });
+        }
+        if (inspected.ok) {
+            try {
+                const computed = computeLegacyEventHash({
+                    investigationId: row.investigation_id,
+                    seq,
+                    prevHash: row.prev_hash,
+                    kind: row.kind,
+                    payloadCanonical: row.payload,
+                    isTerminal: row.is_terminal,
+                    terminalKind: row.terminal_kind,
+                    attemptId: row.attempt_id,
+                    evidenceKind: row.evidence_kind,
+                    createdAt: row.created_at,
+                });
+                if (computed !== row.event_hash) {
+                    violations.push({
+                        investigationId: row.investigation_id,
+                        seq,
+                        kind: "event_hash",
+                        expected: computed,
+                        actual: row.event_hash,
+                    });
+                }
+            } catch (err) {
+                violations.push({
+                    investigationId: row.investigation_id,
+                    seq,
+                    kind: "event_hash",
+                    detail: err.message,
+                });
+            }
+        }
+        expectedSeq = seq + 1;
+        expectedPrev = row.event_hash;
+    }
+
+    if (violations.length > 0) {
+        throw new DatabaseIntegrityError(
+            "legacy event log failed authentication; refusing to migrate",
+            {
+                violationCount: violations.length,
+                violations: violations.slice(0, 50),
+            },
+        );
+    }
+}
+
+function rehashEventsToVersion2(db) {
+    const rows = db.prepare(`
+        SELECT *
+        FROM events
+        ORDER BY investigation_id, seq
+    `).all();
+    const updates = [];
+    let currentInvestigation = null;
+    let previousHash = GENESIS_PREV_HASH;
+
+    for (const row of rows) {
+        if (row.investigation_id !== currentInvestigation) {
+            currentInvestigation = row.investigation_id;
+            previousHash = GENESIS_PREV_HASH;
+        }
+        const eventHash = computeEventHash({
+            investigationId: row.investigation_id,
+            seq: Number(row.seq),
+            prevHash: previousHash,
+            kind: row.kind,
+            payloadCanonical: row.payload,
+            isTerminal: row.is_terminal,
+            terminalKind: row.terminal_kind,
+            attemptId: row.attempt_id,
+            evidenceKind: row.evidence_kind,
+            createdAt: row.created_at,
+        });
+        updates.push({
+            investigationId: row.investigation_id,
+            seq: Number(row.seq),
+            prevHash: previousHash,
+            eventHash,
+        });
+        previousHash = eventHash;
+    }
+
+    const setTemporaryHash = db.prepare(`
+        UPDATE events
+        SET event_hash = ?
+        WHERE investigation_id = ? AND seq = ?
+    `);
+    for (const update of updates) {
+        setTemporaryHash.run(
+            `schema5-migration:${update.seq}:${update.eventHash}`,
+            update.investigationId,
+            update.seq,
+        );
+    }
+
+    const setFinalHashes = db.prepare(`
+        UPDATE events
+        SET prev_hash = ?, event_hash = ?
+        WHERE investigation_id = ? AND seq = ?
+    `);
+    for (const update of updates) {
+        setFinalHashes.run(
+            update.prevHash,
+            update.eventHash,
+            update.investigationId,
+            update.seq,
+        );
+    }
+}
+
+function rebuildRunnerTablesToCurrent(db) {
+    db.exec(`
+        ${runnerLeasesTableDdl("__crucible_runner_leases_v5")}
+        ${commandAttemptsTableDdl("__crucible_command_attempts_v5")}
+
+        INSERT INTO __crucible_runner_leases_v5(
+            lease_id, investigation_id, owner, fencing_token,
+            supervisor_generation, runner_incarnation,
+            acquired_at, released_at
+        )
+        SELECT
+            lease_id, investigation_id, owner, fencing_token,
+            supervisor_generation, runner_incarnation,
+            acquired_at, released_at
+        FROM runner_leases;
+
+        INSERT INTO __crucible_command_attempts_v5(
+            attempt_id, investigation_id, command, state, lease_id,
+            fencing_token, owner, supervisor_generation, runner_incarnation,
+            reserved_at, dispatched_at, observed_at, committed_at,
+            abandoned_at, updated_at
+        )
+        SELECT
+            attempt_id, investigation_id, command, state, lease_id,
+            fencing_token, owner, supervisor_generation, runner_incarnation,
+            reserved_at, dispatched_at, observed_at, committed_at,
+            abandoned_at, updated_at
+        FROM command_attempts;
+
+        DROP TABLE command_attempts;
+        DROP TABLE runner_leases;
+        ALTER TABLE __crucible_runner_leases_v5 RENAME TO runner_leases;
+        ALTER TABLE __crucible_command_attempts_v5 RENAME TO command_attempts;
+        ${RUNNER_LEASE_INDEX_DDL}
+        ${COMMAND_ATTEMPT_INDEX_DDL}
+    `);
+}
+
+function rollbackQuietly(db) {
+    try {
+        db.exec("ROLLBACK;");
+    } catch {
+        // The original typed failure is more useful.
+    }
 }
 
 function migrateVersion2To3(db) {
     db.exec("BEGIN IMMEDIATE;");
     try {
-        const userVersion = readUserVersion(db);
-        const metaRow = db
-            .prepare("SELECT value FROM schema_meta WHERE key = 'schema_version'")
-            .get();
-        const metaVersion = metaRow ? Number(metaRow.value) : NaN;
-        if ((userVersion === 3 && metaVersion === 3)
-            || (userVersion === SCHEMA_VERSION && metaVersion === SCHEMA_VERSION)) {
-            db.exec("COMMIT;");
-            return false;
-        }
-        if (userVersion !== 2 || metaVersion !== 2) {
-            throw new SchemaVersionError(
-                "schema version changed while waiting to migrate",
-                {
-                    fileUserVersion: userVersion,
-                    fileMetaVersion: metaRow ? metaRow.value : null,
-                    expected: 2,
-                },
-            );
-        }
-        db.exec("ALTER TABLE runner_leases ADD COLUMN supervisor_generation INTEGER;");
-        db.exec("ALTER TABLE command_attempts ADD COLUMN supervisor_generation INTEGER;");
-        db.prepare("UPDATE schema_meta SET value = ? WHERE key = 'schema_version'")
-            .run("3");
+        assertVersionPair(db, 2);
+        assertLegacyMetadata(db);
+        assertKnownSchemaStructure(db, 2);
+        verifyDatabaseIntegrity(db);
+        validateLegacyEventLog(db);
+        db.exec(`
+            ALTER TABLE runner_leases ADD COLUMN supervisor_generation INTEGER;
+            ALTER TABLE command_attempts ADD COLUMN supervisor_generation INTEGER;
+        `);
+        db.prepare("UPDATE schema_meta SET value = '3' WHERE key = 'schema_version'").run();
         db.exec("PRAGMA user_version = 3;");
         db.exec("COMMIT;");
-        return true;
     } catch (err) {
-        db.exec("ROLLBACK;");
+        rollbackQuietly(db);
         throw err;
     }
 }
@@ -260,28 +1007,14 @@ function migrateVersion2To3(db) {
 function migrateVersion3To4(db) {
     db.exec("BEGIN IMMEDIATE;");
     try {
-        const userVersion = readUserVersion(db);
-        const metaRow = db
-            .prepare("SELECT value FROM schema_meta WHERE key = 'schema_version'")
-            .get();
-        const metaVersion = metaRow ? Number(metaRow.value) : NaN;
-        if (userVersion === SCHEMA_VERSION && metaVersion === SCHEMA_VERSION) {
-            db.exec("COMMIT;");
-            return false;
-        }
-        if (userVersion !== 3 || metaVersion !== 3) {
-            throw new SchemaVersionError(
-                "schema version changed while waiting to migrate",
-                {
-                    fileUserVersion: userVersion,
-                    fileMetaVersion: metaRow ? metaRow.value : null,
-                    expected: 3,
-                },
-            );
-        }
-        db.exec("ALTER TABLE runner_leases ADD COLUMN runner_incarnation TEXT;");
-        db.exec("ALTER TABLE command_attempts ADD COLUMN runner_incarnation TEXT;");
+        assertVersionPair(db, 3);
+        assertLegacyMetadata(db);
+        assertKnownSchemaStructure(db, 3);
+        verifyDatabaseIntegrity(db);
+        validateLegacyEventLog(db);
         db.exec(`
+            ALTER TABLE runner_leases ADD COLUMN runner_incarnation TEXT;
+            ALTER TABLE command_attempts ADD COLUMN runner_incarnation TEXT;
             CREATE TABLE runner_incarnations (
                 runner_incarnation    TEXT    PRIMARY KEY,
                 investigation_id     TEXT    NOT NULL REFERENCES investigations(investigation_id),
@@ -306,46 +1039,58 @@ function migrateVersion3To4(db) {
                 CHECK (supervisor_generation > 0)
             );
         `);
-        db.prepare("UPDATE schema_meta SET value = ? WHERE key = 'schema_version'")
-            .run(String(SCHEMA_VERSION));
-        db.exec(`PRAGMA user_version = ${SCHEMA_VERSION};`);
+        db.prepare("UPDATE schema_meta SET value = '4' WHERE key = 'schema_version'").run();
+        db.exec("PRAGMA user_version = 4;");
         db.exec("COMMIT;");
-        return true;
     } catch (err) {
-        db.exec("ROLLBACK;");
+        rollbackQuietly(db);
         throw err;
     }
 }
 
-// Create the schema on a fresh database, or verify the version of an existing
-// one. Runs inside a single transaction. Throws SchemaVersionError on mismatch.
-export function applySchema(db) {
-    const alreadyInitialized = tableExists(db, "schema_meta");
-
-    if (alreadyInitialized) {
-        const userVersion = readUserVersion(db);
-        const metaRow = db
-            .prepare("SELECT value FROM schema_meta WHERE key = 'schema_version'")
-            .get();
-        const metaVersion = metaRow ? Number(metaRow.value) : NaN;
-        if (userVersion === 2 && metaVersion === 2) {
-            migrateVersion2To3(db);
-            migrateVersion3To4(db);
-            return { created: false, migrated: true, version: SCHEMA_VERSION };
-        }
-        if (userVersion === 3 && metaVersion === 3) {
-            const migrated = migrateVersion3To4(db);
-            return { created: false, migrated, version: SCHEMA_VERSION };
-        }
-        if (userVersion !== SCHEMA_VERSION || metaVersion !== SCHEMA_VERSION) {
-            throw new SchemaVersionError(
-                `schema version mismatch: file has user_version=${userVersion}, schema_meta=${metaRow ? metaRow.value : "<none>"}, expected ${SCHEMA_VERSION}`,
-                { fileUserVersion: userVersion, fileMetaVersion: metaRow ? metaRow.value : null, expected: SCHEMA_VERSION },
-            );
-        }
-        return { created: false, version: SCHEMA_VERSION };
+function migrateVersion4To5(db) {
+    db.exec("PRAGMA foreign_keys = OFF;");
+    if (Number(pragmaScalar(db, "foreign_keys")) !== 0) {
+        throw new StorageError("failed to suspend foreign keys for canonical schema rebuild", null);
     }
 
+    try {
+        db.exec("BEGIN IMMEDIATE;");
+        try {
+            assertVersionPair(db, 4);
+            assertLegacyMetadata(db);
+            const matched = assertKnownSchemaStructure(db, 4);
+            verifyDatabaseIntegrity(db);
+            validateLegacyEventLog(db);
+            if (matched.variant === "v4-migrated") {
+                rebuildRunnerTablesToCurrent(db);
+            }
+            rehashEventsToVersion2(db);
+            db.prepare("UPDATE schema_meta SET value = ? WHERE key = 'schema_version'")
+                .run(String(SCHEMA_VERSION));
+            db.prepare(`
+                INSERT INTO schema_meta(key, value)
+                VALUES('schema_fingerprint', ?)
+            `).run(SCHEMA_FINGERPRINT);
+            db.prepare(`
+                INSERT INTO schema_meta(key, value)
+                VALUES('event_hash_version', ?)
+            `).run(String(EVENT_HASH_VERSION));
+            db.exec(`PRAGMA user_version = ${SCHEMA_VERSION};`);
+            db.exec("COMMIT;");
+        } catch (err) {
+            rollbackQuietly(db);
+            throw err;
+        }
+    } finally {
+        db.exec("PRAGMA foreign_keys = ON;");
+        if (Number(pragmaScalar(db, "foreign_keys")) !== 1) {
+            throw new StorageError("failed to restore SQLite foreign key enforcement", null);
+        }
+    }
+}
+
+function createFreshSchema(db) {
     db.exec("BEGIN IMMEDIATE;");
     try {
         db.exec(DDL);
@@ -353,11 +1098,153 @@ export function applySchema(db) {
             .run(String(SCHEMA_VERSION));
         db.prepare("INSERT INTO schema_meta(key, value) VALUES('created_at', ?)")
             .run(new Date().toISOString());
+        db.prepare("INSERT INTO schema_meta(key, value) VALUES('schema_fingerprint', ?)")
+            .run(SCHEMA_FINGERPRINT);
+        db.prepare("INSERT INTO schema_meta(key, value) VALUES('event_hash_version', ?)")
+            .run(String(EVENT_HASH_VERSION));
         db.exec(`PRAGMA user_version = ${SCHEMA_VERSION};`);
         db.exec("COMMIT;");
     } catch (err) {
-        db.exec("ROLLBACK;");
+        rollbackQuietly(db);
         throw err;
     }
-    return { created: true, version: SCHEMA_VERSION };
+}
+
+export function verifySchema(db, {
+    busyTimeoutMs = undefined,
+    integrityCheckAdapter = undefined,
+} = {}) {
+    assertVersionPair(db, SCHEMA_VERSION);
+    const pragmas = assertConnectionPragmas(db, {
+        busyTimeoutMs,
+        expectedVersion: SCHEMA_VERSION,
+    });
+    verifyDatabaseIntegrity(db, { adapter: integrityCheckAdapter });
+    const matched = assertKnownSchemaStructure(db, SCHEMA_VERSION);
+    const actualFingerprint = schemaFingerprint(
+        matched.manifest,
+        pragmas,
+        SCHEMA_VERSION,
+        EVENT_HASH_VERSION,
+    );
+    if (actualFingerprint !== SCHEMA_FINGERPRINT) {
+        throw new SchemaIntegrityError(
+            "computed schema fingerprint does not match the canonical fingerprint",
+            { expected: SCHEMA_FINGERPRINT, actual: actualFingerprint },
+        );
+    }
+    const storedFingerprint = readMetaValue(db, "schema_fingerprint");
+    if (storedFingerprint !== SCHEMA_FINGERPRINT) {
+        throw new SchemaIntegrityError(
+            "stored schema fingerprint does not match the canonical fingerprint",
+            { expected: SCHEMA_FINGERPRINT, stored: storedFingerprint },
+        );
+    }
+    const storedHashVersion = readMetaValue(db, "event_hash_version");
+    if (storedHashVersion !== String(EVENT_HASH_VERSION)) {
+        throw new SchemaIntegrityError(
+            "stored event hash version does not match the canonical format",
+            { expected: String(EVENT_HASH_VERSION), stored: storedHashVersion },
+        );
+    }
+    return {
+        version: SCHEMA_VERSION,
+        fingerprint: SCHEMA_FINGERPRINT,
+        eventHashVersion: EVENT_HASH_VERSION,
+    };
+}
+
+function assertFreshOrInitialized(db) {
+    if (tableExists(db, "schema_meta")) {
+        return true;
+    }
+    const objectCount = Number(db.prepare(`
+        SELECT COUNT(*) AS count
+        FROM sqlite_schema
+        WHERE name NOT LIKE 'sqlite_%'
+    `).get()?.count ?? 0);
+    const userVersion = readUserVersion(db);
+    if (objectCount !== 0 || userVersion !== 0) {
+        throw new SchemaIntegrityError(
+            "database contains schema objects but no schema_meta table",
+            { objectCount, userVersion },
+        );
+    }
+    return false;
+}
+
+export function applySchema(db, {
+    busyTimeoutMs = undefined,
+    integrityCheckAdapter = undefined,
+} = {}) {
+    const initialized = assertFreshOrInitialized(db);
+    if (!initialized) {
+        createFreshSchema(db);
+        verifySchema(db, { busyTimeoutMs, integrityCheckAdapter });
+        return {
+            created: true,
+            migrated: false,
+            version: SCHEMA_VERSION,
+            fingerprint: SCHEMA_FINGERPRINT,
+        };
+    }
+
+    const pair = readVersionPair(db);
+    if (pair.userVersion !== pair.metaVersion) {
+        throw new SchemaVersionError(
+            `schema version mismatch: file has user_version=${pair.userVersion}, schema_meta=${pair.metaValue ?? "<none>"}`,
+            {
+                fileUserVersion: pair.userVersion,
+                fileMetaVersion: pair.metaValue,
+                expected: SCHEMA_VERSION,
+            },
+        );
+    }
+
+    if (pair.userVersion === SCHEMA_VERSION) {
+        verifySchema(db, { busyTimeoutMs, integrityCheckAdapter });
+        return {
+            created: false,
+            migrated: false,
+            version: SCHEMA_VERSION,
+            fingerprint: SCHEMA_FINGERPRINT,
+        };
+    }
+    if (![2, 3, 4].includes(pair.userVersion)) {
+        throw new SchemaVersionError(
+            `schema version mismatch: file has user_version=${pair.userVersion}, schema_meta=${pair.metaValue ?? "<none>"}, expected ${SCHEMA_VERSION}`,
+            {
+                fileUserVersion: pair.userVersion,
+                fileMetaVersion: pair.metaValue,
+                expected: SCHEMA_VERSION,
+            },
+        );
+    }
+
+    assertConnectionPragmas(db, {
+        busyTimeoutMs,
+        expectedVersion: pair.userVersion,
+    });
+    verifyDatabaseIntegrity(db, { adapter: integrityCheckAdapter });
+    assertLegacyMetadata(db);
+    assertKnownSchemaStructure(db, pair.userVersion);
+    validateLegacyEventLog(db);
+
+    if (pair.userVersion === 2) {
+        migrateVersion2To3(db);
+    }
+    if (readUserVersion(db) === 3) {
+        migrateVersion3To4(db);
+    }
+    if (readUserVersion(db) === 4) {
+        migrateVersion4To5(db);
+    }
+
+    verifySchema(db, { busyTimeoutMs, integrityCheckAdapter });
+    return {
+        created: false,
+        migrated: true,
+        version: SCHEMA_VERSION,
+        fingerprint: SCHEMA_FINGERPRINT,
+    };
 }

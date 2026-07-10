@@ -13,7 +13,10 @@ export {
     CruciblePersistenceError,
     LocalPathError,
     SchemaVersionError,
+    SchemaIntegrityError,
+    DatabaseIntegrityError,
     InvalidArgumentError,
+    CanonicalPayloadError,
     NotFoundError,
     CasConflictError,
     TerminalExistsError,
@@ -24,8 +27,21 @@ export {
     StorageError,
 } from "./errors.mjs";
 export { assertLocalDatabasePath, isNetworkOrUncPath } from "./paths.mjs";
-export { canonicalize, computeEventHash, sha256Hex, GENESIS_PREV_HASH } from "./canonical.mjs";
-export { SCHEMA_VERSION, COMMAND_STATES, TERMINAL_KINDS } from "./schema.mjs";
+export {
+    canonicalize,
+    inspectCanonicalJson,
+    parseCanonicalJson,
+    computeEventHash,
+    sha256Hex,
+    GENESIS_PREV_HASH,
+} from "./canonical.mjs";
+export {
+    SCHEMA_VERSION,
+    SCHEMA_FINGERPRINT,
+    COMMAND_STATES,
+    TERMINAL_KINDS,
+    verifyDatabaseIntegrity,
+} from "./schema.mjs";
 
 // Immutable content-addressed artifact store (filesystem CAS).
 export {
@@ -42,6 +58,7 @@ export {
     DestinationExistsError,
     SnapshotInvalidError,
     SourceChangedError,
+    JournalCorruptError,
     objectIdFor,
     parseObjectId,
     objectRelPath,
@@ -52,9 +69,15 @@ export {
     exportBundle,
     importBundle,
     readBundleManifest,
+    BUNDLE_TYPE,
+    BUNDLE_VERSION,
     BUNDLE_ERROR_CODES,
     BundleError,
     BundleDestinationExistsError,
     BundleTamperError,
     BundleInventoryError,
+    BundleManifestError,
+    BundleAuthenticationError,
+    BundleSourceChangedError,
+    BundleUnsafePathError,
 } from "./bundle.mjs";

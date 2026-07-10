@@ -1,13 +1,7 @@
-// crucible/__tests__/persistence-bundle.test.mjs
-//
-// Self-contained audit bundle: deterministic directory export (DB online
-// backup + referenced CAS objects + manifest + SHA-256 inventory) and a verified
-// import that refuses to copy a tampered bundle or import into a non-empty
-// destination.
-
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
+import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 
 import {
@@ -16,10 +10,12 @@ import {
     exportBundle,
     importBundle,
     readBundleManifest,
+    canonicalize,
     BUNDLE_ERROR_CODES,
 } from "../persistence/index.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
+const SNAPSHOT_CONTENT_TYPE = "application/vnd.crucible.snapshot+json";
 
 let base;
 let store;
@@ -27,11 +23,80 @@ let repo;
 let snap;
 let extraObject;
 
+function sha256(bytes) {
+    return createHash("sha256").update(bytes).digest("hex");
+}
+
+function sha256File(file) {
+    return sha256(fs.readFileSync(file));
+}
+
+function listFiles(root) {
+    const files = [];
+    const walk = (dir, prefix = []) => {
+        for (const name of fs.readdirSync(dir).sort()) {
+            const abs = path.join(dir, name);
+            const rel = [...prefix, name];
+            const stat = fs.lstatSync(abs);
+            if (stat.isDirectory()) {
+                walk(abs, rel);
+            } else if (stat.isFile()) {
+                files.push(rel.join("/"));
+            }
+        }
+    };
+    walk(root);
+    return files.sort();
+}
+
+function regenerateInventory(bundleDir) {
+    const lines = listFiles(bundleDir)
+        .filter((rel) => rel !== "inventory.sha256")
+        .map((rel) => `${sha256File(path.join(bundleDir, ...rel.split("/")))}  ${rel}`);
+    fs.writeFileSync(path.join(bundleDir, "inventory.sha256"), lines.join("\n") + "\n");
+}
+
+function rewriteManifest(bundleDir, mutate) {
+    const manifestPath = path.join(bundleDir, "manifest.json");
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+    mutate(manifest);
+    fs.writeFileSync(manifestPath, canonicalize(manifest) + "\n");
+    regenerateInventory(bundleDir);
+}
+
+function catchErr(fn) {
+    try {
+        fn();
+    } catch (err) {
+        return err;
+    }
+    throw new Error("expected the operation to throw");
+}
+
+function registerObject(objectId, artifactId, contentType = "application/octet-stream") {
+    const bytes = store.readObject(objectId);
+    repo.registerExternalArtifact({
+        investigationId: "inv-1",
+        artifactId,
+        algo: "sha256",
+        hash: objectId.slice("sha256:".length),
+        sizeBytes: bytes.length,
+        contentType,
+    });
+    repo.markArtifactDurable(artifactId);
+    repo.referenceArtifact({ investigationId: "inv-1", artifactId });
+}
+
+function stageEntries(prefix) {
+    return fs.readdirSync(base)
+        .filter((name) => name.startsWith(`.crucible-bundle-${prefix}-`)
+            && name.endsWith(".stage"));
+}
+
 beforeEach(() => {
     base = fs.mkdtempSync(path.join(HERE, ".persist-tmp-"));
     store = openArtifactStore({ root: path.join(base, "cas") });
 
-    // A snapshot (manifest + files) plus a standalone object to include.
     const src = path.join(base, "evidence");
     fs.mkdirSync(path.join(src, "logs"), { recursive: true });
     fs.writeFileSync(path.join(src, "report.txt"), "the target was reachable");
@@ -41,6 +106,17 @@ beforeEach(() => {
 
     repo = openRepository({ file: path.join(base, "events.sqlite") });
     repo.ensureInvestigation({ investigationId: "inv-1", metadata: { case: "audit" } });
+    repo.appendEvents({
+        investigationId: "inv-1",
+        expectedHead: null,
+        events: [{ kind: "bundle:seed", payload: { case: "audit" } }],
+    });
+
+    registerObject(snap.snapshot, "snapshot-manifest", SNAPSHOT_CONTENT_TYPE);
+    for (const [index, entry] of snap.manifest.entries.entries()) {
+        registerObject(entry.object, `snapshot-object-${index}`);
+    }
+    registerObject(extraObject.id, "standalone-object");
 });
 
 afterEach(() => {
@@ -52,183 +128,422 @@ afterEach(() => {
     fs.rmSync(base, { recursive: true, force: true });
 });
 
-function catchErr(fn) {
-    try {
-        fn();
-    } catch (err) {
-        return err;
-    }
-    throw new Error("expected the operation to throw");
-}
-
-function doExport(destName = "bundle") {
+function doExport(destName = "bundle", overrides = {}) {
     const destDir = path.join(base, destName);
     const res = exportBundle({
         store,
         dbFile: repo.databaseFile,
         destDir,
+        investigationId: "inv-1",
         objectIds: [extraObject.id],
         snapshots: [snap.snapshot],
         now: () => "2026-07-09T00:00:00.000Z",
+        ...overrides,
     });
     return { destDir, res };
 }
 
-describe("export", () => {
-    it("produces a deterministic self-contained bundle directory", () => {
-        const { destDir, res } = doExport();
+describe("canonical export", () => {
+    it("produces a strict deterministic bundle bound to schema, head, and referenced closure", () => {
+        const first = doExport("bundle-a");
+        const second = doExport("bundle-b");
 
-        expect(fs.existsSync(path.join(destDir, "db", "database.sqlite"))).toBe(true);
-        expect(fs.existsSync(path.join(destDir, "manifest.json"))).toBe(true);
-        expect(fs.existsSync(path.join(destDir, "inventory.sha256"))).toBe(true);
-        expect(fs.existsSync(path.join(destDir, "objects", "sha256"))).toBe(true);
-
-        // Closure = snapshot manifest + its 2 files + the standalone object.
-        expect(res.objectCount).toBe(4);
-
-        const manifest = readBundleManifest(destDir);
+        const manifest = readBundleManifest(first.destDir);
         expect(manifest.type).toBe("crucible-audit-bundle");
+        expect(manifest.version).toBe(2);
         expect(manifest.database.path).toBe("db/database.sqlite");
-        expect(manifest.snapshots).toContain(snap.snapshot);
-        expect(manifest.objects.map((o) => o.id)).toContain(extraObject.id);
+        expect(manifest.database.schemaFingerprint).toMatch(/^[0-9a-f]{64}$/);
+        expect(manifest.investigation).toEqual({
+            id: "inv-1",
+            domainHead: repo.getHead("inv-1"),
+        });
+        expect(manifest.snapshots).toEqual([snap.snapshot]);
+        expect(manifest.artifacts.map((artifact) => artifact.artifactId)).toEqual([
+            "snapshot-manifest",
+            "snapshot-object-0",
+            "snapshot-object-1",
+            "standalone-object",
+        ]);
+        expect(first.res.objectCount).toBe(4);
+        expect(first.res.digest).toBe(second.res.digest);
+        expect(fs.readFileSync(path.join(first.destDir, "manifest.json")))
+            .toEqual(fs.readFileSync(path.join(second.destDir, "manifest.json")));
+        expect(fs.readFileSync(path.join(first.destDir, "inventory.sha256")))
+            .toEqual(fs.readFileSync(path.join(second.destDir, "inventory.sha256")));
 
-        // Inventory covers every file except itself, and lists the DB.
-        const inv = fs.readFileSync(path.join(destDir, "inventory.sha256"), "utf8");
-        expect(inv).toMatch(/ {2}db\/database\.sqlite$/m);
-        expect(inv).not.toMatch(/inventory\.sha256/);
+        const inventory = fs.readFileSync(path.join(first.destDir, "inventory.sha256"), "utf8");
+        expect(inventory).toMatch(/ {2}db\/database\.sqlite$/m);
+        expect(inventory).not.toMatch(/inventory\.sha256/);
+    });
+
+    it("publishes only after completion and leaves no partial destination or stage", () => {
+        const missing = store.putBytes(Buffer.from("missing-after-reference"));
+        registerObject(missing.id, "will-be-missing");
+        fs.rmSync(store.objectPath(missing.id));
+        const destDir = path.join(base, "bundle-missing");
+
+        const err = catchErr(() => exportBundle({
+            store,
+            dbFile: repo.databaseFile,
+            destDir,
+            investigationId: "inv-1",
+        }));
+        expect(err.code).toBe(BUNDLE_ERROR_CODES.OBJECT_MISSING);
+        expect(fs.existsSync(destDir)).toBe(false);
+        expect(stageEntries("export")).toEqual([]);
     });
 
     it("refuses a non-empty destination", () => {
         const destDir = path.join(base, "occupied");
-        fs.mkdirSync(destDir, { recursive: true });
+        fs.mkdirSync(destDir);
         fs.writeFileSync(path.join(destDir, "squatter"), "x");
-        const err = catchErr(() =>
-            exportBundle({ store, dbFile: repo.databaseFile, destDir, objectIds: [extraObject.id] }),
-        );
+        const err = catchErr(() => exportBundle({
+            store,
+            dbFile: repo.databaseFile,
+            destDir,
+            investigationId: "inv-1",
+        }));
         expect(err.code).toBe(BUNDLE_ERROR_CODES.DESTINATION_EXISTS);
-    });
-
-    it("fails when a referenced object is missing from the store", () => {
-        const destDir = path.join(base, "bundle-missing");
-        const err = catchErr(() =>
-            exportBundle({ store, dbFile: repo.databaseFile, destDir, objectIds: ["sha256:" + "ab".repeat(32)] }),
-        );
-        expect(err.code).toBe(BUNDLE_ERROR_CODES.OBJECT_MISSING);
     });
 });
 
-describe("import round-trip", () => {
-    it("verifies the inventory and materializes an intact bundle", () => {
-        const { destDir } = doExport();
-        repo.close(); // release the live DB before re-opening the backup copy
-
+describe("authenticated import and round trip", () => {
+    it("authenticates the expected digest and materializes an identical bundle", () => {
+        const { destDir, res } = doExport();
         const dest = path.join(base, "imported");
-        const imp = importBundle({ bundleDir: destDir, destDir: dest });
-        expect(imp.verified).toBe(true);
+        const imported = importBundle({
+            bundleDir: destDir,
+            destDir: dest,
+            expectedDigest: res.digest,
+        });
 
-        // The restored DB is a real, openable repository with the same data.
+        expect(imported).toMatchObject({
+            verified: true,
+            trustLevel: "authenticated",
+            digest: res.digest,
+            investigationId: "inv-1",
+        });
+        expect(listFiles(dest)).toEqual(listFiles(destDir));
+        for (const rel of listFiles(destDir)) {
+            expect(sha256File(path.join(dest, ...rel.split("/"))))
+                .toBe(sha256File(path.join(destDir, ...rel.split("/"))));
+        }
+
         const restored = openRepository({ file: path.join(dest, "db", "database.sqlite") });
         try {
-            expect(restored.getInvestigation("inv-1")).not.toBeNull();
+            expect(restored.getHead("inv-1")).toEqual(repo.getHead("inv-1"));
         } finally {
             restored.close();
         }
-
-        // The restored objects verify under a fresh store rooted at the import.
         const restoredStore = openArtifactStore({ root: dest });
         expect(restoredStore.verifyObject(extraObject.id).ok).toBe(true);
         expect(restoredStore.verifySnapshot(snap.snapshot).ok).toBe(true);
     });
 
-    it("refuses to import into a non-empty destination", () => {
+    it("rejects a missing or incorrect authentication claim", () => {
+        const { destDir, res } = doExport();
+        const noClaim = path.join(base, "no-claim");
+        const required = catchErr(() => importBundle({ bundleDir: destDir, destDir: noClaim }));
+        expect(required.code).toBe(BUNDLE_ERROR_CODES.AUTHENTICATION_REQUIRED);
+        expect(fs.existsSync(noClaim)).toBe(false);
+
+        const wrong = path.join(base, "wrong-digest");
+        const failed = catchErr(() => importBundle({
+            bundleDir: destDir,
+            destDir: wrong,
+            expectedDigest: `sha256:${res.digest.endsWith("0")
+                ? res.digest.slice(7, -1) + "1"
+                : res.digest.slice(7, -1) + "0"}`,
+        }));
+        expect(failed.code).toBe(BUNDLE_ERROR_CODES.AUTHENTICATION_FAILED);
+        expect(fs.existsSync(wrong)).toBe(false);
+    });
+
+    it("returns self-consistent only after explicit unauthenticated opt-in", () => {
+        const { destDir } = doExport();
+        const dest = path.join(base, "self-consistent");
+        const imported = importBundle({
+            bundleDir: destDir,
+            destDir: dest,
+            allowUnauthenticated: true,
+        });
+        expect(imported.trustLevel).toBe("self-consistent");
+        expect(imported.verified).toBe(true);
+    });
+
+    it("refuses a non-empty import destination before publication", () => {
         const { destDir } = doExport();
         const dest = path.join(base, "occupied-import");
-        fs.mkdirSync(dest, { recursive: true });
-        fs.writeFileSync(path.join(dest, "pre-existing"), "x");
-        const err = catchErr(() => importBundle({ bundleDir: destDir, destDir: dest }));
+        fs.mkdirSync(dest);
+        fs.writeFileSync(path.join(dest, "existing"), "x");
+        const err = catchErr(() => importBundle({
+            bundleDir: destDir,
+            destDir: dest,
+            allowUnauthenticated: true,
+        }));
         expect(err.code).toBe(BUNDLE_ERROR_CODES.DESTINATION_EXISTS);
+        expect(fs.readFileSync(path.join(dest, "existing"), "utf8")).toBe("x");
+    });
+
+    it("supports caller-owned signature verification", () => {
+        const { destDir, res } = doExport();
+        const dest = path.join(base, "signature-auth");
+        const imported = importBundle({
+            bundleDir: destDir,
+            destDir: dest,
+            expectedSignature: Buffer.from("signed"),
+            verifySignature({ digest, signature }) {
+                return digest === res.digest && signature.equals(Buffer.from("signed"));
+            },
+        });
+        expect(imported.trustLevel).toBe("authenticated");
     });
 });
 
-describe("tamper detection", () => {
-    function firstObjectFile(destDir) {
-        const objectsRoot = path.join(destDir, "objects", "sha256");
-        const prefix = fs.readdirSync(objectsRoot)[0];
-        const prefixDir = path.join(objectsRoot, prefix);
-        return path.join(prefixDir, fs.readdirSync(prefixDir)[0]);
-    }
-
-    it("rejects a bundle whose CAS object bytes were altered", () => {
+describe("canonical closure validation", () => {
+    it("rejects an arbitrary self-checksummed directory payload", () => {
         const { destDir } = doExport();
-        const victim = firstObjectFile(destDir);
-        fs.writeFileSync(victim, Buffer.from("tampered-object-bytes"));
+        fs.writeFileSync(path.join(destDir, "payload.bin"), "arbitrary");
+        regenerateInventory(destDir);
 
-        const dest = path.join(base, "imported");
-        const err = catchErr(() => importBundle({ bundleDir: destDir, destDir: dest }));
+        const dest = path.join(base, "arbitrary-import");
+        const err = catchErr(() => importBundle({
+            bundleDir: destDir,
+            destDir: dest,
+            allowUnauthenticated: true,
+        }));
+        expect(err.code).toBe(BUNDLE_ERROR_CODES.CLOSURE_INVALID);
+        expect(fs.existsSync(dest)).toBe(false);
+    });
+
+    it("rejects a valid-schema database substitution even with regenerated inventory", () => {
+        const { destDir } = doExport();
+        const alternatePath = path.join(base, "alternate.sqlite");
+        const alternate = openRepository({ file: alternatePath });
+        alternate.ensureInvestigation({ investigationId: "inv-other" });
+        alternate.close();
+        fs.copyFileSync(alternatePath, path.join(destDir, "db", "database.sqlite"));
+        regenerateInventory(destDir);
+
+        const dest = path.join(base, "db-substitution");
+        const err = catchErr(() => importBundle({
+            bundleDir: destDir,
+            destDir: dest,
+            allowUnauthenticated: true,
+        }));
         expect(err.code).toBe(BUNDLE_ERROR_CODES.TAMPER_DETECTED);
         expect(fs.existsSync(dest)).toBe(false);
     });
 
-    it("rejects a bundle whose database backup was altered", () => {
+    it("rejects an object closure mismatch with canonical manifest and inventory", () => {
         const { destDir } = doExport();
-        const dbPath = path.join(destDir, "db", "database.sqlite");
-        const bytes = fs.readFileSync(dbPath);
-        bytes[bytes.length - 1] ^= 0xff;
-        fs.writeFileSync(dbPath, bytes);
+        const removedId = snap.manifest.entries[0].object;
+        rewriteManifest(destDir, (manifest) => {
+            const record = manifest.objects.find((object) => object.id === removedId);
+            fs.rmSync(path.join(destDir, ...record.path.split("/")));
+            manifest.objects = manifest.objects.filter((object) => object.id !== removedId);
+        });
 
-        const dest = path.join(base, "imported");
-        const err = catchErr(() => importBundle({ bundleDir: destDir, destDir: dest }));
-        expect(err.code).toBe(BUNDLE_ERROR_CODES.TAMPER_DETECTED);
+        const dest = path.join(base, "closure-mismatch");
+        const err = catchErr(() => importBundle({
+            bundleDir: destDir,
+            destDir: dest,
+            allowUnauthenticated: true,
+        }));
+        expect(err.code).toBe(BUNDLE_ERROR_CODES.CLOSURE_INVALID);
         expect(fs.existsSync(dest)).toBe(false);
     });
 
-    it("rejects a bundle whose manifest was altered", () => {
+    it("rejects a non-canonical manifest version after all checksums are regenerated", () => {
         const { destDir } = doExport();
-        const manifestPath = path.join(destDir, "manifest.json");
-        fs.appendFileSync(manifestPath, "\n");
+        rewriteManifest(destDir, (manifest) => {
+            manifest.version = 999;
+        });
+        const err = catchErr(() => importBundle({
+            bundleDir: destDir,
+            destDir: path.join(base, "bad-version"),
+            allowUnauthenticated: true,
+        }));
+        expect(err.code).toBe(BUNDLE_ERROR_CODES.MANIFEST_INVALID);
+    });
+});
 
-        const dest = path.join(base, "imported");
-        const err = catchErr(() => importBundle({ bundleDir: destDir, destDir: dest }));
-        expect(err.code).toBe(BUNDLE_ERROR_CODES.TAMPER_DETECTED);
+describe("source mutation and filesystem races", () => {
+    it("fails closed when an opened source file is mutated during copy", () => {
+        const { destDir } = doExport();
+        const dest = path.join(base, "mutated-copy");
+        let injected = false;
+        const err = catchErr(() => importBundle({
+            bundleDir: destDir,
+            destDir: dest,
+            allowUnauthenticated: true,
+            hooks: {
+                afterSourceOpen(event) {
+                    if (!injected && event.relativePath === "manifest.json") {
+                        injected = true;
+                        fs.appendFileSync(event.path, " ");
+                    }
+                },
+            },
+        }));
+        expect(injected).toBe(true);
+        expect(err.code).toBe(BUNDLE_ERROR_CODES.SOURCE_CHANGED);
         expect(fs.existsSync(dest)).toBe(false);
+        expect(stageEntries("import")).toEqual([]);
     });
 
-    it("rejects a bundle with an injected file not present in the inventory", () => {
+    it("detects files added while the source is being copied", () => {
         const { destDir } = doExport();
-        fs.writeFileSync(path.join(destDir, "db", "planted.txt"), "surprise");
-
-        const dest = path.join(base, "imported");
-        const err = catchErr(() => importBundle({ bundleDir: destDir, destDir: dest }));
-        expect(err.code).toBe(BUNDLE_ERROR_CODES.TAMPER_DETECTED);
-        expect(fs.existsSync(dest)).toBe(false);
+        let injected = false;
+        const err = catchErr(() => importBundle({
+            bundleDir: destDir,
+            destDir: path.join(base, "added-during-copy"),
+            allowUnauthenticated: true,
+            hooks: {
+                afterSourceCopy(event) {
+                    if (!injected && event.relativePath === "manifest.json") {
+                        injected = true;
+                        fs.writeFileSync(path.join(destDir, "added.txt"), "late");
+                    }
+                },
+            },
+        }));
+        expect(injected).toBe(true);
+        expect(err.code).toBe(BUNDLE_ERROR_CODES.SOURCE_CHANGED);
     });
 
-    it("rejects a bundle with a file removed after inventory was written", () => {
+    it("detects files removed after their opened bytes were copied", () => {
         const { destDir } = doExport();
-        fs.rmSync(firstObjectFile(destDir));
-
-        const dest = path.join(base, "imported");
-        const err = catchErr(() => importBundle({ bundleDir: destDir, destDir: dest }));
-        expect(err.code).toBe(BUNDLE_ERROR_CODES.TAMPER_DETECTED);
-        expect(fs.existsSync(dest)).toBe(false);
+        const victim = readBundleManifest(destDir).objects[0].path;
+        let injected = false;
+        const err = catchErr(() => importBundle({
+            bundleDir: destDir,
+            destDir: path.join(base, "removed-during-copy"),
+            allowUnauthenticated: true,
+            hooks: {
+                afterSourceCopy(event) {
+                    if (!injected && event.relativePath === victim) {
+                        injected = true;
+                        fs.rmSync(event.path);
+                    }
+                },
+            },
+        }));
+        expect(injected).toBe(true);
+        expect(err.code).toBe(BUNDLE_ERROR_CODES.SOURCE_CHANGED);
     });
 
-    it("rejects a malformed inventory", () => {
+    it("rejects a junction swap before staging writes and never writes outside", () => {
         const { destDir } = doExport();
-        fs.writeFileSync(path.join(destDir, "inventory.sha256"), "not a valid inventory line\n");
-
-        const dest = path.join(base, "imported");
-        const err = catchErr(() => importBundle({ bundleDir: destDir, destDir: dest }));
-        expect(err.code).toBe(BUNDLE_ERROR_CODES.INVENTORY_INVALID);
+        const outside = path.join(base, "outside");
+        fs.mkdirSync(outside);
+        let injected = false;
+        const dest = path.join(base, "junction-import");
+        const err = catchErr(() => importBundle({
+            bundleDir: destDir,
+            destDir: dest,
+            allowUnauthenticated: true,
+            hooks: {
+                beforeStageFileOpen(event) {
+                    if (!injected && event.relativePath === "db/database.sqlite") {
+                        injected = true;
+                        const dbDir = path.dirname(event.path);
+                        fs.rmdirSync(dbDir);
+                        fs.symlinkSync(outside, dbDir, "junction");
+                    }
+                },
+            },
+        }));
+        expect(injected).toBe(true);
+        expect(err.code).toBe(BUNDLE_ERROR_CODES.UNSAFE_PATH);
+        expect(fs.existsSync(path.join(outside, "database.sqlite"))).toBe(false);
         expect(fs.existsSync(dest)).toBe(false);
+        expect(stageEntries("import")).toEqual([]);
     });
 
-    it("rejects a bundle missing its inventory entirely", () => {
+    it("cleans partial staging after an injected copy failure", () => {
         const { destDir } = doExport();
-        fs.rmSync(path.join(destDir, "inventory.sha256"));
+        const dest = path.join(base, "partial");
+        const err = catchErr(() => importBundle({
+            bundleDir: destDir,
+            destDir: dest,
+            allowUnauthenticated: true,
+            faultInjector(event) {
+                if (event.point === "after-source-copy"
+                    && event.relativePath === "manifest.json") {
+                    throw new Error("injected copy failure");
+                }
+            },
+        }));
+        expect(err.code).toBe(BUNDLE_ERROR_CODES.IO_ERROR);
+        expect(fs.existsSync(dest)).toBe(false);
+        expect(stageEntries("import")).toEqual([]);
+    });
+});
 
-        const dest = path.join(base, "imported");
-        const err = catchErr(() => importBundle({ bundleDir: destDir, destDir: dest }));
-        expect(err.code).toBe(BUNDLE_ERROR_CODES.INVENTORY_INVALID);
+describe("basic tamper detection", () => {
+    it("rejects altered object, database, manifest, missing file, and malformed inventory", () => {
+        const cases = [
+            {
+                name: "object",
+                mutate(bundleDir) {
+                    const record = readBundleManifest(bundleDir).objects[0];
+                    fs.writeFileSync(path.join(bundleDir, ...record.path.split("/")), "tampered");
+                },
+                code: BUNDLE_ERROR_CODES.TAMPER_DETECTED,
+            },
+            {
+                name: "database",
+                mutate(bundleDir) {
+                    const dbPath = path.join(bundleDir, "db", "database.sqlite");
+                    const bytes = fs.readFileSync(dbPath);
+                    bytes[bytes.length - 1] ^= 0xff;
+                    fs.writeFileSync(dbPath, bytes);
+                },
+                code: BUNDLE_ERROR_CODES.TAMPER_DETECTED,
+            },
+            {
+                name: "manifest",
+                mutate(bundleDir) {
+                    fs.appendFileSync(path.join(bundleDir, "manifest.json"), "\n");
+                },
+                code: BUNDLE_ERROR_CODES.TAMPER_DETECTED,
+            },
+            {
+                name: "missing",
+                mutate(bundleDir) {
+                    const record = readBundleManifest(bundleDir).objects[0];
+                    fs.rmSync(path.join(bundleDir, ...record.path.split("/")));
+                },
+                code: BUNDLE_ERROR_CODES.TAMPER_DETECTED,
+            },
+            {
+                name: "inventory",
+                mutate(bundleDir) {
+                    fs.writeFileSync(path.join(bundleDir, "inventory.sha256"), "not valid\n");
+                },
+                code: BUNDLE_ERROR_CODES.INVENTORY_INVALID,
+            },
+            {
+                name: "missing-inventory",
+                mutate(bundleDir) {
+                    fs.rmSync(path.join(bundleDir, "inventory.sha256"));
+                },
+                code: BUNDLE_ERROR_CODES.INVENTORY_INVALID,
+            },
+        ];
+
+        for (const testCase of cases) {
+            const { destDir } = doExport(`tamper-${testCase.name}`);
+            testCase.mutate(destDir);
+            const imported = path.join(base, `import-${testCase.name}`);
+            const err = catchErr(() => importBundle({
+                bundleDir: destDir,
+                destDir: imported,
+                allowUnauthenticated: true,
+            }));
+            expect(err.code, testCase.name).toBe(testCase.code);
+            expect(fs.existsSync(imported), testCase.name).toBe(false);
+        }
     });
 });
