@@ -11,9 +11,15 @@ import {
     DOMAIN_VERSION,
     EVENT_TYPES,
     EVENT_VOCABULARY,
+    EXTERNAL_EVENT_TYPES,
     KERNEL_DECISION_EVENT_TYPES,
 } from "./constants.mjs";
-import { decisionEventMatches, computeEventHash } from "./events.mjs";
+import {
+    computeEventHash,
+    decisionEventMatches,
+    normalizeEventIdentifier,
+    normalizeExternalEventPayload,
+} from "./events.mjs";
 import {
     ERROR_CODES,
     DomainVersionRestartRequiredError,
@@ -21,9 +27,21 @@ import {
     TransitionError,
 } from "./errors.mjs";
 import { deriveEvidencePayload } from "./evidence.mjs";
-import { createInitialAggregate } from "./state.mjs";
+import {
+    cloneAggregateForMutation,
+    createInitialAggregate,
+    immutableAggregate,
+} from "./state.mjs";
 
 const EVENT_KEYS = Object.freeze(["eventHash", "payload", "prevHash", "seq", "type"]);
+
+function hasOwnEntry(record, key) {
+    return Object.hasOwn(record, key);
+}
+
+function ownEntry(record, key) {
+    return hasOwnEntry(record, key) ? record[key] : null;
+}
 
 function assertEventEnvelope(aggregate, event) {
     if (event === null || typeof event !== "object" || Array.isArray(event)) {
@@ -63,6 +81,25 @@ function assertEventEnvelope(aggregate, event) {
             ERROR_CODES.EVENT_HASH_MISMATCH,
             "Event hash does not match canonical event content",
             { expected: expectedHash, actual: event.eventHash },
+        );
+    }
+}
+
+function assertCanonicalExternalPayload(aggregate, event) {
+    if (!EXTERNAL_EVENT_TYPES.includes(event.type)
+        && event.type !== EVENT_TYPES.COMMAND_OBSERVED) {
+        return;
+    }
+    const normalized = normalizeExternalEventPayload(
+        event.type,
+        event.payload,
+        aggregate,
+    );
+    if (!canonicalEqual(normalized, event.payload)) {
+        throw new TransitionError(
+            ERROR_CODES.INVALID_EVENT,
+            `${event.type} payload is not in canonical kernel form`,
+            { type: event.type },
         );
     }
 }
@@ -126,8 +163,9 @@ function applyInvestigationOpened(next, event) {
 }
 
 function applyCapabilityEpoch(next, event) {
-    const { epochId, capabilities } = event.payload;
-    if (next.capabilityEpochs[epochId] !== undefined) {
+    const epochId = normalizeEventIdentifier(event.payload?.epochId, "epochId");
+    const { capabilities } = event.payload;
+    if (hasOwnEntry(next.capabilityEpochs, epochId)) {
         duplicate("capability epoch", epochId);
     }
     next.capabilityEpochs[epochId] = {
@@ -139,8 +177,9 @@ function applyCapabilityEpoch(next, event) {
 }
 
 function applyCommandReserved(next, event) {
-    const { commandId, command } = event.payload;
-    if (next.commands[commandId] !== undefined) {
+    const commandId = normalizeEventIdentifier(event.payload?.commandId, "commandId");
+    const { command } = event.payload;
+    if (hasOwnEntry(next.commands, commandId)) {
         duplicate("command", commandId);
     }
     next.commands[commandId] = {
@@ -156,8 +195,8 @@ function applyCommandReserved(next, event) {
 
 function applyCommandDispatched(next, event) {
     const { commandId, capabilityEpochId } = event.payload;
-    const command = next.commands[commandId];
-    if (command === undefined) {
+    const command = ownEntry(next.commands, commandId);
+    if (command === null) {
         throw new TransitionError(
             ERROR_CODES.ILLEGAL_TRANSITION,
             "Cannot dispatch an unknown command",
@@ -171,7 +210,7 @@ function applyCommandDispatched(next, event) {
             { commandId, status: command.status },
         );
     }
-    if (capabilityEpochId !== null && next.capabilityEpochs[capabilityEpochId] === undefined) {
+    if (capabilityEpochId !== null && !hasOwnEntry(next.capabilityEpochs, capabilityEpochId)) {
         throw new TransitionError(
             ERROR_CODES.ILLEGAL_TRANSITION,
             "Dispatched command references an unknown capability epoch",
@@ -185,15 +224,15 @@ function applyCommandDispatched(next, event) {
 
 function applyCommandObserved(next, event) {
     const payload = event.payload;
-    const command = next.commands[payload.commandId];
-    if (command === undefined || command.status !== "dispatched") {
+    const command = ownEntry(next.commands, payload.commandId);
+    if (command === null || command.status !== "dispatched") {
         throw new TransitionError(
             ERROR_CODES.ILLEGAL_TRANSITION,
             "Only a dispatched command can be observed",
             { commandId: payload.commandId },
         );
     }
-    if (next.observations[payload.observationId] !== undefined) {
+    if (hasOwnEntry(next.observations, payload.observationId)) {
         duplicate("observation", payload.observationId);
     }
     if (payload.sourceKind === "harness"
@@ -217,6 +256,38 @@ function applyCommandObserved(next, event) {
             ERROR_CODES.INVALID_EVIDENCE,
             "Search-candidate commands require authoritative harness candidate observations",
         );
+    }
+    if (command.command.kind === "verify_impossibility"
+        && (payload.sourceKind !== "harness" || payload.purpose !== "impossibility")) {
+        throw new TransitionError(
+            ERROR_CODES.INVALID_EVIDENCE,
+            "Impossibility-verification commands require authoritative harness impossibility observations",
+        );
+    }
+    if (payload.purpose === "impossibility") {
+        if (command.command.kind !== "verify_impossibility"
+            || next.contract.hypothesisTopology !== "certified_impossibility") {
+            throw new TransitionError(
+                ERROR_CODES.INVALID_EVIDENCE,
+                "Impossibility observations require a reserved certified-impossibility verifier command",
+            );
+        }
+        if (payload.data.certificateVersion !== command.command.certificateVersion
+            || payload.data.verificationRequestHash !== command.command.requestHash
+            || payload.receipt.certificateArtifactHash
+                !== payload.data.certificateArtifactHash
+            || payload.receipt.measurementReceiptHash
+                !== payload.data.measurementReceiptHash
+            || payload.receipt.verificationRequestHash
+                !== payload.data.verificationRequestHash
+            || payload.receipt.verificationSnapshotHash
+                !== payload.data.verificationSnapshotHash
+            || payload.data.verifiedFacts.parserVersion !== command.command.parserVersion) {
+            throw new TransitionError(
+                ERROR_CODES.INVALID_EVIDENCE,
+                "Impossibility observation receipt and verifier facts do not match the reserved command",
+            );
+        }
     }
     if (payload.purpose === "candidate") {
         const promptRefs = new Set(command.command.promptContextRefs ?? []);
@@ -288,36 +359,47 @@ function applyCommandObserved(next, event) {
 
 function applyEvidenceCommitted(next, event) {
     const payload = event.payload;
-    if (next.evidence[payload.evidenceId] !== undefined) {
-        duplicate("evidence", payload.evidenceId);
+    const evidenceId = normalizeEventIdentifier(payload?.evidenceId, "evidenceId");
+    const observationId = normalizeEventIdentifier(
+        payload?.observationId,
+        "observationId",
+    );
+    if (hasOwnEntry(next.evidence, evidenceId)) {
+        duplicate("evidence", evidenceId);
     }
-    const observation = next.observations[payload.observationId];
-    if (observation === undefined || observation.evidenceId !== null) {
+    const observation = ownEntry(next.observations, observationId);
+    if (observation === null || observation.evidenceId !== null) {
         throw new TransitionError(
             ERROR_CODES.INVALID_EVIDENCE,
             "Evidence must reference one uncommitted observation",
         );
     }
     if (observation.sourceKind === "harness" && observation.purpose === "candidate") {
-        const duplicateCandidate = next.evidenceOrder.some((evidenceId) =>
-            next.evidence[evidenceId].sourceKind === "harness"
-            && next.evidence[evidenceId].purpose === "candidate"
-            && !next.evidence[evidenceId].invalidated
-            && next.evidence[evidenceId].candidateId === observation.candidateId);
+        const duplicateCandidate = next.evidenceOrder.some((existingId) => {
+            const existing = ownEntry(next.evidence, existingId);
+            return existing !== null
+                && existing.sourceKind === "harness"
+                && existing.purpose === "candidate"
+                && !existing.invalidated
+                && existing.candidateId === observation.candidateId;
+        });
         if (duplicateCandidate) {
             duplicate("candidate", observation.candidateId);
         }
-        const duplicateSlot = next.evidenceOrder.some((evidenceId) =>
-            next.evidence[evidenceId].sourceKind === "harness"
-            && next.evidence[evidenceId].purpose === "candidate"
-            && !next.evidence[evidenceId].invalidated
-            && next.evidence[evidenceId].round === observation.round
-            && next.evidence[evidenceId].slotIndex === observation.slotIndex);
+        const duplicateSlot = next.evidenceOrder.some((existingId) => {
+            const existing = ownEntry(next.evidence, existingId);
+            return existing !== null
+                && existing.sourceKind === "harness"
+                && existing.purpose === "candidate"
+                && !existing.invalidated
+                && existing.round === observation.round
+                && existing.slotIndex === observation.slotIndex;
+        });
         if (duplicateSlot) {
             duplicate("candidate slot", `${observation.round}:${observation.slotIndex}`);
         }
     }
-    const expected = deriveEvidencePayload(next, observation, payload.evidenceId);
+    const expected = deriveEvidencePayload(next, observation, evidenceId);
     if (!canonicalEqual(payload, expected)) {
         throw new TransitionError(
             ERROR_CODES.INVALID_EVIDENCE,
@@ -325,7 +407,7 @@ function applyEvidenceCommitted(next, event) {
         );
     }
 
-    next.evidence[payload.evidenceId] = {
+    next.evidence[evidenceId] = {
         ...payload,
         committedSeq: event.seq,
         commitEventHash: event.eventHash,
@@ -333,13 +415,13 @@ function applyEvidenceCommitted(next, event) {
         invalidatedSeq: null,
         invalidationReason: null,
     };
-    next.evidenceOrder.push(payload.evidenceId);
-    observation.evidenceId = payload.evidenceId;
+    next.evidenceOrder.push(evidenceId);
+    observation.evidenceId = evidenceId;
 }
 
 function applyEvidenceInvalidated(next, event) {
-    const evidence = next.evidence[event.payload.evidenceId];
-    if (evidence === undefined) {
+    const evidence = ownEntry(next.evidence, event.payload.evidenceId);
+    if (evidence === null) {
         throw new TransitionError(
             ERROR_CODES.EVIDENCE_NOT_FOUND,
             "Cannot invalidate unknown evidence",
@@ -362,8 +444,9 @@ function applyEvidenceInvalidated(next, event) {
 }
 
 function applyValidationCompleted(next, event) {
-    const evidence = next.evidence[event.payload.evidenceId];
-    if (evidence === undefined
+    const evidenceId = normalizeEventIdentifier(event.payload?.evidenceId, "evidenceId");
+    const evidence = ownEntry(next.evidence, evidenceId);
+    if (evidence === null
         || evidence.invalidated
         || evidence.validationSatisfied !== true
         || event.payload.evidenceHash !== evidence.commitEventHash) {
@@ -546,6 +629,7 @@ export function reduceEvent(aggregate, event) {
         );
     }
     requireOpen(aggregate, event);
+    assertCanonicalExternalPayload(aggregate, event);
 
     if (KERNEL_DECISION_EVENT_TYPES.includes(event.type)
         && !decisionEventMatches(aggregate, event)) {
@@ -556,11 +640,11 @@ export function reduceEvent(aggregate, event) {
         );
     }
 
-    const next = JSON.parse(JSON.stringify(aggregate));
+    const next = cloneAggregateForMutation(aggregate);
     applyTransition(next, event);
     next.lastSeq = event.seq;
     next.lastEventHash = event.eventHash;
-    return immutableCanonical(next);
+    return immutableAggregate(next);
 }
 
 export function replayEvents(events) {

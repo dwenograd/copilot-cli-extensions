@@ -21,6 +21,7 @@ import {
     EVENT_TYPES,
     createInvestigationContract,
     decideNext,
+    deriveImpossibilityVerdict,
     hashCanonical,
 } from "../domain/index.mjs";
 import { openArtifactStore, openRepository } from "../persistence/index.mjs";
@@ -186,6 +187,61 @@ function seedReceipt(observationId, isCandidate) {
     };
 }
 
+function seedImpossibilityObservation(reserved, observationId, facts) {
+    const verifiedFacts = {
+        pass: facts.pass,
+        searchSpaceExhausted: facts.searchSpaceExhausted,
+        parserVersion: reserved.parserVersion,
+    };
+    const certificateArtifactHash = hashCanonical({
+        observationId,
+        artifact: "certificate",
+    });
+    const measurementReceiptHash = hashCanonical({
+        observationId,
+        receipt: "measurement",
+    });
+    const verificationSnapshotHash = hashCanonical({
+        observationId,
+        snapshot: "verification",
+    });
+    return {
+        purpose: "impossibility",
+        receipt: {
+            attemptId: `attempt-${observationId}`,
+            runnerEpochId: "runner-epoch-seed",
+            rawStdoutHash: hashCanonical({ observationId, stream: "stdout" }),
+            rawStderrHash: hashCanonical({ observationId, stream: "stderr" }),
+            candidateArtifactHash: null,
+            certificateArtifactHash,
+            measurementReceiptArtifactHash: hashCanonical({
+                observationId,
+                artifact: "measurement-receipt",
+            }),
+            measurementReceiptHash,
+            rawStderrArtifactHash: hashCanonical({
+                observationId,
+                artifact: "stderr",
+            }),
+            rawStdoutArtifactHash: hashCanonical({
+                observationId,
+                artifact: "stdout",
+            }),
+            verificationRequestHash: reserved.requestHash,
+            verificationSnapshotHash,
+        },
+        data: {
+            certificateVersion: reserved.certificateVersion,
+            certificateVerdict: deriveImpossibilityVerdict(verifiedFacts),
+            certificateArtifactHash,
+            measurementReceiptHash,
+            verificationRequestHash: reserved.requestHash,
+            verificationSnapshotHash,
+            verifiedFacts,
+        },
+    };
+}
+
 function baseSeedContract(overrides = {}) {
     return {
         objective: "seed objective",
@@ -285,6 +341,20 @@ function driveToTerminal(adapter, candidateQueue) {
                         data: spec.data,
                         ...(spec.annotations === undefined ? {} : { annotations: spec.annotations }),
                     });
+                } else if (reserved.kind === "verify_impossibility") {
+                    const spec = candidateQueue.shift();
+                    if (spec?.certificateFacts === undefined) {
+                        throw new Error("impossibility certificate queue entry is missing");
+                    }
+                    adapter.appendHarnessObservation({
+                        commandId: recommendation.commandId,
+                        observationId,
+                        ...seedImpossibilityObservation(
+                            reserved,
+                            observationId,
+                            spec.certificateFacts,
+                        ),
+                    });
                 } else {
                     throw new Error(`unexpected reserved command ${reserved.kind}`);
                 }
@@ -346,6 +416,50 @@ function seedTargetUnreachable(stateRoot, investigationId) {
         (adapter) => driveToTerminal(adapter, [
             { data: { pass: false, metrics: { score: 10 } } },
             { data: { pass: false, metrics: { score: 20 } } },
+        ]),
+    );
+}
+
+function seedCertifiedTargetUnreachable(stateRoot, investigationId) {
+    return seedInvestigation(
+        stateRoot,
+        investigationId,
+        baseSeedContract({
+            hypothesisTopology: "certified_impossibility",
+            workerModels: ["model-a"],
+            candidatesPerRound: 1,
+            maxRounds: 1,
+        }),
+        (adapter) => driveToTerminal(adapter, [
+            { data: { pass: false, metrics: { score: 20 } } },
+            {
+                certificateFacts: {
+                    pass: true,
+                    searchSpaceExhausted: true,
+                },
+            },
+        ]),
+    );
+}
+
+function seedCertifiedNonResult(stateRoot, investigationId) {
+    return seedInvestigation(
+        stateRoot,
+        investigationId,
+        baseSeedContract({
+            hypothesisTopology: "certified_impossibility",
+            workerModels: ["model-a"],
+            candidatesPerRound: 1,
+            maxRounds: 1,
+        }),
+        (adapter) => driveToTerminal(adapter, [
+            { data: { pass: false, metrics: { score: 20 } } },
+            {
+                certificateFacts: {
+                    pass: false,
+                    searchSpaceExhausted: true,
+                },
+            },
         ]),
     );
 }
@@ -578,6 +692,24 @@ describe("crucible_start", () => {
             expect(validationCase.artifactHash).toMatch(/^sha256:[a-f0-9]{64}$/u);
             expect(validationCase).not.toHaveProperty("path");
         }
+    });
+
+    it("freezes the certified-impossibility trigger and certificate prerequisites", () => {
+        const workspace = makeWorkspace("start-certified");
+        const { deps } = makeDeps(workspace.env);
+        const started = startInvestigation(startArgs(workspace.projectDir, {
+            hypothesis_topology: "certified_impossibility",
+            max_rounds: 1,
+        }), deps);
+        const aggregate = replayAggregate(workspace.stateRoot, started.investigation_id);
+        expect(aggregate.contract).toMatchObject({
+            hypothesisTopology: "certified_impossibility",
+            impossibilityPolicy: {
+                trigger: "search_exhausted",
+                requestVersion: "crucible-impossibility-request-v1",
+                certificateVersion: "crucible-impossibility-certificate-v1",
+            },
+        });
     });
 
     it("starts domain v2 beside a legacy v1 identity instead of reopening it", () => {
@@ -1002,6 +1134,54 @@ describe("crucible_result", () => {
         expect(result.banner).toBe(TERMINAL_BANNER);
         expect(result.decision).toBe("TARGET_UNREACHABLE");
         expect(result.basis.kind).toBe("search_space_exhausted");
+    });
+
+    it("returns a persisted certificate-backed TARGET_UNREACHABLE only at result", () => {
+        const workspace = makeWorkspace("result-certified-unreach");
+        seedCertifiedTargetUnreachable(workspace.stateRoot, "certified-unreach-inv");
+        const { deps } = makeDeps(workspace.env);
+
+        const result = resultInvestigation({
+            investigation_id: "certified-unreach-inv",
+        }, deps);
+        expect(result).toMatchObject({
+            is_result: true,
+            banner: TERMINAL_BANNER,
+            decision: "TARGET_UNREACHABLE",
+            basis: {
+                kind: "verified_impossibility_certificate",
+                certificateVerdict: "target_unreachable",
+            },
+        });
+        expect(result.basis.certificateArtifactHash).toMatch(
+            /^sha256:[a-z0-9][a-z0-9._-]*:[a-f0-9]{64}$/u,
+        );
+    });
+
+    it("keeps an inconclusive certificate behind the strict non-result boundary", () => {
+        const workspace = makeWorkspace("result-certified-non-result");
+        seedCertifiedNonResult(workspace.stateRoot, "certified-non-result-inv");
+        const { deps } = makeDeps(workspace.env);
+
+        const result = resultInvestigation({
+            investigation_id: "certified-non-result-inv",
+        }, deps);
+        expect(result).toMatchObject({
+            is_result: false,
+            banner: NON_RESULT_BANNER,
+            non_result: true,
+            non_result_code: "IMPOSSIBILITY_CERTIFICATE_INCONCLUSIVE",
+        });
+        for (const forbidden of [
+            "decision",
+            "evidence_id",
+            "evidence_hash",
+            "basis",
+            "contract_hash",
+            "terminal_event_hash",
+        ]) {
+            expect(result).not.toHaveProperty(forbidden);
+        }
     });
 
     it("strictly redacts an in-progress non-result", () => {

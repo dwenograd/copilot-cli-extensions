@@ -6,6 +6,7 @@ import {
     ERROR_CODES,
     ESCAPE_SEARCH_OPERATORS,
     EVENT_TYPES,
+    IMPOSSIBILITY_CERTIFICATE_VERSION,
     NON_RESULT_CODES,
     canonicalJson,
     computeEventHash,
@@ -21,6 +22,7 @@ import {
     decideNext,
     detectPlateau,
     hashCanonical,
+    normalizeEventIdentifier,
     reduceEvent,
     replayEvents,
     searchProgress,
@@ -86,6 +88,13 @@ function append(context, event) {
     context.history.push(event);
     context.aggregate = reduceEvent(context.aggregate, event);
     return event;
+}
+
+function forgeEvent(event, payload) {
+    const forged = JSON.parse(JSON.stringify(event));
+    forged.payload = payload;
+    forged.eventHash = computeEventHash(forged);
+    return forged;
 }
 
 function openInvestigation(overrides = {}) {
@@ -184,6 +193,74 @@ function commitCandidate(context, {
     return { command: reserved.command, evidence };
 }
 
+function impossibilityObservationInput(command, label, {
+    pass = true,
+    searchSpaceExhausted = true,
+    certificateVerdict,
+} = {}) {
+    const requestHash = command.requestHash ?? hashCanonical({ label, request: "legacy" });
+    const certificateArtifactHash = hashCanonical({ label, artifact: "certificate" });
+    const measurementReceiptHash = hashCanonical({ label, receipt: "measurement" });
+    const verificationSnapshotHash = hashCanonical({ label, snapshot: "verification" });
+    const verifiedFacts = {
+        pass,
+        searchSpaceExhausted,
+        parserVersion: command.parserVersion ?? "parser-v2",
+    };
+    const derivedVerdict = pass && searchSpaceExhausted
+        ? "target_unreachable"
+        : pass
+            ? "invalid"
+            : "not_proven";
+    return {
+        commandId: command.commandId,
+        observationId: `impossibility-observation-${label}`,
+        purpose: "impossibility",
+        receipt: {
+            attemptId: `impossibility-attempt-${label}`,
+            runnerEpochId: "runner-epoch-1",
+            rawStdoutHash: hashCanonical({ label, stream: "stdout" }),
+            rawStderrHash: hashCanonical({ label, stream: "stderr" }),
+            candidateArtifactHash: null,
+            certificateArtifactHash,
+            measurementReceiptArtifactHash: hashCanonical({
+                label,
+                artifact: "measurement-receipt",
+            }),
+            measurementReceiptHash,
+            rawStderrArtifactHash: hashCanonical({ label, artifact: "stderr" }),
+            rawStdoutArtifactHash: hashCanonical({ label, artifact: "stdout" }),
+            verificationRequestHash: requestHash,
+            verificationSnapshotHash,
+        },
+        data: {
+            certificateVersion:
+                command.certificateVersion ?? IMPOSSIBILITY_CERTIFICATE_VERSION,
+            certificateVerdict: certificateVerdict ?? derivedVerdict,
+            certificateArtifactHash,
+            measurementReceiptHash,
+            verificationRequestHash: requestHash,
+            verificationSnapshotHash,
+            verifiedFacts,
+        },
+    };
+}
+
+function commitImpossibility(context, reserved, label, facts = {}) {
+    const input = impossibilityObservationInput({
+        ...reserved.command,
+        commandId: reserved.commandId,
+    }, label, facts);
+    const observed = constructHarnessObservedEvent(context.aggregate, input);
+    append(context, observed);
+    const evidenceId = `impossibility-evidence-${label}`;
+    append(context, constructEvidenceCommittedEvent(context.aggregate, {
+        evidenceId,
+        observationId: input.observationId,
+    }));
+    return context.aggregate.evidence[evidenceId];
+}
+
 describe("Crucible domain version 2 kernel", () => {
     it("stamps investigation_opened with DOMAIN_VERSION=2 and replays deterministically", () => {
         const context = validateInvestigation(openInvestigation());
@@ -217,6 +294,187 @@ describe("Crucible domain version 2 kernel", () => {
                 code: ERROR_CODES.DOMAIN_VERSION_RESTART_REQUIRED,
                 details: expect.objectContaining({ restartRequired: true }),
             }));
+        }
+    });
+
+    it("uses prototype-safe aggregate maps and rejects unsafe event identifiers", () => {
+        const context = openInvestigation();
+        const prototypeBefore = Object.getPrototypeOf({});
+        const pollutionKey = "__crucible_phase1_polluted__";
+        const pollutionBefore = Object.getOwnPropertyDescriptor(Object.prototype, pollutionKey);
+
+        for (const field of ["capabilityEpochs", "commands", "observations", "evidence"]) {
+            expect(Object.getPrototypeOf(context.aggregate[field])).toBeNull();
+        }
+        const replayed = replayEvents(context.history);
+        for (const field of ["capabilityEpochs", "commands", "observations", "evidence"]) {
+            expect(Object.getPrototypeOf(replayed[field])).toBeNull();
+        }
+
+        const unsafeIdentifiers = [
+            "__proto__",
+            "constructor",
+            "prototype",
+            "../escape",
+            "..\\escape",
+            "nested/path",
+            "nested\\path",
+            "trailing.",
+        ];
+        for (const identifier of unsafeIdentifiers) {
+            expect(() => normalizeEventIdentifier(identifier, "testId")).toThrow(
+                expect.objectContaining({ code: ERROR_CODES.INVALID_EVENT }),
+            );
+        }
+
+        const epoch = createExternalEvent(
+            context.aggregate,
+            EVENT_TYPES.CAPABILITY_EPOCH_RECORDED,
+            { epochId: "epoch-safe", capabilities: ["execute"] },
+        );
+        const invalidation = createExternalEvent(
+            context.aggregate,
+            EVENT_TYPES.EVIDENCE_INVALIDATED,
+            { evidenceId: "evidence-safe", reason: "probe" },
+        );
+        for (const identifier of ["__proto__", "constructor", "prototype", "../escape"]) {
+            expect(() => reduceEvent(
+                context.aggregate,
+                forgeEvent(epoch, { ...epoch.payload, epochId: identifier }),
+            )).toThrow(expect.objectContaining({ code: ERROR_CODES.INVALID_EVENT }));
+            expect(() => reduceEvent(
+                context.aggregate,
+                forgeEvent(invalidation, {
+                    ...invalidation.payload,
+                    evidenceId: identifier,
+                }),
+            )).toThrow(expect.objectContaining({ code: ERROR_CODES.INVALID_EVENT }));
+        }
+
+        expect(Object.getPrototypeOf({})).toBe(prototypeBefore);
+        expect(Object.getOwnPropertyDescriptor(Object.prototype, pollutionKey)).toEqual(
+            pollutionBefore,
+        );
+        expect(Object.hasOwn(Object.prototype, pollutionKey)).toBe(
+            pollutionBefore !== undefined,
+        );
+    });
+
+    it("canonical-compares every externally supplied payload before application", () => {
+        const open = openInvestigation();
+        const capability = createExternalEvent(
+            open.aggregate,
+            EVENT_TYPES.CAPABILITY_EPOCH_RECORDED,
+            { epochId: "epoch-a", capabilities: ["a", "z"] },
+        );
+        const stop = createExternalEvent(open.aggregate, EVENT_TYPES.STOP_REQUESTED, {
+            requestId: "stop-a",
+            reason: "probe canonical defaults",
+        });
+        const invalidation = createExternalEvent(
+            open.aggregate,
+            EVENT_TYPES.EVIDENCE_INVALIDATED,
+            { evidenceId: "evidence-a", reason: "probe canonical fields" },
+        );
+
+        expect(() => reduceEvent(
+            open.aggregate,
+            forgeEvent(capability, {
+                epochId: "epoch-a",
+                capabilities: ["z", "a", "a"],
+            }),
+        )).toThrow(expect.objectContaining({ code: ERROR_CODES.INVALID_EVENT }));
+        expect(() => reduceEvent(
+            open.aggregate,
+            forgeEvent(stop, {
+                requestId: "stop-a",
+                reason: "probe canonical defaults",
+            }),
+        )).toThrow(expect.objectContaining({ code: ERROR_CODES.INVALID_EVENT }));
+        expect(() => reduceEvent(
+            open.aggregate,
+            forgeEvent(invalidation, {
+                ...invalidation.payload,
+                unexpected: true,
+            }),
+        )).toThrow(expect.objectContaining({ code: ERROR_CODES.INVALID_EVENT }));
+
+        const reserved = constructKernelDecisionEvent(open.aggregate);
+        append(open, reserved);
+        const dispatch = createExternalEvent(open.aggregate, EVENT_TYPES.COMMAND_DISPATCHED, {
+            commandId: reserved.payload.commandId,
+        });
+        expect(() => reduceEvent(
+            open.aggregate,
+            forgeEvent(dispatch, { commandId: reserved.payload.commandId }),
+        )).toThrow(expect.objectContaining({ code: ERROR_CODES.INVALID_EVENT }));
+    });
+
+    it("rejects forged validation and candidate receipts during hashed replay", () => {
+        const validation = openInvestigation();
+        const validationCommand = reserveAndDispatch(validation);
+        const validationObserved = constructHarnessObservedEvent(validation.aggregate, {
+            commandId: validationCommand.commandId,
+            observationId: "forged-validation-observation",
+            purpose: "validation",
+            receipt: {
+                attemptId: "forged-validation-attempt",
+                runnerEpochId: "runner-epoch-1",
+                rawStdoutHash: hashCanonical({ forged: "validation-stdout" }),
+                rawStderrHash: hashCanonical({ forged: "validation-stderr" }),
+                candidateArtifactHash: null,
+            },
+            data: validationData(),
+        });
+        const validationReceipts = [
+            null,
+            { attemptId: "minimal-validation-attempt" },
+            {
+                ...validationObserved.payload.receipt,
+                candidateArtifactHash: hashCanonical({ forged: "validation-artifact" }),
+            },
+        ];
+        for (const receipt of validationReceipts) {
+            expect(() => replayEvents([
+                ...validation.history,
+                forgeEvent(validationObserved, {
+                    ...validationObserved.payload,
+                    receipt,
+                }),
+            ])).toThrow(expect.objectContaining({ code: ERROR_CODES.INVALID_EVENT }));
+        }
+
+        const candidate = validateInvestigation(openInvestigation());
+        const candidateCommand = reserveAndDispatch(candidate);
+        const candidateObserved = constructHarnessObservedEvent(candidate.aggregate, {
+            commandId: candidateCommand.commandId,
+            observationId: "forged-candidate-observation",
+            purpose: "candidate",
+            receipt: {
+                attemptId: "forged-candidate-attempt",
+                runnerEpochId: "runner-epoch-1",
+                rawStdoutHash: hashCanonical({ forged: "candidate-stdout" }),
+                rawStderrHash: hashCanonical({ forged: "candidate-stderr" }),
+                candidateArtifactHash: hashCanonical({ forged: "candidate-artifact" }),
+            },
+            data: { pass: false },
+        });
+        const candidateReceipts = [
+            null,
+            { attemptId: "minimal-candidate-attempt" },
+            {
+                ...candidateObserved.payload.receipt,
+                candidateArtifactHash: null,
+            },
+        ];
+        for (const receipt of candidateReceipts) {
+            expect(() => replayEvents([
+                ...candidate.history,
+                forgeEvent(candidateObserved, {
+                    ...candidateObserved.payload,
+                    receipt,
+                }),
+            ])).toThrow(expect.objectContaining({ code: ERROR_CODES.INVALID_EVENT }));
         }
     });
 
@@ -566,6 +824,263 @@ describe("Crucible domain version 2 kernel", () => {
             code: NON_RESULT_CODES.BUDGET_EXHAUSTED_INCONCLUSIVE,
         });
         expect(recommendation.event.type).toBe(EVENT_TYPES.NON_RESULT_RECORDED);
+    });
+
+    it("rejects the legacy direct-certificate injection path and reserves a kernel verifier", () => {
+        const context = validateInvestigation(openInvestigation({
+            hypothesisTopology: "certified_impossibility",
+            workerModels: ["model-alpha"],
+            candidatesPerRound: 1,
+            maxRounds: 1,
+        }));
+        expect(context.contract.impossibilityPolicy).toEqual({
+            trigger: "search_exhausted",
+            requestVersion: "crucible-impossibility-request-v1",
+            certificateVersion: IMPOSSIBILITY_CERTIFICATE_VERSION,
+        });
+        const search = reserveAndDispatch(context);
+        expect(search.command.kind).toBe("search_candidate");
+        const legacyObserved = constructHarnessObservedEvent(
+            context.aggregate,
+            impossibilityObservationInput({
+                ...search.command,
+                commandId: search.commandId,
+            }, "legacy"),
+        );
+        expect(() => reduceEvent(context.aggregate, legacyObserved)).toThrow(
+            expect.objectContaining({ code: ERROR_CODES.INVALID_EVIDENCE }),
+        );
+
+        observeAndCommit(context, search.commandId, {
+            purpose: "candidate",
+            observationId: "candidate-observation-certified-reject",
+            evidenceId: "candidate-evidence-certified-reject",
+            data: {
+                pass: false,
+                searchSpaceExhausted: true,
+                impossibilityCertificateHash: hashCanonical({ modelClaim: true }),
+            },
+        });
+        const recommendation = decideNext(context.aggregate);
+        expect(recommendation).toMatchObject({
+            kind: "COMMAND",
+            command: {
+                kind: "verify_impossibility",
+                attemptOrdinal: 1,
+                certificateVersion: IMPOSSIBILITY_CERTIFICATE_VERSION,
+                request: {
+                    trigger: {
+                        kind: "search_exhausted",
+                        roundsExhausted: true,
+                        candidateCount: 1,
+                    },
+                },
+            },
+        });
+        expect(context.aggregate.evidence["candidate-evidence-certified-reject"].unreachableBasis)
+            .toBeNull();
+    });
+
+    it("emits TARGET_UNREACHABLE only from a positive verified certificate", () => {
+        const context = validateInvestigation(openInvestigation({
+            hypothesisTopology: "certified_impossibility",
+            workerModels: ["model-alpha"],
+            candidatesPerRound: 1,
+            maxRounds: 1,
+        }));
+        commitCandidate(context, {
+            label: "certified-reject",
+            data: { pass: false },
+        });
+        const verifier = reserveAndDispatch(context);
+        expect(verifier.command.kind).toBe("verify_impossibility");
+        const evidence = commitImpossibility(context, verifier, "positive");
+        expect(evidence.unreachableBasis).toMatchObject({
+            kind: "verified_impossibility_certificate",
+            topology: "certified_impossibility",
+            certificateVerdict: "target_unreachable",
+        });
+
+        const terminal = constructKernelDecisionEvent(context.aggregate);
+        expect(terminal).toMatchObject({
+            type: EVENT_TYPES.TARGET_UNREACHABLE,
+            payload: {
+                decision: "TARGET_UNREACHABLE",
+                basis: {
+                    kind: "verified_impossibility_certificate",
+                    certificateVerdict: "target_unreachable",
+                },
+                evidenceId: "impossibility-evidence-positive",
+            },
+        });
+        append(context, terminal);
+        expect(replayEvents(context.history)).toEqual(context.aggregate);
+    });
+
+    it("does not run an impossibility verifier after any candidate satisfies acceptance", () => {
+        const context = validateInvestigation(openInvestigation({
+            hypothesisTopology: "certified_impossibility",
+            workerModels: ["model-alpha"],
+            candidatesPerRound: 1,
+            maxRounds: 1,
+            metrics: [{ key: "score", direction: "max", epsilon: 0 }],
+        }));
+        const candidate = commitCandidate(context, {
+            label: "accepted-with-invalid-metrics",
+            data: { pass: true, metrics: {} },
+        });
+        expect(candidate.evidence.acceptanceSatisfied).toBe(true);
+        expect(candidate.evidence.outcomeClass).toBe("invalid_metrics");
+        const recommendation = decideNext(context.aggregate);
+        expect(recommendation).toMatchObject({
+            kind: "NON_RESULT",
+            code: NON_RESULT_CODES.BUDGET_EXHAUSTED_INCONCLUSIVE,
+        });
+        expect(recommendation.command?.kind).not.toBe("verify_impossibility");
+    });
+
+    it.each([
+        ["not_proven", { pass: false, searchSpaceExhausted: true }],
+        ["invalid", { pass: true, searchSpaceExhausted: false }],
+    ])("records a %s impossibility certificate as a non-result", (verdict, facts) => {
+        const context = validateInvestigation(openInvestigation({
+            hypothesisTopology: "certified_impossibility",
+            workerModels: ["model-alpha"],
+            candidatesPerRound: 1,
+            maxRounds: 1,
+        }));
+        commitCandidate(context, {
+            label: `certificate-${verdict}-candidate`,
+            data: { pass: false },
+        });
+        const verifier = reserveAndDispatch(context);
+        const evidence = commitImpossibility(context, verifier, verdict, facts);
+        expect(evidence.unreachableBasis).toBeNull();
+        expect(decideNext(context.aggregate)).toMatchObject({
+            kind: "NON_RESULT",
+            code: NON_RESULT_CODES.IMPOSSIBILITY_CERTIFICATE_INCONCLUSIVE,
+            certificateVerdict: verdict,
+            event: {
+                type: EVENT_TYPES.NON_RESULT_RECORDED,
+                payload: { certificateVerdict: verdict },
+            },
+        });
+    });
+
+    it("rejects forged or minimal impossibility receipts during hashed replay", () => {
+        const context = validateInvestigation(openInvestigation({
+            hypothesisTopology: "certified_impossibility",
+            workerModels: ["model-alpha"],
+            candidatesPerRound: 1,
+            maxRounds: 1,
+        }));
+        commitCandidate(context, {
+            label: "forged-certificate-candidate",
+            data: { pass: false },
+        });
+        const verifier = reserveAndDispatch(context);
+        const input = impossibilityObservationInput({
+            ...verifier.command,
+            commandId: verifier.commandId,
+        }, "forged");
+        const observed = constructHarnessObservedEvent(context.aggregate, input);
+
+        expect(() => replayEvents([
+            ...context.history,
+            forgeEvent(observed, {
+                ...observed.payload,
+                receipt: { attemptId: "minimal" },
+            }),
+        ])).toThrow(expect.objectContaining({ code: ERROR_CODES.INVALID_EVENT }));
+        expect(() => replayEvents([
+            ...context.history,
+            forgeEvent(observed, {
+                ...observed.payload,
+                receipt: {
+                    ...observed.payload.receipt,
+                    certificateArtifactHash: hashCanonical({ forged: true }),
+                },
+            }),
+        ])).toThrow(expect.objectContaining({ code: ERROR_CODES.INVALID_EVIDENCE }));
+    });
+
+    it("retries an invalidated impossibility certificate deterministically", () => {
+        const context = validateInvestigation(openInvestigation({
+            hypothesisTopology: "certified_impossibility",
+            workerModels: ["model-alpha"],
+            candidatesPerRound: 1,
+            maxRounds: 1,
+        }));
+        commitCandidate(context, {
+            label: "invalidate-certificate-candidate",
+            data: { pass: false },
+        });
+        const verifier = reserveAndDispatch(context);
+        const evidence = commitImpossibility(context, verifier, "invalidate");
+        append(context, createExternalEvent(context.aggregate, EVENT_TYPES.EVIDENCE_INVALIDATED, {
+            evidenceId: evidence.evidenceId,
+            reason: "certificate artifact failed later integrity review",
+        }));
+
+        expect(decideNext(context.aggregate)).toMatchObject({
+            kind: "COMMAND",
+            command: {
+                kind: "verify_impossibility",
+                attemptOrdinal: 2,
+            },
+        });
+    });
+
+    it("does not reuse a certificate after its candidate-evidence trigger is invalidated", () => {
+        const context = validateInvestigation(openInvestigation({
+            hypothesisTopology: "certified_impossibility",
+            workerModels: ["model-alpha"],
+            candidatesPerRound: 1,
+            maxRounds: 1,
+        }));
+        const candidate = commitCandidate(context, {
+            label: "invalidate-certificate-trigger",
+            data: { pass: false },
+        });
+        const verifier = reserveAndDispatch(context);
+        commitImpossibility(context, verifier, "trigger-positive");
+        append(context, createExternalEvent(context.aggregate, EVENT_TYPES.EVIDENCE_INVALIDATED, {
+            evidenceId: candidate.evidence.evidenceId,
+            reason: "candidate measurement was invalidated after certificate creation",
+        }));
+
+        expect(decideNext(context.aggregate)).toMatchObject({
+            kind: "COMMAND",
+            command: {
+                kind: "search_candidate",
+                round: 1,
+                slotIndex: 0,
+                replacementOrdinal: 1,
+            },
+        });
+    });
+
+    it("turns a stop request into a pause instead of an impossibility certificate", () => {
+        const context = validateInvestigation(openInvestigation({
+            hypothesisTopology: "certified_impossibility",
+            workerModels: ["model-alpha"],
+            candidatesPerRound: 1,
+            maxRounds: 1,
+        }));
+        commitCandidate(context, {
+            label: "stop-before-certificate",
+            data: { pass: false },
+        });
+        append(context, createExternalEvent(context.aggregate, EVENT_TYPES.STOP_REQUESTED, {
+            requestId: "stop-certified",
+            reason: "operator requested pause",
+            pauseRequested: true,
+        }));
+        expect(decideNext(context.aggregate)).toMatchObject({
+            kind: "NON_RESULT",
+            code: NON_RESULT_CODES.INVESTIGATION_PAUSED,
+            event: { type: EVENT_TYPES.INVESTIGATION_PAUSED },
+        });
     });
 
     it("can prove a finite declared search space unreachable without a stop request", () => {

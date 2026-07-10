@@ -1,15 +1,20 @@
+import { hashCanonical } from "./canonical.mjs";
 import { commandBudget } from "./contract.mjs";
 import {
     EVENT_TYPES,
+    IMPOSSIBILITY_REQUEST_HASH_ALGORITHM,
     NON_RESULT_CODES,
 } from "./constants.mjs";
+import { impossibilitySearchEvidenceHash } from "./impossibility.mjs";
 import { DecisionError, ERROR_CODES } from "./errors.mjs";
 import { detectPlateau, buildSearchCandidateCommand } from "./strategy.mjs";
 import {
     activeCommand,
     boundedSearchExhaustion,
     currentValidationEvidence,
+    impossibilityEvidenceItems,
     latestUnhandledStopRequest,
+    latestApplicableImpossibilityEvidence,
     qualifyingCandidateEvidence,
     qualifyingCandidateEvidenceItems,
     qualifyingUnreachableEvidence,
@@ -40,6 +45,32 @@ function budgetRecommendation(aggregate, reason) {
         commandBudget: budget,
         maxRounds: aggregate.contract.maxRounds,
         sourceStopRequestSeq: null,
+    };
+    return {
+        kind: "NON_RESULT",
+        ...payload,
+        event: {
+            type: EVENT_TYPES.NON_RESULT_RECORDED,
+            payload,
+        },
+    };
+}
+
+function impossibilityNonResultRecommendation(aggregate, evidence) {
+    const observation = aggregate.observations[evidence.observationId];
+    const certificateVerdict = observation?.data?.certificateVerdict ?? "invalid";
+    const payload = {
+        code: NON_RESULT_CODES.IMPOSSIBILITY_CERTIFICATE_INCONCLUSIVE,
+        reason: certificateVerdict === "not_proven"
+            ? "The trusted impossibility verifier did not certify that the target is unreachable."
+            : "The trusted impossibility verifier produced an invalid certificate verdict.",
+        commandCount: aggregate.commandOrder.length,
+        commandBudget: commandBudget(aggregate.contract),
+        maxRounds: aggregate.contract.maxRounds,
+        sourceStopRequestSeq: null,
+        certificateVerdict,
+        evidenceId: evidence.evidenceId,
+        evidenceHash: evidence.commitEventHash,
     };
     return {
         kind: "NON_RESULT",
@@ -113,10 +144,30 @@ function unreachableRecommendation(aggregate) {
     if (evidence === null) {
         return null;
     }
+    const observation = aggregate.observations[evidence.observationId];
+    const verifierCommand = aggregate.commands[observation.commandId].command;
+    const validation = currentValidationEvidence(aggregate);
     const basis = {
         ...evidence.unreachableBasis,
         evidenceId: evidence.evidenceId,
         evidenceHash: evidence.commitEventHash,
+        evidenceClosure: {
+            validation: {
+                evidenceId: validation.evidenceId,
+                evidenceHash: validation.commitEventHash,
+            },
+            search: {
+                candidateCount: verifierCommand.request.trigger.candidateCount,
+                candidateEvidenceHash:
+                    verifierCommand.request.trigger.candidateEvidenceHash,
+            },
+            certificate: {
+                evidenceId: evidence.evidenceId,
+                evidenceHash: evidence.commitEventHash,
+                certificateArtifactHash:
+                    evidence.unreachableBasis.certificateArtifactHash,
+            },
+        },
     };
     return {
         kind: "TERMINAL",
@@ -169,6 +220,61 @@ function reserveCommandRecommendation(aggregate) {
             );
         }
     }
+    return {
+        kind: "COMMAND",
+        commandId,
+        command,
+        event: {
+            type: EVENT_TYPES.COMMAND_RESERVED,
+            payload: {
+                commandId,
+                command,
+            },
+        },
+    };
+}
+
+function buildImpossibilityVerificationCommand(aggregate, progress) {
+    const validation = currentValidationEvidence(aggregate);
+    const attemptOrdinal = impossibilityEvidenceItems(
+        aggregate,
+        { includeInvalidated: true },
+    ).length + 1;
+    const candidateEvidenceHash = impossibilitySearchEvidenceHash(progress.candidates);
+    const request = {
+        version: aggregate.contract.impossibilityPolicy.requestVersion,
+        contract: aggregate.contract,
+        contractHash: aggregate.contractHash,
+        attemptOrdinal,
+        trigger: {
+            kind: aggregate.contract.impossibilityPolicy.trigger,
+            roundsExhausted: true,
+            completedRounds: progress.completedRounds,
+            maxRounds: aggregate.contract.maxRounds,
+            candidatesPerRound: aggregate.contract.candidatesPerRound,
+            candidateCount: progress.candidates.length,
+            acceptanceSatisfiedCount: progress.candidates.filter(
+                (evidence) => evidence.acceptanceSatisfied === true,
+            ).length,
+            candidateEvidenceHash,
+            validationEvidenceId: validation.evidenceId,
+            validationEvidenceHash: validation.commitEventHash,
+        },
+    };
+    return {
+        kind: "verify_impossibility",
+        harnessId: aggregate.contract.harnessId,
+        parserVersion: aggregate.contract.parserVersion,
+        attemptOrdinal,
+        certificateVersion: aggregate.contract.impossibilityPolicy.certificateVersion,
+        request,
+        requestHash: hashCanonical(request, IMPOSSIBILITY_REQUEST_HASH_ALGORITHM),
+    };
+}
+
+function reserveImpossibilityRecommendation(aggregate, progress) {
+    const commandId = nextCommandId(aggregate);
+    const command = buildImpossibilityVerificationCommand(aggregate, progress);
     return {
         kind: "COMMAND",
         commandId,
@@ -296,6 +402,18 @@ export function decideNext(aggregate) {
     }
 
     const progress = searchProgress(aggregate);
+    const targetObserved = progress.candidates.some(
+        (evidence) => evidence.acceptanceSatisfied === true,
+    );
+    if (aggregate.contract.hypothesisTopology === "certified_impossibility"
+        && incumbent === null
+        && !targetObserved
+        && progress.roundsExhausted) {
+        const certificateEvidence = latestApplicableImpossibilityEvidence(aggregate);
+        if (certificateEvidence !== null) {
+            return impossibilityNonResultRecommendation(aggregate, certificateEvidence);
+        }
+    }
     if (budgetIsExhausted(aggregate)) {
         return incumbent === null
             ? budgetRecommendation(
@@ -307,6 +425,13 @@ export function decideNext(aggregate) {
                 commandCount: aggregate.commandOrder.length,
                 commandBudget: commandBudget(aggregate.contract),
             });
+    }
+
+    if (aggregate.contract.hypothesisTopology === "certified_impossibility"
+        && incumbent === null
+        && !targetObserved
+        && progress.roundsExhausted) {
+        return reserveImpossibilityRecommendation(aggregate, progress);
     }
 
     if (progress.roundsExhausted) {

@@ -233,6 +233,17 @@ describe("crucible API schema (single source)", () => {
             .toThrow(SchemaValidationError);
     });
 
+    it("documents and accepts the certified-impossibility verifier prerequisite", () => {
+        const parsed = crucibleStartSpec.parse(validStartArgs({
+            hypothesis_topology: "certified_impossibility",
+        }));
+        expect(parsed.hypothesis_topology).toBe("certified_impossibility");
+        const description = crucibleStartSpec.parameters.properties
+            .hypothesis_topology.description;
+        expect(description).toContain("crucible-impossibility-request.json");
+        expect(description).toContain("after validation");
+    });
+
     it("carries the acceptance_predicate object through unchanged", () => {
         const predicate = { kind: "all", predicates: [{ kind: "harness_pass" }] };
         const parsed = crucibleStartSpec.parse(validStartArgs({ acceptance_predicate: predicate }));

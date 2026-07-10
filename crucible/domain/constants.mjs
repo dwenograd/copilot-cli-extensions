@@ -7,6 +7,23 @@ export const HYPOTHESIS_TOPOLOGIES = Object.freeze([
     "certified_impossibility",
 ]);
 
+export const IMPOSSIBILITY_REQUEST_VERSION = "crucible-impossibility-request-v1";
+export const IMPOSSIBILITY_CERTIFICATE_VERSION = "crucible-impossibility-certificate-v1";
+export const IMPOSSIBILITY_REQUEST_HASH_ALGORITHM =
+    "sha256:crucible-impossibility-request-v1";
+export const IMPOSSIBILITY_SEARCH_EVIDENCE_HASH_ALGORITHM =
+    "sha256:crucible-impossibility-search-evidence-v1";
+export const IMPOSSIBILITY_VERDICTS = Object.freeze([
+    "target_unreachable",
+    "not_proven",
+    "invalid",
+]);
+export const DEFAULT_IMPOSSIBILITY_POLICY = Object.freeze({
+    trigger: "search_exhausted",
+    requestVersion: IMPOSSIBILITY_REQUEST_VERSION,
+    certificateVersion: IMPOSSIBILITY_CERTIFICATE_VERSION,
+});
+
 export const CANDIDATE_OUTCOME_CLASSES = Object.freeze([
     "accepted",
     "near_miss",
@@ -150,6 +167,7 @@ export const EVIDENCE_PURPOSES = Object.freeze([
 
 export const NON_RESULT_CODES = Object.freeze({
     BUDGET_EXHAUSTED_INCONCLUSIVE: "BUDGET_EXHAUSTED_INCONCLUSIVE",
+    IMPOSSIBILITY_CERTIFICATE_INCONCLUSIVE: "IMPOSSIBILITY_CERTIFICATE_INCONCLUSIVE",
     VALIDATION_INCONCLUSIVE: "VALIDATION_INCONCLUSIVE",
     INVESTIGATION_PAUSED: "INVESTIGATION_PAUSED",
 });

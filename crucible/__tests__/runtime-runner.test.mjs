@@ -8,6 +8,7 @@ import {
     ESCAPE_SEARCH_OPERATORS,
     createInvestigationContract,
     harnessCandidateEvidenceItems,
+    impossibilityEvidenceItems,
 } from "../domain/index.mjs";
 import {
     PARSER_VERSION,
@@ -87,6 +88,7 @@ function makeContract({
     goodSnapshot,
     badSnapshot,
     boundedCandidateIds,
+    hypothesisTopology,
     candidatesPerRound = 1,
     maxRounds = 4,
     maxCommands = 20,
@@ -106,9 +108,10 @@ function makeContract({
             { id: "known-bad", expectation: "reject", artifactHash: badSnapshot },
         ],
         harnessId: "score-harness",
-        hypothesisTopology: boundedCandidateIds === undefined
-            ? "open_generative"
-            : "finite_enumerable",
+        hypothesisTopology: hypothesisTopology
+            ?? (boundedCandidateIds === undefined
+                ? "open_generative"
+                : "finite_enumerable"),
         criticality: "high",
         policyVersion: "policy-v1",
         parserVersion: PARSER_VERSION,
@@ -187,7 +190,10 @@ class FakeWorkerPool {
     }
 }
 
-function setupInvestigation(label, contractOptions = {}, { countHarnessCalls = false } = {}) {
+function setupInvestigation(label, contractOptions = {}, {
+    countHarnessCalls = false,
+    impossibilityResult = null,
+} = {}) {
     const root = makeRoot(label);
     const stateDir = path.join(root, "state");
     const artifactRoot = path.join(root, "artifacts");
@@ -199,15 +205,27 @@ function setupInvestigation(label, contractOptions = {}, { countHarnessCalls = f
     const countHarnessCall = countHarnessCalls
         ? `fs.appendFileSync(${JSON.stringify(harnessCounterPath)}, "1\\n");`
         : "";
+    const certificateResult = impossibilityResult ?? {
+        pass: false,
+        searchSpaceExhausted: false,
+    };
     const scriptPath = writeHarnessScript(root, "score-harness", `
         ${countHarnessCall}
         const candidatePath = process.argv[2];
-        const raw = fs.readFileSync(path.join(candidatePath, "score.txt"), "utf8").trim();
-        const score = Number(raw);
-        process.stdout.write(JSON.stringify({
-            pass: Number.isFinite(score) && score >= 90,
-            metrics: raw === "omit" ? {} : { score }
-        }));
+        const impossibilityRequest = path.join(
+            candidatePath,
+            "crucible-impossibility-request.json",
+        );
+        if (fs.existsSync(impossibilityRequest)) {
+            process.stdout.write(JSON.stringify(${JSON.stringify(certificateResult)}));
+        } else {
+            const raw = fs.readFileSync(path.join(candidatePath, "score.txt"), "utf8").trim();
+            const score = Number(raw);
+            process.stdout.write(JSON.stringify({
+                pass: Number.isFinite(score) && score >= 90,
+                metrics: raw === "omit" ? {} : { score }
+            }));
+        }
     `);
     const allowlistPath = writeRuntimeAllowlist(root, "score-harness", scriptPath, {
         "known-good": goodSnapshot,
@@ -444,6 +462,175 @@ describe("Crucible autonomous runner", () => {
         ]);
         replayed.repository.close();
     }, 60_000);
+
+    it("runs the allowlisted verifier and persists a positive impossibility certificate", async () => {
+        const setup = setupInvestigation(
+            "certified-positive",
+            {
+                hypothesisTopology: "certified_impossibility",
+                candidatesPerRound: 1,
+                maxRounds: 1,
+            },
+            {
+                countHarnessCalls: true,
+                impossibilityResult: {
+                    pass: true,
+                    searchSpaceExhausted: true,
+                },
+            },
+        );
+        const pool = new FakeWorkerPool([20]);
+        const result = await runAutonomousInvestigation(
+            setup.config,
+            runnerDependencies(pool),
+        );
+        expect(result).toMatchObject({
+            kind: "TERMINAL",
+            decision: "TARGET_UNREACHABLE",
+            tempRootCleaned: true,
+        });
+        expect(pool.calls).toHaveLength(1);
+        expect(harnessCallCount(setup)).toBe(4);
+
+        const replayed = replaySetup(setup);
+        expect(replayed.aggregate.commandOrder.map((commandId) =>
+            replayed.aggregate.commands[commandId].command.kind)).toEqual([
+            "run_validation",
+            "search_candidate",
+            "verify_impossibility",
+        ]);
+        const [certificateEvidence] = impossibilityEvidenceItems(replayed.aggregate);
+        expect(certificateEvidence.unreachableBasis).toMatchObject({
+            kind: "verified_impossibility_certificate",
+            certificateVerdict: "target_unreachable",
+        });
+        expect(replayed.aggregate.terminal.basis).toMatchObject({
+            kind: "verified_impossibility_certificate",
+            certificateArtifactHash:
+                certificateEvidence.unreachableBasis.certificateArtifactHash,
+        });
+        const operational = replayed.adapter.listOperationalEvidence();
+        const certificateRow = operational.find((row) =>
+            row.kind === "runtime:impossibility_certificate");
+        expect(certificateRow?.payload).toMatchObject({
+            certificateVerdict: "target_unreachable",
+        });
+        for (const field of [
+            "certificateArtifactHash",
+            "measurementReceiptArtifactHash",
+            "measurementReceiptHash",
+            "rawStderrArtifactHash",
+            "rawStdoutArtifactHash",
+            "verificationSnapshotHash",
+        ]) {
+            expect(certificateRow.payload[field]).toMatch(
+                /^sha256:[a-z0-9][a-z0-9._-]*:[a-f0-9]{64}$/u,
+            );
+        }
+        expect(replayed.repository.getArtifact(certificateRow.payload.certificateArtifactId))
+            .toMatchObject({ durable: true, storage: "external" });
+        expect(replayed.repository.getArtifact(certificateRow.payload.rawStdoutArtifactId))
+            .toMatchObject({ durable: true, storage: "external" });
+        expect(replayed.repository.getArtifact(
+            certificateRow.payload.measurementReceiptArtifactId,
+        )).toMatchObject({ durable: true, storage: "external" });
+        replayed.repository.close();
+    }, 60_000);
+
+    it.each([
+        ["not_proven", { pass: false, searchSpaceExhausted: true }],
+        ["invalid", { pass: true, searchSpaceExhausted: false }],
+    ])("keeps a %s impossibility certificate as a non-result", async (verdict, output) => {
+        const setup = setupInvestigation(
+            `certified-${verdict}`,
+            {
+                hypothesisTopology: "certified_impossibility",
+                candidatesPerRound: 1,
+                maxRounds: 1,
+            },
+            { impossibilityResult: output },
+        );
+        const result = await runAutonomousInvestigation(
+            setup.config,
+            runnerDependencies(new FakeWorkerPool([20])),
+        );
+        expect(result).toMatchObject({
+            kind: "NON_RESULT",
+            code: "IMPOSSIBILITY_CERTIFICATE_INCONCLUSIVE",
+        });
+        const replayed = replaySetup(setup);
+        expect(replayed.aggregate.terminal).toBeNull();
+        expect(replayed.aggregate.nonResults.at(-1)).toMatchObject({
+            code: "IMPOSSIBILITY_CERTIFICATE_INCONCLUSIVE",
+            certificateVerdict: verdict,
+        });
+        expect(impossibilityEvidenceItems(replayed.aggregate)[0].unreachableBasis)
+            .toBeNull();
+        replayed.repository.close();
+    }, 60_000);
+
+    it("recovers a committed impossibility verifier effect without re-execution", async () => {
+        const setup = setupInvestigation(
+            "certified-crash-recovery",
+            {
+                hypothesisTopology: "certified_impossibility",
+                candidatesPerRound: 1,
+                maxRounds: 1,
+            },
+            {
+                countHarnessCalls: true,
+                impossibilityResult: {
+                    pass: true,
+                    searchSpaceExhausted: true,
+                },
+            },
+        );
+        let injected = false;
+        await expect(runAutonomousInvestigation(
+            setup.config,
+            runnerDependencies(new FakeWorkerPool([20]), {
+                faultInjector(point, details) {
+                    if (!injected
+                        && point === "after_effect_commit"
+                        && details.command?.kind === "impossibility-verification") {
+                        injected = true;
+                        throw new InjectedCrashError(point);
+                    }
+                },
+            }),
+        )).rejects.toMatchObject({
+            code: "CRUCIBLE_RUNTIME_INJECTED_CRASH",
+        });
+        expect(harnessCallCount(setup)).toBe(4);
+
+        const branchA = clonePersistedSetup(setup, "certified-crash-branch-a");
+        const branchB = clonePersistedSetup(setup, "certified-crash-branch-b");
+        const resultA = await runAutonomousInvestigation(
+            branchA.config,
+            runnerDependencies(new FakeWorkerPool([])),
+        );
+        const resultB = await runAutonomousInvestigation(
+            branchB.config,
+            runnerDependencies(new FakeWorkerPool([])),
+        );
+        expect(resultA).toMatchObject({
+            kind: "TERMINAL",
+            decision: "TARGET_UNREACHABLE",
+        });
+        expect(resultB).toMatchObject({
+            kind: "TERMINAL",
+            decision: "TARGET_UNREACHABLE",
+        });
+        expect(harnessCallCount(setup)).toBe(4);
+        const replayedA = replaySetup(branchA);
+        const replayedB = replaySetup(branchB);
+        expect(replayedA.aggregate.terminal.eventHash)
+            .toBe(replayedB.aggregate.terminal.eventHash);
+        expect(replayedA.aggregate.terminal.basis.certificateArtifactHash)
+            .toBe(replayedB.aggregate.terminal.basis.certificateArtifactHash);
+        replayedA.repository.close();
+        replayedB.repository.close();
+    }, 120_000);
 
     it("feeds generation-one outcomes and findings into generation two", async () => {
         const setup = setupInvestigation("prompt-context", {

@@ -67,6 +67,7 @@ function evidence({
     finding = null,
     round = 1,
     slotIndex = 0,
+    invalidated = false,
 }) {
     return {
         evidenceId,
@@ -75,7 +76,7 @@ function evidence({
         purpose: "candidate",
         round,
         slotIndex,
-        invalidated: false,
+        invalidated,
         rankable: outcomeClass !== "invalid_metrics",
         outcomeClass,
         metrics: outcomeClass === "invalid_metrics" ? {} : { score },
@@ -177,6 +178,65 @@ describe("Crucible deterministic archive and strategy", () => {
         expect(first.lessonGroups).toHaveLength(1);
     });
 
+    it("keeps one active artifact primary after the historical duplicate root is invalidated", () => {
+        const searchPolicy = policy({
+            archiveCaps: {
+                accepted: 2,
+                mechanismGroups: 8,
+            },
+        });
+        const sharedArtifact = hashCanonical({ artifact: "shared-lineage" });
+        const historicalRoot = evidence({
+            evidenceId: "historical-root",
+            committedSeq: 1,
+            score: 5,
+            outcomeClass: "accepted",
+            artifact: sharedArtifact,
+            mechanism: "mechanism-root",
+            invalidated: true,
+        });
+        const activePrimary = evidence({
+            evidenceId: "active-primary",
+            committedSeq: 2,
+            score: 20,
+            outcomeClass: "accepted",
+            artifact: sharedArtifact,
+            duplicateOf: "historical-root",
+            mechanism: "mechanism-a",
+        });
+        const activeClone = evidence({
+            evidenceId: "active-clone",
+            committedSeq: 3,
+            score: 100,
+            outcomeClass: "accepted",
+            artifact: sharedArtifact,
+            duplicateOf: "historical-root",
+            mechanism: "mechanism-b",
+        });
+        const unique = evidence({
+            evidenceId: "unique",
+            committedSeq: 4,
+            score: 10,
+            outcomeClass: "accepted",
+            artifact: hashCanonical({ artifact: "unique" }),
+            mechanism: "mechanism-c",
+        });
+        const items = [historicalRoot, activePrimary, activeClone, unique];
+
+        const first = buildCandidateArchive(aggregateFor(items, searchPolicy));
+        const replay = buildCandidateArchive(aggregateFor([...items].reverse(), searchPolicy));
+        expect(first).toEqual(replay);
+        expect(first.accepted.map((item) => item.evidenceId))
+            .toEqual(["active-primary", "unique"]);
+        expect(first.incumbent.evidenceId).toBe("active-primary");
+        expect(first.duplicateIndex[sharedArtifact]).toBe("active-primary");
+        const groupedIds = first.mechanismGroups.flatMap((group) => group.evidenceIds);
+        expect(groupedIds).toContain("active-primary");
+        expect(groupedIds).toContain("unique");
+        expect(groupedIds).not.toContain("historical-root");
+        expect(groupedIds).not.toContain("active-clone");
+    });
+
     it("uses deterministic integer/hash operator assignment and forces escape operators", () => {
         const searchPolicy = policy();
         const archive = {
@@ -240,6 +300,61 @@ describe("Crucible deterministic archive and strategy", () => {
         expect(oneParentWeights.crossover).toBe(0);
     });
 
+    it("deduplicates archive parents and excludes invalidated parents from eligibility", () => {
+        const searchPolicy = policy();
+        const sharedArtifact = hashCanonical({ artifact: "parent-lineage" });
+        const incumbent = evidence({
+            evidenceId: "active-parent",
+            committedSeq: 1,
+            score: 100,
+            outcomeClass: "accepted",
+            artifact: sharedArtifact,
+            duplicateOf: "historical-parent",
+        });
+        const clone = evidence({
+            evidenceId: "active-parent-clone",
+            committedSeq: 2,
+            score: 99,
+            outcomeClass: "accepted",
+            artifact: sharedArtifact,
+            duplicateOf: "historical-parent",
+        });
+        const invalidParent = evidence({
+            evidenceId: "invalid-parent",
+            committedSeq: 3,
+            score: 98,
+            outcomeClass: "near_miss",
+            artifact: hashCanonical({ artifact: "invalid-parent" }),
+            invalidated: true,
+        });
+        const archive = {
+            accepted: [incumbent, clone, incumbent],
+            nearMisses: [invalidParent],
+            rejected: [],
+            invalidMetrics: [],
+            mechanismGroups: [],
+            lessonGroups: [],
+            duplicateIndex: {},
+            incumbent,
+        };
+
+        const weights = adaptiveOperatorWeights(searchPolicy, archive);
+        expect(weights.refinement).toBeGreaterThan(0);
+        expect(weights.adversarial).toBeGreaterThan(0);
+        expect(weights.crossover).toBe(0);
+
+        const invalidOnlyArchive = {
+            ...archive,
+            accepted: [],
+            nearMisses: [invalidParent],
+            incumbent: invalidParent,
+        };
+        const invalidOnlyWeights = adaptiveOperatorWeights(searchPolicy, invalidOnlyArchive);
+        expect(invalidOnlyWeights.refinement).toBe(0);
+        expect(invalidOnlyWeights.crossover).toBe(0);
+        expect(invalidOnlyWeights.adversarial).toBe(0);
+    });
+
     it("assigns crossover two distinct parents and prefers different mechanisms", () => {
         const crossoverPolicy = policy({
             operatorWeights: {
@@ -281,6 +396,52 @@ describe("Crucible deterministic archive and strategy", () => {
         expect(new Set(command.parentEvidenceIds).size).toBe(2);
     });
 
+    it("prefers two represented mechanism groups even when the incumbent has none", () => {
+        const crossoverPolicy = policy({
+            operatorWeights: {
+                fresh: 1,
+                refinement: 0,
+                crossover: 1_000_000,
+                diversification: 1,
+                adversarial: 0,
+                restart: 1,
+            },
+        });
+        const incumbent = evidence({
+            evidenceId: "incumbent-without-mechanism",
+            committedSeq: 1,
+            score: 100,
+            outcomeClass: "accepted",
+            artifact: hashCanonical({ artifact: "incumbent-without-mechanism" }),
+        });
+        const nearA = evidence({
+            evidenceId: "near-a",
+            committedSeq: 2,
+            score: 99,
+            outcomeClass: "near_miss",
+            artifact: hashCanonical({ artifact: "near-a" }),
+            mechanism: "mechanism-a",
+        });
+        const nearB = evidence({
+            evidenceId: "near-b",
+            committedSeq: 3,
+            score: 98,
+            outcomeClass: "near_miss",
+            artifact: hashCanonical({ artifact: "near-b" }),
+            mechanism: "mechanism-b",
+        });
+        const aggregate = aggregateFor([incumbent, nearA, nearB], crossoverPolicy);
+        let command = null;
+        for (let round = 2; round < 100 && command?.operator !== "crossover"; round += 1) {
+            command = buildSearchCandidateCommand(aggregate, {
+                nextRound: round,
+                nextSlot: 0,
+            });
+        }
+        expect(command.operator).toBe("crossover");
+        expect(command.parentEvidenceIds).toEqual(["near-a", "near-b"]);
+    });
+
     it("falls back deterministically when crossover cannot receive two parents", () => {
         const cappedPolicy = policy({
             promptCaps: { parentEvidenceIds: 1, promptContextRefs: 2 },
@@ -317,5 +478,125 @@ describe("Crucible deterministic archive and strategy", () => {
         expect(["fresh", "diversification", "restart"]).toContain(command.operator);
         expect(command.operator).not.toBe("crossover");
         expect(command.parentEvidenceIds.length).toBeLessThanOrEqual(1);
+    });
+
+    it("replays the zero-weight fallback audit case without selecting disabled diversification", () => {
+        const fallbackPolicy = policy({
+            promptCaps: { parentEvidenceIds: 2, promptContextRefs: 2 },
+            operatorWeights: {
+                fresh: 1,
+                refinement: 0,
+                crossover: 1_000_000,
+                diversification: 0,
+                adversarial: 0,
+                restart: 1,
+            },
+        });
+        const incumbent = evidence({
+            evidenceId: "incumbent",
+            committedSeq: 1,
+            score: 100,
+            outcomeClass: "accepted",
+            artifact: hashCanonical({ artifact: "incumbent" }),
+            mechanism: "z-incumbent",
+        });
+        const acceptedSecond = evidence({
+            evidenceId: "accepted-second",
+            committedSeq: 2,
+            score: 90,
+            outcomeClass: "accepted",
+            artifact: hashCanonical({ artifact: "accepted-second" }),
+            mechanism: "z-second",
+        });
+        const rejectedContext = evidence({
+            evidenceId: "rejected-context",
+            committedSeq: 3,
+            score: 1,
+            outcomeClass: "rejected",
+            artifact: hashCanonical({ artifact: "rejected-context" }),
+            mechanism: "a-rejected",
+        });
+        const aggregate = aggregateFor(
+            [incumbent, acceptedSecond, rejectedContext],
+            fallbackPolicy,
+        );
+
+        const first = buildSearchCandidateCommand(aggregate, {
+            nextRound: 2,
+            nextSlot: 0,
+        });
+        const replay = buildSearchCandidateCommand(aggregate, {
+            nextRound: 2,
+            nextSlot: 0,
+        });
+        expect(first).toEqual(replay);
+        expect(first.promptContextRefs).toEqual(["incumbent", "rejected-context"]);
+        expect(["fresh", "restart"]).toContain(first.operator);
+        expect(fallbackPolicy.operatorWeights[first.operator]).toBeGreaterThan(0);
+        expect(first.parentEvidenceIds).toEqual([]);
+    });
+
+    it("fails deterministically rather than returning a zero-weight operator", () => {
+        const emptyArchive = {
+            accepted: [],
+            nearMisses: [],
+            rejected: [],
+            invalidMetrics: [],
+            mechanismGroups: [],
+            lessonGroups: [],
+            duplicateIndex: {},
+            incumbent: null,
+        };
+        const errorMessage = (input) => {
+            try {
+                selectAdaptiveOperator(input);
+                return null;
+            } catch (error) {
+                return `${error.name}: ${error.message}`;
+            }
+        };
+        const noOperatorsPolicy = policy({
+            operatorWeights: {
+                fresh: 0,
+                refinement: 0,
+                crossover: 0,
+                diversification: 0,
+                adversarial: 0,
+                restart: 0,
+            },
+        });
+        const normalInput = {
+            searchPolicy: noOperatorsPolicy,
+            archive: emptyArchive,
+            contractHash: hashCanonical({ contract: "no-operators" }),
+            round: 1,
+            slotIndex: 0,
+        };
+        const firstNormalError = errorMessage(normalInput);
+        expect(firstNormalError).toBe(errorMessage(normalInput));
+        expect(firstNormalError).toContain(
+            "Deterministic strategy error: no positive-weight eligible operators",
+        );
+
+        const incumbentOnlyEscapePolicy = policy({
+            operatorWeights: {
+                fresh: 1,
+                refinement: 0,
+                crossover: 0,
+                diversification: 0,
+                adversarial: 1,
+                restart: 0,
+            },
+        });
+        const escapeInput = {
+            ...normalInput,
+            searchPolicy: incumbentOnlyEscapePolicy,
+            phase: "mandatory_escape",
+        };
+        const firstEscapeError = errorMessage(escapeInput);
+        expect(firstEscapeError).toBe(errorMessage(escapeInput));
+        expect(firstEscapeError).toContain(
+            "Deterministic strategy error: no positive-weight eligible operators",
+        );
     });
 });

@@ -193,18 +193,76 @@ export function deterministicSeed(value) {
     return deterministicHashInteger(value, 0x7ffffffe) + 1;
 }
 
+function deterministicStrategyError(message) {
+    const error = new Error(`Deterministic strategy error: ${message}`);
+    error.name = "DeterministicStrategyError";
+    return error;
+}
+
+function configuredOperatorWeight(searchPolicy, operator) {
+    const weight = searchPolicy.operatorWeights[operator];
+    return Number.isSafeInteger(weight) && weight > 0 ? weight : 0;
+}
+
+function selectWeightedOperator(weights, entropy, emptyReason) {
+    const total = SEARCH_OPERATORS.reduce(
+        (sum, operator) => sum + (weights[operator] > 0 ? weights[operator] : 0),
+        0,
+    );
+    if (total < 1) {
+        throw deterministicStrategyError(emptyReason);
+    }
+    let selected = deterministicHashInteger(entropy, total);
+    for (const operator of SEARCH_OPERATORS) {
+        const weight = weights[operator] > 0 ? weights[operator] : 0;
+        if (selected < weight) {
+            return operator;
+        }
+        selected -= weight;
+    }
+    throw deterministicStrategyError("weighted operator selection exhausted unexpectedly");
+}
+
 export function adaptiveOperatorWeights(searchPolicy, archive, phase = "normal") {
     const weights = Object.fromEntries(
-        SEARCH_OPERATORS.map((operator) => [operator, searchPolicy.operatorWeights[operator]]),
+        SEARCH_OPERATORS.map((operator) => [
+            operator,
+            configuredOperatorWeight(searchPolicy, operator),
+        ]),
     );
-    const parentPool = distinctParentCandidates(archive);
+    const promptContextRefs = selectPromptEvidence(archive, searchPolicy);
+    const parentCap = searchPolicy.promptCaps.parentEvidenceIds;
+    const refinementParents = parentEvidenceIds(
+        archive,
+        promptContextRefs,
+        "refinement",
+        parentCap,
+    );
+    const crossoverParents = parentEvidenceIds(
+        archive,
+        promptContextRefs,
+        "crossover",
+        parentCap,
+    );
+    const adversarialParents = parentEvidenceIds(
+        archive,
+        promptContextRefs,
+        "adversarial",
+        parentCap,
+    );
+    const visibleIds = new Set(promptContextRefs);
+    const refinementPool = distinctParentCandidates({
+        incumbent: archive.incumbent,
+        nearMisses: archive.nearMisses,
+        accepted: [],
+    }).filter((candidate) => visibleIds.has(candidate.evidenceId));
 
-    if (parentPool.length < 1) {
+    if (refinementParents.length !== 1) {
         weights.refinement = 0;
     } else if (weights.refinement > 0) {
-        weights.refinement += archive.nearMisses.length + (archive.incumbent === null ? 0 : 1);
+        weights.refinement += refinementPool.length;
     }
-    if (parentPool.length < 2 || searchPolicy.promptCaps.parentEvidenceIds < 2) {
+    if (crossoverParents.length !== 2) {
         weights.crossover = 0;
     } else if (weights.crossover > 0) {
         weights.crossover += Math.min(archive.mechanismGroups.length, 8);
@@ -212,7 +270,7 @@ export function adaptiveOperatorWeights(searchPolicy, archive, phase = "normal")
     if (weights.diversification > 0 && archive.mechanismGroups.length < 2) {
         weights.diversification += 1;
     }
-    if (archive.incumbent === null) {
+    if (adversarialParents.length !== 1) {
         weights.adversarial = 0;
     }
     if (phase !== "normal") {
@@ -224,7 +282,7 @@ export function adaptiveOperatorWeights(searchPolicy, archive, phase = "normal")
         if (weights.restart > 0) {
             weights.restart += 1;
         }
-        if (weights.adversarial > 0 && archive.incumbent !== null) {
+        if (weights.adversarial > 0) {
             weights.adversarial += 1;
         }
         if (weights.diversification > 0 && archive.mechanismGroups.length === 0) {
@@ -247,58 +305,111 @@ export function selectAdaptiveOperator({
         && archive.nearMisses.length === 0
         && archive.accepted.length === 0
         && archive.rejected.length === 0
-        && archive.invalidMetrics.length === 0) {
+        && archive.invalidMetrics.length === 0
+        && configuredOperatorWeight(searchPolicy, "fresh") > 0) {
         return "fresh";
     }
     const weights = adaptiveOperatorWeights(searchPolicy, archive, phase);
-    const total = SEARCH_OPERATORS.reduce((sum, operator) => sum + weights[operator], 0);
-    if (total < 1) {
-        return phase === "normal" ? "fresh" : "restart";
-    }
-    let selected = deterministicHashInteger({
+    return selectWeightedOperator(weights, {
         contractHash,
         round,
         slotIndex,
         phase,
         weights,
-    }, total);
-    for (const operator of SEARCH_OPERATORS) {
-        if (selected < weights[operator]) {
-            return operator;
-        }
-        selected -= weights[operator];
-    }
-    return phase === "normal" ? "fresh" : "restart";
+    }, `no positive-weight eligible operators for phase "${phase}"`);
 }
 
 export const selectOperator = selectAdaptiveOperator;
 export const assignSearchOperator = selectAdaptiveOperator;
 
+function eligibleParentCandidate(candidate) {
+    return candidate !== null
+        && candidate !== undefined
+        && candidate.invalidated !== true
+        && typeof candidate.evidenceId === "string"
+        && candidate.evidenceId.length > 0;
+}
+
+function parentLineageRoot(candidate, candidateById) {
+    let rootId = candidate.evidenceId;
+    let duplicateOf = candidate.duplicateOf;
+    const visited = new Set([rootId]);
+    while (typeof duplicateOf === "string"
+        && duplicateOf.length > 0
+        && !visited.has(duplicateOf)) {
+        rootId = duplicateOf;
+        visited.add(duplicateOf);
+        duplicateOf = candidateById.get(duplicateOf)?.duplicateOf;
+    }
+    return rootId;
+}
+
 function distinctParentCandidates(archive) {
-    const seen = new Set();
-    return [
+    const candidateById = new Map();
+    const uniqueIds = [];
+    for (const candidate of [
         archive.incumbent,
-        ...archive.nearMisses,
-        ...archive.accepted,
-    ].filter((candidate) => {
-        if (candidate === null
-            || candidate === undefined
-            || typeof candidate.evidenceId !== "string"
-            || seen.has(candidate.evidenceId)) {
+        ...(archive.nearMisses ?? []),
+        ...(archive.accepted ?? []),
+    ]) {
+        if (!eligibleParentCandidate(candidate)
+            || candidateById.has(candidate.evidenceId)) {
+            continue;
+        }
+        candidateById.set(candidate.evidenceId, candidate);
+        uniqueIds.push(candidate);
+    }
+
+    const seenGroups = new Set();
+    return uniqueIds.filter((candidate) => {
+        const artifactHash = candidate.receipt?.candidateArtifactHash;
+        const groupKey = typeof artifactHash === "string" && artifactHash.length > 0
+            ? `artifact:${artifactHash}`
+            : `lineage:${parentLineageRoot(candidate, candidateById)}`;
+        if (seenGroups.has(groupKey)) {
             return false;
         }
-        seen.add(candidate.evidenceId);
+        seenGroups.add(groupKey);
         return true;
     });
 }
 
-function fallbackOperator(archive, phase) {
-    if (phase !== "normal") {
-        return "restart";
+function eligibleIncumbent(archive) {
+    return eligibleParentCandidate(archive.incumbent)
+        ? archive.incumbent
+        : null;
+}
+
+function mechanismGroupOf(archive, candidate) {
+    const annotation = candidate.annotations?.mechanism;
+    if (typeof annotation === "string" && annotation.length > 0) {
+        return annotation;
     }
-    return distinctParentCandidates(archive).length === 0
-        ? "fresh"
-        : "diversification";
+    for (const group of archive.mechanismGroups ?? []) {
+        if (group.representativeEvidenceId === candidate.evidenceId
+            || group.evidenceIds?.includes(candidate.evidenceId)) {
+            return typeof group.mechanism === "string" && group.mechanism.length > 0
+                ? group.mechanism
+                : null;
+        }
+    }
+    return null;
+}
+
+function preferredCrossoverParents(archive, visible) {
+    for (let firstIndex = 0; firstIndex < visible.length - 1; firstIndex += 1) {
+        const firstMechanism = mechanismGroupOf(archive, visible[firstIndex]);
+        if (firstMechanism === null) {
+            continue;
+        }
+        for (let secondIndex = firstIndex + 1; secondIndex < visible.length; secondIndex += 1) {
+            const secondMechanism = mechanismGroupOf(archive, visible[secondIndex]);
+            if (secondMechanism !== null && secondMechanism !== firstMechanism) {
+                return [visible[firstIndex], visible[secondIndex]];
+            }
+        }
+    }
+    return visible.slice(0, 2);
 }
 
 function parentEvidenceIds(archive, promptContextRefs, operator, cap) {
@@ -306,7 +417,7 @@ function parentEvidenceIds(archive, promptContextRefs, operator, cap) {
         return [];
     }
     if (operator === "adversarial") {
-        const incumbentId = archive.incumbent?.evidenceId ?? null;
+        const incumbentId = eligibleIncumbent(archive)?.evidenceId ?? null;
         return incumbentId !== null && cap >= 1 && promptContextRefs.includes(incumbentId)
             ? [incumbentId]
             : [];
@@ -319,16 +430,65 @@ function parentEvidenceIds(archive, promptContextRefs, operator, cap) {
     if (visible.length < 2 || cap < 2) {
         return [];
     }
-    const first = visible[0];
-    const firstMechanism = first.annotations?.mechanism ?? null;
-    const second = visible.find((candidate, index) =>
-        index > 0
-        && firstMechanism !== null
-        && candidate.annotations?.mechanism !== null
-        && candidate.annotations?.mechanism !== undefined
-        && candidate.annotations.mechanism !== firstMechanism)
-        ?? visible[1];
-    return [first.evidenceId, second.evidenceId];
+    return preferredCrossoverParents(archive, visible)
+        .map((candidate) => candidate.evidenceId);
+}
+
+function parentRequirementSatisfied(archive, operator, parents) {
+    if (operator === "adversarial") {
+        const incumbentId = eligibleIncumbent(archive)?.evidenceId ?? null;
+        return parents.length === 1 && parents[0] === incumbentId;
+    }
+    if (operator === "refinement") {
+        return parents.length === 1;
+    }
+    if (operator === "crossover") {
+        return parents.length === 2 && new Set(parents).size === 2;
+    }
+    return true;
+}
+
+function fallbackOperator({
+    searchPolicy,
+    archive,
+    promptContextRefs,
+    contractHash,
+    round,
+    slotIndex,
+    phase,
+    failedOperator,
+}) {
+    const weights = { ...adaptiveOperatorWeights(searchPolicy, archive, phase) };
+    weights[failedOperator] = 0;
+    for (const operator of SEARCH_OPERATORS) {
+        const parents = parentEvidenceIds(
+            archive,
+            promptContextRefs,
+            operator,
+            searchPolicy.promptCaps.parentEvidenceIds,
+        );
+        if (!parentRequirementSatisfied(archive, operator, parents)) {
+            weights[operator] = 0;
+        }
+    }
+
+    const preferredFallbacks = phase === "normal"
+        ? ["fresh", "restart"]
+        : ["restart"];
+    for (const operator of preferredFallbacks) {
+        if (weights[operator] > 0) {
+            return operator;
+        }
+    }
+    return selectWeightedOperator(weights, {
+        contractHash,
+        round,
+        slotIndex,
+        phase,
+        failedOperator,
+        promptContextRefs,
+        weights,
+    }, `no positive-weight eligible fallback after "${failedOperator}" for phase "${phase}"`);
 }
 
 function generatedCandidateId(round, slotIndex, replacementOrdinal = 0) {
@@ -372,28 +532,40 @@ export function buildSearchCandidateCommand(aggregate, progress) {
         phase: plateau.phase,
     });
     const promptContextRefs = selectPromptEvidence(archive, policy);
-    const parents = parentEvidenceIds(
+    let parents = parentEvidenceIds(
         archive,
         promptContextRefs,
         operator,
         policy.promptCaps.parentEvidenceIds,
     );
-    const parentEligible = operator === "crossover"
-        ? parents.length === 2 && parents[0] !== parents[1]
-        : operator === "refinement" || operator === "adversarial"
-            ? parents.length === 1
-            : true;
-    if (!parentEligible) {
-        operator = fallbackOperator(archive, plateau.phase);
-    }
-    const eligibleParents = parentEligible
-        ? parents
-        : parentEvidenceIds(
+    if (!parentRequirementSatisfied(archive, operator, parents)) {
+        operator = fallbackOperator({
+            searchPolicy: policy,
+            archive,
+            promptContextRefs,
+            contractHash: aggregate.contractHash,
+            round,
+            slotIndex,
+            phase: plateau.phase,
+            failedOperator: operator,
+        });
+        parents = parentEvidenceIds(
             archive,
             promptContextRefs,
             operator,
             policy.promptCaps.parentEvidenceIds,
         );
+    }
+    if (configuredOperatorWeight(policy, operator) < 1) {
+        throw deterministicStrategyError(
+            `selected operator "${operator}" has zero configured weight`,
+        );
+    }
+    if (!parentRequirementSatisfied(archive, operator, parents)) {
+        throw deterministicStrategyError(
+            `operator "${operator}" lacks eligible parent evidence`,
+        );
+    }
     const seed = deterministicSeed({
         contractHash: aggregate.contractHash,
         round,
@@ -401,7 +573,7 @@ export function buildSearchCandidateCommand(aggregate, progress) {
         candidateId,
         model,
         operator,
-        parentEvidenceIds: eligibleParents,
+        parentEvidenceIds: parents,
         promptContextRefs,
         replacementOrdinal: replacement,
     });
@@ -413,7 +585,7 @@ export function buildSearchCandidateCommand(aggregate, progress) {
         candidateId,
         model,
         operator,
-        parentEvidenceIds: eligibleParents,
+        parentEvidenceIds: parents,
         promptContextRefs,
         seed,
         replacementOrdinal: replacement,

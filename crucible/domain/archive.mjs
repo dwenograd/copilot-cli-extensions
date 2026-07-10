@@ -125,7 +125,7 @@ function artifactHashOf(evidence) {
 export function buildDuplicateIndex(candidateEvidence, cap = Number.MAX_SAFE_INTEGER) {
     const index = {};
     let size = 0;
-    const ordered = [...candidateEvidence].sort(evidenceOrder);
+    const ordered = selectPrimaryEvidence(candidateEvidence);
     for (const evidence of ordered) {
         const artifactHash = artifactHashOf(evidence);
         if (artifactHash === null || Object.hasOwn(index, artifactHash)) {
@@ -150,20 +150,46 @@ export function duplicateEvidenceId(candidateEvidence, candidateArtifactHash) {
 }
 
 export function selectIncumbent(contract, candidateEvidence) {
-    return selectPrimaryEvidence(candidateEvidence
+    return selectPrimaryEvidence(candidateEvidence)
         .filter((evidence) =>
-            !evidence.invalidated
-            && evidence.rankable === true
-            && evidence.outcomeClass === "accepted"))
+            evidence.rankable === true
+            && evidence.outcomeClass === "accepted")
         .sort((left, right) => compareCandidateEvidence(contract.metrics, left, right))[0] ?? null;
 }
 
+function duplicateLineageRoot(evidence, evidenceById) {
+    let rootId = evidence.evidenceId;
+    let duplicateOf = evidence.duplicateOf;
+    const visited = new Set([rootId]);
+    while (typeof duplicateOf === "string"
+        && duplicateOf.length > 0
+        && !visited.has(duplicateOf)) {
+        rootId = duplicateOf;
+        visited.add(duplicateOf);
+        duplicateOf = evidenceById.get(duplicateOf)?.duplicateOf;
+    }
+    return rootId;
+}
+
 function selectPrimaryEvidence(candidates) {
-    const activeIds = new Set(candidates.map((candidate) => candidate.evidenceId));
-    return candidates.filter((candidate) =>
-        candidate.duplicateOf === null
-        || candidate.duplicateOf === undefined
-        || !activeIds.has(candidate.duplicateOf));
+    const ordered = [...candidates]
+        .filter((candidate) => !candidate.invalidated)
+        .sort(evidenceOrder);
+    const evidenceById = new Map(
+        ordered.map((candidate) => [candidate.evidenceId, candidate]),
+    );
+    const seenGroups = new Set();
+    return ordered.filter((candidate) => {
+        const artifactHash = artifactHashOf(candidate);
+        const groupKey = artifactHash === null
+            ? `lineage:${duplicateLineageRoot(candidate, evidenceById)}`
+            : `artifact:${artifactHash}`;
+        if (seenGroups.has(groupKey)) {
+            return false;
+        }
+        seenGroups.add(groupKey);
+        return true;
+    });
 }
 
 function groupAnnotations(candidates, field, outputField, cap, memberCap) {
@@ -197,8 +223,7 @@ export function buildCandidateArchive(aggregate) {
         .filter((evidence) =>
             evidence.sourceKind === "harness"
             && evidence.purpose === "candidate");
-    const candidates = allCandidates.filter((evidence) => !evidence.invalidated);
-    const primary = selectPrimaryEvidence(candidates);
+    const primary = selectPrimaryEvidence(allCandidates);
     const comparator = (left, right) =>
         compareCandidateEvidence(contract.metrics, left, right);
     const accepted = boundedSelect(
@@ -241,8 +266,8 @@ export function buildCandidateArchive(aggregate) {
             caps.lessonGroups,
             caps.rejected,
         ),
-        duplicateIndex: buildDuplicateIndex(allCandidates, caps.duplicateIndex),
-        incumbent: selectIncumbent(contract, candidates),
+        duplicateIndex: buildDuplicateIndex(primary, caps.duplicateIndex),
+        incumbent: selectIncumbent(contract, primary),
     });
 }
 

@@ -5,6 +5,7 @@ import {
     immutableCanonical,
 } from "./canonical.mjs";
 import {
+    DEFAULT_IMPOSSIBILITY_POLICY,
     DEFAULT_SEARCH_POLICY,
     ESCAPE_SEARCH_OPERATORS,
     HYPOTHESIS_TOPOLOGIES,
@@ -510,6 +511,31 @@ function normalizeSearch(search, topology) {
     return normalized;
 }
 
+function normalizeImpossibilityPolicy(input, topology) {
+    if (topology !== "certified_impossibility") {
+        if (input !== undefined && input !== null) {
+            throw new ContractError(
+                "impossibilityPolicy is only valid for certified_impossibility topology",
+            );
+        }
+        return null;
+    }
+    const policy = input ?? DEFAULT_IMPOSSIBILITY_POLICY;
+    requireExactObjectKeys(
+        policy,
+        "impossibilityPolicy",
+        ["certificateVersion", "requestVersion", "trigger"],
+    );
+    if (policy.trigger !== DEFAULT_IMPOSSIBILITY_POLICY.trigger
+        || policy.requestVersion !== DEFAULT_IMPOSSIBILITY_POLICY.requestVersion
+        || policy.certificateVersion !== DEFAULT_IMPOSSIBILITY_POLICY.certificateVersion) {
+        throw new ContractError(
+            "impossibilityPolicy must use the canonical certified-impossibility policy",
+        );
+    }
+    return immutableCanonical(policy);
+}
+
 export function createSearchPolicy(input) {
     requireExactObjectKeys(input, "searchPolicy", SEARCH_POLICY_KEYS);
     if (typeof input.stopOnFirstAccept !== "boolean") {
@@ -691,6 +717,10 @@ export function createInvestigationContract(input) {
     }
 
     const search = normalizeSearch(input.search ?? input, input.hypothesisTopology);
+    const impossibilityPolicy = normalizeImpossibilityPolicy(
+        input.impossibilityPolicy,
+        input.hypothesisTopology,
+    );
     const contract = {
         objective,
         acceptancePredicate: normalizePredicate(input.acceptancePredicate),
@@ -708,6 +738,7 @@ export function createInvestigationContract(input) {
             : { boundedCandidateIds: search.boundedCandidateIds }),
         metrics: normalizeMetrics(input.metrics),
         searchPolicy,
+        ...(impossibilityPolicy === null ? {} : { impossibilityPolicy }),
         declaredLimits: normalizeDeclaredLimits(input.declaredLimits),
     };
 

@@ -1,12 +1,43 @@
-import { immutableCanonical } from "./canonical.mjs";
+import {
+    canonicalClone,
+    deepFreeze,
+    immutableCanonical,
+} from "./canonical.mjs";
 import {
     compareCandidateEvidence,
     selectIncumbent,
 } from "./archive.mjs";
 import { DOMAIN_VERSION } from "./constants.mjs";
+import { impossibilitySearchEvidenceHash } from "./impossibility.mjs";
+
+const AGGREGATE_MAP_FIELDS = Object.freeze([
+    "capabilityEpochs",
+    "commands",
+    "observations",
+    "evidence",
+]);
+
+function ownEntry(record, key) {
+    return Object.hasOwn(record, key) ? record[key] : null;
+}
+
+function restorePrototypeSafeMaps(aggregate) {
+    for (const field of AGGREGATE_MAP_FIELDS) {
+        aggregate[field] = Object.assign(Object.create(null), aggregate[field]);
+    }
+    return aggregate;
+}
+
+export function cloneAggregateForMutation(aggregate) {
+    return restorePrototypeSafeMaps(canonicalClone(aggregate));
+}
+
+export function immutableAggregate(aggregate) {
+    return deepFreeze(cloneAggregateForMutation(aggregate));
+}
 
 export function createInitialAggregate() {
-    return immutableCanonical({
+    return immutableAggregate({
         domainVersion: DOMAIN_VERSION,
         status: "empty",
         contract: null,
@@ -42,7 +73,7 @@ export function currentValidationEvidence(aggregate) {
     if (evidenceId === null) {
         return null;
     }
-    const evidence = aggregate.evidence[evidenceId] ?? null;
+    const evidence = ownEntry(aggregate.evidence, evidenceId);
     if (evidence === null || evidence.invalidated || evidence.validationSatisfied !== true) {
         return null;
     }
@@ -51,7 +82,10 @@ export function currentValidationEvidence(aggregate) {
 
 export function qualifyingValidationEvidence(aggregate) {
     for (const evidenceId of aggregate.evidenceOrder) {
-        const evidence = aggregate.evidence[evidenceId];
+        const evidence = ownEntry(aggregate.evidence, evidenceId);
+        if (evidence === null) {
+            continue;
+        }
         if (!evidence.invalidated
             && evidence.sourceKind === "harness"
             && evidence.purpose === "validation"
@@ -64,7 +98,10 @@ export function qualifyingValidationEvidence(aggregate) {
 
 export function activeCommand(aggregate) {
     for (let index = aggregate.commandOrder.length - 1; index >= 0; index -= 1) {
-        const command = aggregate.commands[aggregate.commandOrder[index]];
+        const command = ownEntry(aggregate.commands, aggregate.commandOrder[index]);
+        if (command === null) {
+            continue;
+        }
         if (command.status !== "observed") {
             return command;
         }
@@ -74,7 +111,10 @@ export function activeCommand(aggregate) {
 
 export function uncommittedObservation(aggregate) {
     for (const observationId of aggregate.observationOrder) {
-        const observation = aggregate.observations[observationId];
+        const observation = ownEntry(aggregate.observations, observationId);
+        if (observation === null) {
+            continue;
+        }
         if (observation.evidenceId === null) {
             return observation;
         }
@@ -96,11 +136,59 @@ export function qualifyingCandidateEvidenceItems(aggregate) {
 
 export function harnessCandidateEvidenceItems(aggregate, { includeInvalidated = false } = {}) {
     return aggregate.evidenceOrder
-        .map((evidenceId) => aggregate.evidence[evidenceId])
+        .map((evidenceId) => ownEntry(aggregate.evidence, evidenceId))
         .filter((evidence) =>
-            evidence.sourceKind === "harness"
+            evidence !== null
+            && evidence.sourceKind === "harness"
             && evidence.purpose === "candidate"
             && (includeInvalidated || !evidence.invalidated));
+}
+
+export function impossibilityEvidenceItems(aggregate, { includeInvalidated = false } = {}) {
+    return aggregate.evidenceOrder
+        .map((evidenceId) => ownEntry(aggregate.evidence, evidenceId))
+        .filter((evidence) =>
+            evidence !== null
+            && evidence.sourceKind === "harness"
+            && evidence.purpose === "impossibility"
+            && (includeInvalidated || !evidence.invalidated));
+}
+
+export function latestImpossibilityEvidence(aggregate, options = {}) {
+    return impossibilityEvidenceItems(aggregate, options).at(-1) ?? null;
+}
+
+function impossibilityEvidenceMatchesCurrentTrigger(aggregate, evidence) {
+    const observation = ownEntry(aggregate.observations, evidence.observationId);
+    const command = observation === null
+        ? null
+        : ownEntry(aggregate.commands, observation.commandId)?.command ?? null;
+    const validation = currentValidationEvidence(aggregate);
+    const progress = searchProgress(aggregate);
+    const trigger = command?.request?.trigger ?? null;
+    return command?.kind === "verify_impossibility"
+        && validation !== null
+        && progress.roundsExhausted
+        && trigger?.kind === aggregate.contract.impossibilityPolicy?.trigger
+        && trigger.roundsExhausted === true
+        && trigger.completedRounds === progress.completedRounds
+        && trigger.maxRounds === aggregate.contract.maxRounds
+        && trigger.candidatesPerRound === aggregate.contract.candidatesPerRound
+        && trigger.candidateCount === progress.candidates.length
+        && trigger.acceptanceSatisfiedCount === progress.candidates.filter(
+            (candidate) => candidate.acceptanceSatisfied === true,
+        ).length
+        && trigger.acceptanceSatisfiedCount === 0
+        && trigger.candidateEvidenceHash
+            === impossibilitySearchEvidenceHash(progress.candidates)
+        && trigger.validationEvidenceId === validation.evidenceId
+        && trigger.validationEvidenceHash === validation.commitEventHash;
+}
+
+export function latestApplicableImpossibilityEvidence(aggregate) {
+    return impossibilityEvidenceItems(aggregate)
+        .filter((evidence) => impossibilityEvidenceMatchesCurrentTrigger(aggregate, evidence))
+        .at(-1) ?? null;
 }
 
 export function searchProgress(aggregate) {
@@ -205,7 +293,7 @@ export function boundedSearchExhaustion(aggregate) {
     const progress = searchProgress(aggregate);
     if (!progress.boundedComplete
         || progress.candidates.some((evidence) =>
-            evidence.rankable === true && evidence.outcomeClass === "accepted")) {
+            evidence.acceptanceSatisfied === true)) {
         return null;
     }
     const byCandidateId = new Map(
@@ -228,16 +316,8 @@ export function boundedSearchExhaustion(aggregate) {
 }
 
 export function qualifyingUnreachableEvidence(aggregate) {
-    for (const evidenceId of aggregate.evidenceOrder) {
-        const evidence = aggregate.evidence[evidenceId];
-        if (!evidence.invalidated
-            && evidence.sourceKind === "harness"
-            && evidence.purpose === "impossibility"
-            && evidence.unreachableBasis !== null) {
-            return evidence;
-        }
-    }
-    return null;
+    const evidence = latestApplicableImpossibilityEvidence(aggregate);
+    return evidence?.unreachableBasis === null ? null : evidence;
 }
 
 export function latestUnhandledStopRequest(aggregate) {

@@ -479,7 +479,8 @@ export const crucibleStartSpec = defineTool({
             description: "Acceptance-predicate grammar object (harness_pass / metric_compare / field_equals / all / any / not ...). Validated by the domain contract.",
         }),
         hypothesis_topology: enumField(HYPOTHESIS_TOPOLOGIES, {
-            description: "Search topology: finite_enumerable, bounded_parameterized, open_generative, or certified_impossibility.",
+            description:
+                "Search topology. finite_enumerable/bounded_parameterized require bounded_candidate_ids for exhaustive TARGET_UNREACHABLE. open_generative can never emit TARGET_UNREACHABLE. certified_impossibility runs the same allowlisted harness in verifier mode only after validation and every frozen search slot complete without an accepted candidate; the harness must recognize crucible-impossibility-request.json and return a certificate verdict.",
         }),
         validation_cases: array(
             object({
@@ -526,7 +527,8 @@ export const crucibleStartSpec = defineTool({
             maximum: 8,
         }),
         max_rounds: integer({
-            description: "Maximum number of frozen search rounds (>= 1).",
+            description:
+                "Maximum number of frozen search rounds (>= 1). For certified_impossibility, verification is eligible only after all slots in these rounds have qualifying non-invalidated candidate evidence.",
             minimum: 1,
             maximum: 100000,
         }),

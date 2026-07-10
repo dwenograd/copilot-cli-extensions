@@ -101,6 +101,29 @@ Validation runs use the same `pass` field against frozen accept/reject cases.
 Optional fields are `validationCases`, `searchSpaceExhausted`, and
 `impossibilityCertificateHash`.
 
+For `hypothesisTopology: "certified_impossibility"`, the same allowlisted
+harness must also support verifier mode. After validation and every frozen
+search slot complete without an accepted candidate, the kernel reserves a
+single `verify_impossibility` command. The runner materializes a snapshot whose
+root contains `crucible-impossibility-request.json`; the harness must inspect
+that request and emit:
+
+```json
+{
+  "pass": true,
+  "searchSpaceExhausted": true
+}
+```
+
+Only that exact positive combination parses to the certificate verdict
+`target_unreachable`. `pass: false` is `not_proven`; `pass: true` without
+`searchSpaceExhausted: true` is `invalid`. Both are persisted non-results. The
+runtime captures and persists the exact stdout/stderr bytes, full measurement
+receipt, canonical certificate, and verification-request snapshot. The domain
+accepts only their algorithm-tagged hashes from the fenced trusted-harness
+observation; a candidate/model claim or the optional
+`impossibilityCertificateHash` output field cannot establish unreachability.
+
 **Every candidate produces evidence.** The kernel commits a candidate evidence
 record for every observed candidate slot and classifies it as one of
 `accepted`, `near_miss`, `rejected`, or `invalid_metrics`; nothing is silently
@@ -278,6 +301,12 @@ novelty during those rounds counts as breaking the plateau. Open-generative
 investigations are never declared `TARGET_UNREACHABLE`; a finite/bounded search
 space that is fully evaluated without acceptance terminates
 `TARGET_UNREACHABLE` with a `search_space_exhausted` evidence closure.
+`certified_impossibility` is distinct: it freezes an `impossibilityPolicy`
+(`search_exhausted` trigger plus request/certificate schema versions), completes
+the ordinary search first, then runs the kernel-reserved allowlisted verifier.
+Only non-invalidated evidence with verdict `target_unreachable` yields
+`TARGET_UNREACHABLE`; negative/invalid certificates are non-results, invalidated
+certificates are retried deterministically, and stop requests remain pauses.
 
 ## Domain v2 is a hard cutover
 

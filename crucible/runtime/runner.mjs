@@ -1,16 +1,19 @@
 import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
+import { PassThrough } from "node:stream";
 
 import {
     ANNOTATION_LIMITS,
     EVENT_TYPES,
+    IMPOSSIBILITY_REQUEST_HASH_ALGORITHM,
     NON_RESULT_CODES,
     buildCandidateArchive,
     canonicalEqual,
     canonicalJson,
     createExternalEvent,
     decideNext,
+    deriveImpossibilityVerdict,
     detectPlateau,
     duplicateEvidenceId,
     hashCanonical,
@@ -22,9 +25,12 @@ import {
 } from "../persistence/index.mjs";
 import {
     PARSER_VERSION,
+    STREAM_HASH_ALGORITHM,
     createMeasurementExecutor,
+    createDefaultProcessAdapter,
     hashReceipt,
     loadHarnessAllowlist,
+    sha256Bytes,
 } from "../measurement/index.mjs";
 import { normalizeRunnerConfig } from "./config.mjs";
 import { createDomainRepositoryAdapter, formatAttemptCommand } from "./domain-adapter.mjs";
@@ -49,11 +55,21 @@ import {
     removeTreeInside,
     sha256Hex,
     snapshotObjectHex,
+    taggedHash,
 } from "./utils.mjs";
 
 const VALIDATION_RECEIPT_HASH_ALGORITHM = "sha256:crucible-runtime-validation-receipts-v1";
 const OBSERVATION_STREAM_HASH_ALGORITHM = "sha256:crucible-runtime-observation-streams-v1";
 const LOGICAL_EFFECT_KEY_ALGORITHM = "sha256:crucible-runtime-logical-effect-v1";
+const IMPOSSIBILITY_CERTIFICATE_ARTIFACT_HASH_ALGORITHM =
+    "sha256:crucible-impossibility-certificate-artifact-v1";
+const IMPOSSIBILITY_RECEIPT_ARTIFACT_HASH_ALGORITHM =
+    "sha256:crucible-impossibility-receipt-artifact-v1";
+const IMPOSSIBILITY_STDOUT_ARTIFACT_HASH_ALGORITHM =
+    "sha256:crucible-impossibility-stdout-artifact-v1";
+const IMPOSSIBILITY_STDERR_ARTIFACT_HASH_ALGORITHM =
+    "sha256:crucible-impossibility-stderr-artifact-v1";
+const IMPOSSIBILITY_REQUEST_FILENAME = "crucible-impossibility-request.json";
 
 function defaultClock() {
     return {
@@ -92,6 +108,55 @@ function uniqueNonexistentPath(root, prefix, idFactory) {
         "Unable to allocate a unique temporary path",
         { root, prefix },
     );
+}
+
+function createOutputCapturingProcessAdapter(baseAdapter, captures) {
+    if (baseAdapter === null
+        || typeof baseAdapter !== "object"
+        || typeof baseAdapter.spawn !== "function"
+        || typeof baseAdapter.terminateTree !== "function") {
+        throw new RuntimeConfigError(
+            "processAdapter must expose spawn() and terminateTree()",
+        );
+    }
+    return Object.freeze({
+        spawn(executable, argv, options) {
+            const child = baseAdapter.spawn(executable, argv, options);
+            const attemptId = options?.env?.CRUCIBLE_ATTEMPT_ID;
+            if (typeof attemptId !== "string" || attemptId.length === 0) {
+                return child;
+            }
+            const capture = { stdout: [], stderr: [] };
+            captures.set(attemptId, capture);
+            const tee = (stream, sink) => {
+                if (stream === null || stream === undefined) return stream;
+                const pass = new PassThrough();
+                stream.on("data", (chunk) => {
+                    sink.push(Buffer.isBuffer(chunk) ? Buffer.from(chunk) : Buffer.from(chunk));
+                });
+                stream.on("error", (error) => pass.destroy(error));
+                stream.pipe(pass);
+                return pass;
+            };
+            const proxy = {
+                pid: child.pid,
+                stdout: tee(child.stdout, capture.stdout),
+                stderr: tee(child.stderr, capture.stderr),
+                on(eventName, listener) {
+                    child.on(eventName, listener);
+                    return proxy;
+                },
+                once(eventName, listener) {
+                    child.once(eventName, listener);
+                    return proxy;
+                },
+            };
+            return proxy;
+        },
+        terminateTree(pid) {
+            return baseAdapter.terminateTree(pid);
+        },
+    });
 }
 
 function terminalResult(aggregate) {
@@ -208,6 +273,7 @@ export class AutonomousRunner {
     #runTempRoot = null;
     #attemptCounter = 0;
     #workerAssignments = new Map();
+    #capturedOutputs = new Map();
     #clock;
 
     constructor(config, dependencies = {}) {
@@ -319,11 +385,17 @@ export class AutonomousRunner {
         this.#validateHarnessContract(opened.aggregate.contract);
         this.#recordCapabilityEpoch(opened.aggregate);
 
+        const baseProcessAdapter = this.#dependencies.processAdapter
+            ?? createDefaultProcessAdapter();
+        const processAdapter = createOutputCapturingProcessAdapter(
+            baseProcessAdapter,
+            this.#capturedOutputs,
+        );
         this.#executor = this.#dependencies.executor
             ?? (this.#dependencies.executorFactory ?? createMeasurementExecutor)({
                 allowlist: this.#allowlist,
                 sandboxProvider: this.#dependencies.sandboxProvider ?? null,
-                processAdapter: this.#dependencies.processAdapter,
+                processAdapter,
                 clock: this.#clock,
                 scratchRoot: this.#runTempRoot,
             });
@@ -353,6 +425,9 @@ export class AutonomousRunner {
             `harness:${aggregate.contract.harnessId}`,
             `parser:${aggregate.contract.parserVersion}`,
             `allowlist:${this.#allowlist.contentHash}`,
+            ...(aggregate.contract.hypothesisTopology === "certified_impossibility"
+                ? [`impossibility-verifier:${aggregate.contract.harnessId}`]
+                : []),
             ...aggregate.contract.workerModels.map((model) => `model:${model}`),
         ].sort();
         this.#adapter.appendFromFactory((current) => {
@@ -468,6 +543,46 @@ export class AutonomousRunner {
         return this.#config.deadlineMs !== null && this.#clock.now() >= this.#config.deadlineMs;
     }
 
+    #takeCapturedOutput(attemptId, measurement) {
+        const captured = this.#capturedOutputs.get(attemptId) ?? null;
+        this.#capturedOutputs.delete(attemptId);
+        const stdout = captured === null
+            ? measurement?.rawStdoutBytes ?? null
+            : Buffer.concat(captured.stdout);
+        const stderr = captured === null
+            ? measurement?.rawStderrBytes ?? null
+            : Buffer.concat(captured.stderr);
+        if (!Buffer.isBuffer(stdout) || !Buffer.isBuffer(stderr)) {
+            return null;
+        }
+        if (sha256Bytes(stdout, STREAM_HASH_ALGORITHM) !== measurement.stdoutHash
+            || sha256Bytes(stderr, STREAM_HASH_ALGORITHM) !== measurement.stderrHash) {
+            throw new RuntimeIntegrityError(
+                "Captured harness output does not match the trusted measurement receipt",
+                { attemptId },
+            );
+        }
+        return { stdout, stderr };
+    }
+
+    async #runHarnessMeasurement(input, { requireRawOutput = false } = {}) {
+        let measurement;
+        try {
+            measurement = await this.#executor.run(input);
+        } catch (error) {
+            this.#capturedOutputs.delete(input.attemptId);
+            throw error;
+        }
+        const rawOutput = this.#takeCapturedOutput(input.attemptId, measurement);
+        if (requireRawOutput && rawOutput === null) {
+            throw new RuntimeIntegrityError(
+                "The impossibility verifier completed without capturable raw output",
+                { attemptId: input.attemptId },
+            );
+        }
+        return { measurement, rawOutput };
+    }
+
     async #runLoop() {
         for (let iteration = 0; iteration < this.#config.options.maxLoopIterations; iteration += 1) {
             const { aggregate } = this.#adapter.replay();
@@ -574,6 +689,13 @@ export class AutonomousRunner {
             );
         } else if (commandRecord.command.kind === "search_candidate") {
             observation = await this.#runSearchCandidateCommand(
+                currentAggregate,
+                commandId,
+                mainAttemptId,
+                commandRecord.command,
+            );
+        } else if (commandRecord.command.kind === "verify_impossibility") {
+            observation = await this.#runImpossibilityVerificationCommand(
                 currentAggregate,
                 commandId,
                 mainAttemptId,
@@ -811,6 +933,27 @@ export class AutonomousRunner {
     }
 
     #readRegisteredJsonArtifact(artifactId, label) {
+        const bytes = this.#readRegisteredBytesArtifact(artifactId, label);
+        let value;
+        try {
+            value = JSON.parse(bytes.toString("utf8"));
+        } catch (error) {
+            throw new RuntimeIntegrityError(
+                `${label} artifact is not valid JSON`,
+                { artifactId },
+                { cause: error },
+            );
+        }
+        if (!Buffer.from(canonicalJson(value), "utf8").equals(bytes)) {
+            throw new RuntimeIntegrityError(
+                `${label} artifact is not in canonical persisted form`,
+                { artifactId },
+            );
+        }
+        return value;
+    }
+
+    #readRegisteredBytesArtifact(artifactId, label) {
         const artifact = this.#repository.getArtifact(artifactId);
         if (artifact === null
             || artifact.investigationId !== this.#config.investigationId
@@ -844,23 +987,7 @@ export class AutonomousRunner {
                 },
             );
         }
-        let value;
-        try {
-            value = JSON.parse(bytes.toString("utf8"));
-        } catch (error) {
-            throw new RuntimeIntegrityError(
-                `${label} artifact is not valid JSON`,
-                { artifactId },
-                { cause: error },
-            );
-        }
-        if (!Buffer.from(canonicalJson(value), "utf8").equals(bytes)) {
-            throw new RuntimeIntegrityError(
-                `${label} artifact is not in canonical persisted form`,
-                { artifactId },
-            );
-        }
-        return value;
+        return bytes;
     }
 
     #recoverProposalEffect({
@@ -1019,6 +1146,84 @@ export class AutonomousRunner {
         };
     }
 
+    #recoverImpossibilityVerification({
+        committed,
+        logicalEffectKey,
+        aggregate,
+        commandId,
+        command,
+        snapshotId,
+    }) {
+        const measurement = this.#recoverMeasurementEffect({
+            committed,
+            logicalEffectKey,
+            aggregate,
+            purpose: "impossibility",
+            commandId,
+            candidateId: `impossibility-${command.attemptOrdinal}`,
+            snapshotId,
+        });
+        const measurementEvent = this.#requireRecoveredEffectEvent(
+            committed,
+            "runtime:measurement",
+            logicalEffectKey,
+        );
+        const certificateEvent = this.#requireRecoveredEffectEvent(
+            committed,
+            "runtime:impossibility_certificate",
+            logicalEffectKey,
+        );
+        const payload = certificateEvent.payload;
+        if (payload.commandId !== commandId
+            || payload.attemptOrdinal !== command.attemptOrdinal
+            || payload.requestHash !== command.requestHash
+            || payload.snapshotId !== snapshotId
+            || payload.verificationSnapshotHash !== measurementSnapshotHash(snapshotId)
+            || payload.measurementReceiptArtifactId
+                !== measurementEvent.payload.receiptArtifactId) {
+            throw new RuntimeIntegrityError(
+                "Committed impossibility certificate does not match the reserved verifier command",
+                { logicalEffectKey, attemptId: committed.attempt.attemptId },
+            );
+        }
+        const rawStdoutBytes = this.#readRegisteredBytesArtifact(
+            payload.rawStdoutArtifactId,
+            "Committed impossibility stdout",
+        );
+        const rawStderrBytes = this.#readRegisteredBytesArtifact(
+            payload.rawStderrArtifactId,
+            "Committed impossibility stderr",
+        );
+        const rebuilt = this.#buildImpossibilityVerificationResult({
+            aggregate,
+            command,
+            snapshotId,
+            measurement,
+            rawOutput: {
+                stdout: rawStdoutBytes,
+                stderr: rawStderrBytes,
+            },
+        });
+        const persistedCertificate = this.#readRegisteredJsonArtifact(
+            payload.certificateArtifactId,
+            "Committed impossibility certificate",
+        );
+        if (!canonicalEqual(persistedCertificate, rebuilt.certificate)
+            || payload.certificateArtifactHash !== rebuilt.certificateArtifactHash
+            || payload.certificateVerdict !== rebuilt.certificateVerdict
+            || payload.measurementReceiptHash !== rebuilt.measurementReceiptHash
+            || payload.measurementReceiptArtifactHash
+                !== rebuilt.measurementReceiptArtifactHash
+            || payload.rawStdoutArtifactHash !== rebuilt.rawStdoutArtifactHash
+            || payload.rawStderrArtifactHash !== rebuilt.rawStderrArtifactHash) {
+            throw new RuntimeIntegrityError(
+                "Committed impossibility artifacts do not reproduce the trusted certificate",
+                { logicalEffectKey, attemptId: committed.attempt.attemptId },
+            );
+        }
+        return rebuilt;
+    }
+
     async #runValidationCommand(aggregate, commandId, mainAttemptId) {
         const contract = aggregate.contract;
         const settledCases = await Promise.allSettled(contract.validationCases.map(async (validationCase) => {
@@ -1037,7 +1242,7 @@ export class AutonomousRunner {
                     command,
                     async (attemptId) => {
                         const verifiedEntry = this.#allowlist.verifyEntry(contract.harnessId);
-                        return this.#executor.run({
+                        return (await this.#runHarnessMeasurement({
                             verifiedEntry,
                             candidateSnapshot: Object.freeze({
                                 path: materialized.dest,
@@ -1045,7 +1250,7 @@ export class AutonomousRunner {
                             }),
                             attemptId,
                             runnerEpochId: this.#config.runnerEpochId,
-                        });
+                        })).measurement;
                     },
                     async (measurement, attemptId, logicalEffectKey) => {
                         this.#persistMeasurement({
@@ -1183,6 +1388,254 @@ export class AutonomousRunner {
                 compositeReceiptHash,
             },
         };
+    }
+
+    #ingestImpossibilityRequest(command) {
+        const expectedRequestHash = hashCanonical(
+            command.request,
+            IMPOSSIBILITY_REQUEST_HASH_ALGORITHM,
+        );
+        if (command.requestHash !== expectedRequestHash
+            || command.request?.contract?.hypothesisTopology !== "certified_impossibility") {
+            throw new RuntimeIntegrityError(
+                "Reserved impossibility request is not canonical or certified-impossibility scoped",
+                {
+                    expectedRequestHash,
+                    actualRequestHash: command.requestHash ?? null,
+                },
+            );
+        }
+        const sourceRoot = ensureDirectory(path.join(this.#runTempRoot, "impossibility-requests"));
+        const sourceDir = makeUniqueDirectory(
+            sourceRoot,
+            `request-${command.attemptOrdinal}`,
+        );
+        try {
+            fs.writeFileSync(
+                path.join(sourceDir, IMPOSSIBILITY_REQUEST_FILENAME),
+                canonicalJson(command.request),
+                { encoding: "utf8", flag: "wx", mode: 0o600 },
+            );
+            return this.#artifactStore.ingestDirectory({ sourceDir });
+        } finally {
+            removeTreeInside(sourceDir, sourceRoot);
+        }
+    }
+
+    #persistImpossibilityRequestSnapshot({
+        attemptId,
+        commandId,
+        command,
+        snapshotId,
+    }) {
+        const snapshotArtifact = this.#registerCasObject({
+            attemptId,
+            kind: `impossibility-request-${command.attemptOrdinal}`,
+            objectId: snapshotId,
+            size: this.#artifactStore.readObject(snapshotId, { verify: true }).length,
+            contentType: "application/vnd.crucible.snapshot+json",
+        });
+        this.#adapter.ingestOperationalEvidence({
+            attemptId,
+            evidenceKind: `impossibility-request:${command.attemptOrdinal}`,
+            kind: "runtime:impossibility_request",
+            payload: {
+                commandId,
+                attemptOrdinal: command.attemptOrdinal,
+                requestHash: command.requestHash,
+                snapshotId,
+                verificationSnapshotHash: measurementSnapshotHash(snapshotId),
+                artifactId: snapshotArtifact.artifactId,
+            },
+        });
+    }
+
+    #buildImpossibilityVerificationResult({
+        aggregate,
+        command,
+        snapshotId,
+        measurement,
+        rawOutput,
+    }) {
+        const verificationSnapshotHash = measurementSnapshotHash(snapshotId);
+        if (measurement.receipt?.candidateSnapshotHash !== verificationSnapshotHash
+            || measurement.receipt?.parserVersion !== command.parserVersion
+            || measurement.receipt?.parsed === undefined
+            || !canonicalEqual(measurement.receipt.parsed, measurement.parsed)
+            || sha256Bytes(rawOutput.stdout, STREAM_HASH_ALGORITHM)
+                !== measurement.stdoutHash
+            || sha256Bytes(rawOutput.stderr, STREAM_HASH_ALGORITHM)
+                !== measurement.stderrHash) {
+            throw new RuntimeIntegrityError(
+                "Impossibility measurement receipt is not bound to the reserved verifier request",
+                {
+                    requestHash: command.requestHash,
+                    verificationSnapshotHash,
+                },
+            );
+        }
+        const verifiedFacts = {
+            pass: measurement.parsed.pass,
+            searchSpaceExhausted: measurement.parsed.searchSpaceExhausted,
+            parserVersion: measurement.receipt.parserVersion,
+        };
+        const certificateVerdict = deriveImpossibilityVerdict(verifiedFacts);
+        const measurementReceiptHash = hashReceipt(measurement.receipt);
+        const measurementReceiptBytes = Buffer.from(
+            canonicalJson(measurement.receipt),
+            "utf8",
+        );
+        const certificate = {
+            version: command.certificateVersion,
+            verdict: certificateVerdict,
+            contractHash: aggregate.contractHash,
+            harnessId: command.harnessId,
+            parserVersion: command.parserVersion,
+            verificationRequestHash: command.requestHash,
+            verificationSnapshotHash,
+            measurementReceiptHash,
+            verifiedFacts,
+            parsedResult: measurement.parsed,
+        };
+        const certificateBytes = Buffer.from(canonicalJson(certificate), "utf8");
+        return {
+            measurement,
+            rawStdoutBytes: rawOutput.stdout,
+            rawStderrBytes: rawOutput.stderr,
+            certificate,
+            certificateBytes,
+            certificateVerdict,
+            verifiedFacts,
+            verificationSnapshotHash,
+            measurementReceiptHash,
+            measurementReceiptArtifactHash: taggedHash(
+                IMPOSSIBILITY_RECEIPT_ARTIFACT_HASH_ALGORITHM,
+                measurementReceiptBytes,
+            ),
+            rawStdoutArtifactHash: taggedHash(
+                IMPOSSIBILITY_STDOUT_ARTIFACT_HASH_ALGORITHM,
+                rawOutput.stdout,
+            ),
+            rawStderrArtifactHash: taggedHash(
+                IMPOSSIBILITY_STDERR_ARTIFACT_HASH_ALGORITHM,
+                rawOutput.stderr,
+            ),
+            certificateArtifactHash: taggedHash(
+                IMPOSSIBILITY_CERTIFICATE_ARTIFACT_HASH_ALGORITHM,
+                certificateBytes,
+            ),
+        };
+    }
+
+    async #runImpossibilityVerificationCommand(
+        aggregate,
+        commandId,
+        mainAttemptId,
+        command,
+    ) {
+        if (command.request.contractHash !== aggregate.contractHash
+            || !canonicalEqual(command.request.contract, aggregate.contract)) {
+            throw new RuntimeIntegrityError(
+                "Reserved impossibility request does not match the replayed contract",
+                { commandId, requestHash: command.requestHash },
+            );
+        }
+        const requestSnapshot = this.#ingestImpossibilityRequest(command);
+        this.#persistImpossibilityRequestSnapshot({
+            attemptId: mainAttemptId,
+            commandId,
+            command,
+            snapshotId: requestSnapshot.snapshot,
+        });
+        const materialized = this.#materializeSnapshot(
+            requestSnapshot.snapshot,
+            `impossibility-${command.attemptOrdinal}`,
+        );
+        try {
+            const effect = await this.#executeEffect(
+                {
+                    kind: "impossibility-verification",
+                    commandId,
+                    attemptOrdinal: command.attemptOrdinal,
+                    requestHash: command.requestHash,
+                    snapshot: requestSnapshot.snapshot,
+                },
+                async (attemptId) => {
+                    const verifiedEntry = this.#allowlist.verifyEntry(command.harnessId);
+                    const executed = await this.#runHarnessMeasurement({
+                        verifiedEntry,
+                        candidateSnapshot: Object.freeze({
+                            path: materialized.dest,
+                            hash: measurementSnapshotHash(requestSnapshot.snapshot),
+                        }),
+                        attemptId,
+                        runnerEpochId: this.#config.runnerEpochId,
+                    }, { requireRawOutput: true });
+                    return this.#buildImpossibilityVerificationResult({
+                        aggregate,
+                        command,
+                        snapshotId: requestSnapshot.snapshot,
+                        measurement: executed.measurement,
+                        rawOutput: executed.rawOutput,
+                    });
+                },
+                async (result, attemptId, logicalEffectKey) => {
+                    this.#persistImpossibilityVerification({
+                        result,
+                        attemptId,
+                        logicalEffectKey,
+                        commandId,
+                        command,
+                        snapshotId: requestSnapshot.snapshot,
+                    });
+                },
+                async (committed, logicalEffectKey) =>
+                    this.#recoverImpossibilityVerification({
+                        committed,
+                        logicalEffectKey,
+                        aggregate,
+                        commandId,
+                        command,
+                        snapshotId: requestSnapshot.snapshot,
+                    }),
+            );
+            const result = effect.result;
+            return {
+                commandId,
+                observationId: this.#stableObservationId(commandId, {
+                    purpose: "impossibility",
+                    attemptOrdinal: command.attemptOrdinal,
+                    requestHash: command.requestHash,
+                }),
+                purpose: "impossibility",
+                receipt: {
+                    attemptId: effect.attemptId,
+                    runnerEpochId: result.measurement.receipt.runnerEpochId,
+                    rawStdoutHash: result.measurement.stdoutHash,
+                    rawStderrHash: result.measurement.stderrHash,
+                    candidateArtifactHash: null,
+                    certificateArtifactHash: result.certificateArtifactHash,
+                    measurementReceiptArtifactHash:
+                        result.measurementReceiptArtifactHash,
+                    measurementReceiptHash: result.measurementReceiptHash,
+                    rawStderrArtifactHash: result.rawStderrArtifactHash,
+                    rawStdoutArtifactHash: result.rawStdoutArtifactHash,
+                    verificationRequestHash: command.requestHash,
+                    verificationSnapshotHash: result.verificationSnapshotHash,
+                },
+                data: {
+                    certificateVersion: command.certificateVersion,
+                    certificateVerdict: result.certificateVerdict,
+                    certificateArtifactHash: result.certificateArtifactHash,
+                    measurementReceiptHash: result.measurementReceiptHash,
+                    verificationRequestHash: command.requestHash,
+                    verificationSnapshotHash: result.verificationSnapshotHash,
+                    verifiedFacts: result.verifiedFacts,
+                },
+            };
+        } finally {
+            removeTreeInside(materialized.dest, this.#runTempRoot);
+        }
     }
 
     async #runSearchCandidateCommand(aggregate, commandId, mainAttemptId, command) {
@@ -1334,7 +1787,7 @@ export class AutonomousRunner {
                         const verifiedEntry = this.#allowlist.verifyEntry(
                             aggregate.contract.harnessId,
                         );
-                        return this.#executor.run({
+                        return (await this.#runHarnessMeasurement({
                             verifiedEntry,
                             candidateSnapshot: Object.freeze({
                                 path: materialized.dest,
@@ -1342,7 +1795,7 @@ export class AutonomousRunner {
                             }),
                             attemptId,
                             runnerEpochId: this.#config.runnerEpochId,
-                        });
+                        })).measurement;
                     },
                     async (result, attemptId, logicalEffectKey) => {
                         this.#persistMeasurement({
@@ -1925,10 +2378,115 @@ export class AutonomousRunner {
                 stderrHash: measurement.stderrHash,
             },
         });
+        return {
+            receiptArtifact,
+            snapshotArtifact,
+        };
+    }
+
+    #persistImpossibilityVerification({
+        result,
+        attemptId,
+        logicalEffectKey,
+        commandId,
+        command,
+        snapshotId,
+    }) {
+        const persistedMeasurement = this.#persistMeasurement({
+            measurement: result.measurement,
+            attemptId,
+            logicalEffectKey,
+            purpose: "impossibility",
+            commandId,
+            candidateId: `impossibility-${command.attemptOrdinal}`,
+            snapshotId,
+        });
+        const measurementReceiptBytes = Buffer.from(
+            canonicalJson(result.measurement.receipt),
+            "utf8",
+        );
+        const receiptArtifactHash = taggedHash(
+            IMPOSSIBILITY_RECEIPT_ARTIFACT_HASH_ALGORITHM,
+            measurementReceiptBytes,
+        );
+        if (receiptArtifactHash !== result.measurementReceiptArtifactHash) {
+            throw new RuntimeIntegrityError(
+                "Impossibility measurement receipt artifact hash changed before persistence",
+                { attemptId },
+            );
+        }
+        const rawStdoutArtifact = this.#persistBytesArtifact({
+            attemptId,
+            kind: `impossibility-stdout-${command.attemptOrdinal}`,
+            bytes: result.rawStdoutBytes,
+            contentType: "application/vnd.crucible.impossibility-stdout",
+        });
+        const rawStderrArtifact = this.#persistBytesArtifact({
+            attemptId,
+            kind: `impossibility-stderr-${command.attemptOrdinal}`,
+            bytes: result.rawStderrBytes,
+            contentType: "application/vnd.crucible.impossibility-stderr",
+        });
+        const certificateArtifact = this.#persistJsonArtifact({
+            attemptId,
+            kind: `impossibility-certificate-${command.attemptOrdinal}`,
+            value: result.certificate,
+            contentType: "application/vnd.crucible.impossibility-certificate+json",
+        });
+        if (taggedHash(
+            IMPOSSIBILITY_STDOUT_ARTIFACT_HASH_ALGORITHM,
+            result.rawStdoutBytes,
+        ) !== result.rawStdoutArtifactHash
+            || taggedHash(
+                IMPOSSIBILITY_STDERR_ARTIFACT_HASH_ALGORITHM,
+                result.rawStderrBytes,
+            ) !== result.rawStderrArtifactHash
+            || taggedHash(
+                IMPOSSIBILITY_CERTIFICATE_ARTIFACT_HASH_ALGORITHM,
+                result.certificateBytes,
+            ) !== result.certificateArtifactHash) {
+            throw new RuntimeIntegrityError(
+                "Impossibility artifact hashes changed before persistence",
+                { attemptId },
+            );
+        }
+        this.#adapter.ingestOperationalEvidence({
+            attemptId,
+            evidenceKind: `impossibility-certificate:${command.attemptOrdinal}`,
+            kind: "runtime:impossibility_certificate",
+            payload: {
+                logicalEffectKey,
+                commandId,
+                attemptOrdinal: command.attemptOrdinal,
+                requestHash: command.requestHash,
+                snapshotId,
+                verificationSnapshotHash: result.verificationSnapshotHash,
+                certificateVerdict: result.certificateVerdict,
+                certificateArtifactHash: result.certificateArtifactHash,
+                certificateArtifactId: certificateArtifact.artifactId,
+                measurementReceiptHash: result.measurementReceiptHash,
+                measurementReceiptArtifactHash: result.measurementReceiptArtifactHash,
+                measurementReceiptArtifactId:
+                    persistedMeasurement.receiptArtifact.artifactId,
+                rawStdoutArtifactHash: result.rawStdoutArtifactHash,
+                rawStdoutArtifactId: rawStdoutArtifact.artifactId,
+                rawStderrArtifactHash: result.rawStderrArtifactHash,
+                rawStderrArtifactId: rawStderrArtifact.artifactId,
+            },
+        });
     }
 
     #persistJsonArtifact({ attemptId, kind, value, contentType }) {
         const bytes = Buffer.from(canonicalJson(value), "utf8");
+        return this.#persistBytesArtifact({
+            attemptId,
+            kind,
+            bytes,
+            contentType,
+        });
+    }
+
+    #persistBytesArtifact({ attemptId, kind, bytes, contentType }) {
         const stored = this.#artifactStore.putBytes(bytes, { contentType });
         return this.#registerCasObject({
             attemptId,
@@ -2025,6 +2583,7 @@ export class AutonomousRunner {
 
     async #cleanup() {
         let firstError = null;
+        this.#capturedOutputs.clear();
         if (this.#workerPool !== null && typeof this.#workerPool.close === "function") {
             try {
                 await this.#workerPool.close();

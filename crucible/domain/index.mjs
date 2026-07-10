@@ -30,6 +30,7 @@ export {
 export {
     ANNOTATION_LIMITS,
     CANDIDATE_OUTCOME_CLASSES,
+    DEFAULT_IMPOSSIBILITY_POLICY,
     DEFAULT_SEARCH_POLICY,
     DOMAIN_VERSION,
     ESCAPE_SEARCH_OPERATORS,
@@ -40,6 +41,11 @@ export {
     EVENT_VOCABULARY,
     EXTERNAL_EVENT_TYPES,
     HYPOTHESIS_TOPOLOGIES,
+    IMPOSSIBILITY_CERTIFICATE_VERSION,
+    IMPOSSIBILITY_REQUEST_HASH_ALGORITHM,
+    IMPOSSIBILITY_REQUEST_VERSION,
+    IMPOSSIBILITY_SEARCH_EVIDENCE_HASH_ALGORITHM,
+    IMPOSSIBILITY_VERDICTS,
     KERNEL_DECISION_EVENT_TYPES,
     KERNEL_CONTROL_EVENT_TYPES,
     NON_RESULT_CODES,
@@ -47,6 +53,12 @@ export {
     SOURCE_KINDS,
     TERMINAL_EVENT_TYPES,
 } from "./constants.mjs";
+
+export {
+    deriveImpossibilityVerdict,
+    impossibilitySearchEvidenceHash,
+    isImpossibilityVerdict,
+} from "./impossibility.mjs";
 
 export { decideNext } from "./decision.mjs";
 
@@ -59,6 +71,13 @@ export {
     constructModelObservedEvent,
     createExternalEvent,
     createInvestigationOpenedEvent,
+    normalizeCapabilityEpochPayload,
+    normalizeCommandDispatchedPayload,
+    normalizeCommandObservedPayload,
+    normalizeEventIdentifier,
+    normalizeEvidenceInvalidatedPayload,
+    normalizeExternalEventPayload,
+    normalizeStopRequestedPayload,
 } from "./events.mjs";
 
 export {
@@ -117,7 +136,10 @@ export {
     createInitialAggregate,
     currentValidationEvidence,
     harnessCandidateEvidenceItems,
+    impossibilityEvidenceItems,
+    latestApplicableImpossibilityEvidence,
     latestUnhandledStopRequest,
+    latestImpossibilityEvidence,
     qualifyingCandidateEvidence,
     qualifyingCandidateEvidenceItems,
     qualifyingUnreachableEvidence,
