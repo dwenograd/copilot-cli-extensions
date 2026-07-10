@@ -9,6 +9,7 @@ import {
     constructHarnessObservedEvent,
     constructInvestigationResumedEvent,
     constructKernelDecisionEvent,
+    constructModelObservedEvent,
     createExternalEvent,
     createInvestigationOpenedEvent,
     createMeasurementProvenance,
@@ -55,6 +56,8 @@ const SNAPSHOT_CLOSURE_HASH_ALGORITHM =
     "sha256:crucible-measurement-snapshot-closure-v1";
 const VALIDATION_RECEIPT_HASH_ALGORITHM =
     "sha256:crucible-runtime-validation-receipts-v1";
+const DOMAIN_FACT_IDENTITY_HASH_ALGORITHM =
+    "sha256:crucible-runtime-domain-fact-v1";
 const IMPOSSIBILITY_CERTIFICATE_ARTIFACT_HASH_ALGORITHM =
     "sha256:crucible-impossibility-certificate-artifact-v1";
 const IMPOSSIBILITY_RECEIPT_ARTIFACT_HASH_ALGORITHM =
@@ -97,6 +100,13 @@ function isCasConflict(error) {
 
 function expectedTerminalKind(domainEvent) {
     return TERMINAL_METADATA[domainEvent.type] ?? null;
+}
+
+function domainFactIdentity(domainEvent) {
+    return hashCanonical({
+        type: domainEvent.type,
+        payload: domainEvent.payload,
+    }, DOMAIN_FACT_IDENTITY_HASH_ALGORITHM);
 }
 
 function integrityFailure(message, details = null, cause = null) {
@@ -1042,6 +1052,9 @@ export class DomainRepositoryAdapter {
             || typeof repository !== "object"
             || typeof repository.appendEvents !== "function"
             || typeof repository.appendEventsWithAttemptTransition !== "function"
+            || typeof repository.assertAttemptAuthority !== "function"
+            || typeof repository.ingestEvidenceBatchFenced !== "function"
+            || typeof repository.ingestEvidenceBatchWithAttemptTransition !== "function"
             || typeof repository.verifyInvestigation !== "function"
             || typeof repository.listArtifactRefsForEvent !== "function"
             || typeof repository.getArtifact !== "function"
@@ -1077,6 +1090,10 @@ export class DomainRepositoryAdapter {
 
     get operationalInvestigationId() {
         return this.#operationalInvestigationId;
+    }
+
+    domainFactIdentity(domainEvent) {
+        return domainFactIdentity(domainEvent);
     }
 
     replay() {
@@ -1304,15 +1321,58 @@ export class DomainRepositoryAdapter {
         return { aggregate: nextAggregate, domainEvent, repositoryEvent: row };
     }
 
-    appendFromFactory(factory, { maxCasRetries = 8, attemptTransition = null } = {}) {
+    appendFromFactory(factory, {
+        maxCasRetries = 8,
+        attemptTransition = null,
+        expectedDomainFactHash = null,
+    } = {}) {
         if (typeof factory !== "function") {
             throw new RuntimeConfigError("appendFromFactory requires a function");
         }
+        let boundDomainFactHash = expectedDomainFactHash;
         for (let attempt = 0; attempt <= maxCasRetries; attempt += 1) {
+            if (attemptTransition !== null) {
+                this.#repository.assertAttemptAuthority({
+                    authorityInvestigationId:
+                        attemptTransition.authorityInvestigationId
+                        ?? this.#investigationId,
+                    attemptId: attemptTransition.attemptId,
+                    attemptCommand: attemptTransition.attemptCommand,
+                    leaseId: attemptTransition.leaseId,
+                    fencingToken: attemptTransition.fencingToken,
+                    owner: attemptTransition.owner,
+                    supervisorGeneration:
+                        attemptTransition.supervisorGeneration ?? null,
+                    runnerIncarnation:
+                        attemptTransition.runnerIncarnation ?? null,
+                    expectedState: attemptTransition.fromState,
+                });
+            }
             const { aggregate } = this.replay();
             const domainEvent = factory(aggregate);
             if (domainEvent === null) {
+                if (attemptTransition !== null && boundDomainFactHash !== null) {
+                    throw new RuntimeIntegrityError(
+                        "CAS replay removed the logical domain fact bound to the attempt",
+                        { expectedDomainFactHash: boundDomainFactHash },
+                    );
+                }
                 return { aggregate, domainEvent: null, repositoryEvent: null };
+            }
+            if (attemptTransition !== null || boundDomainFactHash !== null) {
+                const actualDomainFactHash = domainFactIdentity(domainEvent);
+                if (boundDomainFactHash === null) {
+                    boundDomainFactHash = actualDomainFactHash;
+                } else if (actualDomainFactHash !== boundDomainFactHash) {
+                    throw new RuntimeIntegrityError(
+                        "CAS replay changed the logical domain fact bound to the attempt",
+                        {
+                            expectedDomainFactHash: boundDomainFactHash,
+                            actualDomainFactHash,
+                            type: domainEvent.type,
+                        },
+                    );
+                }
             }
             try {
                 return this.appendDomainEvent(domainEvent, {
@@ -1332,6 +1392,27 @@ export class DomainRepositoryAdapter {
         return this.appendFromFactory((aggregate) => constructKernelDecisionEvent(aggregate));
     }
 
+    appendKernelDecisionFenced({
+        attemptId,
+        command,
+        lease,
+        expectedDomainFactHash = null,
+    } = {}) {
+        return this.appendFromFactory(
+            (aggregate) => constructKernelDecisionEvent(aggregate),
+            {
+                attemptTransition: this.#attemptTransition({
+                    attemptId,
+                    command,
+                    lease,
+                    fromState: "observed",
+                    toState: "committed",
+                }),
+                expectedDomainFactHash,
+            },
+        );
+    }
+
     resumeInvestigation() {
         return this.appendFromFactory((aggregate) => {
             if (aggregate.pause === null) return null;
@@ -1343,25 +1424,68 @@ export class DomainRepositoryAdapter {
         return this.appendFromFactory((aggregate) => createExternalEvent(aggregate, type, payload));
     }
 
+    appendExternalFenced(type, payload, {
+        attemptId,
+        command,
+        lease,
+        fromState,
+        toState,
+        expectedDomainFactHash = null,
+    } = {}) {
+        return this.appendFromFactory(
+            (aggregate) => createExternalEvent(aggregate, type, payload),
+            {
+                attemptTransition: this.#attemptTransition({
+                    attemptId,
+                    command,
+                    lease,
+                    fromState,
+                    toState,
+                }),
+                expectedDomainFactHash,
+            },
+        );
+    }
+
     appendHarnessObservation(payload) {
         return this.appendFromFactory((aggregate) =>
             constructHarnessObservedEvent(aggregate, payload));
     }
 
-    appendHarnessObservationFenced(payload, { attemptId, lease } = {}) {
-        requireString(attemptId, "attemptId", { max: 256 });
-        requirePlainObject(lease, "lease");
+    appendHarnessObservationFenced(payload, {
+        attemptId,
+        command,
+        lease,
+    } = {}) {
         return this.appendFromFactory(
             (aggregate) => constructHarnessObservedEvent(aggregate, payload),
             {
-                attemptTransition: {
+                attemptTransition: this.#attemptTransition({
                     attemptId,
-                    leaseId: lease.leaseId,
-                    fencingToken: lease.fencingToken,
-                    owner: lease.owner,
+                    command,
+                    lease,
                     fromState: "dispatched",
                     toState: "observed",
-                },
+                }),
+            },
+        );
+    }
+
+    appendModelObservationFenced(payload, {
+        attemptId,
+        command,
+        lease,
+    } = {}) {
+        return this.appendFromFactory(
+            (aggregate) => constructModelObservedEvent(aggregate, payload),
+            {
+                attemptTransition: this.#attemptTransition({
+                    attemptId,
+                    command,
+                    lease,
+                    fromState: "dispatched",
+                    toState: "observed",
+                }),
             },
         );
     }
@@ -1371,22 +1495,49 @@ export class DomainRepositoryAdapter {
             constructEvidenceCommittedEvent(aggregate, input));
     }
 
-    appendEvidenceCommitFenced(input, { attemptId, lease } = {}) {
-        requireString(attemptId, "attemptId", { max: 256 });
-        requirePlainObject(lease, "lease");
+    appendEvidenceCommitFenced(input, {
+        attemptId,
+        command,
+        lease,
+    } = {}) {
         return this.appendFromFactory(
             (aggregate) => constructEvidenceCommittedEvent(aggregate, input),
             {
-                attemptTransition: {
+                attemptTransition: this.#attemptTransition({
                     attemptId,
-                    leaseId: lease.leaseId,
-                    fencingToken: lease.fencingToken,
-                    owner: lease.owner,
+                    command,
+                    lease,
                     fromState: "observed",
                     toState: "committed",
-                },
+                }),
             },
         );
+    }
+
+    #attemptTransition({
+        attemptId,
+        command,
+        lease,
+        fromState,
+        toState,
+    }) {
+        requireString(attemptId, "attemptId", { max: 256 });
+        requirePlainObject(command, "command");
+        requirePlainObject(lease, "lease");
+        requireString(fromState, "fromState", { max: 32 });
+        requireString(toState, "toState", { max: 32 });
+        return {
+            authorityInvestigationId: this.#investigationId,
+            attemptId,
+            attemptCommand: canonicalJson(command),
+            leaseId: lease.leaseId,
+            fencingToken: lease.fencingToken,
+            owner: lease.owner,
+            supervisorGeneration: lease.supervisorGeneration ?? null,
+            runnerIncarnation: lease.runnerIncarnation ?? null,
+            fromState,
+            toState,
+        };
     }
 
     requestStop({ requestId, reason, pauseRequested = true } = {}) {
@@ -1411,13 +1562,59 @@ export class DomainRepositoryAdapter {
         });
     }
 
-    acquireRunnerLease({ leaseId, owner } = {}) {
+    requestStopFenced({
+        requestId,
+        reason,
+        pauseRequested = true,
+        attemptId,
+        command,
+        lease,
+        expectedDomainFactHash = null,
+    } = {}) {
+        requireString(requestId, "requestId", { max: 128 });
+        requireString(reason, "reason", { max: 4096, allowLineBreaks: true });
+        const operationalNonResult = this.latestOperationalNonResult();
+        if (operationalNonResult !== null) {
+            const { aggregate } = this.replay();
+            return { aggregate, domainEvent: null, repositoryEvent: null };
+        }
+        return this.appendFromFactory((aggregate) => {
+            if (aggregate.terminal !== null
+                || aggregate.pause !== null
+                || aggregate.nonResults.length > 0) {
+                return null;
+            }
+            return createExternalEvent(aggregate, EVENT_TYPES.STOP_REQUESTED, {
+                requestId,
+                reason,
+                pauseRequested,
+            });
+        }, {
+            attemptTransition: this.#attemptTransition({
+                attemptId,
+                command,
+                lease,
+                fromState: "observed",
+                toState: "committed",
+            }),
+            expectedDomainFactHash,
+        });
+    }
+
+    acquireRunnerLease({
+        leaseId,
+        owner,
+        supervisorGeneration = null,
+        runnerIncarnation = null,
+    } = {}) {
         requireString(leaseId, "leaseId", { max: 256 });
         requireString(owner, "owner", { max: 256 });
         const lease = this.#repository.acquireLease({
             investigationId: this.#investigationId,
             leaseId,
             owner,
+            supervisorGeneration,
+            runnerIncarnation,
         });
         const recovery = this.recoverStaleAttempts(lease);
         return { lease, recovery };
@@ -1443,6 +1640,8 @@ export class DomainRepositoryAdapter {
                 leaseId: lease.leaseId,
                 fencingToken: lease.fencingToken,
                 owner: lease.owner,
+                supervisorGeneration: lease.supervisorGeneration ?? null,
+                runnerIncarnation: lease.runnerIncarnation ?? null,
             }));
         }
         return Object.freeze({
@@ -1464,6 +1663,8 @@ export class DomainRepositoryAdapter {
             leaseId: lease.leaseId,
             fencingToken: lease.fencingToken,
             owner: lease.owner,
+            supervisorGeneration: lease.supervisorGeneration ?? null,
+            runnerIncarnation: lease.runnerIncarnation ?? null,
         });
     }
 
@@ -1471,7 +1672,11 @@ export class DomainRepositoryAdapter {
         return this.#repository.dispatchCommand({
             investigationId: this.#investigationId,
             attemptId,
+            leaseId: lease.leaseId,
             fencingToken: lease.fencingToken,
+            owner: lease.owner,
+            supervisorGeneration: lease.supervisorGeneration ?? null,
+            runnerIncarnation: lease.runnerIncarnation ?? null,
         });
     }
 
@@ -1479,7 +1684,11 @@ export class DomainRepositoryAdapter {
         return this.#repository.observeCommand({
             investigationId: this.#investigationId,
             attemptId,
+            leaseId: lease.leaseId,
             fencingToken: lease.fencingToken,
+            owner: lease.owner,
+            supervisorGeneration: lease.supervisorGeneration ?? null,
+            runnerIncarnation: lease.runnerIncarnation ?? null,
         });
     }
 
@@ -1487,7 +1696,11 @@ export class DomainRepositoryAdapter {
         return this.#repository.commitCommand({
             investigationId: this.#investigationId,
             attemptId,
+            leaseId: lease.leaseId,
             fencingToken: lease.fencingToken,
+            owner: lease.owner,
+            supervisorGeneration: lease.supervisorGeneration ?? null,
+            runnerIncarnation: lease.runnerIncarnation ?? null,
         });
     }
 
@@ -1512,6 +1725,73 @@ export class DomainRepositoryAdapter {
             kind,
             payload,
         });
+    }
+
+    ingestOperationalEvidenceBatchFenced(evidence, {
+        attemptId,
+        command,
+        lease,
+        fromState,
+        toState = null,
+    } = {}) {
+        if (!Array.isArray(evidence) || evidence.length === 0) {
+            throw new RuntimeConfigError(
+                "ingestOperationalEvidenceBatchFenced requires a non-empty evidence array",
+            );
+        }
+        const transition = this.#attemptTransition({
+            attemptId,
+            command,
+            lease,
+            fromState,
+            toState: toState ?? fromState,
+        });
+        const normalized = evidence.map((item, index) => {
+            requirePlainObject(item, `evidence[${index}]`);
+            if (item.attemptId !== undefined && item.attemptId !== attemptId) {
+                throw new RuntimeConfigError(
+                    "operational evidence attemptId must match its fenced attempt",
+                    {
+                        expectedAttemptId: attemptId,
+                        actualAttemptId: item.attemptId,
+                        index,
+                    },
+                );
+            }
+            return {
+                evidenceKind: item.evidenceKind,
+                kind: item.kind ?? "runtime:evidence",
+                payload: item.payload,
+                ...(item.createdAt === undefined ? {} : { createdAt: item.createdAt }),
+            };
+        });
+        const input = {
+            investigationId: this.#operationalInvestigationId,
+            authorityInvestigationId: this.#investigationId,
+            attemptId: transition.attemptId,
+            attemptCommand: transition.attemptCommand,
+            leaseId: transition.leaseId,
+            fencingToken: transition.fencingToken,
+            owner: transition.owner,
+            supervisorGeneration: transition.supervisorGeneration,
+            runnerIncarnation: transition.runnerIncarnation,
+            evidence: normalized,
+        };
+        if (toState === null) {
+            return this.#repository.ingestEvidenceBatchFenced({
+                ...input,
+                expectedState: fromState,
+            });
+        }
+        return this.#repository.ingestEvidenceBatchWithAttemptTransition({
+            ...input,
+            fromState,
+            toState,
+        });
+    }
+
+    ingestOperationalEvidenceFenced(evidence, authority) {
+        return this.ingestOperationalEvidenceBatchFenced([evidence], authority);
     }
 
     recordOperationalNonResult({ attemptId, code, reason, details = null } = {}) {

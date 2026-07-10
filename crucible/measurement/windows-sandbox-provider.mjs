@@ -645,6 +645,38 @@ function effectiveEnvironment(requestEnv, outputRoot) {
     return Object.freeze(env);
 }
 
+function requestDeadlineTimeout(request, maximum, stage, budgetStartedAtMs = null) {
+    const requested = request?.launch?.timeoutMs;
+    const deadlineMs = request?.launch?.deadlineMs;
+    let timeoutMs = Number.isSafeInteger(requested) && requested > 0
+        ? Math.min(maximum, requested)
+        : maximum;
+    if (deadlineMs !== null && deadlineMs !== undefined) {
+        if (!Number.isFinite(deadlineMs)) {
+            throw new MeasurementError(
+                MEASUREMENT_ERROR_CODES.INVALID_ARGUMENT,
+                "sandbox launch deadlineMs must be finite epoch milliseconds or null",
+                { deadlineMs },
+            );
+        }
+    }
+    if (Number.isFinite(budgetStartedAtMs)) {
+        timeoutMs -= Math.max(0, Math.floor(Date.now() - budgetStartedAtMs));
+    }
+    if (timeoutMs < 1) {
+        throw new MeasurementError(
+            MEASUREMENT_ERROR_CODES.TIMEOUT,
+            `sandbox deadline expired during ${stage}`,
+            {
+                deadlineExceeded: true,
+                deadlineMs: deadlineMs ?? null,
+                stage,
+            },
+        );
+    }
+    return timeoutMs;
+}
+
 function waitForChildClose(child, timeoutMs) {
     if (child.exitCode !== null || child.signalCode !== null) {
         return Promise.resolve(true);
@@ -767,6 +799,7 @@ export function createWindowsSandboxProvider(options = {}) {
         providerVersion: PROVIDER_VERSION,
         async admitAndPrepare(request, issueLaunchCapability) {
             const available = requireAvailability(await availability());
+            const budgetStartedAtMs = Date.now();
             const helper = available.helper;
             const controlRoot = available.controlRoot;
             if (request.stagedRoots.length !== 1) {
@@ -798,7 +831,14 @@ export function createWindowsSandboxProvider(options = {}) {
                         request.candidateSnapshot.path,
                         helper.sourceHash,
                     ],
-                    { timeoutMs: 120_000 },
+                    {
+                        timeoutMs: requestDeadlineTimeout(
+                            request,
+                            120_000,
+                            "native sandbox preparation",
+                            budgetStartedAtMs,
+                        ),
+                    },
                 );
                 if (prepared.prepared !== true
                     || typeof prepared.appContainerSid !== "string"
@@ -812,9 +852,18 @@ export function createWindowsSandboxProvider(options = {}) {
                 expectedStateHash = stateHash(statePath);
                 const profileEnvironment =
                     sandboxProfileEnvironment(prepared.outputRoot);
+                const effectiveLimits = Object.freeze({
+                    ...limits,
+                    wallTimeMs: requestDeadlineTimeout(
+                        request,
+                        limits.wallTimeMs,
+                        "native sandbox policy issuance",
+                        budgetStartedAtMs,
+                    ),
+                });
                 const policy = buildPolicy({
                     helper,
-                    limits,
+                    limits: effectiveLimits,
                     request,
                     prepared,
                     profileEnvironment,
@@ -867,12 +916,12 @@ export function createWindowsSandboxProvider(options = {}) {
                                 launchRequest.executable,
                                 launchRequest.options.cwd,
                                 envPayload,
-                                String(limits.activeProcessLimit),
-                                String(limits.processMemoryBytes),
-                                String(limits.jobMemoryBytes),
-                                String(limits.cpuRatePercent),
-                                String(limits.cpuTimeMs),
-                                String(limits.wallTimeMs),
+                                String(effectiveLimits.activeProcessLimit),
+                                String(effectiveLimits.processMemoryBytes),
+                                String(effectiveLimits.jobMemoryBytes),
+                                String(effectiveLimits.cpuRatePercent),
+                                String(effectiveLimits.cpuTimeMs),
+                                String(effectiveLimits.wallTimeMs),
                                 "--",
                                 ...launchRequest.argv,
                             ],

@@ -27,6 +27,9 @@ const RUNNER_KEYS = new Set([
     "cliPath",
     "copilotCliPath",
     "runnerEpochId",
+    "supervisorGeneration",
+    "supervisorNonce",
+    "runnerIncarnation",
     "deadline",
     "options",
     "resultPath",
@@ -34,11 +37,19 @@ const RUNNER_KEYS = new Set([
 
 const RUNNER_OPTION_KEYS = new Set([
     "sessionTimeoutMs",
+    "shutdownTimeoutMs",
     "maxLoopIterations",
     "reasoningEffort",
     "candidateLimits",
     "workerAdditionalContext",
     "tempRoot",
+    "supervisorAuthority",
+]);
+
+const SUPERVISOR_AUTHORITY_KEYS = new Set([
+    "supervisorGeneration",
+    "supervisorNonce",
+    "runnerIncarnation",
 ]);
 
 const CANDIDATE_LIMIT_KEYS = new Set([
@@ -56,6 +67,8 @@ const CANDIDATE_LIMIT_MAXIMA = Object.freeze({
     maxFileBytes: 256 * 1024,
     maxTotalBytes: 1024 * 1024,
 });
+
+const SUPERVISOR_HEARTBEAT_OPERATION_MARGIN_MS = 1_000;
 
 const SUPERVISOR_KEYS = new Set([
     "runner",
@@ -115,6 +128,30 @@ function normalizeCandidateLimits(value) {
     return output;
 }
 
+function normalizeSupervisorAuthority(value, field = "options.supervisorAuthority") {
+    if (value === undefined || value === null) {
+        return null;
+    }
+    const authority = requirePlainObject(value, field);
+    rejectUnknownKeys(authority, SUPERVISOR_AUTHORITY_KEYS, field);
+    return Object.freeze({
+        supervisorGeneration: requirePositiveInteger(
+            authority.supervisorGeneration,
+            `${field}.supervisorGeneration`,
+        ),
+        supervisorNonce: requireString(
+            authority.supervisorNonce,
+            `${field}.supervisorNonce`,
+            { max: 256 },
+        ),
+        runnerIncarnation: requireString(
+            authority.runnerIncarnation,
+            `${field}.runnerIncarnation`,
+            { max: 256 },
+        ),
+    });
+}
+
 export function normalizeRunnerConfig(input, { env = process.env } = {}) {
     rejectUnknownKeys(input, RUNNER_KEYS, "runner config");
     const investigationId = requireString(input.investigationId, "investigationId", { max: 128 });
@@ -144,6 +181,39 @@ export function normalizeRunnerConfig(input, { env = process.env } = {}) {
         throw new RuntimeConfigError("Specify only one of copilotCliPath or cliPath");
     }
     const runnerEpochId = requireLowerIdentifier(input.runnerEpochId, "runnerEpochId");
+    const options = input.options === undefined ? {} : requirePlainObject(input.options, "options");
+    rejectUnknownKeys(options, RUNNER_OPTION_KEYS, "options");
+    const nestedAuthority = normalizeSupervisorAuthority(options.supervisorAuthority);
+    const topAuthorityValues = [
+        input.supervisorGeneration,
+        input.supervisorNonce,
+        input.runnerIncarnation,
+    ];
+    const hasTopAuthority = topAuthorityValues.some((value) => value !== undefined);
+    if (hasTopAuthority && topAuthorityValues.some((value) => value === undefined)) {
+        throw new RuntimeConfigError(
+            "supervisorGeneration, supervisorNonce, and runnerIncarnation must be provided together",
+        );
+    }
+    const topAuthority = hasTopAuthority
+        ? normalizeSupervisorAuthority({
+            supervisorGeneration: input.supervisorGeneration,
+            supervisorNonce: input.supervisorNonce,
+            runnerIncarnation: input.runnerIncarnation,
+        }, "runner authority")
+        : null;
+    if (topAuthority !== null && nestedAuthority !== null
+        && (topAuthority.supervisorGeneration !== nestedAuthority.supervisorGeneration
+            || topAuthority.supervisorNonce !== nestedAuthority.supervisorNonce
+            || topAuthority.runnerIncarnation !== nestedAuthority.runnerIncarnation)) {
+        throw new RuntimeConfigError(
+            "top-level runner authority must match options.supervisorAuthority",
+        );
+    }
+    const supervisorAuthority = topAuthority ?? nestedAuthority;
+    const supervisorGeneration = supervisorAuthority?.supervisorGeneration ?? null;
+    const supervisorNonce = supervisorAuthority?.supervisorNonce ?? null;
+    const runnerIncarnation = supervisorAuthority?.runnerIncarnation ?? null;
     if (isPathInside(stateDir, artifactRoot)) {
         throw new RuntimeConfigError(
             "stateDir cannot be equal to or nested inside artifactRoot",
@@ -156,8 +226,6 @@ export function normalizeRunnerConfig(input, { env = process.env } = {}) {
             { stateDir, artifactRoot },
         );
     }
-    const options = input.options === undefined ? {} : requirePlainObject(input.options, "options");
-    rejectUnknownKeys(options, RUNNER_OPTION_KEYS, "options");
     const tempRoot = options.tempRoot === undefined
         ? path.join(stateDir, "runtime-temp")
         : assertPathInside(requireAbsolutePath(options.tempRoot, "options.tempRoot"), stateDir, "options.tempRoot");
@@ -191,6 +259,9 @@ export function normalizeRunnerConfig(input, { env = process.env } = {}) {
         sdkPath,
         cliPath,
         runnerEpochId,
+        supervisorGeneration,
+        supervisorNonce,
+        runnerIncarnation,
         deadlineMs: parseDeadline(input.deadline),
         resultPath,
         options: Object.freeze({
@@ -199,6 +270,12 @@ export function normalizeRunnerConfig(input, { env = process.env } = {}) {
                 "options.sessionTimeoutMs",
                 120_000,
                 60 * 60 * 1000,
+            ),
+            shutdownTimeoutMs: optionalPositiveInteger(
+                options.shutdownTimeoutMs,
+                "options.shutdownTimeoutMs",
+                10_000,
+                60 * 1000,
             ),
             maxLoopIterations: optionalPositiveInteger(
                 options.maxLoopIterations,
@@ -219,6 +296,9 @@ export function normalizeRunnerConfig(input, { env = process.env } = {}) {
                     allowLineBreaks: true,
                 }),
             tempRoot,
+            ...(supervisorAuthority === null
+                ? {}
+                : { supervisorAuthority }),
         }),
     });
 }
@@ -234,6 +314,7 @@ export function supervisorPaths(stateDir, investigationId) {
         directory,
         lockPath: path.join(directory, `${token}.lock.json`),
         statusPath: path.join(directory, `${token}.status.json`),
+        generationPath: path.join(directory, `${token}.generation.json`),
         configPath: path.join(directory, `${token}.config.json`),
         childConfigPath: path.join(directory, `${token}.runner.json`),
         childResultPath: path.join(directory, `${token}.runner-result.json`),
@@ -244,11 +325,46 @@ export function supervisorPaths(stateDir, investigationId) {
 export function normalizeSupervisorConfig(input, options = {}) {
     rejectUnknownKeys(input, SUPERVISOR_KEYS, "supervisor config");
     const runner = normalizeRunnerConfig(requirePlainObject(input.runner, "runner"), options);
+    if (runner.supervisorGeneration !== null
+        || runner.supervisorNonce !== null
+        || runner.runnerIncarnation !== null) {
+        throw new RuntimeConfigError(
+            "supervisor runner ownership is allocated at runtime and cannot be preconfigured",
+        );
+    }
     const runnerCliPath = requireLocalAbsolutePath(
         input.runnerCliPath ?? path.join(path.dirname(fileURLToPath(import.meta.url)), "runner-cli.mjs"),
         "runnerCliPath",
         options.env ?? process.env,
     );
+    const heartbeatIntervalMs = optionalPositiveInteger(
+        input.heartbeatIntervalMs,
+        "heartbeatIntervalMs",
+        1_000,
+        60 * 1000,
+    );
+    const staleLockMs = optionalPositiveInteger(
+        input.staleLockMs,
+        "staleLockMs",
+        30_000,
+        24 * 60 * 60 * 1000,
+    );
+    const jitterOperationMarginMs = Math.max(
+        SUPERVISOR_HEARTBEAT_OPERATION_MARGIN_MS,
+        Math.ceil(heartbeatIntervalMs / 2),
+    );
+    const minimumExclusiveStaleLockMs = heartbeatIntervalMs + jitterOperationMarginMs;
+    if (staleLockMs <= minimumExclusiveStaleLockMs) {
+        throw new RuntimeConfigError(
+            "staleLockMs must exceed heartbeatIntervalMs plus the supervisor jitter/operation margin",
+            {
+                heartbeatIntervalMs,
+                staleLockMs,
+                jitterOperationMarginMs,
+                minimumExclusiveStaleLockMs,
+            },
+        );
+    }
     return Object.freeze({
         runner,
         runnerCliPath,
@@ -270,18 +386,8 @@ export function normalizeSupervisorConfig(input, options = {}) {
             30_000,
             10 * 60 * 1000,
         ),
-        heartbeatIntervalMs: optionalPositiveInteger(
-            input.heartbeatIntervalMs,
-            "heartbeatIntervalMs",
-            1_000,
-            60 * 1000,
-        ),
-        staleLockMs: optionalPositiveInteger(
-            input.staleLockMs,
-            "staleLockMs",
-            30_000,
-            24 * 60 * 60 * 1000,
-        ),
+        heartbeatIntervalMs,
+        staleLockMs,
         circuitWindowMs: optionalPositiveInteger(
             input.circuitWindowMs,
             "circuitWindowMs",

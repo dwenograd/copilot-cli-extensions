@@ -154,6 +154,16 @@ function request(candidateId = "candidate-a") {
     };
 }
 
+function mutableClock(start = 10_000) {
+    let now = start;
+    return {
+        now: () => now,
+        advance(milliseconds) {
+            now += milliseconds;
+        },
+    };
+}
+
 // In-memory parent snapshot reader that exposes ONLY the two read callbacks the
 // worker is allowed to use. There is no write/execute surface at all.
 const SNAPSHOT_A = `sha256:${"a".repeat(64)}`;
@@ -276,6 +286,80 @@ describe("Crucible SDK worker pool", () => {
         expect(captured.disconnected).toBe(1);
         await pool.close();
         expect(captured.stopped).toBe(true);
+    });
+
+    it("caps the SDK session timeout to the remaining absolute deadline", async () => {
+        const root = makeRoot("deadline");
+        const clock = mutableClock();
+        const deadlineMs = clock.now() + 600;
+        const captured = {
+            timeoutMs: null,
+            disconnected: 0,
+            aborted: 0,
+        };
+        const client = {
+            async start() {},
+            async stop() {},
+            async createSession(config) {
+                return {
+                    async sendAndWait(_request, timeoutMs) {
+                        captured.timeoutMs = timeoutMs;
+                        await config.tools[0].handler(validPayload("candidate-a"), {
+                            sessionId: config.sessionId,
+                            toolCallId: "deadline-call",
+                            toolName: config.tools[0].name,
+                        });
+                        clock.advance(601);
+                    },
+                    async abort() {
+                        captured.aborted += 1;
+                    },
+                    async disconnect() {
+                        captured.disconnected += 1;
+                    },
+                };
+            },
+        };
+        const pool = createSdkWorkerPool({
+            client,
+            baseDirectory: path.join(root, "sdk"),
+            workingDirectory: path.join(root, "work"),
+            sessionTimeoutMs: 5_000,
+            deadlineMs,
+            clock,
+        });
+        await expect(pool.propose(request())).rejects.toMatchObject({
+            code: RUNTIME_ERROR_CODES.DEADLINE_EXCEEDED,
+        });
+        expect(captured.timeoutMs).toBe(600);
+        expect(captured.aborted).toBe(1);
+        expect(captured.disconnected).toBe(1);
+        await pool.close();
+    });
+
+    it("bounds a hung SDK client shutdown", async () => {
+        const root = makeRoot("shutdown-bound");
+        const client = {
+            async start() {},
+            stop() {
+                return new Promise(() => {});
+            },
+            async createSession() {
+                throw new Error("must not create a session");
+            },
+        };
+        const pool = createSdkWorkerPool({
+            client,
+            baseDirectory: path.join(root, "sdk"),
+            workingDirectory: path.join(root, "work"),
+            shutdownTimeoutMs: 10,
+        });
+        await pool.start();
+        const started = Date.now();
+        await expect(pool.close()).rejects.toMatchObject({
+            code: RUNTIME_ERROR_CODES.RUNTIME_FAILURE,
+        });
+        expect(Date.now() - started).toBeLessThan(500);
     });
 
     it.each([

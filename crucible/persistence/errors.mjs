@@ -29,6 +29,7 @@ export const ERROR_CODES = Object.freeze({
     // Command lifecycle / fencing.
     ILLEGAL_TRANSITION: "CRUCIBLE_PERSIST_ILLEGAL_TRANSITION",
     FENCE_REJECTED: "CRUCIBLE_PERSIST_FENCE_REJECTED",
+    ATTEMPT_IDENTITY_MISMATCH: "CRUCIBLE_PERSIST_ATTEMPT_IDENTITY_MISMATCH",
     RESERVATION_CONFLICT: "CRUCIBLE_PERSIST_RESERVATION_CONFLICT",
 
     // Artifacts.
@@ -107,6 +108,13 @@ export class FenceRejectedError extends CruciblePersistenceError {
     constructor(message, details) {
         super(ERROR_CODES.FENCE_REJECTED, message, details);
         this.name = "FenceRejectedError";
+    }
+}
+
+export class AttemptIdentityError extends CruciblePersistenceError {
+    constructor(message, details) {
+        super(ERROR_CODES.ATTEMPT_IDENTITY_MISMATCH, message, details);
+        this.name = "AttemptIdentityError";
     }
 }
 

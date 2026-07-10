@@ -8,6 +8,7 @@ import {
     RUNTIME_ERROR_CODES,
     acquireSupervisorLock,
     ensureSupervisor,
+    normalizeRunnerConfig,
     normalizeSupervisorConfig,
     releaseSupervisorLock,
     runSupervisor,
@@ -15,6 +16,9 @@ import {
     supervisorPaths,
     terminateExactSupervisor,
 } from "../runtime/index.mjs";
+import { scavengeStaleGenerationOwnedPaths } from "../runtime/supervisor.mjs";
+import { RUNTIME_TEMP_OWNER_MARKER } from "../runtime/utils.mjs";
+import { ERROR_CODES as PERSISTENCE_ERROR_CODES, openRepository } from "../persistence/index.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const roots = [];
@@ -46,8 +50,8 @@ function rawConfig(root, overrides = {}) {
         maxRestarts: 2,
         baseBackoffMs: 10,
         maxBackoffMs: 100,
-        heartbeatIntervalMs: 1000,
-        staleLockMs: 100,
+        heartbeatIntervalMs: 100,
+        staleLockMs: 2_000,
         circuitWindowMs: 10_000,
         ...overrides,
     };
@@ -60,6 +64,43 @@ function mutableClock(start = Date.parse("2026-07-09T12:00:00.000Z")) {
         isoNow: () => new Date(now).toISOString(),
         advance(milliseconds) {
             now += milliseconds;
+        },
+    };
+}
+
+function deferred() {
+    let resolve;
+    let reject;
+    const promise = new Promise((resolvePromise, rejectPromise) => {
+        resolve = resolvePromise;
+        reject = rejectPromise;
+    });
+    return { promise, resolve, reject };
+}
+
+function controlledTimers() {
+    const intervals = new Map();
+    let nextId = 1;
+    return {
+        setInterval(callback) {
+            const handle = {
+                id: nextId++,
+                unref() {},
+            };
+            intervals.set(handle, callback);
+            return handle;
+        },
+        clearInterval(handle) {
+            intervals.delete(handle);
+        },
+        setTimeout(callback) {
+            setImmediate(callback);
+            return { unref() {} };
+        },
+        runIntervals() {
+            for (const callback of [...intervals.values()]) {
+                callback();
+            }
         },
     };
 }
@@ -85,7 +126,96 @@ function childResultSpawner(sequence) {
     };
 }
 
+function writeRuntimeOwnerMarker(root, {
+    investigationId = "supervised-investigation",
+    supervisorGeneration,
+    supervisorNonce,
+    runnerEpochId = "runner-epoch",
+    pid,
+} = {}) {
+    fs.mkdirSync(root, { recursive: true });
+    fs.writeFileSync(path.join(root, RUNTIME_TEMP_OWNER_MARKER), JSON.stringify({
+        version: 1,
+        kind: "crucible-runtime-temp-root",
+        investigationId,
+        supervisorGeneration,
+        supervisorNonce,
+        runnerEpochId,
+        pid,
+        root,
+        createdAt: new Date(0).toISOString(),
+        ownedPaths: [
+            root,
+            path.join(root, "sdk-home"),
+            path.join(root, "sdk-work"),
+            path.join(root, "materialized"),
+        ],
+    }));
+}
+
+function writeGenerationRecord(directory, generation, nonce, pid) {
+    fs.writeFileSync(path.join(directory, `owner-${generation}.json`), JSON.stringify({
+        version: 1,
+        investigationId: "supervised-investigation",
+        supervisorGeneration: generation,
+        pid,
+        nonce,
+        allocatedAt: new Date(0).toISOString(),
+    }));
+}
+
 describe("Crucible supervisor", () => {
+    it("requires staleLockMs to exceed heartbeat plus jitter and operation margin", () => {
+        const root = makeRoot("heartbeat-margin");
+        expect(() => normalizeSupervisorConfig(rawConfig(root, {
+            heartbeatIntervalMs: 1_000,
+            staleLockMs: 2_000,
+        }))).toThrow(expect.objectContaining({
+            code: RUNTIME_ERROR_CODES.INVALID_CONFIG,
+            details: expect.objectContaining({
+                heartbeatIntervalMs: 1_000,
+                staleLockMs: 2_000,
+                jitterOperationMarginMs: 1_000,
+            }),
+        }));
+        expect(normalizeSupervisorConfig(rawConfig(root, {
+            heartbeatIntervalMs: 1_000,
+            staleLockMs: 2_001,
+        })).staleLockMs).toBe(2_001);
+    });
+
+    it("allocates a durable monotonic generation for each acquired supervisor", () => {
+        const root = makeRoot("generation");
+        const config = normalizeSupervisorConfig(rawConfig(root));
+        const first = acquireSupervisorLock(config, {
+            pid: 91,
+            idFactory: () => "generation-one",
+            isPidAlive: () => false,
+        });
+        expect(first.supervisorGeneration).toBe(1);
+        expect(JSON.parse(fs.readFileSync(config.paths.generationPath, "utf8")))
+            .toMatchObject({
+                supervisorGeneration: 1,
+                pid: 91,
+                nonce: "generation-one",
+            });
+        expect(releaseSupervisorLock(first)).toBe(true);
+
+        const second = acquireSupervisorLock(config, {
+            pid: 92,
+            idFactory: () => "generation-two",
+            isPidAlive: () => false,
+        });
+        expect(second.supervisorGeneration).toBe(2);
+        expect(JSON.parse(fs.readFileSync(config.paths.generationPath, "utf8")))
+            .toMatchObject({
+                supervisorGeneration: 2,
+                pid: 92,
+                nonce: "generation-two",
+            });
+        expect(releaseSupervisorLock(second)).toBe(true);
+    });
+
     it("enforces one live supervisor lock per investigation", () => {
         const root = makeRoot("singleton");
         const config = normalizeSupervisorConfig(rawConfig(root));
@@ -107,7 +237,7 @@ describe("Crucible supervisor", () => {
         expect(releaseSupervisorLock(first)).toBe(true);
     });
 
-    it("recovers a stale lock only when its exact PID is dead and old enough", () => {
+    it("reclaims a stale lock with no fresh heartbeat even when its PID is live", () => {
         const root = makeRoot("stale");
         const config = normalizeSupervisorConfig(rawConfig(root));
         const firstClock = mutableClock();
@@ -125,9 +255,13 @@ describe("Crucible supervisor", () => {
             pid: 222,
             idFactory: () => "new-nonce",
             clock: secondClock,
-            isPidAlive: () => false,
+            isPidAlive: () => true,
         });
-        expect(recovered).toMatchObject({ pid: 222, nonce: "new-nonce" });
+        expect(recovered).toMatchObject({
+            pid: 222,
+            nonce: "new-nonce",
+            supervisorGeneration: 2,
+        });
         expect(releaseSupervisorLock(recovered)).toBe(true);
     });
 
@@ -177,8 +311,203 @@ describe("Crucible supervisor", () => {
             restartCount: 1,
             pid: 303,
             nonce: "supervisor-nonce",
+            supervisorGeneration: 1,
         });
         expect(fs.existsSync(config.paths.lockPath)).toBe(false);
+    });
+
+    it("persists a unique incarnation before each launch and rotates it before restart", async () => {
+        const root = makeRoot("runner-incarnation");
+        const config = normalizeSupervisorConfig(rawConfig(root));
+        const incarnations = [
+            "supervisor-launch-incarnation-one",
+            "supervisor-launch-incarnation-two",
+        ];
+        const launches = [];
+        let firstLease = null;
+        let staleRejection = null;
+        let activeBeforeStaleRejection = null;
+        let activeAfterStaleRejection = null;
+        const result = await runSupervisor(config, {
+            pid: 306,
+            idFactory: () => "incarnation-supervisor",
+            runnerIncarnationFactory: () => incarnations.shift(),
+            isPidAlive: () => false,
+            sleep: async () => {},
+            spawnRunner: async (launchConfig, context) => {
+                const repository = openRepository({
+                    file: path.join(config.runner.stateDir, "events.sqlite"),
+                });
+                const child = new EventEmitter();
+                child.pid = 5300 + context.launchNumber;
+                try {
+                    const authority = repository.getSupervisorAuthority(
+                        config.runner.investigationId,
+                    );
+                    const normalizedChild = normalizeRunnerConfig(
+                        context.runnerConfig,
+                    );
+                    const cliForwardedConfig = normalizeRunnerConfig({
+                        investigationId: normalizedChild.investigationId,
+                        stateDir: normalizedChild.stateDir,
+                        artifactRoot: normalizedChild.artifactRoot,
+                        allowlistPath: normalizedChild.allowlistPath,
+                        copilotSdkPath: normalizedChild.sdkPath,
+                        copilotCliPath: normalizedChild.cliPath,
+                        runnerEpochId: normalizedChild.runnerEpochId,
+                        deadline: normalizedChild.deadlineMs,
+                        resultPath: normalizedChild.resultPath,
+                        options: normalizedChild.options,
+                    });
+                    launches.push({
+                        context,
+                        authority,
+                        config: normalizedChild,
+                        cliForwardedConfig,
+                        childConfigPath: launchConfig.paths.childConfigPath,
+                        childResultPath: launchConfig.paths.childResultPath,
+                    });
+                    if (context.launchNumber === 1) {
+                        firstLease = repository.acquireLease({
+                            investigationId: config.runner.investigationId,
+                            leaseId: "supervisor-launch-lease-one",
+                            owner: "supervisor-launch-runner-one",
+                            supervisorGeneration: context.supervisorGeneration,
+                            runnerIncarnation: context.runnerIncarnation,
+                        });
+                        setImmediate(() => child.emit("close", 75, null));
+                    } else {
+                        activeBeforeStaleRejection = repository.getActiveLease(
+                            config.runner.investigationId,
+                        );
+                        try {
+                            repository.acquireLease({
+                                investigationId: config.runner.investigationId,
+                                leaseId: "supervisor-launch-stale-retry",
+                                owner: "supervisor-launch-runner-stale",
+                                supervisorGeneration:
+                                    launches[0].context.supervisorGeneration,
+                                runnerIncarnation:
+                                    launches[0].context.runnerIncarnation,
+                            });
+                        } catch (error) {
+                            staleRejection = error;
+                        }
+                        activeAfterStaleRejection = repository.getActiveLease(
+                            config.runner.investigationId,
+                        );
+                        repository.acquireLease({
+                            investigationId: config.runner.investigationId,
+                            leaseId: "supervisor-launch-lease-two",
+                            owner: "supervisor-launch-runner-two",
+                            supervisorGeneration: context.supervisorGeneration,
+                            runnerIncarnation: context.runnerIncarnation,
+                        });
+                        setImmediate(() => {
+                            fs.writeFileSync(
+                                launchConfig.paths.childResultPath,
+                                `${JSON.stringify({
+                                    ok: true,
+                                    result: {
+                                        kind: "NON_RESULT",
+                                        code: "INCARNATION_ROTATED",
+                                    },
+                                })}\n`,
+                            );
+                            child.emit("close", 0, null);
+                        });
+                    }
+                } finally {
+                    repository.close();
+                }
+                return {
+                    child,
+                    resultPath: launchConfig.paths.childResultPath,
+                };
+            },
+        });
+
+        expect(result.kind).toBe("NON_RESULT");
+        expect(launches).toHaveLength(2);
+        expect(launches.map((launch) => launch.context.runnerIncarnation))
+            .toEqual([
+                "supervisor-launch-incarnation-one",
+                "supervisor-launch-incarnation-two",
+            ]);
+        expect(launches.every((launch) =>
+            launch.authority.currentRunnerIncarnation
+                === launch.context.runnerIncarnation)).toBe(true);
+        expect(launches.every((launch) =>
+            launch.config.runnerIncarnation
+                === launch.context.runnerIncarnation)).toBe(true);
+        expect(launches.every((launch) =>
+            launch.cliForwardedConfig.runnerIncarnation
+                === launch.context.runnerIncarnation)).toBe(true);
+        expect(launches[0].childConfigPath).not.toBe(launches[1].childConfigPath);
+        expect(launches[0].childResultPath).not.toBe(launches[1].childResultPath);
+        expect(staleRejection).toMatchObject({
+            code: PERSISTENCE_ERROR_CODES.FENCE_REJECTED,
+        });
+        expect(activeBeforeStaleRejection).toMatchObject({
+            ...firstLease,
+            releasedAt: null,
+        });
+        expect(activeAfterStaleRejection).toEqual(activeBeforeStaleRejection);
+
+        const repository = openRepository({
+            file: path.join(config.runner.stateDir, "events.sqlite"),
+        });
+        try {
+            expect(repository.getSupervisorAuthority(config.runner.investigationId))
+                .toMatchObject({
+                    supervisorGeneration: 1,
+                    supervisorNonce: "incarnation-supervisor",
+                    currentRunnerIncarnation: "supervisor-launch-incarnation-two",
+                });
+            expect(repository.getActiveLease(config.runner.investigationId))
+                .toMatchObject({
+                    fencingToken: 2,
+                    runnerIncarnation: "supervisor-launch-incarnation-two",
+                    releasedAt: null,
+                });
+            expect(repository.countEvents(config.runner.investigationId)).toBe(0);
+        } finally {
+            repository.close();
+        }
+    });
+
+    it("caps retry backoff to the remaining investigation deadline", async () => {
+        const root = makeRoot("deadline-backoff");
+        const clock = mutableClock();
+        const raw = rawConfig(root);
+        raw.runner.deadline = clock.now() + 5;
+        const config = normalizeSupervisorConfig(raw);
+        const sleeps = [];
+        const result = await runSupervisor(config, {
+            pid: 305,
+            idFactory: () => "deadline-backoff-nonce",
+            clock,
+            isPidAlive: () => false,
+            sleep: async (milliseconds) => {
+                sleeps.push(milliseconds);
+                clock.advance(milliseconds);
+            },
+            spawnRunner: childResultSpawner([
+                { code: 75 },
+                {
+                    code: 0,
+                    envelope: {
+                        ok: true,
+                        result: {
+                            kind: "NON_RESULT",
+                            code: "DEADLINE_EXCEEDED",
+                        },
+                    },
+                },
+            ]),
+        });
+        expect(result.kind).toBe("NON_RESULT");
+        expect(sleeps).toEqual([5]);
     });
 
     it("keeps the crash-backoff timer referenced until the restart occurs", async () => {
@@ -240,6 +569,12 @@ describe("Crucible supervisor", () => {
         expect(operational).toHaveLength(1);
         expect(operational[0]).toMatchObject({
             code: RUNTIME_ERROR_CODES.CIRCUIT_OPEN,
+            supervisorGeneration: 1,
+            supervisorNonce: "circuit-nonce",
+            details: expect.objectContaining({
+                supervisorGeneration: 1,
+                supervisorNonce: "circuit-nonce",
+            }),
         });
     });
 
@@ -361,7 +696,11 @@ describe("Crucible supervisor", () => {
                 idFactory: () => "new-owner",
                 isPidAlive: () => false,
             });
-            expect(lock).toMatchObject({ pid: 321, nonce: "new-owner" });
+            expect(lock).toMatchObject({
+                pid: 321,
+                nonce: "new-owner",
+                supervisorGeneration: 1,
+            });
             expect(releaseSupervisorLock(lock)).toBe(true);
     });
 
@@ -373,10 +712,20 @@ describe("Crucible supervisor", () => {
                 pid: 777,
                 nonce: "old-owner",
                 startedAt: new Date(Date.now() - 60_000).toISOString(),
+                supervisorGeneration: 7,
+            }));
+            fs.writeFileSync(config.paths.generationPath, JSON.stringify({
+                version: 1,
+                investigationId: config.runner.investigationId,
+                supervisorGeneration: 7,
+                pid: 777,
+                nonce: "old-owner",
+                allocatedAt: new Date(Date.now() - 60_000).toISOString(),
             }));
             fs.writeFileSync(config.paths.statusPath, JSON.stringify({
                 pid: 777,
                 nonce: "different-owner",
+                supervisorGeneration: 7,
                 heartbeatAt: new Date().toISOString(),
                 state: "running",
             }));
@@ -387,8 +736,219 @@ describe("Crucible supervisor", () => {
                 idFactory: () => "replacement-owner",
                 isPidAlive: (pid) => pid === 777,
             });
-            expect(lock).toMatchObject({ pid: 888, nonce: "replacement-owner" });
+            expect(lock).toMatchObject({
+                pid: 888,
+                nonce: "replacement-owner",
+                supervisorGeneration: 8,
+            });
             releaseSupervisorLock(lock);
+    });
+
+    it("fences a stalled live supervisor after takeover and only the new generation restarts", async () => {
+        const root = makeRoot("split-brain");
+        const config = normalizeSupervisorConfig(rawConfig(root));
+        const clock = mutableClock();
+        const oldTimers = controlledTimers();
+        const oldStarted = deferred();
+        const oldChild = new EventEmitter();
+        oldChild.pid = 6101;
+        const oldTerminated = [];
+        const oldLaunches = [];
+
+        const oldPromise = runSupervisor(config, {
+            pid: 601,
+            idFactory: () => "stalled-owner",
+            clock,
+            timers: oldTimers,
+            signalSource: new EventEmitter(),
+            isPidAlive: () => true,
+            spawnRunner: async (ownedConfig, context) => {
+               oldLaunches.push({
+                   generation: context.supervisorGeneration,
+                   nonce: context.supervisorNonce,
+                   runnerIncarnation: context.runnerIncarnation,
+                   runnerConfig: context.runnerConfig,
+               });
+               setImmediate(() => oldStarted.resolve({ ownedConfig, context }));
+               return {
+                   child: oldChild,
+                   resultPath: ownedConfig.paths.childResultPath,
+               };
+            },
+            processTreeAdapter: {
+               async terminateTree(pid) {
+                   oldTerminated.push(pid);
+                   setImmediate(() => oldChild.emit("close", null, "SIGTERM"));
+                   return true;
+               },
+            },
+        });
+        const old = await oldStarted.promise;
+        expect(old.context).toMatchObject({
+            supervisorGeneration: 1,
+            supervisorNonce: "stalled-owner",
+            runnerConfig: {
+               supervisorGeneration: 1,
+               supervisorNonce: "stalled-owner",
+            },
+        });
+        expect(normalizeRunnerConfig(old.context.runnerConfig)).toMatchObject({
+            supervisorGeneration: 1,
+            supervisorNonce: "stalled-owner",
+        });
+
+        clock.advance(config.staleLockMs + 100);
+        const staleLockTime = new Date(clock.now() - config.staleLockMs - 1);
+        fs.utimesSync(config.paths.lockPath, staleLockTime, staleLockTime);
+
+        const newTimers = controlledTimers();
+        const newStarted = deferred();
+        const newLaunches = [];
+        let activeNewChild = null;
+        const newPromise = runSupervisor(config, {
+            pid: 602,
+            idFactory: () => "takeover-owner",
+            clock,
+            timers: newTimers,
+            signalSource: new EventEmitter(),
+            isPidAlive: () => true,
+            sleep: async (milliseconds) => clock.advance(milliseconds),
+            spawnRunner: async (ownedConfig, context) => {
+               const child = new EventEmitter();
+               child.pid = 6200 + context.launchNumber;
+               activeNewChild = child;
+               newLaunches.push({
+                   generation: context.supervisorGeneration,
+                   nonce: context.supervisorNonce,
+                   runnerIncarnation: context.runnerIncarnation,
+                   runnerConfig: context.runnerConfig,
+                   resultPath: ownedConfig.paths.childResultPath,
+                   child,
+               });
+               if (context.launchNumber === 1) {
+                   setImmediate(() => newStarted.resolve({ ownedConfig, context, child }));
+               } else {
+                   setImmediate(() => {
+                       fs.writeFileSync(
+                           ownedConfig.paths.childResultPath,
+                           `${JSON.stringify({
+                               ok: true,
+                               result: {
+                                   kind: "NON_RESULT",
+                                   code: "TAKEOVER_COMPLETE",
+                               },
+                           })}\n`,
+                       );
+                       child.emit("close", 0, null);
+                   });
+               }
+               return {
+                   child,
+                   resultPath: ownedConfig.paths.childResultPath,
+               };
+            },
+        });
+        const takeover = await newStarted.promise;
+        expect(takeover.context).toMatchObject({
+            supervisorGeneration: 2,
+            supervisorNonce: "takeover-owner",
+            runnerConfig: {
+               supervisorGeneration: 2,
+               supervisorNonce: "takeover-owner",
+            },
+        });
+        expect(normalizeRunnerConfig(takeover.context.runnerConfig)).toMatchObject({
+            supervisorGeneration: 2,
+            supervisorNonce: "takeover-owner",
+            runnerIncarnation: takeover.context.runnerIncarnation,
+        });
+
+        const delayedRepository = openRepository({
+            file: path.join(config.runner.stateDir, "events.sqlite"),
+        });
+        const currentRepository = openRepository({
+            file: path.join(config.runner.stateDir, "events.sqlite"),
+        });
+        try {
+            const eventsBeforeDelayedLaunch = currentRepository.countEvents(
+                config.runner.investigationId,
+            );
+            expect(currentRepository.getActiveLease(config.runner.investigationId))
+                .toBeNull();
+            expect(() => delayedRepository.acquireLease({
+                investigationId: config.runner.investigationId,
+                leaseId: "delayed-generation-one-lease",
+                owner: "delayed-generation-one-runner",
+                supervisorGeneration: old.context.supervisorGeneration,
+                runnerIncarnation: old.context.runnerIncarnation,
+            })).toThrow(expect.objectContaining({
+                code: PERSISTENCE_ERROR_CODES.FENCE_REJECTED,
+            }));
+            expect(currentRepository.getActiveLease(config.runner.investigationId))
+                .toBeNull();
+            expect(currentRepository.countEvents(config.runner.investigationId))
+                .toBe(eventsBeforeDelayedLaunch);
+            expect(currentRepository.acquireLease({
+                investigationId: config.runner.investigationId,
+                leaseId: "takeover-generation-two-lease",
+                owner: "takeover-generation-two-runner",
+                supervisorGeneration: takeover.context.supervisorGeneration,
+                runnerIncarnation: takeover.context.runnerIncarnation,
+            })).toMatchObject({
+                fencingToken: 1,
+                supervisorGeneration: 2,
+                runnerIncarnation: takeover.context.runnerIncarnation,
+            });
+        } finally {
+            delayedRepository.close();
+            currentRepository.close();
+        }
+
+        oldTimers.runIntervals();
+        const oldResult = await oldPromise;
+        expect(oldResult).toMatchObject({
+            kind: "STOPPED",
+            ownershipLost: true,
+            shutdown: {
+               kind: "ownership_lost",
+               supervisorGeneration: 1,
+               nonce: "stalled-owner",
+            },
+        });
+        expect(oldTerminated).toEqual([6101]);
+        expect(oldLaunches).toHaveLength(1);
+
+        const statusAfterTakeover = JSON.parse(
+            fs.readFileSync(config.paths.statusPath, "utf8"),
+        );
+        expect(statusAfterTakeover).toMatchObject({
+            state: "running",
+            pid: 602,
+            nonce: "takeover-owner",
+            supervisorGeneration: 2,
+        });
+
+        activeNewChild.emit("close", 75, null);
+        const newResult = await newPromise;
+        expect(newResult.kind).toBe("NON_RESULT");
+        expect(newLaunches).toHaveLength(2);
+        expect(newLaunches.every((launch) => launch.generation === 2)).toBe(true);
+        expect(newLaunches.every((launch) => launch.nonce === "takeover-owner")).toBe(true);
+        expect(newLaunches[0].runnerIncarnation)
+            .not.toBe(newLaunches[1].runnerIncarnation);
+        expect(JSON.parse(fs.readFileSync(config.paths.generationPath, "utf8")))
+            .toMatchObject({
+               supervisorGeneration: 2,
+               pid: 602,
+               nonce: "takeover-owner",
+            });
+        expect(JSON.parse(fs.readFileSync(config.paths.statusPath, "utf8")))
+            .toMatchObject({
+               state: "non_result",
+               restartCount: 1,
+               supervisorGeneration: 2,
+               nonce: "takeover-owner",
+            });
     });
 
     it("terminates and awaits the exact child tree before releasing ownership on signal", async () => {
@@ -421,6 +981,144 @@ describe("Crucible supervisor", () => {
             expect(fs.existsSync(config.paths.lockPath)).toBe(false);
     });
 
+    it("releases supervisor ownership within the final shutdown bound", async () => {
+        const root = makeRoot("bounded-child-cleanup");
+        const config = normalizeSupervisorConfig(rawConfig(root));
+        const signals = new EventEmitter();
+        const child = new EventEmitter();
+        child.pid = 7654;
+        const phases = [];
+        const started = Date.now();
+        const resultPromise = runSupervisor(config, {
+            pid: 506,
+            idFactory: () => "bounded-cleanup-nonce",
+            isPidAlive: () => false,
+            signalSource: signals,
+            shutdownPolicy: {
+                drainMs: 10,
+                escalationMs: 10,
+                finalMs: 25,
+            },
+            spawnRunner: async () => {
+                setImmediate(() => signals.emit("SIGTERM"));
+                return { child, resultPath: config.paths.childResultPath };
+            },
+            processTreeAdapter: {
+                terminateTree(_pid, options) {
+                    phases.push(options.phase);
+                    return new Promise(() => {});
+                },
+                closeJobObject() {
+                    phases.push("job_object_close");
+                    return new Promise(() => {});
+                },
+            },
+        });
+        const result = await resultPromise;
+        expect(Date.now() - started).toBeLessThan(500);
+        expect(result).toMatchObject({
+            kind: "STOPPED",
+            status: {
+                state: "stopped",
+            },
+        });
+        expect(phases).toEqual(["drain", "escalation", "job_object_close"]);
+        expect(fs.existsSync(config.paths.lockPath)).toBe(false);
+    });
+
+    it("scavenges only dead older-generation runtime debris", () => {
+        const root = makeRoot("startup-scavenge");
+        const tempRoot = path.join(root, "state", "runtime-temp");
+        const supervisorDirectory = path.join(root, "state", "supervisor");
+        fs.mkdirSync(tempRoot, { recursive: true });
+        fs.mkdirSync(supervisorDirectory, { recursive: true });
+        writeGenerationRecord(supervisorDirectory, 1, "stale-owner", 901);
+        writeGenerationRecord(supervisorDirectory, 2, "referenced-owner", 902);
+        writeGenerationRecord(supervisorDirectory, 3, "alive-owner", 903);
+        writeGenerationRecord(supervisorDirectory, 4, "current-owner", 904);
+
+        const stale = path.join(tempRoot, "run-g1-stale");
+        writeRuntimeOwnerMarker(stale, {
+            supervisorGeneration: 1,
+            supervisorNonce: "stale-owner",
+            pid: 101,
+        });
+        fs.mkdirSync(path.join(stale, "sdk-home"), { recursive: true });
+        fs.mkdirSync(path.join(stale, ".crucible-stage-abrupt"), { recursive: true });
+        fs.writeFileSync(path.join(stale, ".crucible-stage-abrupt", "node.exe"), "debris");
+
+        const current = path.join(tempRoot, "run-g4-current");
+        writeRuntimeOwnerMarker(current, {
+            supervisorGeneration: 4,
+            supervisorNonce: "current-owner",
+            pid: 202,
+        });
+
+        const referenced = path.join(tempRoot, "run-g1-referenced");
+        writeRuntimeOwnerMarker(referenced, {
+            supervisorGeneration: 2,
+            supervisorNonce: "referenced-owner",
+            pid: 103,
+        });
+        const referencedFile = path.join(referenced, "sdk-work", "active.json");
+        fs.mkdirSync(path.dirname(referencedFile), { recursive: true });
+        fs.writeFileSync(referencedFile, "{}");
+
+        const alive = path.join(tempRoot, "run-g1-alive");
+        writeRuntimeOwnerMarker(alive, {
+            supervisorGeneration: 3,
+            supervisorNonce: "alive-owner",
+            pid: 104,
+        });
+
+        const unproven = path.join(tempRoot, "run-g1-unproven");
+        fs.mkdirSync(unproven);
+
+        const staleAtomic = path.join(
+            supervisorDirectory,
+            `.status.json.101.${"a".repeat(24)}.tmp`,
+        );
+        fs.writeFileSync(staleAtomic, JSON.stringify({
+            pid: 101,
+            supervisorGeneration: 1,
+            nonce: "stale-owner",
+        }));
+        const currentAtomic = path.join(
+            supervisorDirectory,
+            `.status.json.202.${"b".repeat(24)}.tmp`,
+        );
+        fs.writeFileSync(currentAtomic, JSON.stringify({
+            pid: 202,
+            supervisorGeneration: 4,
+            nonce: "current-owner",
+        }));
+
+        const result = scavengeStaleGenerationOwnedPaths({
+            tempRoot,
+            supervisorDirectory,
+            investigationId: "supervised-investigation",
+            currentGeneration: 4,
+            currentNonce: "current-owner",
+            currentPid: 202,
+            referencedPaths: [referencedFile],
+            isPidAlive: (pid) => pid === 104,
+            now: Date.now(),
+            minimumAgeMs: 0,
+        });
+
+        expect(fs.existsSync(stale)).toBe(false);
+        expect(fs.existsSync(staleAtomic)).toBe(false);
+        expect(fs.existsSync(current)).toBe(true);
+        expect(fs.existsSync(referenced)).toBe(true);
+        expect(fs.existsSync(alive)).toBe(true);
+        expect(fs.existsSync(unproven)).toBe(true);
+        expect(fs.existsSync(currentAtomic)).toBe(true);
+        expect(result.removed.map((item) => item.kind).sort()).toEqual([
+            "atomic_temp",
+            "runtime_temp_root",
+        ]);
+    });
+
     it("does not write through a junction outside the assigned state root", () => {
         const root = makeRoot("junction");
         const outside = path.join(root, "outside");
@@ -443,10 +1141,12 @@ describe("Crucible supervisor", () => {
             pid: 777,
             nonce: "expected",
             startedAt: "2026-07-09T12:00:00.000Z",
+            supervisorGeneration: 4,
         }));
         fs.writeFileSync(paths.statusPath, JSON.stringify({
             pid: 777,
             nonce: "expected",
+            supervisorGeneration: 4,
             heartbeatAt: "2026-07-09T12:00:01.000Z",
             state: "running",
         }));
@@ -456,6 +1156,7 @@ describe("Crucible supervisor", () => {
             statusPath: paths.statusPath,
             stopRequestPath: paths.stopRequestPath,
             expectedNonce: "expected",
+            expectedGeneration: 4,
             clock: mutableClock(Date.parse("2026-07-09T12:00:02.000Z")),
             processApi: {
                 kill(pid, signal) {
@@ -465,9 +1166,15 @@ describe("Crucible supervisor", () => {
         });
         expect(result.pid).toBe(777);
         expect(result.action).toBe("stop_requested");
+        expect(result.supervisorGeneration).toBe(4);
         expect(calls).toEqual([{ pid: 777, signal: 0 }]);
-        expect(JSON.parse(fs.readFileSync(paths.stopRequestPath, "utf8")))
-            .toMatchObject({ pid: 777, nonce: "expected", signal: "SIGTERM" });
+        expect(JSON.parse(fs.readFileSync(result.stopRequestPath, "utf8")))
+            .toMatchObject({
+                pid: 777,
+                nonce: "expected",
+                supervisorGeneration: 4,
+                signal: "SIGTERM",
+            });
         expect(() => terminateExactSupervisor({
             lockPath: paths.lockPath,
             statusPath: paths.statusPath,

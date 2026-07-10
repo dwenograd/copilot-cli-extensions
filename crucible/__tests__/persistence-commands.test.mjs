@@ -210,4 +210,326 @@ describe("fencing token / lease ownership", () => {
         });
         expect(replacement.state).toBe("reserved");
     });
+
+    it("binds supervisor generation and attempt logical identity to atomic persistence", () => {
+        repo.ensureInvestigation({ investigationId: "inv-1.runtime-evidence" });
+        repo.claimSupervisorGeneration({
+            investigationId: "inv-1",
+            supervisorGeneration: 7,
+            supervisorNonce: "supervisor-generation-7",
+        });
+        repo.issueRunnerIncarnation({
+            investigationId: "inv-1",
+            supervisorGeneration: 7,
+            supervisorNonce: "supervisor-generation-7",
+            runnerIncarnation: "runner-incarnation-7a",
+        });
+        const lease = repo.acquireLease({
+            investigationId: "inv-1",
+            leaseId: "lease-generation-7",
+            owner: "runner-A",
+            supervisorGeneration: 7,
+            runnerIncarnation: "runner-incarnation-7a",
+        });
+        const command = JSON.stringify({
+            scope: "external-effect",
+            logicalEffectKey: "effect-1",
+        });
+        repo.reserveCommand({
+            investigationId: "inv-1",
+            attemptId: "effect-attempt",
+            command,
+            leaseId: lease.leaseId,
+            fencingToken: lease.fencingToken,
+            owner: lease.owner,
+            supervisorGeneration: lease.supervisorGeneration,
+            runnerIncarnation: lease.runnerIncarnation,
+        });
+        repo.dispatchCommand({
+            investigationId: "inv-1",
+            attemptId: "effect-attempt",
+            leaseId: lease.leaseId,
+            fencingToken: lease.fencingToken,
+            owner: lease.owner,
+            supervisorGeneration: lease.supervisorGeneration,
+            runnerIncarnation: lease.runnerIncarnation,
+        });
+        repo.observeCommand({
+            investigationId: "inv-1",
+            attemptId: "effect-attempt",
+            leaseId: lease.leaseId,
+            fencingToken: lease.fencingToken,
+            owner: lease.owner,
+            supervisorGeneration: lease.supervisorGeneration,
+            runnerIncarnation: lease.runnerIncarnation,
+        });
+
+        expect(() => repo.ingestEvidenceBatchWithAttemptTransition({
+            investigationId: "inv-1.runtime-evidence",
+            authorityInvestigationId: "inv-1",
+            attemptId: "effect-attempt",
+            attemptCommand: JSON.stringify({ scope: "wrong-effect" }),
+            leaseId: lease.leaseId,
+            fencingToken: lease.fencingToken,
+            owner: lease.owner,
+            supervisorGeneration: lease.supervisorGeneration,
+            runnerIncarnation: lease.runnerIncarnation,
+            fromState: "observed",
+            toState: "committed",
+            evidence: [{
+                evidenceKind: "proposal",
+                kind: "runtime:model_proposal",
+                payload: { logicalEffectKey: "effect-1" },
+            }],
+        })).toThrow(expect.objectContaining({
+            code: ERROR_CODES.ATTEMPT_IDENTITY_MISMATCH,
+        }));
+        expect(repo.countEvents("inv-1.runtime-evidence")).toBe(0);
+        expect(repo.getCommandAttempt("effect-attempt").state).toBe("observed");
+
+        expect(() => repo.ingestEvidenceBatchWithAttemptTransition({
+            investigationId: "inv-1.runtime-evidence",
+            authorityInvestigationId: "inv-1",
+            attemptId: "effect-attempt",
+            attemptCommand: command,
+            leaseId: lease.leaseId,
+            fencingToken: lease.fencingToken,
+            owner: lease.owner,
+            fromState: "observed",
+            toState: "committed",
+            evidence: [{
+                evidenceKind: "proposal",
+                kind: "runtime:model_proposal",
+                payload: { logicalEffectKey: "effect-1" },
+            }],
+        })).toThrow(expect.objectContaining({
+            code: ERROR_CODES.FENCE_REJECTED,
+        }));
+        expect(repo.countEvents("inv-1.runtime-evidence")).toBe(0);
+        expect(repo.getCommandAttempt("effect-attempt").state).toBe("observed");
+
+        const committed = repo.ingestEvidenceBatchWithAttemptTransition({
+            investigationId: "inv-1.runtime-evidence",
+            authorityInvestigationId: "inv-1",
+            attemptId: "effect-attempt",
+            attemptCommand: command,
+            leaseId: lease.leaseId,
+            fencingToken: lease.fencingToken,
+            owner: lease.owner,
+            supervisorGeneration: lease.supervisorGeneration,
+            runnerIncarnation: lease.runnerIncarnation,
+            fromState: "observed",
+            toState: "committed",
+            evidence: [
+                {
+                    evidenceKind: "proposal",
+                    kind: "runtime:model_proposal",
+                    payload: { logicalEffectKey: "effect-1" },
+                },
+                {
+                    evidenceKind: "receipt",
+                    kind: "runtime:measurement",
+                    payload: { logicalEffectKey: "effect-1", score: 95 },
+                },
+            ],
+        });
+        expect(committed.deduplicated).toBe(false);
+        expect(committed.events).toHaveLength(2);
+        expect(committed.attempt.state).toBe("committed");
+
+        const retry = repo.ingestEvidenceBatchWithAttemptTransition({
+            investigationId: "inv-1.runtime-evidence",
+            authorityInvestigationId: "inv-1",
+            attemptId: "effect-attempt",
+            attemptCommand: command,
+            leaseId: lease.leaseId,
+            fencingToken: lease.fencingToken,
+            owner: lease.owner,
+            supervisorGeneration: lease.supervisorGeneration,
+            runnerIncarnation: lease.runnerIncarnation,
+            fromState: "observed",
+            toState: "committed",
+            evidence: [
+                {
+                    evidenceKind: "proposal",
+                    kind: "runtime:model_proposal",
+                    payload: { logicalEffectKey: "effect-1" },
+                },
+                {
+                    evidenceKind: "receipt",
+                    kind: "runtime:measurement",
+                    payload: { logicalEffectKey: "effect-1", score: 95 },
+                },
+            ],
+        });
+        expect(retry.deduplicated).toBe(true);
+        expect(repo.countEvents("inv-1.runtime-evidence")).toBe(2);
+        expect(repo.getCommandAttempt("effect-attempt").state).toBe("committed");
+    });
+
+    it("fences delayed generations and single-use incarnations across two repositories", () => {
+        const repoB = openRepository({ file: repo.databaseFile });
+        try {
+            repo.claimSupervisorGeneration({
+                investigationId: "inv-1",
+                supervisorGeneration: 1,
+                supervisorNonce: "supervisor-one",
+            });
+            repo.issueRunnerIncarnation({
+                investigationId: "inv-1",
+                supervisorGeneration: 1,
+                supervisorNonce: "supervisor-one",
+                runnerIncarnation: "generation-one-delayed-launch",
+            });
+            repoB.claimSupervisorGeneration({
+                investigationId: "inv-1",
+                supervisorGeneration: 2,
+                supervisorNonce: "supervisor-two",
+            });
+            repoB.issueRunnerIncarnation({
+                investigationId: "inv-1",
+                supervisorGeneration: 2,
+                supervisorNonce: "supervisor-two",
+                runnerIncarnation: "generation-two-launch-one",
+            });
+
+            expect(() => repo.acquireLease({
+                investigationId: "inv-1",
+                leaseId: "delayed-generation-one",
+                owner: "runner-generation-one",
+                supervisorGeneration: 1,
+                runnerIncarnation: "generation-one-delayed-launch",
+            })).toThrow(expect.objectContaining({
+                code: ERROR_CODES.FENCE_REJECTED,
+            }));
+            expect(repoB.getActiveLease("inv-1")).toBeNull();
+            expect(repoB.countEvents("inv-1")).toBe(0);
+
+            const firstCurrentLease = repoB.acquireLease({
+                investigationId: "inv-1",
+                leaseId: "generation-two-lease-one",
+                owner: "runner-generation-two-one",
+                supervisorGeneration: 2,
+                runnerIncarnation: "generation-two-launch-one",
+            });
+            expect(firstCurrentLease.fencingToken).toBe(1);
+            const command = "same-generation-restart-command";
+            repoB.reserveCommand({
+                investigationId: "inv-1",
+                attemptId: "same-generation-old-attempt",
+                command,
+                leaseId: firstCurrentLease.leaseId,
+                fencingToken: firstCurrentLease.fencingToken,
+                owner: firstCurrentLease.owner,
+                supervisorGeneration: firstCurrentLease.supervisorGeneration,
+                runnerIncarnation: firstCurrentLease.runnerIncarnation,
+            });
+            repoB.dispatchCommand({
+                investigationId: "inv-1",
+                attemptId: "same-generation-old-attempt",
+                leaseId: firstCurrentLease.leaseId,
+                fencingToken: firstCurrentLease.fencingToken,
+                owner: firstCurrentLease.owner,
+                supervisorGeneration: firstCurrentLease.supervisorGeneration,
+                runnerIncarnation: firstCurrentLease.runnerIncarnation,
+            });
+
+            repoB.issueRunnerIncarnation({
+                investigationId: "inv-1",
+                supervisorGeneration: 2,
+                supervisorNonce: "supervisor-two",
+                runnerIncarnation: "generation-two-launch-two",
+            });
+            const activeBeforeRejection = repoB.getActiveLease("inv-1");
+            const eventsBeforeRejection = repoB.countEvents("inv-1");
+            expect(() => repo.appendEventsWithAttemptTransition({
+                investigationId: "inv-1",
+                expectedHead: null,
+                events: [{ kind: "stale-domain-event", payload: { stale: true } }],
+                attemptId: "same-generation-old-attempt",
+                attemptCommand: command,
+                leaseId: firstCurrentLease.leaseId,
+                fencingToken: firstCurrentLease.fencingToken,
+                owner: firstCurrentLease.owner,
+                supervisorGeneration: firstCurrentLease.supervisorGeneration,
+                runnerIncarnation: firstCurrentLease.runnerIncarnation,
+                fromState: "dispatched",
+                toState: "observed",
+            })).toThrow(expect.objectContaining({
+                code: ERROR_CODES.FENCE_REJECTED,
+            }));
+            expect(repoB.countEvents("inv-1")).toBe(eventsBeforeRejection);
+            expect(repoB.getCommandAttempt("same-generation-old-attempt").state)
+                .toBe("dispatched");
+            expect(repoB.getActiveLease("inv-1")).toEqual(activeBeforeRejection);
+
+            expect(() => repo.acquireLease({
+                investigationId: "inv-1",
+                leaseId: "same-generation-old-reacquire",
+                owner: "runner-generation-two-old",
+                supervisorGeneration: 2,
+                runnerIncarnation: "generation-two-launch-one",
+            })).toThrow(expect.objectContaining({
+                code: ERROR_CODES.FENCE_REJECTED,
+            }));
+            expect(repoB.countEvents("inv-1")).toBe(eventsBeforeRejection);
+            expect(repoB.getActiveLease("inv-1")).toEqual(activeBeforeRejection);
+
+            const currentLease = repoB.acquireLease({
+                investigationId: "inv-1",
+                leaseId: "generation-two-lease-two",
+                owner: "runner-generation-two-two",
+                supervisorGeneration: 2,
+                runnerIncarnation: "generation-two-launch-two",
+            });
+            expect(currentLease.fencingToken).toBe(2);
+            repoB.abandonStaleCommand({
+                investigationId: "inv-1",
+                attemptId: "same-generation-old-attempt",
+                leaseId: currentLease.leaseId,
+                fencingToken: currentLease.fencingToken,
+                owner: currentLease.owner,
+                supervisorGeneration: currentLease.supervisorGeneration,
+                runnerIncarnation: currentLease.runnerIncarnation,
+            });
+            repoB.reserveCommand({
+                investigationId: "inv-1",
+                attemptId: "same-generation-current-attempt",
+                command,
+                leaseId: currentLease.leaseId,
+                fencingToken: currentLease.fencingToken,
+                owner: currentLease.owner,
+                supervisorGeneration: currentLease.supervisorGeneration,
+                runnerIncarnation: currentLease.runnerIncarnation,
+            });
+            repoB.dispatchCommand({
+                investigationId: "inv-1",
+                attemptId: "same-generation-current-attempt",
+                leaseId: currentLease.leaseId,
+                fencingToken: currentLease.fencingToken,
+                owner: currentLease.owner,
+                supervisorGeneration: currentLease.supervisorGeneration,
+                runnerIncarnation: currentLease.runnerIncarnation,
+            });
+            repoB.appendEventsWithAttemptTransition({
+                investigationId: "inv-1",
+                expectedHead: null,
+                events: [{ kind: "current-domain-event", payload: { current: true } }],
+                attemptId: "same-generation-current-attempt",
+                attemptCommand: command,
+                leaseId: currentLease.leaseId,
+                fencingToken: currentLease.fencingToken,
+                owner: currentLease.owner,
+                supervisorGeneration: currentLease.supervisorGeneration,
+                runnerIncarnation: currentLease.runnerIncarnation,
+                fromState: "dispatched",
+                toState: "observed",
+            });
+            expect(repoB.countEvents("inv-1")).toBe(1);
+            expect(repoB.getCommandAttempt("same-generation-current-attempt").state)
+                .toBe("observed");
+        } finally {
+            repoB.close();
+        }
+    });
 });

@@ -55,19 +55,28 @@ import {
 } from "./worker-pool.mjs";
 import { buildPromptContext } from "./prompt-context.mjs";
 import {
+    RUNTIME_TEMP_OWNER_MARKER,
     assertPathInside,
     atomicWriteJson,
+    deadlineReached,
     ensureDirectory,
     makeUniqueDirectory,
     measurementSnapshotHash,
+    remainingDeadlineMs,
     removeTreeInside,
+    safeFileToken,
     sha256Hex,
     snapshotObjectHex,
+    settleWithin,
     taggedHash,
 } from "./utils.mjs";
 
 const VALIDATION_RECEIPT_HASH_ALGORITHM = "sha256:crucible-runtime-validation-receipts-v1";
 const LOGICAL_EFFECT_KEY_ALGORITHM = "sha256:crucible-runtime-logical-effect-v1";
+const EFFECT_RECOVERY_CAPSULE_HASH_ALGORITHM =
+    "sha256:crucible-runtime-effect-recovery-capsule-v1";
+const EFFECT_RECOVERY_CAPSULE_VERSION = 1;
+const RUNTIME_TEMP_OWNER_VERSION = 1;
 const IMPOSSIBILITY_CERTIFICATE_ARTIFACT_HASH_ALGORITHM =
     "sha256:crucible-impossibility-certificate-artifact-v1";
 const IMPOSSIBILITY_RECEIPT_ARTIFACT_HASH_ALGORITHM =
@@ -340,8 +349,12 @@ export class AutonomousRunner {
     #recovery = null;
     #runTempRoot = null;
     #attemptCounter = 0;
+    #attemptCommands = new Map();
+    #effectEvidenceBuffers = new Map();
     #workerAssignments = new Map();
     #capturedOutputs = new Map();
+    #domainDeadlineGuardDepth = 0;
+    #domainDeadlineStage = null;
     #clock;
 
     constructor(config, dependencies = {}) {
@@ -368,7 +381,18 @@ export class AutonomousRunner {
             this.#initialize();
             result = await this.#runLoop();
         } catch (error) {
-            thrown = error;
+            if (this.#isDeadlineError(error) && this.#adapter !== null) {
+                try {
+                    result = this.#recordDeadlineNonResult(
+                        this.#adapter.replay().aggregate,
+                        error,
+                    );
+                } catch (deadlinePersistenceError) {
+                    thrown = deadlinePersistenceError;
+                }
+            } else {
+                thrown = error;
+            }
         } finally {
             const cleanupError = await this.#cleanup();
             if (thrown === null && cleanupError !== null) {
@@ -405,6 +429,7 @@ export class AutonomousRunner {
         return {
             ...result,
             runnerEpochId: this.#config.runnerEpochId,
+            runnerIncarnation: this.#config.runnerIncarnation,
             recovery: this.#recovery,
             tempRootCleaned: this.#runTempRoot === null || !fs.existsSync(this.#runTempRoot),
         };
@@ -417,7 +442,14 @@ export class AutonomousRunner {
         const repositoryFactory = this.#dependencies.repositoryFactory ?? openRepository;
         this.#repository = repositoryFactory({
             file: path.join(stateDir, "events.sqlite"),
-            now: () => this.#clock.isoNow(),
+            now: () => {
+                if (this.#domainDeadlineGuardDepth > 0) {
+                    this.#assertDeadlineOpen(
+                        this.#domainDeadlineStage ?? "domain persistence",
+                    );
+                }
+                return this.#clock.isoNow();
+            },
         });
         this.#adapter = createDomainRepositoryAdapter({
             repository: this.#repository,
@@ -438,16 +470,46 @@ export class AutonomousRunner {
         if (opened.aggregate.terminal !== null
             || opened.aggregate.pause !== null
             || opened.aggregate.nonResults.length > 0
-            || operationalNonResult !== null
-            || this.#deadlineReached()) {
+            || operationalNonResult !== null) {
+            return;
+        }
+
+        const previousLease = this.#repository.getActiveLease(this.#config.investigationId);
+        const leaseGeneration = (previousLease?.fencingToken ?? 0) + 1;
+        const leaseId = this.#nextStableId("lease", {
+            epoch: this.#config.runnerEpochId,
+            runnerIncarnation: this.#config.runnerIncarnation,
+            leaseGeneration,
+            previousLeaseId: previousLease?.leaseId ?? null,
+            nonce: this.#idFactory()(),
+        });
+        const owner = `runner-${this.#config.runnerEpochId}-${
+            safeFileToken(
+                this.#config.runnerIncarnation ?? this.#config.runnerEpochId,
+            ).slice(-12)
+        }-${process.pid}`;
+        const acquired = this.#adapter.acquireRunnerLease({
+            leaseId,
+            owner,
+            supervisorGeneration: this.#config.supervisorGeneration,
+            runnerIncarnation: this.#config.runnerIncarnation,
+        });
+        this.#lease = acquired.lease;
+        this.#recovery = acquired.recovery;
+        if (this.#deadlineReached()) {
             return;
         }
 
         const tempRoot = ensureDirectory(this.#config.options.tempRoot);
         this.#runTempRoot = makeUniqueDirectory(
             tempRoot,
-            `run-${this.#config.runnerEpochId}`,
+            `run-g${this.#config.supervisorGeneration ?? 0}-${safeFileToken(
+                this.#config.runnerIncarnation
+                    ?? this.#config.supervisorNonce
+                    ?? this.#config.runnerEpochId,
+            ).slice(-8)}`,
         );
+        this.#writeRuntimeTempOwnerMarker();
         const allowlistLoader = this.#dependencies.allowlistLoader ?? loadHarnessAllowlist;
         this.#allowlist = allowlistLoader(this.#config.allowlistPath);
         this.#validateHarnessContract(opened.aggregate.contract);
@@ -478,6 +540,12 @@ export class AutonomousRunner {
                 processAdapter,
                 clock: this.#clock,
                 scratchRoot: this.#runTempRoot,
+                terminationDrainMs: Math.min(
+                    5_000,
+                    this.#config.options.shutdownTimeoutMs,
+                ),
+                capabilityCleanupTimeoutMs:
+                    this.#config.options.shutdownTimeoutMs,
                 onCapturedOutput: ({
                     attemptId,
                     stdout,
@@ -495,18 +563,6 @@ export class AutonomousRunner {
                 },
             });
 
-        const previousLease = this.#repository.getActiveLease(this.#config.investigationId);
-        const leaseGeneration = (previousLease?.fencingToken ?? 0) + 1;
-        const leaseId = this.#nextStableId("lease", {
-            epoch: this.#config.runnerEpochId,
-            leaseGeneration,
-            previousLeaseId: previousLease?.leaseId ?? null,
-            nonce: this.#idFactory()(),
-        });
-        const owner = `runner-${this.#config.runnerEpochId}-${process.pid}`;
-        const acquired = this.#adapter.acquireRunnerLease({ leaseId, owner });
-        this.#lease = acquired.lease;
-        this.#recovery = acquired.recovery;
     }
 
     #recordCapabilityEpoch(aggregate) {
@@ -525,26 +581,28 @@ export class AutonomousRunner {
                 : []),
             ...aggregate.contract.workerModels.map((model) => `model:${model}`),
         ].sort();
-        this.#adapter.appendFromFactory((current) => {
-            const existing = current.capabilityEpochs[this.#config.runnerEpochId];
-            if (existing !== undefined) {
-                if (canonicalJson(existing.capabilities) !== canonicalJson(capabilities)) {
-                    throw new RuntimeIntegrityError(
-                        "runnerEpochId was already recorded with different capabilities",
-                        {
-                            runnerEpochId: this.#config.runnerEpochId,
-                            existing: existing.capabilities,
-                            current: capabilities,
-                        },
-                    );
-                }
-                return null;
+        const existing = aggregate.capabilityEpochs[this.#config.runnerEpochId];
+        if (existing !== undefined) {
+            if (canonicalJson(existing.capabilities) !== canonicalJson(capabilities)) {
+                throw new RuntimeIntegrityError(
+                    "runnerEpochId was already recorded with different capabilities",
+                    {
+                        runnerEpochId: this.#config.runnerEpochId,
+                        existing: existing.capabilities,
+                        current: capabilities,
+                    },
+                );
             }
-            return createExternalEvent(current, EVENT_TYPES.CAPABILITY_EPOCH_RECORDED, {
+            return;
+        }
+        this.#appendExternalFencedWithAttempt(
+            EVENT_TYPES.CAPABILITY_EPOCH_RECORDED,
+            {
                 epochId: this.#config.runnerEpochId,
                 capabilities,
-            });
-        });
+            },
+            "capability-epoch",
+        );
     }
 
     #validateHarnessContract(contract) {
@@ -616,10 +674,178 @@ export class AutonomousRunner {
         }).slice(0, 48)}`;
     }
 
+    #reserveAttempt(attemptId, command) {
+        const reserved = this.#adapter.reserveAttempt({
+            attemptId,
+            command,
+            lease: this.#lease,
+        });
+        this.#attemptCommands.set(attemptId, command);
+        return reserved;
+    }
+
+    #attemptCommand(attemptId) {
+        const command = this.#attemptCommands.get(attemptId);
+        if (command === undefined) {
+            throw new RuntimeIntegrityError(
+                "Active attempt is missing its runner-held logical identity",
+                { attemptId },
+            );
+        }
+        return command;
+    }
+
+    #ingestOperationalEvidence(input) {
+        const buffer = this.#effectEvidenceBuffers.get(input.attemptId);
+        if (buffer !== undefined) {
+            buffer.push(input);
+            return { buffered: true };
+        }
+        return this.#adapter.ingestOperationalEvidenceFenced(input, {
+            attemptId: input.attemptId,
+            command: this.#attemptCommand(input.attemptId),
+            lease: this.#lease,
+            fromState: "dispatched",
+        });
+    }
+
+    #appendDedicatedDomainEvent({
+        scope,
+        domainEvent,
+        append,
+        deadlineExempt = false,
+    }) {
+        const factHash = this.#adapter.domainFactIdentity(domainEvent);
+        const command = formatAttemptCommand("domain-event", {
+            scope,
+            eventType: domainEvent.type,
+            factHash,
+        });
+        const attemptId = this.#stableAttemptId("domain-event", {
+            scope,
+            eventType: domainEvent.type,
+            factHash,
+        });
+        this.#reserveAttempt(attemptId, command);
+        this.#adapter.dispatchAttempt(attemptId, this.#lease);
+        this.#adapter.observeAttempt(attemptId, this.#lease);
+        const result = this.#withDomainDeadlineGuard(
+            `${scope} domain append`,
+            () => append({
+                attemptId,
+                command,
+                lease: this.#lease,
+                expectedDomainFactHash: factHash,
+            }),
+            { deadlineExempt },
+        );
+        if (result.domainEvent === null) {
+            throw new RuntimeIntegrityError(
+                "Fenced domain append became a no-op after its attempt was reserved",
+                { attemptId, scope, factHash },
+            );
+        }
+        this.#attemptCommands.delete(attemptId);
+        return result;
+    }
+
+    #appendKernelDecisionFenced({ deadlineExempt = false } = {}) {
+        const { aggregate } = this.#adapter.replay();
+        const recommendation = decideNext(aggregate);
+        if (recommendation.event === null) {
+            throw new RuntimeIntegrityError(
+                "Kernel decision append was requested without a domain event",
+                { recommendation },
+            );
+        }
+        if (deadlineExempt
+            && recommendation.event.type !== EVENT_TYPES.INVESTIGATION_PAUSED) {
+            throw new RuntimeIntegrityError(
+                "Only a deadline pause decision may bypass the domain deadline guard",
+                { type: recommendation.event.type },
+            );
+        }
+        return this.#appendDedicatedDomainEvent({
+            scope: "kernel-decision",
+            domainEvent: recommendation.event,
+            append: (authority) =>
+                this.#adapter.appendKernelDecisionFenced(authority),
+            deadlineExempt,
+        });
+    }
+
+    #appendExternalFencedWithAttempt(type, payload, scope) {
+        const { aggregate } = this.#adapter.replay();
+        const domainEvent = createExternalEvent(aggregate, type, payload);
+        return this.#appendDedicatedDomainEvent({
+            scope,
+            domainEvent,
+            append: (authority) => this.#adapter.appendExternalFenced(
+                type,
+                payload,
+                {
+                    ...authority,
+                    fromState: "observed",
+                    toState: "committed",
+                },
+            ),
+        });
+    }
+
+    #requestStopFenced({ requestId, reason, pauseRequested }) {
+        const { aggregate } = this.#adapter.replay();
+        const domainEvent = createExternalEvent(
+            aggregate,
+            EVENT_TYPES.STOP_REQUESTED,
+            { requestId, reason, pauseRequested },
+        );
+        return this.#appendDedicatedDomainEvent({
+            scope: "stop-request",
+            domainEvent,
+            append: (authority) => this.#adapter.requestStopFenced({
+                requestId,
+                reason,
+                pauseRequested,
+                ...authority,
+            }),
+            deadlineExempt: true,
+        });
+    }
+
     async #fault(point, details = {}) {
         if (typeof this.#dependencies.faultInjector === "function") {
             await this.#dependencies.faultInjector(point, details);
         }
+    }
+
+    #writeRuntimeTempOwnerMarker() {
+        const ownedPaths = [
+            this.#runTempRoot,
+            path.join(this.#runTempRoot, "sdk-home"),
+            path.join(this.#runTempRoot, "sdk-work"),
+            path.join(this.#runTempRoot, "windows-sandbox-control"),
+            path.join(this.#runTempRoot, "submitted"),
+            path.join(this.#runTempRoot, "materialized"),
+        ];
+        atomicWriteJson(path.join(this.#runTempRoot, RUNTIME_TEMP_OWNER_MARKER), {
+            version: RUNTIME_TEMP_OWNER_VERSION,
+            kind: "crucible-runtime-temp-root",
+            investigationId: this.#config.investigationId,
+            supervisorGeneration: this.#config.supervisorGeneration,
+            supervisorNonce: this.#config.supervisorNonce,
+            runnerIncarnation: this.#config.runnerIncarnation,
+            runnerEpochId: this.#config.runnerEpochId,
+            pid: process.pid,
+            root: this.#runTempRoot,
+            createdAt: this.#clock.isoNow(),
+            ownedPaths,
+        }, {
+            token: `runtime-owner:${this.#config.supervisorGeneration ?? "none"}:${
+                safeFileToken(
+                    this.#config.runnerIncarnation ?? this.#config.runnerEpochId,
+                ).slice(-12)
+            }:${process.pid}`,
+        });
     }
 
     #logicalEffectKey(command) {
@@ -635,7 +861,54 @@ export class AutonomousRunner {
     }
 
     #deadlineReached() {
-        return this.#config.deadlineMs !== null && this.#clock.now() >= this.#config.deadlineMs;
+        return deadlineReached(this.#config.deadlineMs, this.#clock.now());
+    }
+
+    #remainingDeadlineMs() {
+        return remainingDeadlineMs(this.#config.deadlineMs, this.#clock.now());
+    }
+
+    #deadlineError(stage) {
+        const error = new CrucibleRuntimeError(
+            RUNTIME_ERROR_CODES.DEADLINE_EXCEEDED,
+            `The autonomous investigation deadline expired during ${stage}`,
+            {
+                deadlineMs: this.#config.deadlineMs,
+                observedAt: this.#clock.isoNow(),
+                observedAtMs: this.#clock.now(),
+                stage,
+            },
+        );
+        error.deadlineExceeded = true;
+        return error;
+    }
+
+    #isDeadlineError(error) {
+        return error?.deadlineExceeded === true
+            || error?.code === RUNTIME_ERROR_CODES.DEADLINE_EXCEEDED
+            || (error?.details?.deadlineExceeded === true && this.#deadlineReached());
+    }
+
+    #assertDeadlineOpen(stage) {
+        if (this.#deadlineReached()) {
+            throw this.#deadlineError(stage);
+        }
+    }
+
+    #withDomainDeadlineGuard(stage, operation, { deadlineExempt = false } = {}) {
+        if (deadlineExempt) {
+            return operation();
+        }
+        this.#assertDeadlineOpen(stage);
+        const previousStage = this.#domainDeadlineStage;
+        this.#domainDeadlineGuardDepth += 1;
+        this.#domainDeadlineStage = stage;
+        try {
+            return operation();
+        } finally {
+            this.#domainDeadlineGuardDepth -= 1;
+            this.#domainDeadlineStage = previousStage;
+        }
     }
 
     #takeCapturedOutput(attemptId, measurement) {
@@ -663,11 +936,21 @@ export class AutonomousRunner {
     async #runHarnessMeasurement(input) {
         let measurement;
         try {
-            measurement = await this.#executor.run(input);
+            measurement = await this.#executor.run({
+                ...input,
+                deadlineMs: this.#config.deadlineMs,
+            });
         } catch (error) {
             this.#capturedOutputs.delete(input.attemptId);
+            if (error?.details?.deadlineExceeded === true || this.#deadlineReached()) {
+                throw this.#deadlineError("trusted harness execution");
+            }
             throw error;
         }
+        await this.#fault("after_measurement_execution", {
+            attemptId: input.attemptId,
+        });
+        this.#assertDeadlineOpen("measurement fact acceptance");
         const rawOutput = this.#takeCapturedOutput(input.attemptId, measurement);
         if (rawOutput === null) {
             throw new RuntimeIntegrityError(
@@ -712,7 +995,22 @@ export class AutonomousRunner {
                 return aggregate.pause === null ? nonResult(aggregate) : pauseResult(aggregate);
             }
             if (recommendation.event !== null) {
-                this.#adapter.appendKernelDecision();
+                try {
+                    if (recommendation.kind === "TERMINAL") {
+                        await this.#fault("before_terminal_append", {
+                            recommendation,
+                        });
+                    }
+                    this.#appendKernelDecisionFenced();
+                } catch (error) {
+                    if (this.#isDeadlineError(error)) {
+                        return this.#recordDeadlineNonResult(
+                            this.#adapter.replay().aggregate,
+                            error,
+                        );
+                    }
+                    throw error;
+                }
                 continue;
             }
             if (recommendation.kind !== "COMMAND") {
@@ -721,19 +1019,29 @@ export class AutonomousRunner {
                 });
             }
 
-            switch (recommendation.command.kind) {
-                case "dispatch_reserved":
-                case "await_observation":
-                    await this.#executeDomainCommand(aggregate, recommendation);
-                    break;
-                case "commit_evidence":
-                    await this.#commitPendingEvidence(recommendation);
-                    break;
-                default:
-                    throw new RuntimeIntegrityError(
-                        "Kernel returned an operational command the runner does not implement",
-                        { command: recommendation.command },
+            try {
+                switch (recommendation.command.kind) {
+                    case "dispatch_reserved":
+                    case "await_observation":
+                        await this.#executeDomainCommand(aggregate, recommendation);
+                        break;
+                    case "commit_evidence":
+                        await this.#commitPendingEvidence(recommendation);
+                        break;
+                    default:
+                        throw new RuntimeIntegrityError(
+                            "Kernel returned an operational command the runner does not implement",
+                            { command: recommendation.command },
+                        );
+                }
+            } catch (error) {
+                if (this.#isDeadlineError(error)) {
+                    return this.#recordDeadlineNonResult(
+                        this.#adapter.replay().aggregate,
+                        error,
                     );
+                }
+                throw error;
             }
         }
         throw new CrucibleRuntimeError(
@@ -755,23 +1063,34 @@ export class AutonomousRunner {
             commandId,
             command: commandRecord.command,
         });
-        this.#adapter.reserveAttempt({
-            attemptId: mainAttemptId,
-            command: formatAttemptCommand("domain-command", {
-                commandId,
-                command: commandRecord.command,
-            }),
-            lease: this.#lease,
+        const mainAttemptCommand = formatAttemptCommand("domain-command", {
+            commandId,
+            command: commandRecord.command,
         });
+        this.#reserveAttempt(mainAttemptId, mainAttemptCommand);
         await this.#fault("after_reservation", { attemptId: mainAttemptId, commandId });
 
         if (commandRecord.status === "reserved") {
-            this.#adapter.appendExternal(EVENT_TYPES.COMMAND_DISPATCHED, {
-                commandId,
-                capabilityEpochId: this.#config.runnerEpochId,
-            });
+            this.#withDomainDeadlineGuard(
+                "command dispatch append",
+                () => this.#adapter.appendExternalFenced(
+                    EVENT_TYPES.COMMAND_DISPATCHED,
+                    {
+                        commandId,
+                        capabilityEpochId: this.#config.runnerEpochId,
+                    },
+                    {
+                        attemptId: mainAttemptId,
+                        command: mainAttemptCommand,
+                        lease: this.#lease,
+                        fromState: "reserved",
+                        toState: "dispatched",
+                    },
+                ),
+            );
+        } else {
+            this.#adapter.dispatchAttempt(mainAttemptId, this.#lease);
         }
-        this.#adapter.dispatchAttempt(mainAttemptId, this.#lease);
         await this.#fault("after_dispatch", { attemptId: mainAttemptId, commandId });
 
         const currentAggregate = this.#adapter.replay().aggregate;
@@ -802,10 +1121,19 @@ export class AutonomousRunner {
             });
         }
 
-        this.#adapter.appendHarnessObservationFenced(observation, {
+        await this.#fault("before_domain_observation", {
             attemptId: mainAttemptId,
-            lease: this.#lease,
+            commandId,
+            observationId: observation.observationId,
         });
+        this.#withDomainDeadlineGuard(
+            "harness observation append",
+            () => this.#adapter.appendHarnessObservationFenced(observation, {
+                attemptId: mainAttemptId,
+                command: mainAttemptCommand,
+                lease: this.#lease,
+            }),
+        );
         await this.#fault("after_domain_observation", {
             attemptId: mainAttemptId,
             commandId,
@@ -819,13 +1147,24 @@ export class AutonomousRunner {
                 { recommendation: commitRecommendation },
             );
         }
-        this.#adapter.appendEvidenceCommitFenced({
+        await this.#fault("before_domain_evidence_append", {
+            attemptId: mainAttemptId,
+            commandId,
             evidenceId: commitRecommendation.command.evidenceId,
             observationId: commitRecommendation.command.observationId,
-        }, {
-            attemptId: mainAttemptId,
-            lease: this.#lease,
         });
+        this.#withDomainDeadlineGuard(
+            "evidence commitment append",
+            () => this.#adapter.appendEvidenceCommitFenced({
+                evidenceId: commitRecommendation.command.evidenceId,
+                observationId: commitRecommendation.command.observationId,
+            }, {
+                attemptId: mainAttemptId,
+                command: mainAttemptCommand,
+                lease: this.#lease,
+            }),
+        );
+        this.#attemptCommands.delete(mainAttemptId);
         await this.#fault("after_evidence_commit", {
             attemptId: mainAttemptId,
             commandId,
@@ -839,29 +1178,301 @@ export class AutonomousRunner {
             observationId: recommendation.command.observationId,
             evidenceId: recommendation.command.evidenceId,
         });
-        this.#adapter.reserveAttempt({
-            attemptId,
-            command: formatAttemptCommand("domain-evidence-commit", {
-                commandId: recommendation.commandId,
-                observationId: recommendation.command.observationId,
-                evidenceId: recommendation.command.evidenceId,
-            }),
-            lease: this.#lease,
+        const attemptCommand = formatAttemptCommand("domain-evidence-commit", {
+            commandId: recommendation.commandId,
+            observationId: recommendation.command.observationId,
+            evidenceId: recommendation.command.evidenceId,
         });
+        this.#reserveAttempt(attemptId, attemptCommand);
         this.#adapter.dispatchAttempt(attemptId, this.#lease);
         this.#adapter.observeAttempt(attemptId, this.#lease);
-        this.#adapter.appendEvidenceCommitFenced({
+        await this.#fault("before_domain_evidence_append", {
+            attemptId,
+            commandId: recommendation.commandId,
             evidenceId: recommendation.command.evidenceId,
             observationId: recommendation.command.observationId,
-        }, {
-            attemptId,
-            lease: this.#lease,
         });
+        this.#withDomainDeadlineGuard(
+            "pending evidence commitment append",
+            () => this.#adapter.appendEvidenceCommitFenced({
+                evidenceId: recommendation.command.evidenceId,
+                observationId: recommendation.command.observationId,
+            }, {
+                attemptId,
+                command: attemptCommand,
+                lease: this.#lease,
+            }),
+        );
+        this.#attemptCommands.delete(attemptId);
         await this.#fault("after_evidence_commit", {
             commandId: recommendation.commandId,
             observationId: recommendation.command.observationId,
             evidenceId: recommendation.command.evidenceId,
         });
+    }
+
+    #effectRecoveryCapsuleArtifactId(logicalEffectKey, command) {
+        const identity = hashCanonical({
+            investigationId: this.#config.investigationId,
+            logicalEffectKey,
+            command,
+        }, EFFECT_RECOVERY_CAPSULE_HASH_ALGORITHM);
+        return `runtime-effect-capsule-${identity
+            .slice(identity.lastIndexOf(":") + 1)
+            .slice(0, 40)}`;
+    }
+
+    #persistEffectRecoveryCapsule({
+        attemptId,
+        command,
+        logicalEffectKey,
+        evidence,
+    }) {
+        this.#assertDeadlineOpen("effect recovery capsule persistence");
+        if (!Array.isArray(evidence) || evidence.length === 0) {
+            throw new RuntimeIntegrityError(
+                "A recoverable external effect must persist at least one evidence record",
+                { attemptId, logicalEffectKey },
+            );
+        }
+        const normalizedEvidence = evidence.map((item, index) => {
+            if (item === null
+                || typeof item !== "object"
+                || typeof item.evidenceKind !== "string"
+                || typeof item.kind !== "string"
+                || item.payload === null
+                || typeof item.payload !== "object"
+                || item.payload.logicalEffectKey !== logicalEffectKey) {
+                throw new RuntimeIntegrityError(
+                    "Effect recovery evidence is not bound to its logical effect",
+                    { attemptId, logicalEffectKey, index },
+                );
+            }
+            return {
+                evidenceKind: item.evidenceKind,
+                kind: item.kind,
+                payload: item.payload,
+            };
+        });
+        if (new Set(normalizedEvidence.map((item) => item.evidenceKind)).size
+            !== normalizedEvidence.length) {
+            throw new RuntimeIntegrityError(
+                "Effect recovery evidence kinds must be unique",
+                { attemptId, logicalEffectKey },
+            );
+        }
+        const identityHash = hashCanonical({
+            investigationId: this.#config.investigationId,
+            logicalEffectKey,
+            command,
+            effectAttemptId: attemptId,
+            evidence: normalizedEvidence,
+        }, EFFECT_RECOVERY_CAPSULE_HASH_ALGORITHM);
+        const capsule = {
+            version: EFFECT_RECOVERY_CAPSULE_VERSION,
+            kind: "crucible-runtime-effect-recovery",
+            investigationId: this.#config.investigationId,
+            logicalEffectKey,
+            command,
+            effectAttemptId: attemptId,
+            identityHash,
+            evidence: normalizedEvidence,
+        };
+        const bytes = Buffer.from(canonicalJson(capsule), "utf8");
+        const stored = this.#artifactStore.putBytes(bytes, {
+            contentType: "application/vnd.crucible.effect-recovery+json",
+        });
+        const artifactId = this.#effectRecoveryCapsuleArtifactId(
+            logicalEffectKey,
+            command,
+        );
+        const existing = this.#repository.getArtifact(artifactId);
+        if (existing === null) {
+            this.#repository.registerExternalArtifact({
+                investigationId: this.#config.investigationId,
+                artifactId,
+                algo: "sha256",
+                hash: snapshotObjectHex(stored.id),
+                sizeBytes: stored.size,
+                contentType: "application/vnd.crucible.effect-recovery+json",
+            });
+            this.#repository.markArtifactDurable(artifactId);
+        } else if (existing.investigationId !== this.#config.investigationId
+            || existing.storage !== "external"
+            || existing.hashAlgo !== "sha256"
+            || existing.hashValue !== snapshotObjectHex(stored.id)
+            || existing.sizeBytes !== stored.size
+            || existing.contentType !== "application/vnd.crucible.effect-recovery+json") {
+            throw new RuntimeIntegrityError(
+                "Effect recovery capsule artifact id collision",
+                { artifactId, logicalEffectKey },
+            );
+        } else if (existing.durable !== true) {
+            this.#artifactStore.readObject(stored.id, { verify: true });
+            this.#repository.markArtifactDurable(artifactId);
+        }
+        const verified = this.#artifactStore.readObject(stored.id, { verify: true });
+        if (!verified.equals(bytes)) {
+            throw new RuntimeIntegrityError(
+                "Effect recovery capsule changed during persistence",
+                { artifactId, logicalEffectKey },
+            );
+        }
+        this.#assertDeadlineOpen("effect recovery capsule persistence");
+        return { artifactId, objectId: stored.id, capsule };
+    }
+
+    #readEffectRecoveryCapsule(logicalEffectKey, command) {
+        const artifactId = this.#effectRecoveryCapsuleArtifactId(
+            logicalEffectKey,
+            command,
+        );
+        const metadata = this.#repository.getArtifact(artifactId);
+        if (metadata === null) return null;
+        if (metadata.investigationId !== this.#config.investigationId
+            || metadata.storage !== "external"
+            || metadata.durable !== true
+            || metadata.hashAlgo !== "sha256"
+            || typeof metadata.hashValue !== "string"
+            || metadata.contentType !== "application/vnd.crucible.effect-recovery+json") {
+            throw new RuntimeIntegrityError(
+                "Effect recovery capsule metadata is not durable and canonical",
+                { artifactId, logicalEffectKey },
+            );
+        }
+        const objectId = `sha256:${metadata.hashValue}`;
+        let bytes;
+        try {
+            bytes = this.#artifactStore.readObject(objectId, { verify: true });
+        } catch (error) {
+            throw new RuntimeIntegrityError(
+                "Effect recovery capsule failed ArtifactStore verification",
+                { artifactId, logicalEffectKey, objectId },
+                { cause: error },
+            );
+        }
+        if (bytes.length !== metadata.sizeBytes) {
+            throw new RuntimeIntegrityError(
+                "Effect recovery capsule size disagrees with repository metadata",
+                { artifactId, logicalEffectKey },
+            );
+        }
+        let capsule;
+        try {
+            capsule = JSON.parse(bytes.toString("utf8"));
+        } catch (error) {
+            throw new RuntimeIntegrityError(
+                "Effect recovery capsule is not valid JSON",
+                { artifactId, logicalEffectKey },
+                { cause: error },
+            );
+        }
+        if (!Buffer.from(canonicalJson(capsule), "utf8").equals(bytes)
+            || capsule?.version !== EFFECT_RECOVERY_CAPSULE_VERSION
+            || capsule.kind !== "crucible-runtime-effect-recovery"
+            || capsule.investigationId !== this.#config.investigationId
+            || capsule.logicalEffectKey !== logicalEffectKey
+            || !canonicalEqual(capsule.command, command)
+            || typeof capsule.effectAttemptId !== "string"
+            || !Array.isArray(capsule.evidence)
+            || capsule.evidence.length === 0) {
+            throw new RuntimeIntegrityError(
+                "Effect recovery capsule is malformed or bound to another effect",
+                { artifactId, logicalEffectKey },
+            );
+        }
+        const expectedIdentityHash = hashCanonical({
+            investigationId: this.#config.investigationId,
+            logicalEffectKey,
+            command,
+            effectAttemptId: capsule.effectAttemptId,
+            evidence: capsule.evidence,
+        }, EFFECT_RECOVERY_CAPSULE_HASH_ALGORITHM);
+        if (capsule.identityHash !== expectedIdentityHash
+            || new Set(capsule.evidence.map((item) => item?.evidenceKind)).size
+                !== capsule.evidence.length
+            || capsule.evidence.some((item) =>
+                item === null
+                || typeof item !== "object"
+                || typeof item.evidenceKind !== "string"
+                || typeof item.kind !== "string"
+                || item.payload?.logicalEffectKey !== logicalEffectKey)) {
+            throw new RuntimeIntegrityError(
+                "Effect recovery capsule identity or evidence binding is invalid",
+                { artifactId, logicalEffectKey },
+            );
+        }
+        return { artifactId, objectId, capsule };
+    }
+
+    async #recoverPersistedEffectCapsule({
+        capsuleRecord,
+        command,
+        logicalEffectKey,
+        recover,
+    }) {
+        const synthetic = {
+            attempt: {
+                attemptId: capsuleRecord.capsule.effectAttemptId,
+                state: "committed",
+            },
+            events: capsuleRecord.capsule.evidence.map((item, index) => ({
+                ...item,
+                seq: index + 1,
+                attemptId: capsuleRecord.capsule.effectAttemptId,
+            })),
+            effectAttemptId: capsuleRecord.capsule.effectAttemptId,
+        };
+        const recovered = await recover(synthetic, logicalEffectKey);
+        if (recovered === null
+            || typeof recovered !== "object"
+            || !Object.hasOwn(recovered, "result")
+            || !Object.hasOwn(recovered, "persisted")) {
+            throw new RuntimeIntegrityError(
+                "Persisted effect recovery did not reproduce a canonical outcome",
+                { logicalEffectKey, command },
+            );
+        }
+        this.#assertDeadlineOpen("persisted effect recovery");
+        const recoveryAttemptId = this.#stableAttemptId("effect-recovery", {
+            logicalEffectKey,
+            effectAttemptId: capsuleRecord.capsule.effectAttemptId,
+        });
+        const attemptCommand = formatAttemptCommand("external-effect", {
+            logicalEffectKey,
+            effect: command,
+            recoveredFromAttemptId: capsuleRecord.capsule.effectAttemptId,
+            recoveryCapsuleArtifactId: capsuleRecord.artifactId,
+        });
+        this.#reserveAttempt(recoveryAttemptId, attemptCommand);
+        this.#adapter.dispatchAttempt(recoveryAttemptId, this.#lease);
+        this.#adapter.observeAttempt(recoveryAttemptId, this.#lease);
+        this.#adapter.ingestOperationalEvidenceBatchFenced(
+            capsuleRecord.capsule.evidence,
+            {
+                attemptId: recoveryAttemptId,
+                command: attemptCommand,
+                lease: this.#lease,
+                fromState: "observed",
+                toState: "committed",
+            },
+        );
+        this.#attemptCommands.delete(recoveryAttemptId);
+        await this.#fault("after_effect_commit", {
+            attemptId: recoveryAttemptId,
+            effectAttemptId: capsuleRecord.capsule.effectAttemptId,
+            command,
+            logicalEffectKey,
+            recoveredFromCapsule: true,
+        });
+        return {
+            attemptId: capsuleRecord.capsule.effectAttemptId,
+            result: recovered.result,
+            persisted: recovered.persisted,
+            logicalEffectKey,
+            recovered: true,
+            recoveredFromCapsule: true,
+        };
     }
 
     async #executeEffect(command, operation, persist = null, recover = null) {
@@ -885,22 +1496,37 @@ export class AutonomousRunner {
                 );
             }
             return {
-                attemptId: committed.attempt.attemptId,
+                attemptId: committed.effectAttemptId,
                 result: recovered.result,
                 persisted: recovered.persisted,
                 logicalEffectKey,
                 recovered: true,
             };
         }
-        const attemptId = this.#stableAttemptId("external-effect", command);
-        this.#adapter.reserveAttempt({
-            attemptId,
-            command: formatAttemptCommand("external-effect", {
+        const capsuleRecord = this.#readEffectRecoveryCapsule(
+            logicalEffectKey,
+            command,
+        );
+        if (capsuleRecord !== null) {
+            if (recover === null) {
+                throw new RuntimeIntegrityError(
+                    "A persisted logical effect exists but no recovery decoder was provided",
+                    { logicalEffectKey, command },
+                );
+            }
+            return this.#recoverPersistedEffectCapsule({
+                capsuleRecord,
+                command,
                 logicalEffectKey,
-                effect: command,
-            }),
-            lease: this.#lease,
+                recover,
+            });
+        }
+        const attemptId = this.#stableAttemptId("external-effect", command);
+        const attemptCommand = formatAttemptCommand("external-effect", {
+            logicalEffectKey,
+            effect: command,
         });
+        this.#reserveAttempt(attemptId, attemptCommand);
         await this.#fault("after_effect_reservation", {
             attemptId,
             command,
@@ -916,12 +1542,18 @@ export class AutonomousRunner {
         let result;
         try {
             result = await operation(attemptId);
+            await this.#fault("after_effect_operation", {
+                attemptId,
+                command,
+                logicalEffectKey,
+            });
+            this.#assertDeadlineOpen("external effect output acceptance");
         } catch (error) {
             if (error?.leaveAttemptActive === true) {
                 throw error;
             }
             this.#adapter.observeAttempt(attemptId, this.#lease);
-            this.#adapter.ingestOperationalEvidence({
+            this.#adapter.ingestOperationalEvidenceBatchFenced([{
                 attemptId,
                 evidenceKind: "effect-failure",
                 kind: "runtime:effect_failure",
@@ -934,21 +1566,53 @@ export class AutonomousRunner {
                         message: error?.message ?? String(error),
                     },
                 },
+            }], {
+                attemptId,
+                command: attemptCommand,
+                lease: this.#lease,
+                fromState: "observed",
+                toState: "committed",
             });
-            this.#adapter.commitAttempt(attemptId, this.#lease);
+            this.#attemptCommands.delete(attemptId);
             throw error;
         }
 
         this.#adapter.observeAttempt(attemptId, this.#lease);
-        const persisted = persist === null
-            ? null
-            : await persist(result, attemptId, logicalEffectKey);
-        await this.#fault("after_effect_artifact_persistence", {
-            attemptId,
-            command,
-            logicalEffectKey,
-        });
-        this.#adapter.commitAttempt(attemptId, this.#lease);
+        this.#effectEvidenceBuffers.set(attemptId, []);
+        let persisted;
+        try {
+            persisted = persist === null
+                ? null
+                : await persist(result, attemptId, logicalEffectKey);
+            const evidence = this.#effectEvidenceBuffers.get(attemptId);
+            this.#assertDeadlineOpen("effect artifact persistence");
+            this.#persistEffectRecoveryCapsule({
+                attemptId,
+                command,
+                logicalEffectKey,
+                evidence,
+            });
+            await this.#fault("after_effect_artifact_persistence", {
+                attemptId,
+                command,
+                logicalEffectKey,
+            });
+            this.#assertDeadlineOpen("effect commitment");
+            if (evidence.length === 0) {
+                this.#adapter.commitAttempt(attemptId, this.#lease);
+            } else {
+                this.#adapter.ingestOperationalEvidenceBatchFenced(evidence, {
+                    attemptId,
+                    command: attemptCommand,
+                    lease: this.#lease,
+                    fromState: "observed",
+                    toState: "committed",
+                });
+            }
+        } finally {
+            this.#effectEvidenceBuffers.delete(attemptId);
+        }
+        this.#attemptCommands.delete(attemptId);
         await this.#fault("after_effect_commit", {
             attemptId,
             command,
@@ -1024,7 +1688,28 @@ export class AutonomousRunner {
                 },
             );
         }
-        return { attempt, events };
+        let effectAttemptId = attempt.attemptId;
+        let metadata;
+        try {
+            metadata = JSON.parse(attempt.command);
+        } catch (error) {
+            throw new RuntimeIntegrityError(
+                "Committed effect command metadata is not valid JSON",
+                { attemptId: attempt.attemptId },
+                { cause: error },
+            );
+        }
+        if (metadata.recoveredFromAttemptId !== undefined) {
+            if (typeof metadata.recoveredFromAttemptId !== "string"
+                || metadata.recoveredFromAttemptId.length === 0) {
+                throw new RuntimeIntegrityError(
+                    "Recovered effect metadata has an invalid source attempt id",
+                    { attemptId: attempt.attemptId, logicalEffectKey },
+                );
+            }
+            effectAttemptId = metadata.recoveredFromAttemptId;
+        }
+        return { attempt, events, effectAttemptId };
     }
 
     #requireRecoveredEffectEvent(committed, kind, logicalEffectKey) {
@@ -1222,7 +1907,7 @@ export class AutonomousRunner {
             || payload.candidateId !== candidateId
             || payload.snapshotId !== snapshotId
             || payload.candidateArtifactHash !== candidateArtifactHash
-            || payload.receipt?.attemptId !== committed.attempt.attemptId
+            || payload.receipt?.attemptId !== committed.effectAttemptId
             || !receiptHasVerifiedSnapshotBytes(
                 payload.receipt,
                 candidateArtifactHash,
@@ -1671,7 +2356,7 @@ export class AutonomousRunner {
             },
             contentType: "application/vnd.crucible.validation-receipt+json",
         });
-        this.#adapter.ingestOperationalEvidence({
+        this.#ingestOperationalEvidence({
             attemptId: mainAttemptId,
             evidenceKind: "validation-composite",
             kind: "runtime:validation_composite",
@@ -1725,6 +2410,7 @@ export class AutonomousRunner {
     }
 
     #ingestImpossibilityRequest(command) {
+        this.#assertDeadlineOpen("impossibility request artifact ingestion");
         const expectedRequestHash = hashCanonical(
             command.request,
             IMPOSSIBILITY_REQUEST_HASH_ALGORITHM,
@@ -1750,7 +2436,9 @@ export class AutonomousRunner {
                 canonicalJson(command.request),
                 { encoding: "utf8", flag: "wx", mode: 0o600 },
             );
-            return this.#artifactStore.ingestDirectory({ sourceDir });
+            const snapshot = this.#artifactStore.ingestDirectory({ sourceDir });
+            this.#assertDeadlineOpen("impossibility request artifact persistence");
+            return snapshot;
         } finally {
             removeTreeInside(sourceDir, sourceRoot);
         }
@@ -1767,7 +2455,7 @@ export class AutonomousRunner {
             kind: `impossibility-request-${command.attemptOrdinal}`,
             snapshotId,
         });
-        this.#adapter.ingestOperationalEvidence({
+        this.#ingestOperationalEvidence({
             attemptId,
             evidenceKind: `impossibility-request:${command.attemptOrdinal}`,
             kind: "runtime:impossibility_request",
@@ -2034,7 +2722,7 @@ export class AutonomousRunner {
                         },
                         contentType: "application/vnd.crucible.candidate-proposal+json",
                     });
-                    this.#adapter.ingestOperationalEvidence({
+                    this.#ingestOperationalEvidence({
                         attemptId,
                         evidenceKind: `proposal:${proposal.candidateId}`,
                         kind: "runtime:model_proposal",
@@ -2323,6 +3011,8 @@ export class AutonomousRunner {
             parents,
             parentReadLimits,
             reasoningEffort: this.#config.options.reasoningEffort,
+            deadlineMs: this.#config.deadlineMs,
+            remainingBudgetMs: this.#remainingDeadlineMs(),
             sessionId,
             challengeNonce,
             allowedCandidateIds: [command.candidateId],
@@ -2342,7 +3032,7 @@ export class AutonomousRunner {
             kind: `candidate-snapshot-${command.candidateId}`,
             snapshotId,
         });
-        this.#adapter.ingestOperationalEvidence({
+        this.#ingestOperationalEvidence({
             attemptId,
             evidenceKind: `candidate-snapshot:${command.candidateId}`,
             kind: "runtime:candidate_snapshot",
@@ -2507,7 +3197,7 @@ export class AutonomousRunner {
             value,
             contentType: "application/vnd.crucible.measurement-reuse+json",
         });
-        this.#adapter.ingestOperationalEvidence({
+        this.#ingestOperationalEvidence({
             attemptId,
             evidenceKind: `measurement-reuse:candidate:${command.candidateId}`,
             kind: "runtime:measurement_reuse",
@@ -2681,6 +3371,10 @@ export class AutonomousRunner {
             workingDirectory: path.join(this.#runTempRoot, "sdk-work"),
             candidateLimits: this.#config.options.candidateLimits,
             sessionTimeoutMs: this.#config.options.sessionTimeoutMs,
+            shutdownTimeoutMs: this.#config.options.shutdownTimeoutMs,
+            deadlineMs: this.#config.deadlineMs,
+            clock: this.#clock,
+            timers: this.#dependencies.timers ?? globalThis,
             existingCandidateIds,
             parentReader,
             parentReadLimits: this.#dependencies.parentReadLimits,
@@ -2696,6 +3390,7 @@ export class AutonomousRunner {
     }
 
     #ingestCandidate(proposal) {
+        this.#assertDeadlineOpen("candidate artifact ingestion");
         const sourceRoot = ensureDirectory(path.join(this.#runTempRoot, "submitted"));
         const sourceDir = makeUniqueDirectory(sourceRoot, proposal.candidateId);
         try {
@@ -2708,13 +3403,16 @@ export class AutonomousRunner {
                 fs.mkdirSync(path.dirname(target), { recursive: true });
                 fs.writeFileSync(target, file.content, { encoding: "utf8", flag: "wx", mode: 0o600 });
             }
-            return this.#artifactStore.ingestDirectory({ sourceDir });
+            const snapshot = this.#artifactStore.ingestDirectory({ sourceDir });
+            this.#assertDeadlineOpen("candidate artifact persistence");
+            return snapshot;
         } finally {
             removeTreeInside(sourceDir, sourceRoot);
         }
     }
 
     #materializeSnapshot(snapshotId, label) {
+        this.#assertDeadlineOpen("snapshot materialization");
         const status = this.#artifactStore.verifySnapshot(snapshotId);
         if (!status.ok) {
             throw new RuntimeIntegrityError("Snapshot closure failed verification", {
@@ -2736,7 +3434,7 @@ export class AutonomousRunner {
                 ...manifest.entries.map((entry) => entry.object),
             ]),
         ].sort(compareStable);
-        return {
+        const result = {
             ...materialized,
             candidateSnapshot: immutableCanonical({
                 path: materialized.dest,
@@ -2746,6 +3444,8 @@ export class AutonomousRunner {
                 expectedObjectClosure,
             }),
         };
+        this.#assertDeadlineOpen("snapshot materialization");
+        return result;
     }
 
     #persistMeasurement({
@@ -2842,7 +3542,7 @@ export class AutonomousRunner {
             snapshot,
             snapshotExecutionHash: snapshotExecutionHash(measurement.receipt),
         });
-        this.#adapter.ingestOperationalEvidence({
+        this.#ingestOperationalEvidence({
             attemptId,
             evidenceKind: `measurement:${purpose}:${candidateId}`,
             kind: "runtime:measurement",
@@ -2933,7 +3633,7 @@ export class AutonomousRunner {
                 { attemptId },
             );
         }
-        this.#adapter.ingestOperationalEvidence({
+        this.#ingestOperationalEvidence({
             attemptId,
             evidenceKind: `impossibility-certificate:${command.attemptOrdinal}`,
             kind: "runtime:impossibility_certificate",
@@ -2965,6 +3665,7 @@ export class AutonomousRunner {
     }
 
     #persistSnapshotProvenance({ attemptId, kind, snapshotId }) {
+        this.#assertDeadlineOpen("snapshot provenance persistence");
         const status = this.#artifactStore.verifySnapshot(snapshotId);
         if (!status.ok) {
             throw new RuntimeIntegrityError(
@@ -3003,11 +3704,13 @@ export class AutonomousRunner {
                     contentType: "application/octet-stream",
                 });
             });
-        return createSnapshotProvenance({
+        const provenance = createSnapshotProvenance({
             snapshotHash: measurementSnapshotHash(snapshotId),
             manifestArtifact,
             objectArtifacts,
         });
+        this.#assertDeadlineOpen("snapshot provenance persistence");
+        return provenance;
     }
 
     #persistJsonArtifact({ attemptId, kind, value, contentType }) {
@@ -3021,17 +3724,21 @@ export class AutonomousRunner {
     }
 
     #persistBytesArtifact({ attemptId, kind, bytes, contentType }) {
+        this.#assertDeadlineOpen("artifact persistence");
         const stored = this.#artifactStore.putBytes(bytes, { contentType });
-        return this.#registerCasObject({
+        const registered = this.#registerCasObject({
             attemptId,
             kind,
             objectId: stored.id,
             size: stored.size,
             contentType,
         });
+        this.#assertDeadlineOpen("artifact persistence");
+        return registered;
     }
 
     #registerCasObject({ attemptId, kind, objectId, size, contentType }) {
+        this.#assertDeadlineOpen("artifact registration");
         const artifactId = `runtime-${stableHex({
             investigationId: this.#config.investigationId,
             attemptId,
@@ -3066,23 +3773,19 @@ export class AutonomousRunner {
                 this.#repository.markArtifactDurable(artifactId);
             }
         }
+        this.#assertDeadlineOpen("artifact registration");
         return { artifactId, objectId };
     }
 
-    #recordDeadlineNonResult(aggregate) {
+    #recordDeadlineNonResult(aggregate, cause = null) {
         const currentRecommendation = decideNext(aggregate);
-        if (currentRecommendation.kind === "TERMINAL"
-            && currentRecommendation.event !== null) {
-            this.#adapter.appendKernelDecision();
-            return terminalResult(this.#adapter.replay().aggregate);
-        }
         const attemptId = this.#nextStableId("deadline", {
             seq: aggregate.lastSeq,
             deadlineMs: this.#config.deadlineMs,
         });
         let domainPausePersisted = false;
         try {
-            const requested = this.#adapter.requestStop({
+            const requested = this.#requestStopFenced({
                 requestId: this.#nextStableId("stop", { reason: "deadline" }),
                 reason: "Autonomous runner deadline reached.",
                 pauseRequested: true,
@@ -3091,7 +3794,7 @@ export class AutonomousRunner {
                 const afterStop = requested.aggregate;
                 const recommendation = decideNext(afterStop);
                 if (recommendation.event?.type === EVENT_TYPES.INVESTIGATION_PAUSED) {
-                    this.#adapter.appendKernelDecision();
+                    this.#appendKernelDecisionFenced({ deadlineExempt: true });
                     domainPausePersisted = true;
                 }
             }
@@ -3109,6 +3812,10 @@ export class AutonomousRunner {
                 observedAt: this.#clock.isoNow(),
                 domainPausePersisted,
                 terminalEmitted: false,
+                terminalRecommendationSuppressed:
+                    currentRecommendation.kind === "TERMINAL",
+                stage: cause?.details?.stage ?? null,
+                causeCode: cause?.code ?? null,
             },
         });
         return {
@@ -3124,11 +3831,22 @@ export class AutonomousRunner {
     async #cleanup() {
         let firstError = null;
         this.#capturedOutputs.clear();
+        this.#effectEvidenceBuffers.clear();
+        this.#attemptCommands.clear();
         if (this.#workerPool !== null && typeof this.#workerPool.close === "function") {
-            try {
-                await this.#workerPool.close();
-            } catch (error) {
-                firstError ??= error;
+            const outcome = await settleWithin(
+                () => this.#workerPool.close(),
+                this.#config.options.shutdownTimeoutMs,
+                { timers: this.#dependencies.timers ?? globalThis },
+            );
+            if (outcome.status === "rejected") {
+                firstError ??= outcome.error;
+            } else if (outcome.status === "timed_out") {
+                firstError ??= new CrucibleRuntimeError(
+                    RUNTIME_ERROR_CODES.RUNTIME_FAILURE,
+                    "Runner worker-pool cleanup exceeded its final shutdown bound",
+                    { timeoutMs: this.#config.options.shutdownTimeoutMs },
+                );
             }
         }
         if (this.#repository !== null) {

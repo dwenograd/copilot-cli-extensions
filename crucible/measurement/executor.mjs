@@ -72,6 +72,8 @@ import { createDefaultProcessAdapter } from "./windows-adapter.mjs";
 
 const SAFE_ID = /^[a-z0-9][a-z0-9._-]{0,127}$/u;
 const HASH_TAG = /^sha256:[a-z0-9][a-z0-9._-]*:[a-f0-9]{64}$/u;
+const DEFAULT_TERMINATION_DRAIN_TIMEOUT_MS = 5_000;
+const DEFAULT_CAPABILITY_CLEANUP_TIMEOUT_MS = 10_000;
 
 // Minimal fixed env keys we always pass through so the child process can
 // find fundamental system resources. NOT candidate for allowedEnv override:
@@ -155,12 +157,107 @@ function validateIdentifier(value, field) {
     return value;
 }
 
+function normalizeDeadline(value) {
+    if (value === null || value === undefined) return null;
+    if (!Number.isFinite(value)) {
+        throw new MeasurementError(
+            MEASUREMENT_ERROR_CODES.INVALID_ARGUMENT,
+            "deadlineMs must be finite epoch milliseconds or null",
+            { deadlineMs: value },
+        );
+    }
+    return value;
+}
+
+function remainingDeadlineMs(deadlineMs, clock) {
+    return deadlineMs === null
+        ? Number.POSITIVE_INFINITY
+        : Math.max(0, Math.floor(deadlineMs - clock.now()));
+}
+
+function deadlineTimeout(deadlineMs, clock, stage) {
+    return new MeasurementError(
+        MEASUREMENT_ERROR_CODES.TIMEOUT,
+        `measurement deadline expired during ${stage}`,
+        {
+            deadlineExceeded: true,
+            deadlineMs,
+            observedAtMs: clock.now(),
+            stage,
+        },
+    );
+}
+
+function assertDeadline(deadlineMs, clock, stage) {
+    if (remainingDeadlineMs(deadlineMs, clock) === 0) {
+        throw deadlineTimeout(deadlineMs, clock, stage);
+    }
+}
+
+function settleWithin(operation, timeoutMs) {
+    let promise;
+    try {
+        promise = Promise.resolve().then(operation);
+    } catch (error) {
+        promise = Promise.reject(error);
+    }
+    return new Promise((resolve) => {
+        let settled = false;
+        const finish = (result) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            resolve(result);
+        };
+        const timer = setTimeout(
+            () => finish({ status: "timed_out" }),
+            Math.max(1, timeoutMs),
+        );
+        timer.unref?.();
+        promise.then(
+            (value) => finish({ status: "fulfilled", value }),
+            (error) => finish({ status: "rejected", error }),
+        );
+    });
+}
+
+async function cleanupCapabilityWithinBound(capability, binding, timeoutMs) {
+    const outcome = await settleWithin(
+        () => cleanupSandboxCapability(capability, binding),
+        timeoutMs,
+    );
+    if (outcome.status === "rejected") {
+        throw outcome.error;
+    }
+    if (outcome.status === "timed_out") {
+        throw new MeasurementError(
+            MEASUREMENT_ERROR_CODES.SANDBOX_LIFECYCLE,
+            "Sandbox capability cleanup exceeded its final bound",
+            { timeoutMs },
+        );
+    }
+}
+
+function normalizeLifecycleTimeout(value, fallback, field) {
+    const actual = value ?? fallback;
+    if (!Number.isSafeInteger(actual) || actual < 1 || actual > 60_000) {
+        throw new MeasurementError(
+            MEASUREMENT_ERROR_CODES.INVALID_ARGUMENT,
+            `${field} must be a positive integer <= 60000`,
+            { field, value: actual },
+        );
+    }
+    return actual;
+}
+
 // Build a MeasurementExecutor. Options:
 //   sandboxProvider    : registered provider from createSandboxProvider() | null
 //   processAdapter     : injected for tests; defaults to real Windows adapter
 //   clock              : { now(): number, isoNow(): string } for tests
 //   scratchRoot        : operator-owned root for private per-attempt staging
 //   onCapturedOutput   : trusted raw-output observer used by the runtime runner
+//   terminationDrainMs : final child-output drain bound after termination
+//   capabilityCleanupTimeoutMs : final sandbox cleanup / Job Object close bound
 export function createMeasurementExecutor(options = {}) {
     const allowlist = options.allowlist;
     if (!isLoadedHarnessAllowlist(allowlist)) {
@@ -201,6 +298,16 @@ export function createMeasurementExecutor(options = {}) {
         );
     }
     const scratchRoot = normalizeScratchRoot(options.scratchRoot);
+    const terminationDrainMs = normalizeLifecycleTimeout(
+        options.terminationDrainMs,
+        DEFAULT_TERMINATION_DRAIN_TIMEOUT_MS,
+        "terminationDrainMs",
+    );
+    const capabilityCleanupTimeoutMs = normalizeLifecycleTimeout(
+        options.capabilityCleanupTimeoutMs,
+        DEFAULT_CAPABILITY_CLEANUP_TIMEOUT_MS,
+        "capabilityCleanupTimeoutMs",
+    );
 
     return Object.freeze({
         sandboxProvider,
@@ -215,6 +322,8 @@ export function createMeasurementExecutor(options = {}) {
                 scratchRoot,
                 allowlist,
                 onCapturedOutput,
+                terminationDrainMs,
+                capabilityCleanupTimeoutMs,
             });
         },
     });
@@ -288,6 +397,8 @@ async function runOnce({
     scratchRoot,
     allowlist,
     onCapturedOutput,
+    terminationDrainMs,
+    capabilityCleanupTimeoutMs,
 }) {
     if (runInput === null || typeof runInput !== "object" || Array.isArray(runInput)) {
         throw new MeasurementError(
@@ -305,6 +416,7 @@ async function runOnce({
     const snapshot = validateCandidateSnapshot(runInput.candidateSnapshot);
     const attemptId = validateIdentifier(runInput.attemptId, "attemptId");
     const runnerEpochId = validateIdentifier(runInput.runnerEpochId, "runnerEpochId");
+    const deadlineMs = normalizeDeadline(runInput.deadlineMs);
     let runLease = null;
     let stageRoot = null;
     let snapshotLease = null;
@@ -312,6 +424,7 @@ async function runOnce({
     let capabilityBinding = null;
     let capabilityCleaned = false;
     try {
+        assertDeadline(deadlineMs, clock, "measurement admission");
         // Re-open and re-hash through the issuing allowlist instance for this
         // exact run, then keep those verified handles live through staging.
         runLease = acquireVerifiedHarnessRun(verifiedEntry, allowlist);
@@ -319,6 +432,7 @@ async function runOnce({
         const stagedRun = stageVerifiedHarnessRun(runLease, stageRoot);
         const entry = stagedRun.entry;
         snapshotLease = openVerifiedSnapshotClosure(snapshot);
+        assertDeadline(deadlineMs, clock, "harness staging");
 
         // Substitute only data placeholders, then replace every declared
         // static file reference with its private staged path.
@@ -355,6 +469,10 @@ async function runOnce({
             stagedRun.cwd,
             ...stagedRun.dependencies.map((dependency) => dependency.path),
         ];
+        const admissionTimeoutMs = Math.max(
+            1,
+            Math.min(entry.timeoutMs, remainingDeadlineMs(deadlineMs, clock)),
+        );
 
         // Fail closed before launch. A successful provider result must be the
         // opaque capability issued for this exact admission; ordinary objects
@@ -382,6 +500,8 @@ async function runOnce({
                         argvHash,
                         cwd,
                         envHash,
+                        deadlineMs,
+                        timeoutMs: admissionTimeoutMs,
                         stagedPaths: Object.freeze([...stagedPaths]),
                     }),
                 }));
@@ -408,8 +528,14 @@ async function runOnce({
             });
             // Validate identity and staged-root binding before any launch.
             describeSandboxCapability(capability, capabilityBinding);
+            assertDeadline(deadlineMs, clock, "sandbox admission");
         }
 
+        assertDeadline(deadlineMs, clock, "harness launch");
+        const effectiveTimeoutMs = Math.max(
+            1,
+            Math.min(entry.timeoutMs, remainingDeadlineMs(deadlineMs, clock)),
+        );
         const startedAt = clock.isoNow();
         const startTimeMs = clock.now();
 
@@ -424,6 +550,8 @@ async function runOnce({
                     argv: spawnArgv,
                     cwd,
                     env,
+                    deadlineMs,
+                    timeoutMs: effectiveTimeoutMs,
                     stagedPaths,
                 },
             );
@@ -444,6 +572,8 @@ async function runOnce({
                     stdio: ["ignore", "pipe", "pipe"],
                     executesCandidateCode: false,
                     launchPath: "host-process-adapter",
+                    deadlineMs,
+                    timeoutMs: effectiveTimeoutMs,
                 });
             } catch (err) {
                 throw new StagingRefusedError(
@@ -472,7 +602,8 @@ async function runOnce({
             pid: child.pid,
             maxStdoutBytes: entry.maxStdoutBytes,
             maxStderrBytes: entry.maxStderrBytes,
-            timeoutMs: entry.timeoutMs,
+            timeoutMs: effectiveTimeoutMs,
+            terminationDrainMs,
             terminationController,
         });
 
@@ -480,10 +611,15 @@ async function runOnce({
         // before the post-run candidate closure check so cleanup cannot mutate
         // candidate bytes outside the receipt's before/after binding.
         if (capability !== null) {
-            await cleanupSandboxCapability(capability, capabilityBinding);
+            await cleanupCapabilityWithinBound(
+                capability,
+                capabilityBinding,
+                capabilityCleanupTimeoutMs,
+            );
             capabilityCleaned = true;
         }
         const snapshotBinding = reverifySnapshotClosure(snapshotLease);
+        assertDeadline(deadlineMs, clock, "measurement fact acceptance");
 
         const completedAt = clock.isoNow();
         const durationMs = clock.now() - startTimeMs;
@@ -512,10 +648,13 @@ async function runOnce({
         if (outcome.timedOut) {
             throw new MeasurementError(
                 MEASUREMENT_ERROR_CODES.TIMEOUT,
-                `harness ${entry.id} exceeded timeout of ${entry.timeoutMs}ms`,
+                `harness ${entry.id} exceeded timeout of ${effectiveTimeoutMs}ms`,
                 {
                     harnessId: entry.id,
-                    timeoutMs: entry.timeoutMs,
+                    timeoutMs: effectiveTimeoutMs,
+                    deadlineMs,
+                    deadlineExceeded: deadlineMs !== null
+                        && remainingDeadlineMs(deadlineMs, clock) === 0,
                     stdoutBytes: stdoutBytes.length,
                     stderrBytes: stderrBytes.length,
                     terminationError: outcome.terminationError?.message ?? null,
@@ -623,7 +762,11 @@ async function runOnce({
     } finally {
         try {
             if (capability !== null && !capabilityCleaned) {
-                await cleanupSandboxCapability(capability, capabilityBinding);
+                await cleanupCapabilityWithinBound(
+                    capability,
+                    capabilityBinding,
+                    capabilityCleanupTimeoutMs,
+                );
             }
         } finally {
             try {
@@ -662,6 +805,7 @@ function captureChild(
         maxStdoutBytes,
         maxStderrBytes,
         timeoutMs,
+        terminationDrainMs,
         terminationController,
     },
 ) {
@@ -676,13 +820,21 @@ function captureChild(
         let exit = { code: null, signal: null };
         let terminationError = null;
         const terminationPromises = [];
+        let forcedFinalizeTimer = null;
 
         function requestTermination(reason) {
             try {
-                const pending = Promise.resolve(
-                    terminationController.terminate(pid, reason),
-                ).catch((error) => {
-                    terminationError = error;
+                const pending = settleWithin(
+                    () => terminationController.terminate(pid, reason),
+                    terminationDrainMs,
+                ).then((outcome) => {
+                    if (outcome.status === "rejected") {
+                        terminationError = outcome.error;
+                    } else if (outcome.status === "timed_out") {
+                        terminationError = new Error(
+                            `process termination exceeded ${terminationDrainMs}ms`,
+                        );
+                    }
                 });
                 terminationPromises.push(pending);
             } catch (error) {
@@ -690,9 +842,18 @@ function captureChild(
             }
         }
 
+        function armForcedFinalize() {
+            if (forcedFinalizeTimer !== null) return;
+            forcedFinalizeTimer = setTimeout(() => {
+                void finalize();
+            }, terminationDrainMs);
+            forcedFinalizeTimer.unref?.();
+        }
+
         const timer = setTimeout(() => {
             timedOut = true;
             requestTermination("timeout");
+            armForcedFinalize();
         }, timeoutMs);
         timer.unref?.();
 
@@ -700,6 +861,7 @@ function captureChild(
             if (settled) return;
             settled = true;
             clearTimeout(timer);
+            clearTimeout(forcedFinalizeTimer);
             await Promise.all(terminationPromises);
             resolve({
                 stdout: Buffer.concat(stdoutChunks, stdoutBytes),
@@ -718,6 +880,7 @@ function captureChild(
                     if (chunk.length > 0 && overflowStream === null) {
                         overflowStream = sinkName;
                         requestTermination(`${sinkName}-overflow`);
+                        armForcedFinalize();
                     }
                     return;
                 }
@@ -732,6 +895,7 @@ function captureChild(
                 if (chunk.length > remaining) {
                     if (overflowStream === null) overflowStream = sinkName;
                     requestTermination(`${sinkName}-overflow`);
+                    armForcedFinalize();
                 }
             });
             stream.on("error", () => { /* surfaced via child.on('error') */ });
@@ -745,6 +909,7 @@ function captureChild(
             // non-zero exit so the executor's downstream check surfaces it.
             exit = { code: exit.code ?? -1, signal: exit.signal ?? null, error: err?.message ?? String(err) };
             requestTermination("child-error");
+            armForcedFinalize();
             // Give any pending data events a tick to flush.
             setImmediate(() => { void finalize(); });
         });

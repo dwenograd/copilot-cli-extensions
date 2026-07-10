@@ -24,6 +24,8 @@ const TABLES = [
     "events",
     "runner_leases",
     "command_attempts",
+    "runner_incarnations",
+    "supervisor_authority",
     "artifacts",
     "artifact_refs",
     "projection_metadata",
@@ -117,6 +119,7 @@ describe("read-only queries do not mutate state", () => {
         repo.getCommandAttempt("c1");
         repo.listCommandAttempts("inv-1");
         repo.getActiveLease("inv-1");
+        repo.getSupervisorAuthority("inv-1");
         repo.getArtifact("art1");
         repo.getInlineArtifact("art1");
         repo.getArtifact("art2");
@@ -192,6 +195,53 @@ describe("local-file-only path rejection", () => {
 });
 
 describe("explicit schema versioning", () => {
+    it("migrates generation-only schema 3 databases to incarnation authority", () => {
+        const legacyFile = path.join(dir, "schema-3.sqlite");
+        const legacy = openRepository({ file: legacyFile });
+        legacy.ensureInvestigation({ investigationId: "legacy-inv" });
+        legacy.close();
+
+        const raw = new DatabaseSync(legacyFile);
+        raw.exec(`
+            PRAGMA foreign_keys = OFF;
+            DROP TABLE supervisor_authority;
+            DROP TABLE runner_incarnations;
+            ALTER TABLE command_attempts DROP COLUMN runner_incarnation;
+            ALTER TABLE runner_leases DROP COLUMN runner_incarnation;
+            UPDATE schema_meta SET value = '3' WHERE key = 'schema_version';
+            PRAGMA user_version = 3;
+        `);
+        raw.close();
+
+        const migrated = openRepository({ file: legacyFile });
+        try {
+            expect(migrated.schemaVersion).toBe(SCHEMA_VERSION);
+            migrated.claimSupervisorGeneration({
+                investigationId: "legacy-inv",
+                supervisorGeneration: 1,
+                supervisorNonce: "legacy-supervisor",
+            });
+            migrated.issueRunnerIncarnation({
+                investigationId: "legacy-inv",
+                supervisorGeneration: 1,
+                supervisorNonce: "legacy-supervisor",
+                runnerIncarnation: "legacy-runner-incarnation",
+            });
+            expect(migrated.acquireLease({
+                investigationId: "legacy-inv",
+                leaseId: "legacy-lease",
+                owner: "legacy-runner",
+                supervisorGeneration: 1,
+                runnerIncarnation: "legacy-runner-incarnation",
+            })).toMatchObject({
+                fencingToken: 1,
+                runnerIncarnation: "legacy-runner-incarnation",
+            });
+        } finally {
+            migrated.close();
+        }
+    });
+
     it("fails closed when the on-disk schema version does not match", () => {
         repo.ensureInvestigation({ investigationId: "inv-1" });
         repo.close();

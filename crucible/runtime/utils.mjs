@@ -8,6 +8,8 @@ const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f]/u;
 const SAFE_IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._@-]{0,127}$/u;
 const SAFE_LOWER_IDENTIFIER = /^[a-z0-9][a-z0-9._-]{0,127}$/u;
 
+export const RUNTIME_TEMP_OWNER_MARKER = ".crucible-runtime-owner.json";
+
 export function isPlainObject(value) {
     return value !== null
         && typeof value === "object"
@@ -295,6 +297,61 @@ export function parseDeadline(value, field = "deadline") {
         throw new RuntimeConfigError(`${field} is not a valid timestamp`, { value });
     }
     return milliseconds;
+}
+
+export function remainingDeadlineMs(deadlineMs, now = Date.now()) {
+    if (deadlineMs === null || deadlineMs === undefined) {
+        return Number.POSITIVE_INFINITY;
+    }
+    if (!Number.isFinite(deadlineMs) || !Number.isFinite(now)) {
+        throw new RuntimeConfigError("deadline and current time must be finite timestamps", {
+            deadlineMs,
+            now,
+        });
+    }
+    return Math.max(0, Math.floor(deadlineMs - now));
+}
+
+export function deadlineReached(deadlineMs, now = Date.now()) {
+    return remainingDeadlineMs(deadlineMs, now) === 0;
+}
+
+export function settleWithin(operation, timeoutMs, { timers = globalThis } = {}) {
+    if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 0) {
+        throw new RuntimeConfigError("timeoutMs must be a non-negative safe integer", {
+            timeoutMs,
+        });
+    }
+    let promise;
+    try {
+        promise = typeof operation === "function"
+            ? Promise.resolve().then(operation)
+            : Promise.resolve(operation);
+    } catch (error) {
+        promise = Promise.reject(error);
+    }
+    return new Promise((resolve) => {
+        let settled = false;
+        const finish = (result) => {
+            if (settled) return;
+            settled = true;
+            if (timer !== null) {
+                timers.clearTimeout?.(timer);
+            }
+            resolve(result);
+        };
+        const timer = timeoutMs === 0
+            ? null
+            : timers.setTimeout(() => finish({ status: "timed_out" }), timeoutMs);
+        timer?.unref?.();
+        promise.then(
+            (value) => finish({ status: "fulfilled", value }),
+            (error) => finish({ status: "rejected", error }),
+        );
+        if (timeoutMs === 0) {
+            finish({ status: "timed_out" });
+        }
+    });
 }
 
 export function delay(milliseconds, timers = globalThis) {

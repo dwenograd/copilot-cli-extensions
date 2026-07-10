@@ -153,6 +153,42 @@ function openAdapter(label = "db") {
     return { root, repository, adapter };
 }
 
+function openSharedAdapters(label) {
+    const root = makeRoot(label);
+    const file = path.join(root, "events.sqlite");
+    const repositoryA = trackRepository(openRepository({ file }));
+    const adapterA = createDomainRepositoryAdapter({
+        repository: repositoryA,
+        investigationId: "inv-runtime",
+    });
+    const repositoryB = trackRepository(openRepository({ file }));
+    const adapterB = createDomainRepositoryAdapter({
+        repository: repositoryB,
+        investigationId: "inv-runtime",
+    });
+    return { root, file, repositoryA, repositoryB, adapterA, adapterB };
+}
+
+function domainPersistenceSnapshot(repository) {
+    return {
+        events: repository.listEvents("inv-runtime").map((event) => event.eventHash),
+        refs: repository.listArtifactRefs("inv-runtime").map((ref) => ({
+            artifactId: ref.artifactId,
+            seq: ref.seq,
+        })),
+        attempts: repository.listCommandAttempts("inv-runtime").map((attempt) => ({
+            attemptId: attempt.attemptId,
+            command: attempt.command,
+            state: attempt.state,
+            leaseId: attempt.leaseId,
+            fencingToken: attempt.fencingToken,
+            owner: attempt.owner,
+            supervisorGeneration: attempt.supervisorGeneration,
+            runnerIncarnation: attempt.runnerIncarnation,
+        })),
+    };
+}
+
 function digestOf(value) {
     return value.split(":").at(-1);
 }
@@ -293,7 +329,59 @@ function harnessReceipt(repository, contract, command, attemptId, purpose) {
     };
 }
 
-function appendFullVerifiedHistory(adapter) {
+function prepareValidationCommand(adapter, repository, {
+    leaseId,
+    owner,
+    attemptId,
+    supervisorGeneration = null,
+    runnerIncarnation = null,
+} = {}) {
+    if (adapter.replay().domainEvents.length === 0) {
+        adapter.openInvestigation(createInvestigationContract(contractInput()));
+    }
+    const reserved = adapter.appendKernelDecision().domainEvent.payload;
+    adapter.appendExternal(EVENT_TYPES.COMMAND_DISPATCHED, {
+        commandId: reserved.commandId,
+    });
+    const acquired = adapter.acquireRunnerLease({
+        leaseId,
+        owner,
+        supervisorGeneration,
+        runnerIncarnation,
+    });
+    const command = formatAttemptCommand("domain-command", {
+        commandId: reserved.commandId,
+        command: reserved.command,
+    });
+    adapter.reserveAttempt({ attemptId, command, lease: acquired.lease });
+    adapter.dispatchAttempt(attemptId, acquired.lease);
+    const aggregate = adapter.replay().aggregate;
+    return {
+        reserved,
+        lease: acquired.lease,
+        command,
+        observation: {
+            commandId: reserved.commandId,
+            observationId: `${attemptId}-validation-observation`,
+            purpose: "validation",
+            receipt: harnessReceipt(
+                repository,
+                aggregate.contract,
+                reserved.command,
+                attemptId,
+                "validation",
+            ),
+            data: {
+                caseResults: [
+                    { id: "good", artifactHash: artifactHash("a"), outcome: "accept" },
+                    { id: "bad", artifactHash: artifactHash("b"), outcome: "reject" },
+                ],
+            },
+        },
+    };
+}
+
+function appendFullVerifiedHistory(adapter, { includeTerminal = true } = {}) {
     let aggregate = adapter.openInvestigation(
         createInvestigationContract(contractInput({
             searchPolicy: searchPolicy({ stopOnFirstAccept: true }),
@@ -378,10 +466,12 @@ function appendFullVerifiedHistory(adapter) {
         }),
         { aggregate },
     ).aggregate;
-    aggregate = adapter.appendDomainEvent(
-        constructKernelDecisionEvent(aggregate),
-        { aggregate },
-    ).aggregate;
+    if (includeTerminal) {
+        aggregate = adapter.appendDomainEvent(
+            constructKernelDecisionEvent(aggregate),
+            { aggregate },
+        ).aggregate;
+    }
     return aggregate;
 }
 
@@ -590,12 +680,13 @@ describe("Crucible domain/persistence adapter", () => {
             commandId: reserved.commandId,
         });
         const first = adapter.acquireRunnerLease({ leaseId: "lease-one", owner: "runner-one" });
+        const attemptCommand = formatAttemptCommand("domain-command", {
+            commandId: reserved.commandId,
+            command: reserved.command,
+        });
         adapter.reserveAttempt({
             attemptId: "attempt-one",
-            command: formatAttemptCommand("domain-command", {
-                commandId: reserved.commandId,
-                command: reserved.command,
-            }),
+            command: attemptCommand,
             lease: first.lease,
         });
         adapter.dispatchAttempt("attempt-one", first.lease);
@@ -621,6 +712,7 @@ describe("Crucible domain/persistence adapter", () => {
             },
         }, {
             attemptId: "attempt-one",
+            command: attemptCommand,
             lease: first.lease,
         })).toThrow(expect.objectContaining({
             code: PERSISTENCE_ERROR_CODES.FENCE_REJECTED,
@@ -639,12 +731,13 @@ describe("Crucible domain/persistence adapter", () => {
             commandId: reserved.commandId,
         });
         const first = adapter.acquireRunnerLease({ leaseId: "lease-one", owner: "runner-one" });
+        const attemptCommand = formatAttemptCommand("domain-command", {
+            commandId: reserved.commandId,
+            command: reserved.command,
+        });
         adapter.reserveAttempt({
             attemptId: "attempt-one",
-            command: formatAttemptCommand("domain-command", {
-                commandId: reserved.commandId,
-                command: reserved.command,
-            }),
+            command: attemptCommand,
             lease: first.lease,
         });
         adapter.dispatchAttempt("attempt-one", first.lease);
@@ -668,6 +761,7 @@ describe("Crucible domain/persistence adapter", () => {
             },
         }, {
             attemptId: "attempt-one",
+            command: attemptCommand,
             lease: first.lease,
         });
         adapter.acquireRunnerLease({ leaseId: "lease-two", owner: "runner-two" });
@@ -678,6 +772,7 @@ describe("Crucible domain/persistence adapter", () => {
             observationId: "validation-observation",
         }, {
             attemptId: "attempt-one",
+            command: attemptCommand,
             lease: first.lease,
         })).toThrow(expect.objectContaining({
             code: PERSISTENCE_ERROR_CODES.FENCE_REJECTED,
@@ -687,5 +782,404 @@ describe("Crucible domain/persistence adapter", () => {
         expect(after.evidenceOrder).toEqual([]);
         expect(after.observations["validation-observation"].evidenceId).toBeNull();
         releaseRepository(repository);
+    });
+
+    it("leaves no observation, artifact ref, or attempt transition after two-handle takeover", () => {
+        const {
+            repositoryA,
+            repositoryB,
+            adapterA,
+            adapterB,
+        } = openSharedAdapters("two-handle-observation-takeover");
+        const prepared = prepareValidationCommand(adapterA, repositoryA, {
+            leaseId: "lease-a",
+            owner: "runner-a",
+            attemptId: "attempt-a",
+        });
+        const leaseB = repositoryB.acquireLease({
+            investigationId: "inv-runtime",
+            leaseId: "lease-b",
+            owner: "runner-b",
+        });
+        const beforeStaleWrite = domainPersistenceSnapshot(repositoryB);
+
+        expect(() => adapterA.appendHarnessObservationFenced(
+            prepared.observation,
+            {
+                attemptId: "attempt-a",
+                command: prepared.command,
+                lease: prepared.lease,
+            },
+        )).toThrow(expect.objectContaining({
+            code: PERSISTENCE_ERROR_CODES.FENCE_REJECTED,
+        }));
+        expect(domainPersistenceSnapshot(repositoryB)).toEqual(beforeStaleWrite);
+        expect(repositoryB.getCommandAttempt("attempt-a").state).toBe("dispatched");
+
+        adapterB.recoverStaleAttempts(leaseB);
+        const currentAttemptId = "attempt-b";
+        adapterB.reserveAttempt({
+            attemptId: currentAttemptId,
+            command: prepared.command,
+            lease: leaseB,
+        });
+        adapterB.dispatchAttempt(currentAttemptId, leaseB);
+        const currentAggregate = adapterB.replay().aggregate;
+        const currentObservation = {
+            ...prepared.observation,
+            observationId: "current-validation-observation",
+            receipt: harnessReceipt(
+                repositoryB,
+                currentAggregate.contract,
+                prepared.reserved.command,
+                currentAttemptId,
+                "validation",
+            ),
+        };
+        adapterB.appendHarnessObservationFenced(currentObservation, {
+            attemptId: currentAttemptId,
+            command: prepared.command,
+            lease: leaseB,
+        });
+        const eventCount = repositoryB.countEvents("inv-runtime");
+        expect(() => adapterB.appendHarnessObservationFenced(currentObservation, {
+            attemptId: currentAttemptId,
+            command: prepared.command,
+            lease: leaseB,
+        })).toThrow(expect.objectContaining({
+            code: PERSISTENCE_ERROR_CODES.ILLEGAL_TRANSITION,
+        }));
+        expect(repositoryB.countEvents("inv-runtime")).toBe(eventCount);
+        expect(repositoryB.getCommandAttempt(currentAttemptId).state).toBe("observed");
+    });
+
+    it("binds domain append authority to the current same-generation incarnation", () => {
+        const {
+            repositoryA,
+            repositoryB,
+            adapterA,
+            adapterB,
+        } = openSharedAdapters("same-generation-incarnation");
+        repositoryA.claimSupervisorGeneration({
+            investigationId: "inv-runtime",
+            supervisorGeneration: 4,
+            supervisorNonce: "supervisor-four",
+        });
+        repositoryA.issueRunnerIncarnation({
+            investigationId: "inv-runtime",
+            supervisorGeneration: 4,
+            supervisorNonce: "supervisor-four",
+            runnerIncarnation: "runner-four-one",
+        });
+        const prepared = prepareValidationCommand(adapterA, repositoryA, {
+            leaseId: "lease-four-one",
+            owner: "runner-four-one",
+            attemptId: "attempt-four-one",
+            supervisorGeneration: 4,
+            runnerIncarnation: "runner-four-one",
+        });
+        repositoryB.issueRunnerIncarnation({
+            investigationId: "inv-runtime",
+            supervisorGeneration: 4,
+            supervisorNonce: "supervisor-four",
+            runnerIncarnation: "runner-four-two",
+        });
+        const activeBeforeRejection = repositoryB.getActiveLease("inv-runtime");
+        const beforeStaleWrite = domainPersistenceSnapshot(repositoryB);
+
+        expect(() => adapterA.appendHarnessObservationFenced(
+            prepared.observation,
+            {
+                attemptId: "attempt-four-one",
+                command: prepared.command,
+                lease: prepared.lease,
+            },
+        )).toThrow(expect.objectContaining({
+            code: PERSISTENCE_ERROR_CODES.FENCE_REJECTED,
+        }));
+        expect(domainPersistenceSnapshot(repositoryB)).toEqual(beforeStaleWrite);
+        expect(repositoryB.getActiveLease("inv-runtime")).toEqual(activeBeforeRejection);
+
+        expect(() => repositoryA.acquireLease({
+            investigationId: "inv-runtime",
+            leaseId: "lease-four-old-retry",
+            owner: "runner-four-old-retry",
+            supervisorGeneration: 4,
+            runnerIncarnation: "runner-four-one",
+        })).toThrow(expect.objectContaining({
+            code: PERSISTENCE_ERROR_CODES.FENCE_REJECTED,
+        }));
+        expect(domainPersistenceSnapshot(repositoryB)).toEqual(beforeStaleWrite);
+        expect(repositoryB.getActiveLease("inv-runtime")).toEqual(activeBeforeRejection);
+
+        const currentLease = adapterB.acquireRunnerLease({
+            leaseId: "lease-four-two",
+            owner: "runner-four-two",
+            supervisorGeneration: 4,
+            runnerIncarnation: "runner-four-two",
+        }).lease;
+        adapterB.reserveAttempt({
+            attemptId: "attempt-four-two",
+            command: prepared.command,
+            lease: currentLease,
+        });
+        adapterB.dispatchAttempt("attempt-four-two", currentLease);
+        const aggregate = adapterB.replay().aggregate;
+        const currentObservation = {
+            ...prepared.observation,
+            observationId: "runner-four-two-observation",
+            receipt: harnessReceipt(
+                repositoryB,
+                aggregate.contract,
+                prepared.reserved.command,
+                "attempt-four-two",
+                "validation",
+            ),
+        };
+        adapterB.appendHarnessObservationFenced(currentObservation, {
+            attemptId: "attempt-four-two",
+            command: prepared.command,
+            lease: currentLease,
+        });
+        expect(repositoryB.getCommandAttempt("attempt-four-two").state).toBe("observed");
+        expect(adapterB.replay().aggregate.observationOrder)
+            .toContain("runner-four-two-observation");
+    });
+
+    it("re-reads attempt authority after CAS and never replays a stale observation", () => {
+        const {
+            repositoryA,
+            repositoryB,
+            adapterA,
+            adapterB,
+        } = openSharedAdapters("cas-takeover");
+        const prepared = prepareValidationCommand(adapterA, repositoryA, {
+            leaseId: "lease-a",
+            owner: "runner-a",
+            attemptId: "attempt-a",
+        });
+        let authorityReads = 0;
+        let appendCalls = 0;
+        let leaseB = null;
+        const repositoryProxy = new Proxy(repositoryA, {
+            get(target, property, receiver) {
+                if (property === "assertAttemptAuthority") {
+                    return (input) => {
+                        authorityReads += 1;
+                        if (authorityReads === 2) {
+                            leaseB = repositoryB.acquireLease({
+                                investigationId: "inv-runtime",
+                                leaseId: "lease-b",
+                                owner: "runner-b",
+                            });
+                        }
+                        return target.assertAttemptAuthority(input);
+                    };
+                }
+                if (property === "appendEventsWithAttemptTransition") {
+                    return (input) => {
+                        appendCalls += 1;
+                        if (appendCalls === 1) {
+                            adapterB.appendExternal(
+                                EVENT_TYPES.CAPABILITY_EPOCH_RECORDED,
+                                {
+                                    epochId: "cas-racer",
+                                    capabilities: ["cas-race"],
+                                },
+                            );
+                        }
+                        return target.appendEventsWithAttemptTransition(input);
+                    };
+                }
+                const value = Reflect.get(target, property, receiver);
+                return typeof value === "function" ? value.bind(target) : value;
+            },
+        });
+        const racingAdapter = createDomainRepositoryAdapter({
+            repository: repositoryProxy,
+            investigationId: "inv-runtime",
+            ensure: false,
+        });
+
+        expect(() => racingAdapter.appendHarnessObservationFenced(
+            prepared.observation,
+            {
+                attemptId: "attempt-a",
+                command: prepared.command,
+                lease: prepared.lease,
+            },
+        )).toThrow(expect.objectContaining({
+            code: PERSISTENCE_ERROR_CODES.FENCE_REJECTED,
+        }));
+        expect(authorityReads).toBe(2);
+        expect(appendCalls).toBe(1);
+        expect(leaseB).not.toBeNull();
+        expect(repositoryB.getCommandAttempt("attempt-a").state).toBe("dispatched");
+        expect(adapterB.replay().aggregate.observationOrder).toEqual([]);
+        expect(repositoryB.listArtifactRefs("inv-runtime")).toEqual([]);
+
+        adapterB.recoverStaleAttempts(leaseB);
+        adapterB.reserveAttempt({
+            attemptId: "attempt-b",
+            command: prepared.command,
+            lease: leaseB,
+        });
+        adapterB.dispatchAttempt("attempt-b", leaseB);
+        const aggregate = adapterB.replay().aggregate;
+        const currentObservation = {
+            ...prepared.observation,
+            observationId: "cas-current-observation",
+            receipt: harnessReceipt(
+                repositoryB,
+                aggregate.contract,
+                prepared.reserved.command,
+                "attempt-b",
+                "validation",
+            ),
+        };
+        adapterB.appendHarnessObservationFenced(currentObservation, {
+            attemptId: "attempt-b",
+            command: prepared.command,
+            lease: leaseB,
+        });
+        expect(adapterB.replay().aggregate.observationOrder)
+            .toEqual(["cas-current-observation"]);
+    });
+
+    it("fences evidence takeover without changing its event, refs, or observed attempt", () => {
+        const {
+            repositoryA,
+            repositoryB,
+            adapterA,
+            adapterB,
+        } = openSharedAdapters("two-handle-evidence-takeover");
+        const prepared = prepareValidationCommand(adapterA, repositoryA, {
+            leaseId: "lease-a",
+            owner: "runner-a",
+            attemptId: "attempt-a",
+        });
+        adapterA.appendHarnessObservationFenced(prepared.observation, {
+            attemptId: "attempt-a",
+            command: prepared.command,
+            lease: prepared.lease,
+        });
+        const leaseB = repositoryB.acquireLease({
+            investigationId: "inv-runtime",
+            leaseId: "lease-b",
+            owner: "runner-b",
+        });
+        const beforeStaleWrite = domainPersistenceSnapshot(repositoryB);
+
+        expect(() => adapterA.appendEvidenceCommitFenced({
+            evidenceId: "evidence-000001",
+            observationId: prepared.observation.observationId,
+        }, {
+            attemptId: "attempt-a",
+            command: prepared.command,
+            lease: prepared.lease,
+        })).toThrow(expect.objectContaining({
+            code: PERSISTENCE_ERROR_CODES.FENCE_REJECTED,
+        }));
+        expect(domainPersistenceSnapshot(repositoryB)).toEqual(beforeStaleWrite);
+        expect(repositoryB.getCommandAttempt("attempt-a").state).toBe("observed");
+
+        adapterB.recoverStaleAttempts(leaseB);
+        const pendingCommand = formatAttemptCommand("domain-evidence-commit", {
+            commandId: prepared.reserved.commandId,
+            observationId: prepared.observation.observationId,
+            evidenceId: "evidence-000001",
+        });
+        adapterB.reserveAttempt({
+            attemptId: "attempt-b",
+            command: pendingCommand,
+            lease: leaseB,
+        });
+        adapterB.dispatchAttempt("attempt-b", leaseB);
+        adapterB.observeAttempt("attempt-b", leaseB);
+        adapterB.appendEvidenceCommitFenced({
+            evidenceId: "evidence-000001",
+            observationId: prepared.observation.observationId,
+        }, {
+            attemptId: "attempt-b",
+            command: pendingCommand,
+            lease: leaseB,
+        });
+        const evidenceEvents = repositoryB.listEvents("inv-runtime")
+            .filter((event) => event.kind === "domain:evidence_committed");
+        expect(evidenceEvents).toHaveLength(1);
+        expect(repositoryB.getCommandAttempt("attempt-b").state).toBe("committed");
+    });
+
+    it("fences terminal takeover and lets only the current owner persist it once", () => {
+        const {
+            repositoryA,
+            repositoryB,
+            adapterA,
+            adapterB,
+        } = openSharedAdapters("two-handle-terminal-takeover");
+        const aggregate = appendFullVerifiedHistory(adapterA, { includeTerminal: false });
+        const terminalEvent = constructKernelDecisionEvent(aggregate);
+        const factHash = adapterA.domainFactIdentity(terminalEvent);
+        const terminalCommand = formatAttemptCommand("domain-event", {
+            scope: "kernel-decision",
+            eventType: terminalEvent.type,
+            factHash,
+        });
+        const leaseA = adapterA.acquireRunnerLease({
+            leaseId: "lease-a",
+            owner: "runner-a",
+        }).lease;
+        adapterA.reserveAttempt({
+            attemptId: "terminal-a",
+            command: terminalCommand,
+            lease: leaseA,
+        });
+        adapterA.dispatchAttempt("terminal-a", leaseA);
+        adapterA.observeAttempt("terminal-a", leaseA);
+        const leaseB = repositoryB.acquireLease({
+            investigationId: "inv-runtime",
+            leaseId: "lease-b",
+            owner: "runner-b",
+        });
+        const beforeStaleWrite = domainPersistenceSnapshot(repositoryB);
+
+        expect(() => adapterA.appendKernelDecisionFenced({
+            attemptId: "terminal-a",
+            command: terminalCommand,
+            lease: leaseA,
+            expectedDomainFactHash: factHash,
+        })).toThrow(expect.objectContaining({
+            code: PERSISTENCE_ERROR_CODES.FENCE_REJECTED,
+        }));
+        expect(domainPersistenceSnapshot(repositoryB)).toEqual(beforeStaleWrite);
+        expect(repositoryB.getTerminalEvent("inv-runtime")).toBeNull();
+
+        adapterB.recoverStaleAttempts(leaseB);
+        adapterB.reserveAttempt({
+            attemptId: "terminal-b",
+            command: terminalCommand,
+            lease: leaseB,
+        });
+        adapterB.dispatchAttempt("terminal-b", leaseB);
+        adapterB.observeAttempt("terminal-b", leaseB);
+        adapterB.appendKernelDecisionFenced({
+            attemptId: "terminal-b",
+            command: terminalCommand,
+            lease: leaseB,
+            expectedDomainFactHash: factHash,
+        });
+        expect(repositoryB.listEvents("inv-runtime")
+            .filter((event) => event.isTerminal)).toHaveLength(1);
+        expect(repositoryB.getCommandAttempt("terminal-b").state).toBe("committed");
+        expect(() => adapterB.appendKernelDecisionFenced({
+            attemptId: "terminal-b",
+            command: terminalCommand,
+            lease: leaseB,
+            expectedDomainFactHash: factHash,
+        })).toThrow(expect.objectContaining({
+            code: PERSISTENCE_ERROR_CODES.ILLEGAL_TRANSITION,
+        }));
+        expect(repositoryB.listEvents("inv-runtime")
+            .filter((event) => event.isTerminal)).toHaveLength(1);
     });
 });

@@ -31,6 +31,7 @@ import {
     TerminalExistsError,
     IllegalTransitionError,
     FenceRejectedError,
+    AttemptIdentityError,
     ArtifactNotDurableError,
     SchemaVersionError,
     StorageError,
@@ -65,6 +66,44 @@ function requireNonEmptyString(value, name) {
         throw new InvalidArgumentError(`${name} must be a non-empty string`, { [name]: value });
     }
     return value;
+}
+
+function normalizeSupervisorGeneration(value) {
+    if (value === undefined || value === null) {
+        return null;
+    }
+    if (!Number.isSafeInteger(value) || value < 1) {
+        throw new InvalidArgumentError(
+            "supervisorGeneration must be a positive safe integer or null",
+            { supervisorGeneration: value },
+        );
+    }
+    return value;
+}
+
+function normalizeRunnerIncarnation(value) {
+    if (value === undefined || value === null) {
+        return null;
+    }
+    if (typeof value !== "string" || value.length === 0 || value.length > 256) {
+        throw new InvalidArgumentError(
+            "runnerIncarnation must be a non-empty string of at most 256 characters or null",
+            { runnerIncarnation: value },
+        );
+    }
+    return value;
+}
+
+function normalizeRunnerAuthority(supervisorGeneration, runnerIncarnation) {
+    const generation = normalizeSupervisorGeneration(supervisorGeneration);
+    const incarnation = normalizeRunnerIncarnation(runnerIncarnation);
+    if ((generation === null) !== (incarnation === null)) {
+        throw new InvalidArgumentError(
+            "supervisorGeneration and runnerIncarnation must be provided together",
+            { supervisorGeneration: generation, runnerIncarnation: incarnation },
+        );
+    }
+    return { supervisorGeneration: generation, runnerIncarnation: incarnation };
 }
 
 function isSqliteError(err) {
@@ -129,7 +168,11 @@ export class EventRepository {
                         "SELECT value FROM schema_meta WHERE key = 'schema_version'",
                     ).get()?.value ?? Number.NaN)
                     : Number.NaN;
-                if (userVersion !== SCHEMA_VERSION || metaVersion !== SCHEMA_VERSION) {
+                const compatibleLegacyRead =
+                    (userVersion === 2 && metaVersion === 2)
+                    || (userVersion === 3 && metaVersion === 3);
+                if (!compatibleLegacyRead
+                    && (userVersion !== SCHEMA_VERSION || metaVersion !== SCHEMA_VERSION)) {
                     throw new SchemaVersionError(
                         `schema version mismatch: file has user_version=${userVersion}, schema_meta=${Number.isNaN(metaVersion) ? "<none>" : metaVersion}, expected ${SCHEMA_VERSION}`,
                         {
@@ -443,21 +486,31 @@ export class EventRepository {
 
     appendEventsWithAttemptTransition({
         investigationId,
+        authorityInvestigationId = investigationId,
         expectedHead,
         events,
         attemptId,
+        attemptCommand,
         leaseId,
         fencingToken,
         owner,
+        supervisorGeneration = null,
+        runnerIncarnation = null,
         fromState,
         toState,
     } = {}) {
         requireNonEmptyString(investigationId, "investigationId");
+        requireNonEmptyString(authorityInvestigationId, "authorityInvestigationId");
         requireNonEmptyString(attemptId, "attemptId");
+        requireNonEmptyString(attemptCommand, "attemptCommand");
         requireNonEmptyString(leaseId, "leaseId");
         requireNonEmptyString(owner, "owner");
         requireNonEmptyString(fromState, "fromState");
         requireNonEmptyString(toState, "toState");
+        const authority = normalizeRunnerAuthority(
+            supervisorGeneration,
+            runnerIncarnation,
+        );
         if (expectedHead !== null && typeof expectedHead !== "string") {
             throw new InvalidArgumentError(
                 "expectedHead is required for CAS append: pass null (empty log) or the current head hash",
@@ -477,63 +530,34 @@ export class EventRepository {
         }
 
         return this.#tx(() => {
-            const attempt = this.#db
-                .prepare("SELECT * FROM command_attempts WHERE attempt_id = ?")
-                .get(attemptId);
-            if (!attempt || attempt.investigation_id !== investigationId) {
-                throw new NotFoundError(
-                    ERROR_CODES.NOT_FOUND,
-                    `unknown command attempt '${attemptId}'`,
-                    { attemptId },
-                );
-            }
-            if (attempt.lease_id !== leaseId
-                || Number(attempt.fencing_token) !== fencingToken
-                || attempt.owner !== owner) {
-                throw new FenceRejectedError(
-                    "attempt identity does not match the presented runner lease",
-                    {
-                        attemptId,
-                        leaseId,
-                        fencingToken,
-                        owner,
-                    },
-                );
-            }
-            const lease = this.#db
-                .prepare("SELECT * FROM runner_leases WHERE lease_id = ?")
-                .get(leaseId);
-            if (!lease
-                || lease.investigation_id !== investigationId
-                || lease.owner !== owner
-                || Number(lease.fencing_token) !== fencingToken
-                || lease.released_at !== null) {
-                throw new FenceRejectedError(
-                    "presented runner lease is not active for this investigation",
-                    { investigationId, leaseId, fencingToken, owner },
-                );
-            }
-            this.#assertFencingCurrent(investigationId, fencingToken, { attemptId, leaseId });
-            if (attempt.state !== fromState) {
-                throw new IllegalTransitionError(
-                    `attempt must be ${fromState} before fenced domain append`,
-                    { attemptId, state: attempt.state, expected: fromState },
-                );
-            }
+            const attempt = this.#assertAttemptAuthorityInTransaction({
+                authorityInvestigationId,
+                attemptId,
+                attemptCommand,
+                leaseId,
+                fencingToken,
+                owner,
+                ...authority,
+                expectedStates: [fromState],
+            });
 
             const appended = this.#appendEventsInTransaction({
                 investigationId,
                 expectedHead,
                 events,
             });
-            const ts = this.#now();
-            const tsColumn = STATE_TIMESTAMP_COLUMN[toState];
-            this.#db
-                .prepare(`UPDATE command_attempts SET state = :state, ${tsColumn} = :ts, updated_at = :ts WHERE attempt_id = :id`)
-                .run({ state: toState, ts, id: attemptId });
             return {
                 ...appended,
-                attempt: this.getCommandAttempt(attemptId),
+                attempt: this.#transitionAttemptInTransaction({
+                    attempt,
+                    attemptCommand,
+                    leaseId,
+                    fencingToken,
+                    owner,
+                    ...authority,
+                    fromState,
+                    toState,
+                }),
             };
         });
     }
@@ -659,15 +683,610 @@ export class EventRepository {
         });
     }
 
-    // --- runner leases / fencing tokens ------------------------------------
+    ingestEvidenceBatchFenced({
+        investigationId,
+        authorityInvestigationId,
+        attemptId,
+        attemptCommand,
+        leaseId,
+        fencingToken,
+        owner,
+        supervisorGeneration = null,
+        runnerIncarnation = null,
+        expectedState,
+        evidence,
+    } = {}) {
+        this.#validateFencedEvidenceInput({
+            investigationId,
+            authorityInvestigationId,
+            attemptId,
+            attemptCommand,
+            leaseId,
+            owner,
+            expectedState,
+            evidence,
+        });
+        const authority = normalizeRunnerAuthority(
+            supervisorGeneration,
+            runnerIncarnation,
+        );
+        return this.#tx(() => {
+            const attempt = this.#assertAttemptAuthorityInTransaction({
+                authorityInvestigationId,
+                attemptId,
+                attemptCommand,
+                leaseId,
+                fencingToken,
+                owner,
+                ...authority,
+                expectedStates: [expectedState],
+            });
+            const appended = this.#ingestEvidenceBatchInTransaction({
+                investigationId,
+                attemptId,
+                evidence,
+                duplicateMode: "deduplicate-exact",
+            });
+            return {
+                ...appended,
+                attempt: this.#rowToAttempt(attempt),
+            };
+        });
+    }
 
-    acquireLease({ investigationId, leaseId, owner } = {}) {
+    ingestEvidenceBatchWithAttemptTransition({
+        investigationId,
+        authorityInvestigationId,
+        attemptId,
+        attemptCommand,
+        leaseId,
+        fencingToken,
+        owner,
+        supervisorGeneration = null,
+        runnerIncarnation = null,
+        fromState,
+        toState,
+        evidence,
+    } = {}) {
+        this.#validateFencedEvidenceInput({
+            investigationId,
+            authorityInvestigationId,
+            attemptId,
+            attemptCommand,
+            leaseId,
+            owner,
+            expectedState: fromState,
+            evidence,
+        });
+        requireNonEmptyString(toState, "toState");
+        if (!COMMAND_STATES.includes(toState) || NEXT_STATE[fromState] !== toState) {
+            throw new InvalidArgumentError(
+                "attempt transition must be one legal forward lifecycle step",
+                { fromState, toState },
+            );
+        }
+        const authority = normalizeRunnerAuthority(
+            supervisorGeneration,
+            runnerIncarnation,
+        );
+        return this.#tx(() => {
+            const attempt = this.#assertAttemptAuthorityInTransaction({
+                authorityInvestigationId,
+                attemptId,
+                attemptCommand,
+                leaseId,
+                fencingToken,
+                owner,
+                ...authority,
+                expectedStates: [fromState, toState],
+            });
+            if (attempt.state === toState) {
+                const deduplicated = this.#ingestEvidenceBatchInTransaction({
+                    investigationId,
+                    attemptId,
+                    evidence,
+                    duplicateMode: "require-exact",
+                });
+                return {
+                    ...deduplicated,
+                    attempt: this.#rowToAttempt(attempt),
+                };
+            }
+            const appended = this.#ingestEvidenceBatchInTransaction({
+                investigationId,
+                attemptId,
+                evidence,
+                duplicateMode: "reject",
+            });
+            return {
+                ...appended,
+                attempt: this.#transitionAttemptInTransaction({
+                    attempt,
+                    attemptCommand,
+                    leaseId,
+                    fencingToken,
+                    owner,
+                    ...authority,
+                    fromState,
+                    toState,
+                }),
+            };
+        });
+    }
+
+    #validateFencedEvidenceInput({
+        investigationId,
+        authorityInvestigationId,
+        attemptId,
+        attemptCommand,
+        leaseId,
+        owner,
+        expectedState,
+        evidence,
+    }) {
         requireNonEmptyString(investigationId, "investigationId");
+        requireNonEmptyString(authorityInvestigationId, "authorityInvestigationId");
+        requireNonEmptyString(attemptId, "attemptId");
+        requireNonEmptyString(attemptCommand, "attemptCommand");
         requireNonEmptyString(leaseId, "leaseId");
         requireNonEmptyString(owner, "owner");
+        requireNonEmptyString(expectedState, "expectedState");
+        if (!COMMAND_STATES.includes(expectedState)) {
+            throw new InvalidArgumentError(
+                `expectedState must be one of ${COMMAND_STATES.join(", ")}`,
+                { expectedState },
+            );
+        }
+        if (!Array.isArray(evidence) || evidence.length === 0) {
+            throw new InvalidArgumentError("evidence must be a non-empty array", { evidence });
+        }
+    }
+
+    #ingestEvidenceBatchInTransaction({
+        investigationId,
+        attemptId,
+        evidence,
+        duplicateMode,
+    }) {
+        this.#requireInvestigation(investigationId);
+        if (this.getTerminalEvent(investigationId) !== null) {
+            throw new TerminalExistsError(
+                "terminal investigations reject subsequent evidence",
+                { investigationId },
+            );
+        }
+        const normalized = evidence.map((item, index) => {
+            if (item === null || typeof item !== "object" || Array.isArray(item)) {
+                throw new InvalidArgumentError(
+                    `evidence[${index}] must be an object`,
+                    { index },
+                );
+            }
+            return {
+                evidenceKind: requireNonEmptyString(
+                    item.evidenceKind,
+                    `evidence[${index}].evidenceKind`,
+                ),
+                kind: requireNonEmptyString(item.kind, `evidence[${index}].kind`),
+                payloadCanonical: canonicalize(
+                    item.payload === undefined ? {} : item.payload,
+                ),
+                createdAt: item.createdAt ?? this.#now(),
+            };
+        });
+        if (new Set(normalized.map((item) => item.evidenceKind)).size !== normalized.length) {
+            throw new InvalidArgumentError(
+                "evidence batch contains duplicate evidenceKind values",
+            );
+        }
+
+        const existing = normalized.map((item) => this.#db
+            .prepare("SELECT * FROM events WHERE investigation_id = ? AND attempt_id = ? AND evidence_kind = ?")
+            .get(investigationId, attemptId, item.evidenceKind) ?? null);
+        const existingCount = existing.filter((row) => row !== null).length;
+        if (existingCount > 0) {
+            const exact = existingCount === normalized.length
+                && existing.every((row, index) =>
+                    row.kind === normalized[index].kind
+                    && row.payload === normalized[index].payloadCanonical);
+            if (exact
+                && (duplicateMode === "deduplicate-exact"
+                    || duplicateMode === "require-exact")) {
+                return {
+                    deduplicated: true,
+                    events: existing.map((row) => this.#rowToEvent(row)),
+                };
+            }
+            throw new CruciblePersistenceError(
+                ERROR_CODES.EVIDENCE_CONFLICT,
+                "fenced evidence batch conflicts with already-persisted facts",
+                {
+                    investigationId,
+                    attemptId,
+                    existingCount,
+                    evidenceCount: normalized.length,
+                },
+            );
+        }
+        if (duplicateMode === "require-exact") {
+            throw new CruciblePersistenceError(
+                ERROR_CODES.EVIDENCE_CONFLICT,
+                "committed attempt is missing its atomic evidence batch",
+                { investigationId, attemptId },
+            );
+        }
+
+        const head = this.getHead(investigationId);
+        let prevSeq = head.seq;
+        let prevHash = head.eventHash ?? GENESIS_PREV_HASH;
+        const appended = [];
+        const insert = this.#db.prepare(`
+            INSERT INTO events(
+                investigation_id, seq, prev_hash, event_hash, kind, payload,
+                is_terminal, terminal_kind, attempt_id, evidence_kind, created_at)
+            VALUES(:inv, :seq, :prev, :hash, :kind, :payload,
+                0, NULL, :attempt, :evidenceKind, :createdAt)`);
+        for (const item of normalized) {
+            const seq = prevSeq + 1;
+            const eventHash = computeEventHash({
+                investigationId,
+                seq,
+                prevHash,
+                kind: item.kind,
+                payloadCanonical: item.payloadCanonical,
+                isTerminal: false,
+                terminalKind: null,
+                attemptId,
+                evidenceKind: item.evidenceKind,
+                createdAt: item.createdAt,
+            });
+            try {
+                insert.run({
+                    inv: investigationId,
+                    seq,
+                    prev: prevHash,
+                    hash: eventHash,
+                    kind: item.kind,
+                    payload: item.payloadCanonical,
+                    attempt: attemptId,
+                    evidenceKind: item.evidenceKind,
+                    createdAt: item.createdAt,
+                });
+            } catch (err) {
+                throw this.#translateEventInsert(err, { investigationId, seq });
+            }
+            appended.push({
+                investigationId,
+                seq,
+                prevHash,
+                eventHash,
+                kind: item.kind,
+                payload: JSON.parse(item.payloadCanonical),
+                isTerminal: false,
+                terminalKind: null,
+                attemptId,
+                evidenceKind: item.evidenceKind,
+                createdAt: item.createdAt,
+            });
+            prevSeq = seq;
+            prevHash = eventHash;
+        }
+        return { deduplicated: false, events: appended };
+    }
+
+    // --- supervisor generations / runner incarnations ----------------------
+
+    getSupervisorAuthority(investigationId) {
+        requireNonEmptyString(investigationId, "investigationId");
+        const row = this.#db
+            .prepare("SELECT * FROM supervisor_authority WHERE investigation_id = ?")
+            .get(investigationId);
+        return row ? this.#rowToSupervisorAuthority(row) : null;
+    }
+
+    claimSupervisorGeneration({
+        investigationId,
+        supervisorGeneration,
+        supervisorNonce,
+    } = {}) {
+        requireNonEmptyString(investigationId, "investigationId");
+        const generation = normalizeSupervisorGeneration(supervisorGeneration);
+        if (generation === null) {
+            throw new InvalidArgumentError(
+                "supervisorGeneration is required",
+                { supervisorGeneration },
+            );
+        }
+        requireNonEmptyString(supervisorNonce, "supervisorNonce");
 
         return this.#tx(() => {
             this.#requireInvestigation(investigationId);
+            const current = this.#db
+                .prepare("SELECT * FROM supervisor_authority WHERE investigation_id = ?")
+                .get(investigationId);
+            if (current !== undefined) {
+                const currentGeneration = Number(current.supervisor_generation);
+                if (generation < currentGeneration) {
+                    throw new FenceRejectedError(
+                        "supervisor generation is below the authoritative high-water mark",
+                        {
+                            investigationId,
+                            presented: generation,
+                            current: currentGeneration,
+                        },
+                    );
+                }
+                if (generation === currentGeneration) {
+                    if (current.supervisor_nonce !== supervisorNonce) {
+                        throw new FenceRejectedError(
+                            "supervisor generation is already owned by another supervisor",
+                            {
+                                investigationId,
+                                supervisorGeneration: generation,
+                            },
+                        );
+                    }
+                    return this.#rowToSupervisorAuthority(current);
+                }
+            }
+
+            const claimedAt = this.#now();
+            this.#db.prepare(`
+                UPDATE runner_incarnations
+                SET revoked_at = COALESCE(revoked_at, :at)
+                WHERE investigation_id = :inv
+                  AND revoked_at IS NULL`).run({
+                inv: investigationId,
+                at: claimedAt,
+            });
+            if (current === undefined) {
+                this.#db.prepare(`
+                    INSERT INTO supervisor_authority(
+                        investigation_id, supervisor_generation, supervisor_nonce,
+                        current_runner_incarnation, claimed_at, updated_at)
+                    VALUES(:inv, :generation, :nonce, NULL, :at, :at)`).run({
+                    inv: investigationId,
+                    generation,
+                    nonce: supervisorNonce,
+                    at: claimedAt,
+                });
+            } else {
+                this.#db.prepare(`
+                    UPDATE supervisor_authority
+                    SET supervisor_generation = :generation,
+                        supervisor_nonce = :nonce,
+                        current_runner_incarnation = NULL,
+                        claimed_at = :at,
+                        updated_at = :at
+                    WHERE investigation_id = :inv`).run({
+                    inv: investigationId,
+                    generation,
+                    nonce: supervisorNonce,
+                    at: claimedAt,
+                });
+            }
+            return this.#rowToSupervisorAuthority(
+                this.#db
+                    .prepare("SELECT * FROM supervisor_authority WHERE investigation_id = ?")
+                    .get(investigationId),
+            );
+        });
+    }
+
+    issueRunnerIncarnation({
+        investigationId,
+        supervisorGeneration,
+        supervisorNonce,
+        runnerIncarnation,
+    } = {}) {
+        requireNonEmptyString(investigationId, "investigationId");
+        const generation = normalizeSupervisorGeneration(supervisorGeneration);
+        if (generation === null) {
+            throw new InvalidArgumentError(
+                "supervisorGeneration is required",
+                { supervisorGeneration },
+            );
+        }
+        requireNonEmptyString(supervisorNonce, "supervisorNonce");
+        const incarnation = normalizeRunnerIncarnation(runnerIncarnation);
+        if (incarnation === null) {
+            throw new InvalidArgumentError(
+                "runnerIncarnation is required",
+                { runnerIncarnation },
+            );
+        }
+
+        return this.#tx(() => {
+            this.#requireInvestigation(investigationId);
+            const authority = this.#db
+                .prepare("SELECT * FROM supervisor_authority WHERE investigation_id = ?")
+                .get(investigationId);
+            if (authority === undefined
+                || Number(authority.supervisor_generation) !== generation
+                || authority.supervisor_nonce !== supervisorNonce) {
+                throw new FenceRejectedError(
+                    "runner incarnation issuer does not own the current supervisor generation",
+                    {
+                        investigationId,
+                        supervisorGeneration: generation,
+                    },
+                );
+            }
+            const existing = this.#db
+                .prepare("SELECT 1 AS present FROM runner_incarnations WHERE runner_incarnation = ?")
+                .get(incarnation);
+            if (existing !== undefined) {
+                throw new FenceRejectedError(
+                    "runner incarnation has already been issued",
+                    { investigationId, runnerIncarnation: incarnation },
+                );
+            }
+
+            const issuedAt = this.#now();
+            if (authority.current_runner_incarnation !== null) {
+                this.#db.prepare(`
+                    UPDATE runner_incarnations
+                    SET revoked_at = COALESCE(revoked_at, :at)
+                    WHERE runner_incarnation = :incarnation
+                      AND investigation_id = :inv`).run({
+                    at: issuedAt,
+                    incarnation: authority.current_runner_incarnation,
+                    inv: investigationId,
+                });
+            }
+            this.#db.prepare(`
+                INSERT INTO runner_incarnations(
+                    runner_incarnation, investigation_id, supervisor_generation,
+                    supervisor_nonce, issued_at, consumed_at, revoked_at, lease_id)
+                VALUES(:incarnation, :inv, :generation, :nonce, :at, NULL, NULL, NULL)`)
+                .run({
+                    incarnation,
+                    inv: investigationId,
+                    generation,
+                    nonce: supervisorNonce,
+                    at: issuedAt,
+                });
+            const updated = this.#db.prepare(`
+                UPDATE supervisor_authority
+                SET current_runner_incarnation = :incarnation,
+                    updated_at = :at
+                WHERE investigation_id = :inv
+                  AND supervisor_generation = :generation
+                  AND supervisor_nonce = :nonce`).run({
+                incarnation,
+                at: issuedAt,
+                inv: investigationId,
+                generation,
+                nonce: supervisorNonce,
+            });
+            if (Number(updated.changes) !== 1) {
+                throw new FenceRejectedError(
+                    "supervisor generation changed before runner incarnation issuance",
+                    {
+                        investigationId,
+                        supervisorGeneration: generation,
+                        runnerIncarnation: incarnation,
+                    },
+                );
+            }
+            return Object.freeze({
+                investigationId,
+                supervisorGeneration: generation,
+                supervisorNonce,
+                runnerIncarnation: incarnation,
+                issuedAt,
+                consumedAt: null,
+                revokedAt: null,
+                leaseId: null,
+            });
+        });
+    }
+
+    #rowToSupervisorAuthority(row) {
+        return Object.freeze({
+            investigationId: row.investigation_id,
+            supervisorGeneration: Number(row.supervisor_generation),
+            supervisorNonce: row.supervisor_nonce,
+            currentRunnerIncarnation: row.current_runner_incarnation ?? null,
+            claimedAt: row.claimed_at,
+            updatedAt: row.updated_at,
+        });
+    }
+
+    #assertLeaseAcquisitionAuthorityInTransaction({
+        investigationId,
+        supervisorGeneration,
+        runnerIncarnation,
+    }) {
+        const authority = this.#db
+            .prepare("SELECT * FROM supervisor_authority WHERE investigation_id = ?")
+            .get(investigationId);
+        if (supervisorGeneration === null) {
+            if (authority !== undefined) {
+                throw new FenceRejectedError(
+                    "supervisor generation and runner incarnation are required by current authority",
+                    { investigationId },
+                );
+            }
+            return null;
+        }
+        if (authority === undefined) {
+            throw new FenceRejectedError(
+                "supervisor generation has not been claimed in the authoritative repository",
+                {
+                    investigationId,
+                    supervisorGeneration,
+                    runnerIncarnation,
+                },
+            );
+        }
+        const currentGeneration = Number(authority.supervisor_generation);
+        if (supervisorGeneration !== currentGeneration) {
+            throw new FenceRejectedError(
+                "supervisor generation is not current",
+                {
+                    investigationId,
+                    presented: supervisorGeneration,
+                    current: currentGeneration,
+                    runnerIncarnation,
+                },
+            );
+        }
+        if (authority.current_runner_incarnation !== runnerIncarnation) {
+            throw new FenceRejectedError(
+                "runner incarnation is not current for the supervisor generation",
+                {
+                    investigationId,
+                    supervisorGeneration,
+                    runnerIncarnation,
+                },
+            );
+        }
+        const issued = this.#db
+            .prepare("SELECT * FROM runner_incarnations WHERE runner_incarnation = ?")
+            .get(runnerIncarnation);
+        if (issued === undefined
+            || issued.investigation_id !== investigationId
+            || Number(issued.supervisor_generation) !== supervisorGeneration
+            || issued.supervisor_nonce !== authority.supervisor_nonce
+            || issued.revoked_at !== null
+            || issued.consumed_at !== null
+            || issued.lease_id !== null) {
+            throw new FenceRejectedError(
+                "runner incarnation is invalid, revoked, or already consumed",
+                {
+                    investigationId,
+                    supervisorGeneration,
+                    runnerIncarnation,
+                },
+            );
+        }
+        return issued;
+    }
+
+    // --- runner leases / fencing tokens ------------------------------------
+
+    acquireLease({
+        investigationId,
+        leaseId,
+        owner,
+        supervisorGeneration = null,
+        runnerIncarnation = null,
+    } = {}) {
+        requireNonEmptyString(investigationId, "investigationId");
+        requireNonEmptyString(leaseId, "leaseId");
+        requireNonEmptyString(owner, "owner");
+        const authority = normalizeRunnerAuthority(
+            supervisorGeneration,
+            runnerIncarnation,
+        );
+
+        return this.#tx(() => {
+            this.#requireInvestigation(investigationId);
+            const issued = this.#assertLeaseAcquisitionAuthorityInTransaction({
+                investigationId,
+                ...authority,
+            });
             const maxRow = this.#db
                 .prepare("SELECT COALESCE(MAX(fencing_token), 0) AS maxToken FROM runner_leases WHERE investigation_id = ?")
                 .get(investigationId);
@@ -681,8 +1300,20 @@ export class EventRepository {
 
             try {
                 this.#db
-                    .prepare("INSERT INTO runner_leases(lease_id, investigation_id, owner, fencing_token, acquired_at) VALUES(:id, :inv, :owner, :token, :at)")
-                    .run({ id: leaseId, inv: investigationId, owner, token: fencingToken, at: acquiredAt });
+                    .prepare(`
+                        INSERT INTO runner_leases(
+                            lease_id, investigation_id, owner, fencing_token,
+                            supervisor_generation, runner_incarnation, acquired_at)
+                        VALUES(:id, :inv, :owner, :token, :generation, :incarnation, :at)`)
+                    .run({
+                        id: leaseId,
+                        inv: investigationId,
+                        owner,
+                        token: fencingToken,
+                        generation: authority.supervisorGeneration,
+                        incarnation: authority.runnerIncarnation,
+                        at: acquiredAt,
+                    });
             } catch (err) {
                 if (isUniqueViolation(err)) {
                     throw new InvalidArgumentError("lease_id already exists", { leaseId });
@@ -692,8 +1323,44 @@ export class EventRepository {
                 }
                 throw err;
             }
+            if (issued !== null) {
+                const consumed = this.#db.prepare(`
+                    UPDATE runner_incarnations
+                    SET consumed_at = :at, lease_id = :leaseId
+                    WHERE runner_incarnation = :incarnation
+                      AND investigation_id = :inv
+                      AND supervisor_generation = :generation
+                      AND consumed_at IS NULL
+                      AND revoked_at IS NULL
+                      AND lease_id IS NULL`).run({
+                    at: acquiredAt,
+                    leaseId,
+                    incarnation: authority.runnerIncarnation,
+                    inv: investigationId,
+                    generation: authority.supervisorGeneration,
+                });
+                if (Number(consumed.changes) !== 1) {
+                    throw new FenceRejectedError(
+                        "runner incarnation was consumed before lease acquisition committed",
+                        {
+                            investigationId,
+                            supervisorGeneration: authority.supervisorGeneration,
+                            runnerIncarnation: authority.runnerIncarnation,
+                            leaseId,
+                        },
+                    );
+                }
+            }
 
-            return { leaseId, investigationId, owner, fencingToken, acquiredAt };
+            return {
+                leaseId,
+                investigationId,
+                owner,
+                fencingToken,
+                supervisorGeneration: authority.supervisorGeneration,
+                runnerIncarnation: authority.runnerIncarnation,
+                acquiredAt,
+            };
         });
     }
 
@@ -718,6 +1385,10 @@ export class EventRepository {
             investigationId: row.investigation_id,
             owner: row.owner,
             fencingToken: Number(row.fencing_token),
+            supervisorGeneration: row.supervisor_generation == null
+                ? null
+                : Number(row.supervisor_generation),
+            runnerIncarnation: row.runner_incarnation ?? null,
             acquiredAt: row.acquired_at,
             releasedAt: row.released_at ?? null,
         };
@@ -742,14 +1413,298 @@ export class EventRepository {
         }
     }
 
+    assertAttemptAuthority({
+        authorityInvestigationId,
+        attemptId,
+        attemptCommand,
+        leaseId,
+        fencingToken,
+        owner,
+        supervisorGeneration = null,
+        runnerIncarnation = null,
+        expectedState,
+    } = {}) {
+        requireNonEmptyString(authorityInvestigationId, "authorityInvestigationId");
+        requireNonEmptyString(attemptId, "attemptId");
+        requireNonEmptyString(attemptCommand, "attemptCommand");
+        requireNonEmptyString(leaseId, "leaseId");
+        requireNonEmptyString(owner, "owner");
+        requireNonEmptyString(expectedState, "expectedState");
+        if (!COMMAND_STATES.includes(expectedState)) {
+            throw new InvalidArgumentError(
+                `expectedState must be one of ${COMMAND_STATES.join(", ")}`,
+                { expectedState },
+            );
+        }
+        const authority = normalizeRunnerAuthority(
+            supervisorGeneration,
+            runnerIncarnation,
+        );
+        return this.#tx(() => this.#rowToAttempt(
+            this.#assertAttemptAuthorityInTransaction({
+                authorityInvestigationId,
+                attemptId,
+                attemptCommand,
+                leaseId,
+                fencingToken,
+                owner,
+                ...authority,
+                expectedStates: [expectedState],
+            }),
+        ));
+    }
+
+    #assertAttemptAuthorityInTransaction({
+        authorityInvestigationId,
+        attemptId,
+        attemptCommand,
+        leaseId,
+        fencingToken,
+        owner,
+        supervisorGeneration,
+        runnerIncarnation,
+        expectedStates,
+    }) {
+        this.#requireInvestigation(authorityInvestigationId);
+        const attempt = this.#db
+            .prepare("SELECT * FROM command_attempts WHERE attempt_id = ?")
+            .get(attemptId);
+        if (!attempt || attempt.investigation_id !== authorityInvestigationId) {
+            throw new NotFoundError(
+                ERROR_CODES.NOT_FOUND,
+                `unknown command attempt '${attemptId}'`,
+                { attemptId, authorityInvestigationId },
+            );
+        }
+        if (attempt.command !== attemptCommand) {
+            throw new AttemptIdentityError(
+                "attempt command does not match the expected logical identity",
+                { attemptId, authorityInvestigationId },
+            );
+        }
+        if (attempt.lease_id !== leaseId
+            || Number(attempt.fencing_token) !== fencingToken
+            || attempt.owner !== owner) {
+            throw new FenceRejectedError(
+                "attempt identity does not match the presented runner lease",
+                {
+                    attemptId,
+                    leaseId,
+                    fencingToken,
+                    owner,
+                },
+            );
+        }
+        const lease = this.#db
+            .prepare("SELECT * FROM runner_leases WHERE lease_id = ?")
+            .get(leaseId);
+        if (!lease
+            || lease.investigation_id !== authorityInvestigationId
+            || lease.owner !== owner
+            || Number(lease.fencing_token) !== fencingToken
+            || lease.released_at !== null) {
+            throw new FenceRejectedError(
+                "presented runner lease is not active for this investigation",
+                {
+                    authorityInvestigationId,
+                    attemptId,
+                    leaseId,
+                    fencingToken,
+                    owner,
+                },
+            );
+        }
+        this.#assertFencingCurrent(
+            authorityInvestigationId,
+            fencingToken,
+            { attemptId, leaseId },
+        );
+        this.#assertRunnerAuthorityInTransaction({
+            investigationId: authorityInvestigationId,
+            supervisorGeneration,
+            runnerIncarnation,
+            attempt,
+            lease,
+            details: { authorityInvestigationId, attemptId, leaseId },
+        });
+        if (!expectedStates.includes(attempt.state)) {
+            throw new IllegalTransitionError(
+                `attempt must be ${expectedStates.join(" or ")} before fenced persistence`,
+                {
+                    attemptId,
+                    state: attempt.state,
+                    expected: expectedStates,
+                },
+            );
+        }
+        return attempt;
+    }
+
+    #assertRunnerAuthorityInTransaction({
+        investigationId,
+        supervisorGeneration,
+        runnerIncarnation,
+        attempt,
+        lease,
+        details,
+    }) {
+        const authority = this.#db
+            .prepare("SELECT * FROM supervisor_authority WHERE investigation_id = ?")
+            .get(investigationId);
+        const persistedGenerations = [];
+        const persistedIncarnations = [];
+        for (const row of [lease, attempt]) {
+            if (Object.hasOwn(row, "supervisor_generation")) {
+                persistedGenerations.push(row.supervisor_generation);
+            }
+            if (Object.hasOwn(row, "runner_incarnation")) {
+                persistedIncarnations.push(row.runner_incarnation);
+            }
+        }
+
+        if (supervisorGeneration === null) {
+            if (authority !== undefined
+                || persistedGenerations.some((value) => value !== null)
+                || persistedIncarnations.some((value) => value !== null)) {
+                throw new FenceRejectedError(
+                    "supervisor generation and runner incarnation are required by persisted authority",
+                    details,
+                );
+            }
+            return;
+        }
+        if (authority === undefined) {
+            throw new FenceRejectedError(
+                "supervisor generation is not persisted by the authority table",
+                { ...details, supervisorGeneration, runnerIncarnation },
+            );
+        }
+        const currentGeneration = Number(authority.supervisor_generation);
+        if (currentGeneration !== supervisorGeneration
+            || authority.current_runner_incarnation !== runnerIncarnation) {
+            throw new FenceRejectedError(
+                "runner generation or incarnation is not current",
+                {
+                    ...details,
+                    supervisorGeneration,
+                    runnerIncarnation,
+                    currentGeneration,
+                    currentRunnerIncarnation:
+                        authority.current_runner_incarnation ?? null,
+                },
+            );
+        }
+        if (persistedGenerations.length === 0 || persistedIncarnations.length === 0
+            || persistedGenerations.some((value) =>
+                value === null || Number(value) !== supervisorGeneration)
+            || persistedIncarnations.some((value) =>
+                value === null || value !== runnerIncarnation)) {
+            throw new FenceRejectedError(
+                "runner generation or incarnation does not match persisted lease authority",
+                { ...details, supervisorGeneration, runnerIncarnation },
+            );
+        }
+        const issued = this.#db
+            .prepare("SELECT * FROM runner_incarnations WHERE runner_incarnation = ?")
+            .get(runnerIncarnation);
+        if (issued === undefined
+            || issued.investigation_id !== investigationId
+            || Number(issued.supervisor_generation) !== supervisorGeneration
+            || issued.supervisor_nonce !== authority.supervisor_nonce
+            || issued.revoked_at !== null
+            || issued.consumed_at === null
+            || issued.lease_id !== lease.lease_id) {
+            throw new FenceRejectedError(
+                "runner incarnation is not the active consumed authority for this lease",
+                { ...details, supervisorGeneration, runnerIncarnation },
+            );
+        }
+    }
+
+    #transitionAttemptInTransaction({
+        attempt,
+        attemptCommand,
+        leaseId,
+        fencingToken,
+        owner,
+        supervisorGeneration,
+        runnerIncarnation,
+        fromState,
+        toState,
+    }) {
+        if (NEXT_STATE[fromState] !== toState) {
+            throw new InvalidArgumentError(
+                "attempt transition must be one legal forward lifecycle step",
+                { fromState, toState },
+            );
+        }
+        const ts = this.#now();
+        const tsColumn = STATE_TIMESTAMP_COLUMN[toState];
+        const result = this.#db.prepare(`
+            UPDATE command_attempts
+            SET state = :toState, ${tsColumn} = :ts, updated_at = :ts
+            WHERE attempt_id = :attemptId
+              AND investigation_id = :investigationId
+              AND command = :attemptCommand
+              AND state = :fromState
+              AND lease_id = :leaseId
+              AND fencing_token = :fencingToken
+              AND owner = :owner
+              AND supervisor_generation IS :supervisorGeneration
+              AND runner_incarnation IS :runnerIncarnation`).run({
+            toState,
+            ts,
+            attemptId: attempt.attempt_id,
+            investigationId: attempt.investigation_id,
+            attemptCommand,
+            fromState,
+            leaseId,
+            fencingToken,
+            owner,
+            supervisorGeneration,
+            runnerIncarnation,
+        });
+        if (Number(result.changes) !== 1) {
+            throw new FenceRejectedError(
+                "attempt authority changed before the atomic transition",
+                {
+                    attemptId: attempt.attempt_id,
+                    fromState,
+                    toState,
+                    leaseId,
+                    fencingToken,
+                    owner,
+                },
+            );
+        }
+        return this.#rowToAttempt(
+            this.#db
+                .prepare("SELECT * FROM command_attempts WHERE attempt_id = ?")
+                .get(attempt.attempt_id),
+        );
+    }
+
     // --- command lifecycle -------------------------------------------------
 
-    reserveCommand({ investigationId, attemptId, command, leaseId, fencingToken, owner } = {}) {
+    reserveCommand({
+        investigationId,
+        attemptId,
+        command,
+        leaseId,
+        fencingToken,
+        owner,
+        supervisorGeneration = null,
+        runnerIncarnation = null,
+    } = {}) {
         requireNonEmptyString(investigationId, "investigationId");
         requireNonEmptyString(attemptId, "attemptId");
         requireNonEmptyString(command, "command");
         requireNonEmptyString(leaseId, "leaseId");
         requireNonEmptyString(owner, "owner");
+        const authority = normalizeRunnerAuthority(
+            supervisorGeneration,
+            runnerIncarnation,
+        );
 
         return this.#tx(() => {
             this.#requireInvestigation(investigationId);
@@ -770,6 +1725,13 @@ export class EventRepository {
                     leaseId, presented: owner, leaseOwner: lease.owner,
                 });
             }
+            this.#assertRunnerAuthorityInTransaction({
+                investigationId,
+                ...authority,
+                attempt: {},
+                lease,
+                details: { investigationId, leaseId, attemptId },
+            });
             this.#assertFencingCurrent(investigationId, fencingToken, { leaseId });
 
             const ts = this.#now();
@@ -777,10 +1739,18 @@ export class EventRepository {
                 this.#db.prepare(`
                     INSERT INTO command_attempts(
                         attempt_id, investigation_id, command, state, lease_id,
-                        fencing_token, owner, reserved_at, updated_at)
-                    VALUES(:id, :inv, :cmd, 'reserved', :lease, :token, :owner, :at, :at)`).run({
+                        fencing_token, owner, supervisor_generation,
+                        runner_incarnation, reserved_at, updated_at)
+                    VALUES(
+                        :id, :inv, :cmd, 'reserved', :lease, :token, :owner,
+                        :generation, :incarnation, :at, :at)`).run({
                     id: attemptId, inv: investigationId, cmd: command,
-                    lease: leaseId, token: fencingToken, owner, at: ts,
+                    lease: leaseId,
+                    token: fencingToken,
+                    owner,
+                    generation: authority.supervisorGeneration,
+                    incarnation: authority.runnerIncarnation,
+                    at: ts,
                 });
             } catch (err) {
                 if (isUniqueViolation(err)) {
@@ -803,7 +1773,16 @@ export class EventRepository {
         });
     }
 
-    transitionCommand({ investigationId, attemptId, toState, fencingToken } = {}) {
+    transitionCommand({
+        investigationId,
+        attemptId,
+        toState,
+        leaseId = null,
+        fencingToken,
+        owner = null,
+        supervisorGeneration = null,
+        runnerIncarnation = null,
+    } = {}) {
         requireNonEmptyString(investigationId, "investigationId");
         requireNonEmptyString(attemptId, "attemptId");
         requireNonEmptyString(toState, "toState");
@@ -811,23 +1790,37 @@ export class EventRepository {
             throw new InvalidArgumentError(`toState must be one of ${COMMAND_STATES.join(", ")}`, { toState });
         }
 
+        const authority = normalizeRunnerAuthority(
+            supervisorGeneration,
+            runnerIncarnation,
+        );
         return this.#tx(() => {
-            const attempt = this.#db
+            const persisted = this.#db
                 .prepare("SELECT * FROM command_attempts WHERE attempt_id = ?")
                 .get(attemptId);
-            if (!attempt || attempt.investigation_id !== investigationId) {
+            if (!persisted || persisted.investigation_id !== investigationId) {
                 throw new NotFoundError(ERROR_CODES.NOT_FOUND, `unknown command attempt '${attemptId}'`, { attemptId });
             }
-
-            // Fencing: the presented token must equal the token this attempt was
-            // reserved under AND still be the current lease token (nobody newer
-            // has taken over).
-            if (Number(attempt.fencing_token) !== fencingToken) {
-                throw new FenceRejectedError("fencing token does not match the reserving lease", {
-                    attemptId, presented: fencingToken, attemptToken: Number(attempt.fencing_token),
-                });
+            const supervised = persisted.supervisor_generation !== null
+                || persisted.runner_incarnation !== null;
+            if (supervised && (leaseId === null || owner === null)) {
+                throw new FenceRejectedError(
+                    "supervised attempt transitions require full lease authority",
+                    { investigationId, attemptId },
+                );
             }
-            this.#assertFencingCurrent(investigationId, fencingToken, { attemptId });
+            const presentedLeaseId = leaseId ?? persisted.lease_id;
+            const presentedOwner = owner ?? persisted.owner;
+            const attempt = this.#assertAttemptAuthorityInTransaction({
+                authorityInvestigationId: investigationId,
+                attemptId,
+                attemptCommand: persisted.command,
+                leaseId: presentedLeaseId,
+                fencingToken,
+                owner: presentedOwner,
+                ...authority,
+                expectedStates: [persisted.state],
+            });
 
             const expected = NEXT_STATE[attempt.state];
             if (toState !== expected) {
@@ -836,14 +1829,16 @@ export class EventRepository {
                     { attemptId, from: attempt.state, to: toState, expected },
                 );
             }
-
-            const ts = this.#now();
-            const tsColumn = STATE_TIMESTAMP_COLUMN[toState];
-            this.#db
-                .prepare(`UPDATE command_attempts SET state = :state, ${tsColumn} = :ts, updated_at = :ts WHERE attempt_id = :id`)
-                .run({ state: toState, ts, id: attemptId });
-
-            return this.getCommandAttempt(attemptId);
+            return this.#transitionAttemptInTransaction({
+                attempt,
+                attemptCommand: attempt.command,
+                leaseId: presentedLeaseId,
+                fencingToken,
+                owner: presentedOwner,
+                ...authority,
+                fromState: attempt.state,
+                toState,
+            });
         });
     }
 
@@ -859,11 +1854,23 @@ export class EventRepository {
         return this.transitionCommand({ ...args, toState: "committed" });
     }
 
-    abandonStaleCommand({ investigationId, attemptId, leaseId, fencingToken, owner } = {}) {
+    abandonStaleCommand({
+        investigationId,
+        attemptId,
+        leaseId,
+        fencingToken,
+        owner,
+        supervisorGeneration = null,
+        runnerIncarnation = null,
+    } = {}) {
         requireNonEmptyString(investigationId, "investigationId");
         requireNonEmptyString(attemptId, "attemptId");
         requireNonEmptyString(leaseId, "leaseId");
         requireNonEmptyString(owner, "owner");
+        const authority = normalizeRunnerAuthority(
+            supervisorGeneration,
+            runnerIncarnation,
+        );
 
         return this.#tx(() => {
             const lease = this.#db
@@ -879,6 +1886,13 @@ export class EventRepository {
                     owner,
                 });
             }
+            this.#assertRunnerAuthorityInTransaction({
+                investigationId,
+                ...authority,
+                attempt: {},
+                lease,
+                details: { investigationId, leaseId, attemptId },
+            });
             this.#assertFencingCurrent(investigationId, fencingToken, { leaseId, attemptId });
 
             const attempt = this.#db
@@ -904,11 +1918,15 @@ export class EventRepository {
             this.#db.prepare(`
                 UPDATE command_attempts
                 SET state = 'abandoned', lease_id = :lease, fencing_token = :token,
-                    owner = :owner, abandoned_at = :ts, updated_at = :ts
+                    owner = :owner, supervisor_generation = :generation,
+                    runner_incarnation = :incarnation,
+                    abandoned_at = :ts, updated_at = :ts
                 WHERE attempt_id = :id`).run({
                 lease: leaseId,
                 token: fencingToken,
                 owner,
+                generation: authority.supervisorGeneration,
+                incarnation: authority.runnerIncarnation,
                 ts,
                 id: attemptId,
             });
@@ -941,6 +1959,10 @@ export class EventRepository {
             leaseId: row.lease_id,
             fencingToken: Number(row.fencing_token),
             owner: row.owner,
+            supervisorGeneration: row.supervisor_generation == null
+                ? null
+                : Number(row.supervisor_generation),
+            runnerIncarnation: row.runner_incarnation ?? null,
             reservedAt: row.reserved_at,
             dispatchedAt: row.dispatched_at ?? null,
             observedAt: row.observed_at ?? null,

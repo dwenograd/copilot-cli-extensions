@@ -10,11 +10,10 @@
 //     and its own process group (detached:true on Windows creates a new
 //     process group we can then tree-terminate by PID).
 //
-//   - terminateTree(pid): kill the child and its descendants **by exact
-//     PID**, never by name. On Windows this shells out to taskkill.exe with
-//     `/F /T /PID <pid>`; taskkill itself is spawned with shell:false. On
-//     other platforms we use process.kill(-pid, "SIGKILL") targeting the
-//     process group we created via detached:true.
+//   - terminateTree(pid, policy): stop the child and descendants **by exact
+//     PID**, never by name. Windows uses bounded taskkill.exe calls, first
+//     without `/F` for drain and then with `/F` for escalation. Other
+//     platforms target the detached process group with SIGTERM/SIGKILL.
 //
 // Tests pass a fake adapter to the executor to observe termination calls
 // without actually spawning processes. Production code uses the real
@@ -37,10 +36,22 @@ function resolveTaskkill() {
     return path.join(systemRoot, "System32", "taskkill.exe");
 }
 
-export function createDefaultProcessAdapter() {
-    const isWindows = process.platform === "win32";
+export function createDefaultProcessAdapter(options = {}) {
+    const platform = options.platform ?? process.platform;
+    const isWindows = platform === "win32";
+    const spawnProcess = options.spawnProcess ?? childSpawn;
+    const timers = options.timers ?? globalThis;
+    const defaultTerminationTimeoutMs = options.terminationTimeoutMs ?? 5_000;
+    if (!Number.isSafeInteger(defaultTerminationTimeoutMs)
+        || defaultTerminationTimeoutMs < 1
+        || defaultTerminationTimeoutMs > 60_000) {
+        throw new MeasurementError(
+            MEASUREMENT_ERROR_CODES.INVALID_ARGUMENT,
+            "terminationTimeoutMs must be a positive integer <= 60000",
+        );
+    }
     return Object.freeze({
-        platform: process.platform,
+        platform,
         spawn(executable, argv, options) {
             if (options?.executesCandidateCode !== false
                 || options?.launchPath !== "host-process-adapter") {
@@ -78,7 +89,7 @@ export function createDefaultProcessAdapter() {
             };
             let child;
             try {
-                child = childSpawn(executable, argv, spawnOptions);
+                child = spawnProcess(executable, argv, spawnOptions);
             } catch (err) {
                 throw new MeasurementError(
                     MEASUREMENT_ERROR_CODES.SPAWN_FAILED,
@@ -88,13 +99,24 @@ export function createDefaultProcessAdapter() {
             }
             return child;
         },
-        async terminateTree(pid) {
+        async terminateTree(pid, termination = {}) {
             if (!Number.isInteger(pid) || pid <= 0) return false;
+            const force = termination?.force !== false;
+            const timeoutMs = Number.isSafeInteger(termination?.timeoutMs)
+                && termination.timeoutMs > 0
+                ? Math.min(termination.timeoutMs, 60_000)
+                : defaultTerminationTimeoutMs;
             if (isWindows) {
                 try {
-                    const killer = childSpawn(
+                    const args = [
+                        ...(force ? ["/F"] : []),
+                        "/T",
+                        "/PID",
+                        String(pid),
+                    ];
+                    const killer = spawnProcess(
                         resolveTaskkill(),
-                        ["/F", "/T", "/PID", String(pid)],
+                        args,
                         {
                             shell: false,
                             windowsHide: true,
@@ -104,13 +126,20 @@ export function createDefaultProcessAdapter() {
                     );
                     return await new Promise((resolve) => {
                         let settled = false;
+                        let timer = null;
                         const finish = (value) => {
                             if (settled) return;
                             settled = true;
+                            timers.clearTimeout?.(timer);
                             resolve(value);
                         };
                         killer.once("error", () => finish(false));
                         killer.once("close", (code) => finish(code === 0 || code === 128));
+                        timer = timers.setTimeout(() => {
+                            try { killer.kill(); } catch { /* bounded failure */ }
+                            finish(false);
+                        }, timeoutMs);
+                        timer?.unref?.();
                     });
                 } catch {
                     return false;
@@ -118,11 +147,11 @@ export function createDefaultProcessAdapter() {
             }
             try {
                 // Negative pid targets the process group created by detached:true.
-                process.kill(-pid, "SIGKILL");
+                process.kill(-pid, force ? "SIGKILL" : "SIGTERM");
                 return true;
             } catch {
                 try {
-                    process.kill(pid, "SIGKILL");
+                    process.kill(pid, force ? "SIGKILL" : "SIGTERM");
                     return true;
                 } catch {
                     return false;

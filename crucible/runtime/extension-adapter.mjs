@@ -197,6 +197,7 @@ export function ensureSupervisor(input, dependencies = {}) {
         const matchingFreshOwner = status !== null
             && status.pid === lock.pid
             && status.nonce === lock.nonce
+            && status.supervisorGeneration === lock.supervisorGeneration
             && Number.isFinite(heartbeatAgeMs)
             && heartbeatAgeMs >= -config.staleLockMs
             && heartbeatAgeMs < config.staleLockMs
@@ -227,6 +228,7 @@ export function terminateSupervisor({
     stateDir,
     investigationId,
     expectedNonce,
+    expectedGeneration,
     signal = "SIGTERM",
     processApi = process,
 } = {}) {
@@ -236,6 +238,7 @@ export function terminateSupervisor({
         statusPath: paths.statusPath,
         stopRequestPath: paths.stopRequestPath,
         expectedNonce,
+        expectedGeneration,
         signal,
         processApi,
     });

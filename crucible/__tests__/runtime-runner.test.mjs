@@ -17,6 +17,7 @@ import {
     createSandboxProvider,
 } from "../measurement/index.mjs";
 import {
+    ERROR_CODES as PERSISTENCE_ERROR_CODES,
     openArtifactStore,
     openRepository,
 } from "../persistence/index.mjs";
@@ -152,6 +153,17 @@ function makeContract({
 function deterministicIds() {
     let next = 0;
     return () => `fixture-id-${++next}`;
+}
+
+function mutableClock(start = 1_000_000) {
+    let now = start;
+    return {
+        now: () => now,
+        isoNow: () => new Date(now).toISOString(),
+        advance(milliseconds) {
+            now += milliseconds;
+        },
+    };
 }
 
 class FakeWorkerPool {
@@ -562,12 +574,16 @@ describe("Crucible autonomous runner", () => {
         expect(calls.hostTerminations).toBe(0);
         expect(providerControlRoots).toHaveLength(1);
         expect(providerControlRoots[0]).toContain(
-            path.join("runtime-temp", "run-runner-epoch-1"),
+            path.join("runtime-temp", "run-g0-"),
         );
         expect(calls.admissions.length).toBeGreaterThanOrEqual(3);
         expect(calls.launches).toHaveLength(calls.admissions.length);
         expect(calls.cleanups).toHaveLength(calls.admissions.length);
         expect(calls.terminations).toHaveLength(0);
+        expect(calls.admissions.every((admission) =>
+            admission.launch.deadlineMs === setup.config.deadline
+            && admission.launch.timeoutMs > 0
+            && admission.launch.timeoutMs <= 15_000)).toBe(true);
 
         const replayed = replaySetup(setup);
         const measurements = replayed.adapter.listOperationalEvidence()
@@ -615,6 +631,33 @@ describe("Crucible autonomous runner", () => {
         replayed.repository.close();
     }, 60_000);
 
+    it("bounds a hung worker-pool close after persisting the terminal result", async () => {
+        const setup = setupInvestigation("runner-shutdown-bound", { maxRounds: 1 });
+        const pool = new FakeWorkerPool([95]);
+        let closeStartedAt = null;
+        pool.close = () => {
+            closeStartedAt = Date.now();
+            return new Promise(() => {});
+        };
+        await expect(runAutonomousInvestigation({
+            ...setup.config,
+            options: {
+                ...setup.config.options,
+                shutdownTimeoutMs: 10,
+            },
+        }, runnerDependencies(pool))).rejects.toMatchObject({
+            code: "CRUCIBLE_RUNTIME_FAILURE",
+            recoverable: true,
+        });
+        expect(closeStartedAt).not.toBeNull();
+        expect(Date.now() - closeStartedAt).toBeLessThan(500);
+        const replayed = replaySetup(setup);
+        expect(replayed.aggregate.terminal).toMatchObject({
+            decision: "VERIFIED_RESULT",
+        });
+        replayed.repository.close();
+    }, 60_000);
+
     it("records a deadline non-result and never emits TARGET_UNREACHABLE", async () => {
         const setup = setupInvestigation("deadline");
         const pool = new FakeWorkerPool([]);
@@ -625,11 +668,13 @@ describe("Crucible autonomous runner", () => {
         expect(result).toMatchObject({
             kind: "NON_RESULT",
             code: "DEADLINE_EXCEEDED",
+            domainPausePersisted: true,
             terminalEmitted: false,
         });
         expect(pool.calls).toHaveLength(0);
         const replayed = replaySetup(setup);
         expect(replayed.aggregate.terminal).toBeNull();
+        expect(replayed.aggregate.pause).not.toBeNull();
         expect(replayed.repository.getTerminalEvent("runtime-investigation")).toBeNull();
         expect(replayed.repository.listEvents(replayed.adapter.operationalInvestigationId)
             .some((row) => row.kind === "runtime:non_result")).toBe(true);
@@ -645,6 +690,225 @@ describe("Crucible autonomous runner", () => {
             persisted: true,
         });
     });
+
+    it("rejects a proposal that completes after the absolute deadline", async () => {
+        const setup = setupInvestigation(
+            "deadline-proposal",
+            { maxRounds: 1 },
+            { countHarnessCalls: true },
+        );
+        const clock = mutableClock();
+        const deadline = clock.now() + 30_000;
+        const pool = new FakeWorkerPool([
+            () => {
+                clock.advance(30_001);
+                return 95;
+            },
+        ]);
+        const result = await runAutonomousInvestigation({
+            ...setup.config,
+            deadline,
+        }, runnerDependencies(pool, { clock }));
+        expect(result).toMatchObject({
+            kind: "NON_RESULT",
+            code: "DEADLINE_EXCEEDED",
+            terminalEmitted: false,
+        });
+        expect(pool.calls).toHaveLength(1);
+        expect(harnessCallCount(setup)).toBe(2);
+        const replayed = replaySetup(setup);
+        expect(replayed.aggregate.terminal).toBeNull();
+        expect(harnessCandidateEvidenceItems(replayed.aggregate)).toHaveLength(0);
+        replayed.repository.close();
+    }, 60_000);
+
+    it("rejects candidate measurement facts completed after the deadline", async () => {
+        const setup = setupInvestigation(
+            "deadline-measurement",
+            { maxRounds: 1 },
+            { countHarnessCalls: true },
+        );
+        const clock = mutableClock();
+        const deadline = clock.now() + 30_000;
+        let advanced = false;
+        const result = await runAutonomousInvestigation({
+            ...setup.config,
+            deadline,
+        }, runnerDependencies(new FakeWorkerPool([95]), {
+            clock,
+            faultInjector(point, details) {
+                if (!advanced
+                    && point === "after_effect_operation"
+                    && details.command?.kind === "candidate-measurement") {
+                    advanced = true;
+                    clock.advance(30_001);
+                }
+            },
+        }));
+        expect(result).toMatchObject({
+            kind: "NON_RESULT",
+            code: "DEADLINE_EXCEEDED",
+            terminalEmitted: false,
+        });
+        expect(harnessCallCount(setup)).toBe(3);
+        const replayed = replaySetup(setup);
+        expect(replayed.aggregate.terminal).toBeNull();
+        expect(harnessCandidateEvidenceItems(replayed.aggregate)).toHaveLength(0);
+        expect(replayed.adapter.listOperationalEvidence().some((row) =>
+            row.kind === "runtime:measurement"
+            && row.payload.purpose === "candidate")).toBe(false);
+        replayed.repository.close();
+    }, 60_000);
+
+    it("keeps artifacts persisted across a deadline crossing out of domain evidence", async () => {
+        const setup = setupInvestigation(
+            "deadline-artifact",
+            { maxRounds: 1 },
+            { countHarnessCalls: true },
+        );
+        const clock = mutableClock();
+        const deadline = clock.now() + 30_000;
+        let advanced = false;
+        const result = await runAutonomousInvestigation({
+            ...setup.config,
+            deadline,
+        }, runnerDependencies(new FakeWorkerPool([95]), {
+            clock,
+            faultInjector(point, details) {
+                if (!advanced
+                    && point === "after_effect_artifact_persistence"
+                    && details.command?.kind === "candidate-measurement") {
+                    advanced = true;
+                    clock.advance(30_001);
+                }
+            },
+        }));
+        expect(result).toMatchObject({
+            kind: "NON_RESULT",
+            code: "DEADLINE_EXCEEDED",
+            terminalEmitted: false,
+        });
+        expect(harnessCallCount(setup)).toBe(3);
+        const replayed = replaySetup(setup);
+        expect(replayed.aggregate.terminal).toBeNull();
+        expect(harnessCandidateEvidenceItems(replayed.aggregate)).toHaveLength(0);
+        expect(replayed.repository.listCommandAttempts("runtime-investigation")
+            .some((attempt) => attempt.state === "observed")).toBe(true);
+        replayed.repository.close();
+    }, 60_000);
+
+    it("rechecks the deadline before appending a domain observation", async () => {
+        const setup = setupInvestigation(
+            "deadline-domain-observation",
+            { maxRounds: 1 },
+            { countHarnessCalls: true },
+        );
+        const clock = mutableClock();
+        const deadline = clock.now() + 30_000;
+        let advanced = false;
+        const result = await runAutonomousInvestigation({
+            ...setup.config,
+            deadline,
+        }, runnerDependencies(new FakeWorkerPool([95]), {
+            clock,
+            faultInjector(point, details) {
+                if (!advanced
+                    && point === "before_domain_observation"
+                    && details.commandId === "cmd-000002") {
+                    advanced = true;
+                    clock.advance(30_001);
+                }
+            },
+        }));
+        expect(result).toMatchObject({
+            kind: "NON_RESULT",
+            code: "DEADLINE_EXCEEDED",
+            terminalEmitted: false,
+        });
+        expect(harnessCallCount(setup)).toBe(3);
+        const replayed = replaySetup(setup);
+        expect(replayed.aggregate.terminal).toBeNull();
+        expect(harnessCandidateEvidenceItems(replayed.aggregate)).toHaveLength(0);
+        expect(Object.values(replayed.aggregate.observations).some((observation) =>
+            observation.purpose === "candidate")).toBe(false);
+        expect(replayed.adapter.listOperationalEvidence().some((row) =>
+            row.kind === "runtime:measurement"
+            && row.payload.purpose === "candidate")).toBe(true);
+        replayed.repository.close();
+    }, 60_000);
+
+    it("rechecks the deadline before the evidence CAS append", async () => {
+        const setup = setupInvestigation(
+            "deadline-evidence-cas",
+            { maxRounds: 1 },
+            { countHarnessCalls: true },
+        );
+        const clock = mutableClock();
+        const deadline = clock.now() + 30_000;
+        let advanced = false;
+        const result = await runAutonomousInvestigation({
+            ...setup.config,
+            deadline,
+        }, runnerDependencies(new FakeWorkerPool([95]), {
+            clock,
+            faultInjector(point, details) {
+                if (!advanced
+                    && point === "before_domain_evidence_append"
+                    && details.commandId === "cmd-000002") {
+                    advanced = true;
+                    clock.advance(30_001);
+                }
+            },
+        }));
+        expect(result).toMatchObject({
+            kind: "NON_RESULT",
+            code: "DEADLINE_EXCEEDED",
+            terminalEmitted: false,
+        });
+        expect(harnessCallCount(setup)).toBe(3);
+        const replayed = replaySetup(setup);
+        expect(replayed.aggregate.terminal).toBeNull();
+        expect(harnessCandidateEvidenceItems(replayed.aggregate)).toHaveLength(0);
+        expect(Object.values(replayed.aggregate.observations).some((observation) =>
+            observation.purpose === "candidate")).toBe(true);
+        replayed.repository.close();
+    }, 60_000);
+
+    it("suppresses a terminal decision when the deadline crosses before append", async () => {
+        const setup = setupInvestigation(
+            "deadline-terminal",
+            { maxRounds: 1 },
+            { countHarnessCalls: true },
+        );
+        const clock = mutableClock();
+        const deadline = clock.now() + 30_000;
+        let advanced = false;
+        const result = await runAutonomousInvestigation({
+            ...setup.config,
+            deadline,
+        }, runnerDependencies(new FakeWorkerPool([95]), {
+            clock,
+            faultInjector(point) {
+                if (!advanced && point === "before_terminal_append") {
+                    advanced = true;
+                    clock.advance(30_001);
+                }
+            },
+        }));
+        expect(result).toMatchObject({
+            kind: "NON_RESULT",
+            code: "DEADLINE_EXCEEDED",
+            terminalEmitted: false,
+        });
+        expect(harnessCallCount(setup)).toBe(3);
+        const replayed = replaySetup(setup);
+        expect(harnessCandidateEvidenceItems(replayed.aggregate)).toHaveLength(1);
+        expect(replayed.aggregate.terminal).toBeNull();
+        expect(replayed.repository.getTerminalEvent("runtime-investigation")).toBeNull();
+        const nonResult = replayed.adapter.latestOperationalNonResult();
+        expect(nonResult.payload.details.terminalRecommendationSuppressed).toBe(true);
+        replayed.repository.close();
+    }, 60_000);
 
     it("emits TARGET_UNREACHABLE only after exhausting every frozen bounded id", async () => {
         const setup = setupInvestigation("bounded", {
@@ -1349,6 +1613,68 @@ describe("Crucible autonomous runner", () => {
         replayed.repository.close();
     }, 60_000);
 
+    it("fences a superseded runner before buffered proposal evidence can persist", async () => {
+        const setup = setupInvestigation(
+            "proposal-takeover",
+            { maxRounds: 1 },
+            { countHarnessCalls: true },
+        );
+        const stalePool = new FakeWorkerPool([95]);
+        const currentPool = new FakeWorkerPool([95]);
+        let injected = false;
+        let staleProposalAttemptId = null;
+        let currentResult = null;
+        let refsAfterCurrent = null;
+
+        await expect(runAutonomousInvestigation(
+            setup.config,
+            runnerDependencies(stalePool, {
+                async faultInjector(point, details) {
+                    if (injected
+                        || point !== "after_effect_artifact_persistence"
+                        || details.command?.kind !== "sdk-proposal") {
+                        return;
+                    }
+                    injected = true;
+                    staleProposalAttemptId = details.attemptId;
+                    currentResult = await runAutonomousInvestigation(
+                        {
+                            ...setup.config,
+                            runnerEpochId: "runner-epoch-2",
+                            deadline: Date.now() + 120_000,
+                        },
+                        runnerDependencies(currentPool),
+                    );
+                    const current = replaySetup(setup);
+                    refsAfterCurrent = current.repository.listArtifactRefs(
+                        "runtime-investigation",
+                    ).length;
+                    current.repository.close();
+                },
+            }),
+        )).rejects.toMatchObject({
+            code: PERSISTENCE_ERROR_CODES.FENCE_REJECTED,
+        });
+
+        expect(currentResult).toMatchObject({
+            kind: "TERMINAL",
+            decision: "VERIFIED_RESULT",
+        });
+        expect(stalePool.calls).toHaveLength(1);
+        expect(currentPool.calls).toHaveLength(0);
+        const replayed = replaySetup(setup);
+        expect(replayed.repository.listEvents("runtime-investigation")
+            .filter((event) => event.isTerminal)).toHaveLength(1);
+        expect(replayed.repository.listArtifactRefs("runtime-investigation"))
+            .toHaveLength(refsAfterCurrent);
+        expect(replayed.adapter.listOperationalEvidence().filter((event) =>
+            event.attemptId === staleProposalAttemptId
+            && event.kind === "runtime:model_proposal")).toEqual([]);
+        expect(replayed.repository.getCommandAttempt(staleProposalAttemptId).state)
+            .toBe("abandoned");
+        replayed.repository.close();
+    }, 120_000);
+
     it("reuses committed proposal and measurement effects after a crash without a second call", async () => {
         const setup = setupInvestigation(
             "committed-effect-recovery",
@@ -1424,6 +1750,59 @@ describe("Crucible autonomous runner", () => {
         replayedB.repository.close();
     }, 120_000);
 
+    it("recovers after the domain observation append without repeating external effects", async () => {
+        const setup = setupInvestigation(
+            "domain-append-recovery",
+            { maxRounds: 1 },
+            { countHarnessCalls: true },
+        );
+        const firstPool = new FakeWorkerPool([95]);
+        let injected = false;
+        await expect(runAutonomousInvestigation(
+            setup.config,
+            runnerDependencies(firstPool, {
+                faultInjector(point, details) {
+                    if (!injected
+                        && point === "after_domain_observation"
+                        && details.commandId === "cmd-000002") {
+                        injected = true;
+                        throw new InjectedCrashError(point);
+                    }
+                },
+            }),
+        )).rejects.toMatchObject({
+            code: "CRUCIBLE_RUNTIME_INJECTED_CRASH",
+        });
+        expect(firstPool.calls).toHaveLength(1);
+        expect(harnessCallCount(setup)).toBe(3);
+
+        const branchA = clonePersistedSetup(setup, "domain-append-branch-a");
+        const branchB = clonePersistedSetup(setup, "domain-append-branch-b");
+        const recoveredPoolA = new FakeWorkerPool([]);
+        const recoveredPoolB = new FakeWorkerPool([]);
+        const resultA = await runAutonomousInvestigation(
+            branchA.config,
+            runnerDependencies(recoveredPoolA),
+        );
+        const resultB = await runAutonomousInvestigation(
+            branchB.config,
+            runnerDependencies(recoveredPoolB),
+        );
+        expect(resultA).toMatchObject({ kind: "TERMINAL", decision: "VERIFIED_RESULT" });
+        expect(resultB).toMatchObject({ kind: "TERMINAL", decision: "VERIFIED_RESULT" });
+        expect(recoveredPoolA.calls).toHaveLength(0);
+        expect(recoveredPoolB.calls).toHaveLength(0);
+        expect(harnessCallCount(setup)).toBe(3);
+        const replayedA = replaySetup(branchA);
+        const replayedB = replaySetup(branchB);
+        expect(replayedA.aggregate.terminal.eventHash)
+            .toBe(replayedB.aggregate.terminal.eventHash);
+        expect(replayedA.aggregate.terminal.evidenceClosure.closureRoot)
+            .toBe(replayedB.aggregate.terminal.evidenceClosure.closureRoot);
+        replayedA.repository.close();
+        replayedB.repository.close();
+    }, 120_000);
+
     it("refuses committed-effect recovery when a required raw artifact is missing", async () => {
         const setup = setupInvestigation(
             "committed-effect-missing-artifact",
@@ -1466,7 +1845,7 @@ describe("Crucible autonomous runner", () => {
         expect(harnessCallCount(setup)).toBe(3);
     }, 120_000);
 
-    it("reruns an uncertain observed effect instead of treating artifact persistence as committed", async () => {
+    it("recovers an artifact-persisted effect without rerunning the harness", async () => {
         const setup = setupInvestigation(
             "uncertain-effect-recovery",
             { maxRounds: 1 },
@@ -1492,14 +1871,31 @@ describe("Crucible autonomous runner", () => {
         expect(firstPool.calls).toHaveLength(1);
         expect(harnessCallCount(setup)).toBe(3);
 
-        const recoveredPool = new FakeWorkerPool([]);
-        const result = await runAutonomousInvestigation(
-            setup.config,
-            runnerDependencies(recoveredPool),
+        const branchA = clonePersistedSetup(setup, "persisted-effect-branch-a");
+        const branchB = clonePersistedSetup(setup, "persisted-effect-branch-b");
+        const recoveredPoolA = new FakeWorkerPool([]);
+        const recoveredPoolB = new FakeWorkerPool([]);
+        const resultA = await runAutonomousInvestigation(
+            branchA.config,
+            runnerDependencies(recoveredPoolA),
         );
-        expect(result).toMatchObject({ kind: "TERMINAL", decision: "VERIFIED_RESULT" });
-        expect(recoveredPool.calls).toHaveLength(0);
-        expect(harnessCallCount(setup)).toBe(4);
-        expect(result.recovery.uncertainDispatched).toBeGreaterThanOrEqual(1);
+        const resultB = await runAutonomousInvestigation(
+            branchB.config,
+            runnerDependencies(recoveredPoolB),
+        );
+        expect(resultA).toMatchObject({ kind: "TERMINAL", decision: "VERIFIED_RESULT" });
+        expect(resultB).toMatchObject({ kind: "TERMINAL", decision: "VERIFIED_RESULT" });
+        expect(recoveredPoolA.calls).toHaveLength(0);
+        expect(recoveredPoolB.calls).toHaveLength(0);
+        expect(harnessCallCount(setup)).toBe(3);
+        expect(resultA.recovery.uncertainDispatched).toBeGreaterThanOrEqual(1);
+        const replayedA = replaySetup(branchA);
+        const replayedB = replaySetup(branchB);
+        expect(replayedA.aggregate.terminal.eventHash)
+            .toBe(replayedB.aggregate.terminal.eventHash);
+        expect(replayedA.aggregate.terminal.evidenceClosure.closureRoot)
+            .toBe(replayedB.aggregate.terminal.evidenceClosure.closureRoot);
+        replayedA.repository.close();
+        replayedB.repository.close();
     }, 120_000);
 });

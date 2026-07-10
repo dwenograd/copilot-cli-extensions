@@ -14,20 +14,287 @@ import {
     SupervisorLockError,
 } from "./errors.mjs";
 import {
+    RUNTIME_TEMP_OWNER_MARKER,
     atomicWriteJson,
     delay,
     ensureDirectory,
+    isPathInside,
     isPlainObject,
     readJsonFile,
+    remainingDeadlineMs,
+    removeTreeInside,
     requireString,
+    settleWithin,
     sha256Hex,
 } from "./utils.mjs";
+
+const DEFAULT_SHUTDOWN_POLICY = Object.freeze({
+    drainMs: 2_000,
+    escalationMs: 3_000,
+    finalMs: 10_000,
+});
+
+const ATOMIC_TEMP_NAME = /^\..+\.(\d+)\.[a-f0-9]{24}\.tmp$/u;
 
 function defaultClock() {
     return {
         now: () => Date.now(),
         isoNow: () => new Date().toISOString(),
     };
+}
+
+function openSupervisorAuthorityRepository(config, dependencies, clock) {
+    const owned = dependencies.authorityRepository === undefined;
+    const repository = owned
+        ? (dependencies.authorityRepositoryFactory ?? openRepository)({
+            file: path.join(config.runner.stateDir, "events.sqlite"),
+            now: () => clock.isoNow(),
+        })
+        : dependencies.authorityRepository;
+    try {
+        repository.ensureInvestigation({
+            investigationId: config.runner.investigationId,
+            metadata: { role: "crucible-domain" },
+        });
+        return { repository, owned };
+    } catch (error) {
+        if (owned) repository.close();
+        throw error;
+    }
+}
+
+function closeSupervisorAuthorityRepository(handle) {
+    if (handle?.owned === true) {
+        handle.repository.close();
+    }
+}
+
+function normalizeShutdownPolicy(value = {}) {
+    if (!isPlainObject(value)) {
+        throw new RuntimeConfigError("shutdownPolicy must be a plain object");
+    }
+    const unknown = Object.keys(value).filter((key) =>
+        !Object.hasOwn(DEFAULT_SHUTDOWN_POLICY, key));
+    if (unknown.length > 0) {
+        throw new RuntimeConfigError("shutdownPolicy contains unknown keys", { unknown });
+    }
+    const policy = {};
+    for (const [key, fallback] of Object.entries(DEFAULT_SHUTDOWN_POLICY)) {
+        const actual = value[key] ?? fallback;
+        if (!Number.isSafeInteger(actual) || actual < 1 || actual > 60_000) {
+            throw new RuntimeConfigError(
+                `shutdownPolicy.${key} must be a positive integer <= 60000`,
+                { key, value: actual },
+            );
+        }
+        policy[key] = actual;
+    }
+    if (policy.finalMs < policy.drainMs + policy.escalationMs) {
+        throw new RuntimeConfigError(
+            "shutdownPolicy.finalMs must cover drainMs plus escalationMs",
+            { policy },
+        );
+    }
+    return Object.freeze(policy);
+}
+
+function samePath(left, right) {
+    const a = path.resolve(left);
+    const b = path.resolve(right);
+    return process.platform === "win32"
+        ? a.toLowerCase() === b.toLowerCase()
+        : a === b;
+}
+
+function pathIsReferenced(candidate, referencedPaths) {
+    return referencedPaths.some((referenced) =>
+        samePath(candidate, referenced) || isPathInside(referenced, candidate));
+}
+
+function safeAgeMs(target, now) {
+    try {
+        const ageMs = now - fs.statSync(target).mtimeMs;
+        return ageMs < 0 && ageMs >= -1_000 ? 0 : ageMs;
+    } catch {
+        return Number.NaN;
+    }
+}
+
+function validRuntimeOwnerMarker(marker, candidate, investigationId) {
+    return isPlainObject(marker)
+        && marker.version === 1
+        && marker.kind === "crucible-runtime-temp-root"
+        && marker.investigationId === investigationId
+        && Number.isSafeInteger(marker.supervisorGeneration)
+        && marker.supervisorGeneration > 0
+        && typeof marker.supervisorNonce === "string"
+        && marker.supervisorNonce.length > 0
+        && typeof marker.runnerEpochId === "string"
+        && marker.runnerEpochId.length > 0
+        && Number.isSafeInteger(marker.pid)
+        && marker.pid > 0
+        && typeof marker.root === "string"
+        && path.isAbsolute(marker.root)
+        && samePath(marker.root, candidate)
+        && Array.isArray(marker.ownedPaths)
+        && marker.ownedPaths.every((ownedPath) =>
+            typeof ownedPath === "string"
+            && path.isAbsolute(ownedPath)
+            && isPathInside(ownedPath, candidate));
+}
+
+function generationOwnerKey(generation, nonce) {
+    return `${generation}\0${nonce}`;
+}
+
+function readKnownGenerationOwners(supervisorDirectory, investigationId) {
+    const owners = new Set();
+    if (!fs.existsSync(supervisorDirectory)) return owners;
+    for (const entry of fs.readdirSync(supervisorDirectory, { withFileTypes: true })) {
+        if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
+        const file = path.join(supervisorDirectory, entry.name);
+        try {
+            const document = validateGenerationDocument(
+                readJsonFile(file, "supervisor generation record", {
+                    maxBytes: 64 * 1024,
+                }),
+                file,
+                investigationId,
+            );
+            owners.add(generationOwnerKey(
+                document.supervisorGeneration,
+                document.nonce,
+            ));
+        } catch {
+            // Non-generation supervisor documents are not ownership proof.
+        }
+    }
+    return owners;
+}
+
+export function scavengeStaleGenerationOwnedPaths({
+    tempRoot,
+    supervisorDirectory,
+    investigationId,
+    currentGeneration,
+    currentNonce,
+    currentPid,
+    referencedPaths = [],
+    isPidAlive = isExactPidAlive,
+    now = Date.now(),
+    minimumAgeMs = 0,
+} = {}) {
+    if (typeof tempRoot !== "string"
+        || !path.isAbsolute(tempRoot)
+        || typeof supervisorDirectory !== "string"
+        || !path.isAbsolute(supervisorDirectory)
+        || typeof investigationId !== "string"
+        || investigationId.length === 0
+        || !isSupervisorGeneration(currentGeneration)
+        || typeof currentNonce !== "string"
+        || currentNonce.length === 0
+        || !Number.isSafeInteger(currentPid)
+        || currentPid < 1
+        || !Array.isArray(referencedPaths)
+        || !Number.isSafeInteger(minimumAgeMs)
+        || minimumAgeMs < 0) {
+        throw new RuntimeConfigError("Invalid startup scavenging configuration");
+    }
+    const references = referencedPaths
+        .filter((value) => typeof value === "string" && path.isAbsolute(value))
+        .map((value) => path.resolve(value));
+    const knownGenerationOwners = readKnownGenerationOwners(
+        supervisorDirectory,
+        investigationId,
+    );
+    const removed = [];
+    const preserved = [];
+
+    if (fs.existsSync(tempRoot)) {
+        for (const entry of fs.readdirSync(tempRoot, { withFileTypes: true })) {
+            if (!entry.isDirectory() || !entry.name.startsWith("run-g")) continue;
+            const candidate = path.join(tempRoot, entry.name);
+            const markerPath = path.join(candidate, RUNTIME_TEMP_OWNER_MARKER);
+            let marker = null;
+            try {
+                marker = readJsonFile(markerPath, "runtime temp owner marker", {
+                    maxBytes: 64 * 1024,
+                });
+            } catch {
+                preserved.push({ path: candidate, reason: "owner_unproven" });
+                continue;
+            }
+            const ageMs = safeAgeMs(markerPath, now);
+            if (!validRuntimeOwnerMarker(marker, candidate, investigationId)) {
+                preserved.push({ path: candidate, reason: "owner_invalid" });
+            } else if (!knownGenerationOwners.has(generationOwnerKey(
+                marker.supervisorGeneration,
+                marker.supervisorNonce,
+            ))) {
+                preserved.push({ path: candidate, reason: "generation_unproven" });
+            } else if (marker.supervisorGeneration >= currentGeneration
+                || (marker.supervisorGeneration === currentGeneration
+                    && marker.supervisorNonce === currentNonce)
+                || marker.pid === currentPid) {
+                preserved.push({ path: candidate, reason: "current_generation" });
+            } else if (!Number.isFinite(ageMs) || ageMs < minimumAgeMs) {
+                preserved.push({ path: candidate, reason: "not_stale" });
+            } else if (isPidAlive(marker.pid)) {
+                preserved.push({ path: candidate, reason: "owner_alive" });
+            } else if (pathIsReferenced(candidate, references)) {
+                preserved.push({ path: candidate, reason: "referenced" });
+            } else {
+                removeTreeInside(candidate, tempRoot);
+                removed.push({ path: candidate, kind: "runtime_temp_root" });
+            }
+        }
+    }
+
+    for (const directory of [tempRoot, supervisorDirectory]) {
+        if (!fs.existsSync(directory)) continue;
+        for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+            if (!entry.isFile()) continue;
+            const match = ATOMIC_TEMP_NAME.exec(entry.name);
+            if (match === null) continue;
+            const file = path.join(directory, entry.name);
+            let document;
+            try {
+                document = readJsonFile(file, "atomic temporary file", {
+                    maxBytes: 4 * 1024 * 1024,
+                });
+            } catch {
+                preserved.push({ path: file, reason: "atomic_owner_unproven" });
+                continue;
+            }
+            const ownerPid = Number(match[1]);
+            const generation = document?.supervisorGeneration;
+            const ownerNonce = document?.nonce ?? document?.supervisorNonce;
+            const ageMs = safeAgeMs(file, now);
+            if (!isSupervisorGeneration(generation)
+                || generation >= currentGeneration
+                || typeof ownerNonce !== "string"
+                || ownerNonce.length === 0
+                || !knownGenerationOwners.has(generationOwnerKey(
+                    generation,
+                    ownerNonce,
+                ))
+                || (document.pid !== undefined && document.pid !== ownerPid)
+                || ownerPid === currentPid
+                || (!Number.isFinite(ageMs) || ageMs < minimumAgeMs)
+                || isPidAlive(ownerPid)
+                || references.some((referenced) => samePath(file, referenced))) {
+                preserved.push({ path: file, reason: "atomic_current_or_unproven" });
+                continue;
+            }
+            fs.rmSync(file, { force: true });
+            removed.push({ path: file, kind: "atomic_temp" });
+        }
+    }
+
+    return Object.freeze({
+        removed: Object.freeze(removed),
+        preserved: Object.freeze(preserved),
+    });
 }
 
 export function isExactPidAlive(pid, processApi = process) {
@@ -42,15 +309,21 @@ export function isExactPidAlive(pid, processApi = process) {
     }
 }
 
+function isSupervisorGeneration(value) {
+    return Number.isSafeInteger(value) && value > 0;
+}
+
 function validateLockDocument(value, lockPath) {
     const keys = isPlainObject(value) ? Object.keys(value).sort() : [];
     if (!isPlainObject(value)
-        || keys.length !== 3
+        || keys.length !== 4
         || keys[0] !== "nonce"
         || keys[1] !== "pid"
         || keys[2] !== "startedAt"
+        || keys[3] !== "supervisorGeneration"
         || !Number.isSafeInteger(value.pid)
         || value.pid < 1
+        || !isSupervisorGeneration(value.supervisorGeneration)
         || typeof value.nonce !== "string"
         || value.nonce.length === 0
         || typeof value.startedAt !== "string"
@@ -65,6 +338,94 @@ function validateLockDocument(value, lockPath) {
     return value;
 }
 
+function validateGenerationDocument(value, generationPath, investigationId) {
+    const keys = isPlainObject(value) ? Object.keys(value).sort() : [];
+    if (!isPlainObject(value)
+        || keys.length !== 6
+        || keys[0] !== "allocatedAt"
+        || keys[1] !== "investigationId"
+        || keys[2] !== "nonce"
+        || keys[3] !== "pid"
+        || keys[4] !== "supervisorGeneration"
+        || keys[5] !== "version"
+        || value.version !== 1
+        || value.investigationId !== investigationId
+        || !Number.isSafeInteger(value.pid)
+        || value.pid < 1
+        || !isSupervisorGeneration(value.supervisorGeneration)
+        || typeof value.nonce !== "string"
+        || value.nonce.length === 0
+        || typeof value.allocatedAt !== "string"
+        || !Number.isFinite(Date.parse(value.allocatedAt))) {
+        throw new SupervisorLockError(
+            RUNTIME_ERROR_CODES.LOCK_INVALID,
+            "Supervisor generation record is malformed",
+            { generationPath, investigationId },
+        );
+    }
+    return value;
+}
+
+function readGenerationDocument(generationPath, investigationId) {
+    if (!fs.existsSync(generationPath)) {
+        return null;
+    }
+    return validateGenerationDocument(
+        readJsonFile(generationPath, "supervisor generation record"),
+        generationPath,
+        investigationId,
+    );
+}
+
+function readLatestGenerationDocument(paths, investigationId) {
+    const records = [];
+    const shared = readGenerationDocument(paths.generationPath, investigationId);
+    if (shared !== null) {
+        records.push(shared);
+    }
+    if (fs.existsSync(paths.directory)) {
+        const extension = path.extname(paths.generationPath);
+        const stem = path.basename(
+            paths.generationPath,
+            extension,
+        );
+        const prefix = `${stem}.g`;
+        for (const entry of fs.readdirSync(paths.directory, { withFileTypes: true })) {
+            if (!entry.isFile()
+                || !entry.name.startsWith(prefix)
+                || !entry.name.endsWith(extension)) {
+                continue;
+            }
+            const record = readGenerationDocument(
+                path.join(paths.directory, entry.name),
+                investigationId,
+            );
+            if (record !== null) {
+                records.push(record);
+            }
+        }
+    }
+    let latest = null;
+    for (const record of records) {
+        if (latest === null || record.supervisorGeneration > latest.supervisorGeneration) {
+            latest = record;
+            continue;
+        }
+        if (record.supervisorGeneration === latest.supervisorGeneration
+            && (record.nonce !== latest.nonce || record.pid !== latest.pid)) {
+            throw new SupervisorLockError(
+                RUNTIME_ERROR_CODES.LOCK_INVALID,
+                "Supervisor generation records disagree for the same generation",
+                {
+                    investigationId,
+                    supervisorGeneration: record.supervisorGeneration,
+                },
+            );
+        }
+    }
+    return latest;
+}
+
 export function readSupervisorLock(lockPath) {
     if (!fs.existsSync(lockPath)) {
         return null;
@@ -72,7 +433,43 @@ export function readSupervisorLock(lockPath) {
     return validateLockDocument(readJsonFile(lockPath, "supervisor lock"), lockPath);
 }
 
-function readStatusForOwnership(statusPath) {
+function ownerScopedPath(file, owner) {
+    const token = sha256Hex(Buffer.from(owner.nonce, "utf8")).slice(0, 24);
+    const extension = path.extname(file);
+    const stem = extension.length === 0 ? file : file.slice(0, -extension.length);
+    return `${stem}.g${owner.supervisorGeneration}-${token}${extension}`;
+}
+
+function ownerRuntimePaths(paths, owner) {
+    return Object.freeze({
+        statusPath: ownerScopedPath(paths.statusPath, owner),
+        childConfigPath: ownerScopedPath(paths.childConfigPath, owner),
+        childResultPath: ownerScopedPath(paths.childResultPath, owner),
+        stopRequestPath: ownerScopedPath(paths.stopRequestPath, owner),
+    });
+}
+
+function runnerIncarnationPath(file, runnerIncarnation) {
+    const token = sha256Hex(Buffer.from(runnerIncarnation, "utf8")).slice(0, 24);
+    const extension = path.extname(file);
+    const stem = extension.length === 0 ? file : file.slice(0, -extension.length);
+    return `${stem}.r${token}${extension}`;
+}
+
+function runnerLaunchPaths(paths, runnerIncarnation) {
+    return Object.freeze({
+        childConfigPath: runnerIncarnationPath(
+            paths.childConfigPath,
+            runnerIncarnation,
+        ),
+        childResultPath: runnerIncarnationPath(
+            paths.childResultPath,
+            runnerIncarnation,
+        ),
+    });
+}
+
+function readStatusDocument(statusPath) {
     if (typeof statusPath !== "string" || !path.isAbsolute(statusPath) || !fs.existsSync(statusPath)) {
         return null;
     }
@@ -83,6 +480,8 @@ function readStatusForOwnership(statusPath) {
             || value.pid < 1
             || typeof value.nonce !== "string"
             || value.nonce.length === 0
+            || (value.supervisorGeneration !== undefined
+                && !isSupervisorGeneration(value.supervisorGeneration))
             || typeof value.heartbeatAt !== "string"
             || !Number.isFinite(Date.parse(value.heartbeatAt))) {
             return null;
@@ -93,10 +492,26 @@ function readStatusForOwnership(statusPath) {
     }
 }
 
+function readStatusForOwnership(statusPath, owner = null) {
+    if (owner !== null && isSupervisorGeneration(owner.supervisorGeneration)) {
+        const owned = readStatusDocument(ownerScopedPath(statusPath, owner));
+        if (owned !== null) {
+            return owned;
+        }
+    }
+    return readStatusDocument(statusPath);
+}
+
+function statusMatchesOwner(status, owner) {
+    return status !== null
+        && status.pid === owner.pid
+        && status.nonce === owner.nonce
+        && (!isSupervisorGeneration(owner.supervisorGeneration)
+            || status.supervisorGeneration === owner.supervisorGeneration);
+}
+
 function hasFreshMatchingHeartbeat(lock, status, now, staleLockMs, isPidAlive) {
-    if (lock === null || status === null
-        || status.pid !== lock.pid
-        || status.nonce !== lock.nonce) {
+    if (lock === null || !statusMatchesOwner(status, lock)) {
         return false;
     }
     const heartbeatAgeMs = now - Date.parse(status.heartbeatAt);
@@ -104,6 +519,57 @@ function hasFreshMatchingHeartbeat(lock, status, now, staleLockMs, isPidAlive) {
         && heartbeatAgeMs >= -staleLockMs
         && heartbeatAgeMs < staleLockMs
         && isPidAlive(lock.pid);
+}
+
+function ownershipLostError(lock, action, current = null) {
+    const error = new SupervisorLockError(
+        RUNTIME_ERROR_CODES.LOCK_HELD,
+        "Supervisor generation ownership was lost",
+        {
+            action,
+            lockPath: lock.lockPath,
+            expected: {
+                pid: lock.pid,
+                nonce: lock.nonce,
+                supervisorGeneration: lock.supervisorGeneration,
+            },
+            current: current === null
+                ? null
+                : {
+                    pid: current.pid,
+                    nonce: current.nonce,
+                    supervisorGeneration: current.supervisorGeneration,
+                },
+        },
+    );
+    error.ownershipLost = true;
+    return error;
+}
+
+function isOwnershipLostError(error) {
+    return error?.ownershipLost === true;
+}
+
+function currentLockIfValid(lockPath) {
+    try {
+        return validateLockDocument(
+            readJsonFile(lockPath, "supervisor lock"),
+            lockPath,
+        );
+    } catch {
+        return null;
+    }
+}
+
+function assertSupervisorOwnership(lock, action) {
+    const current = currentLockIfValid(lock.lockPath);
+    if (current === null
+        || current.pid !== lock.pid
+        || current.nonce !== lock.nonce
+        || current.supervisorGeneration !== lock.supervisorGeneration) {
+        throw ownershipLostError(lock, action, current);
+    }
+    return current;
 }
 
 function fsyncDirectoryBestEffort(directory) {
@@ -166,6 +632,103 @@ function inspectExistingLock(lockPath) {
     };
 }
 
+function persistGenerationRecord(config, lock, clock) {
+    assertSupervisorOwnership(lock, "supervisor generation allocation");
+    const current = readLatestGenerationDocument(
+        config.paths,
+        config.runner.investigationId,
+    );
+    if (current !== null) {
+        if (current.supervisorGeneration > lock.supervisorGeneration
+            || (current.supervisorGeneration === lock.supervisorGeneration
+                && (current.nonce !== lock.nonce || current.pid !== lock.pid))) {
+            throw new SupervisorLockError(
+                RUNTIME_ERROR_CODES.LOCK_INVALID,
+                "Supervisor generation record is ahead of the acquired lock",
+                {
+                    generationPath: config.paths.generationPath,
+                    lockGeneration: lock.supervisorGeneration,
+                    recordedGeneration: current.supervisorGeneration,
+                },
+            );
+        }
+        if (current.supervisorGeneration === lock.supervisorGeneration) {
+            return current;
+        }
+    }
+    const document = {
+        version: 1,
+        investigationId: config.runner.investigationId,
+        supervisorGeneration: lock.supervisorGeneration,
+        pid: lock.pid,
+        nonce: lock.nonce,
+        allocatedAt: clock.isoNow(),
+    };
+    const ownedGenerationPath = ownerScopedPath(config.paths.generationPath, lock);
+    assertSupervisorOwnership(lock, "immutable supervisor generation record write");
+    if (!publishLockCrashSafely(
+        ownedGenerationPath,
+        document,
+        lock.pid,
+        lock.nonce,
+    )) {
+        const existing = readGenerationDocument(
+            ownedGenerationPath,
+            config.runner.investigationId,
+        );
+        if (existing.supervisorGeneration !== lock.supervisorGeneration
+            || existing.nonce !== lock.nonce
+            || existing.pid !== lock.pid) {
+            throw new SupervisorLockError(
+                RUNTIME_ERROR_CODES.LOCK_INVALID,
+                "Immutable supervisor generation record conflicts with the acquired lock",
+                {
+                    generationPath: ownedGenerationPath,
+                    supervisorGeneration: lock.supervisorGeneration,
+                },
+            );
+        }
+    }
+    assertSupervisorOwnership(lock, "supervisor generation high-water write");
+    const shared = readGenerationDocument(
+        config.paths.generationPath,
+        config.runner.investigationId,
+    );
+    if (shared === null || shared.supervisorGeneration < lock.supervisorGeneration) {
+        atomicWriteJson(config.paths.generationPath, document, {
+            token: `generation:${lock.supervisorGeneration}:${lock.nonce}`,
+        });
+    } else if (shared.supervisorGeneration === lock.supervisorGeneration
+        && (shared.nonce !== lock.nonce || shared.pid !== lock.pid)) {
+        throw new SupervisorLockError(
+            RUNTIME_ERROR_CODES.LOCK_INVALID,
+            "Supervisor generation high-water record conflicts with the acquired lock",
+            {
+                generationPath: config.paths.generationPath,
+                supervisorGeneration: lock.supervisorGeneration,
+            },
+        );
+    }
+    const verified = readLatestGenerationDocument(
+        config.paths,
+        config.runner.investigationId,
+    );
+    if (verified.supervisorGeneration !== lock.supervisorGeneration
+        || verified.nonce !== lock.nonce
+        || verified.pid !== lock.pid) {
+        throw new SupervisorLockError(
+            RUNTIME_ERROR_CODES.LOCK_INVALID,
+            "Supervisor generation record verification failed",
+            {
+                generationPath: config.paths.generationPath,
+                supervisorGeneration: lock.supervisorGeneration,
+            },
+        );
+    }
+    assertSupervisorOwnership(lock, "supervisor generation allocation verification");
+    return verified;
+}
+
 export function acquireSupervisorLock(config, dependencies = {}) {
     const normalized = coerceSupervisorConfig(config, {
         env: dependencies.env ?? process.env,
@@ -183,103 +746,185 @@ export function acquireSupervisorLock(config, dependencies = {}) {
     const isPidAlive = dependencies.isPidAlive ?? isExactPidAlive;
     const lockPath = normalized.paths.lockPath;
     ensureDirectory(path.dirname(lockPath));
+    const startedAt = clock.isoNow();
+    let observedGeneration = 0;
+    const authorityHandle = openSupervisorAuthorityRepository(
+        normalized,
+        dependencies,
+        clock,
+    );
 
-    for (let pass = 0; pass < 3; pass += 1) {
-        const document = {
-            pid,
-            nonce,
-            startedAt: clock.isoNow(),
-        };
-        validateLockDocument(document, lockPath);
-        try {
-            if (!publishLockCrashSafely(lockPath, document, pid, nonce)) {
-                throw Object.assign(new Error("lock exists"), { code: "EEXIST" });
+    try {
+        for (let pass = 0; pass < 8; pass += 1) {
+            const generationRecord = readLatestGenerationDocument(
+                normalized.paths,
+                normalized.runner.investigationId,
+            );
+            const authority = authorityHandle.repository.getSupervisorAuthority(
+                normalized.runner.investigationId,
+            );
+            const supervisorGeneration = Math.max(
+                observedGeneration,
+                generationRecord?.supervisorGeneration ?? 0,
+                authority?.supervisorGeneration ?? 0,
+            ) + 1;
+            const document = {
+                pid,
+                nonce,
+                startedAt,
+                supervisorGeneration,
+            };
+            validateLockDocument(document, lockPath);
+            try {
+                if (!publishLockCrashSafely(lockPath, document, pid, nonce)) {
+                    throw Object.assign(new Error("lock exists"), { code: "EEXIST" });
+                }
+                const lock = Object.freeze({ ...document, lockPath });
+                try {
+                    persistGenerationRecord(normalized, lock, clock);
+                    assertSupervisorOwnership(
+                        lock,
+                        "supervisor generation authority claim",
+                    );
+                    authorityHandle.repository.claimSupervisorGeneration({
+                        investigationId: normalized.runner.investigationId,
+                        supervisorGeneration,
+                        supervisorNonce: nonce,
+                    });
+                    assertSupervisorOwnership(
+                        lock,
+                        "supervisor generation authority verification",
+                    );
+                    return lock;
+                } catch (error) {
+                    releaseSupervisorLock(lock);
+                    throw error;
+                }
+            } catch (error) {
+                if (error?.code !== "EEXIST") {
+                    throw error;
+                }
             }
-            return Object.freeze({ ...document, lockPath });
-        } catch (error) {
-            if (error?.code !== "EEXIST") {
+
+            let inspected;
+            try {
+                inspected = inspectExistingLock(lockPath);
+            } catch (error) {
+                if (error?.code === "ENOENT") continue;
                 throw error;
             }
-        }
-
-        let inspected;
-        try {
-            inspected = inspectExistingLock(lockPath);
-        } catch (error) {
-            if (error?.code === "ENOENT") continue;
-            throw error;
-        }
-        const now = clock.now();
-        const ageMs = now - inspected.mtimeMs;
-        const status = readStatusForOwnership(normalized.paths.statusPath);
-        const looseOwner = inspected.valid ?? (
-            isPlainObject(inspected.parsed)
-            && Number.isSafeInteger(inspected.parsed.pid)
-            && inspected.parsed.pid > 0
-            && typeof inspected.parsed.nonce === "string"
-            && inspected.parsed.nonce.length > 0
-                ? { pid: inspected.parsed.pid, nonce: inspected.parsed.nonce }
-                : null
-        );
-        const freshOwner = looseOwner !== null
-            && hasFreshMatchingHeartbeat(
+            if (isSupervisorGeneration(inspected.parsed?.supervisorGeneration)) {
+                observedGeneration = Math.max(
+                    observedGeneration,
+                    inspected.parsed.supervisorGeneration,
+                );
+            }
+            const now = clock.now();
+            const ageMs = now - inspected.mtimeMs;
+            const looseOwner = inspected.valid ?? (
+                isPlainObject(inspected.parsed)
+                && Number.isSafeInteger(inspected.parsed.pid)
+                && inspected.parsed.pid > 0
+                && typeof inspected.parsed.nonce === "string"
+                && inspected.parsed.nonce.length > 0
+                    ? {
+                        pid: inspected.parsed.pid,
+                        nonce: inspected.parsed.nonce,
+                        supervisorGeneration: isSupervisorGeneration(
+                            inspected.parsed.supervisorGeneration,
+                        )
+                            ? inspected.parsed.supervisorGeneration
+                            : undefined,
+                    }
+                    : null
+            );
+            const status = readStatusForOwnership(normalized.paths.statusPath, looseOwner);
+            const freshOwner = looseOwner !== null
+                && hasFreshMatchingHeartbeat(
+                    looseOwner,
+                    status,
+                    now,
+                    normalized.staleLockMs,
+                    isPidAlive,
+                );
+            if (freshOwner || !Number.isFinite(ageMs) || ageMs < normalized.staleLockMs) {
+                throw new SupervisorLockError(
+                    RUNTIME_ERROR_CODES.LOCK_HELD,
+                    "Another supervisor owns this investigation",
+                    {
+                        investigationId: normalized.runner.investigationId,
+                        pid: inspected.valid?.pid ?? null,
+                        nonce: inspected.valid?.nonce ?? null,
+                        ageMs,
+                        freshHeartbeat: freshOwner,
+                        malformed: inspected.valid === null,
+                    },
+                );
+            }
+            const confirm = inspectExistingLock(lockPath);
+            if (confirm.rawHash !== inspected.rawHash || confirm.mtimeMs !== inspected.mtimeMs) {
+                throw new SupervisorLockError(
+                    RUNTIME_ERROR_CODES.LOCK_HELD,
+                    "Supervisor lock changed during stale recovery",
+                    { lockPath },
+                );
+            }
+            const confirmedStatus = readStatusForOwnership(
+                normalized.paths.statusPath,
                 looseOwner,
-                status,
-                now,
+            );
+            if (looseOwner !== null && hasFreshMatchingHeartbeat(
+                looseOwner,
+                confirmedStatus,
+                clock.now(),
                 normalized.staleLockMs,
                 isPidAlive,
-            );
-        if (freshOwner || !Number.isFinite(ageMs) || ageMs < normalized.staleLockMs) {
-            throw new SupervisorLockError(
-                RUNTIME_ERROR_CODES.LOCK_HELD,
-                "Another supervisor owns this investigation",
-                {
-                    investigationId: normalized.runner.investigationId,
-                    pid: inspected.valid?.pid ?? null,
-                    nonce: inspected.valid?.nonce ?? null,
-                    ageMs,
-                    freshHeartbeat: freshOwner,
-                    malformed: inspected.valid === null,
-                },
-            );
-        }
-        const confirm = inspectExistingLock(lockPath);
-        if (confirm.rawHash !== inspected.rawHash || confirm.mtimeMs !== inspected.mtimeMs) {
-            throw new SupervisorLockError(
-                RUNTIME_ERROR_CODES.LOCK_HELD,
-                "Supervisor lock changed during stale recovery",
-                { lockPath },
-            );
-        }
-        const staleClaimToken = sha256Hex(Buffer.from(nonce, "utf8")).slice(0, 24);
-        const staleClaimPath = `${lockPath}.stale-${pid}-${staleClaimToken}`;
-        try {
-            fs.renameSync(lockPath, staleClaimPath);
-        } catch (error) {
-            if (error?.code === "ENOENT") {
-                continue;
+            )) {
+                throw new SupervisorLockError(
+                    RUNTIME_ERROR_CODES.LOCK_HELD,
+                    "Supervisor heartbeat refreshed during stale recovery",
+                    {
+                        lockPath,
+                        pid: looseOwner.pid,
+                        nonce: looseOwner.nonce,
+                        supervisorGeneration: looseOwner.supervisorGeneration ?? null,
+                    },
+                );
             }
-            throw error;
-        }
-        const claimed = inspectExistingLock(staleClaimPath);
-        if (claimed.rawHash !== inspected.rawHash) {
-            if (!fs.existsSync(lockPath)) {
-                fs.renameSync(staleClaimPath, lockPath);
+            const staleClaimToken = sha256Hex(
+                Buffer.from(`${nonce}:${randomUUID()}`, "utf8"),
+            ).slice(0, 24);
+            const staleClaimPath = `${lockPath}.stale-${pid}-${staleClaimToken}`;
+            try {
+                fs.renameSync(lockPath, staleClaimPath);
+            } catch (error) {
+                if (error?.code === "ENOENT") {
+                    continue;
+                }
+                throw error;
             }
-            throw new SupervisorLockError(
-                RUNTIME_ERROR_CODES.LOCK_HELD,
-                "A newer supervisor lock appeared during stale recovery",
-                { lockPath },
-            );
+            const claimed = inspectExistingLock(staleClaimPath);
+            if (claimed.rawHash !== inspected.rawHash) {
+                if (!fs.existsSync(lockPath)) {
+                    fs.renameSync(staleClaimPath, lockPath);
+                }
+                throw new SupervisorLockError(
+                    RUNTIME_ERROR_CODES.LOCK_HELD,
+                    "A newer supervisor lock appeared during stale recovery",
+                    { lockPath },
+                );
+            }
+            fs.rmSync(staleClaimPath);
+            fsyncDirectoryBestEffort(path.dirname(lockPath));
         }
-        fs.rmSync(staleClaimPath);
-        fsyncDirectoryBestEffort(path.dirname(lockPath));
+        throw new SupervisorLockError(
+            RUNTIME_ERROR_CODES.LOCK_HELD,
+            "Unable to acquire supervisor lock after stale recovery",
+            { lockPath },
+        );
+    } finally {
+        closeSupervisorAuthorityRepository(authorityHandle);
     }
-    throw new SupervisorLockError(
-        RUNTIME_ERROR_CODES.LOCK_HELD,
-        "Unable to acquire supervisor lock after stale recovery",
-        { lockPath },
-    );
 }
 
 export function releaseSupervisorLock(lock) {
@@ -295,7 +940,9 @@ export function releaseSupervisorLock(lock) {
         }
         throw error;
     }
-    if (current.pid !== lock.pid || current.nonce !== lock.nonce) {
+    if (current.pid !== lock.pid
+        || current.nonce !== lock.nonce
+        || current.supervisorGeneration !== lock.supervisorGeneration) {
         return false;
     }
     fs.rmSync(lock.lockPath);
@@ -303,7 +950,12 @@ export function releaseSupervisorLock(lock) {
     return true;
 }
 
-function runnerConfigForChild(config) {
+function runnerConfigForChild(config, lock, runnerIncarnation) {
+    const supervisorAuthority = Object.freeze({
+        supervisorGeneration: lock.supervisorGeneration,
+        supervisorNonce: lock.nonce,
+        runnerIncarnation,
+    });
     return {
         investigationId: config.runner.investigationId,
         stateDir: config.runner.stateDir,
@@ -312,9 +964,15 @@ function runnerConfigForChild(config) {
         copilotSdkPath: config.runner.sdkPath,
         copilotCliPath: config.runner.cliPath,
         runnerEpochId: config.runner.runnerEpochId,
+        supervisorGeneration: lock.supervisorGeneration,
+        supervisorNonce: lock.nonce,
+        runnerIncarnation,
         deadline: config.runner.deadlineMs,
         resultPath: config.paths.childResultPath,
-        options: config.runner.options,
+        options: {
+            ...config.runner.options,
+            supervisorAuthority,
+        },
     };
 }
 
@@ -339,9 +997,16 @@ function waitForChild(child) {
     });
 }
 
-function defaultSpawnRunner(config) {
+function defaultSpawnRunner(config, context) {
+    context.assertOwnership("runner result cleanup");
     fs.rmSync(config.paths.childResultPath, { force: true });
-    atomicWriteJson(config.paths.childConfigPath, runnerConfigForChild(config));
+    context.assertOwnership("runner configuration write");
+    atomicWriteJson(config.paths.childConfigPath, context.runnerConfig, {
+        token: `runner-config:${context.supervisorGeneration}:${
+            context.runnerIncarnation
+        }`,
+    });
+    context.assertOwnership("runner process launch");
     const child = spawn(
         process.execPath,
         [config.runnerCliPath, "--config", config.paths.childConfigPath],
@@ -379,50 +1044,63 @@ function classifySuccessfulResult(result) {
     }
 }
 
-function persistSupervisorNonResult(config, lock, dependencies, input) {
+function persistSupervisorNonResult(config, lock, dependencies, input, assertOwnership) {
+    const fencedInput = {
+        ...input,
+        supervisorGeneration: lock.supervisorGeneration,
+        supervisorNonce: lock.nonce,
+        details: {
+            ...(isPlainObject(input.details) ? input.details : { value: input.details ?? null }),
+            supervisorGeneration: lock.supervisorGeneration,
+            supervisorNonce: lock.nonce,
+        },
+    };
+    assertOwnership("operational non-result write");
     if (typeof dependencies.recordOperationalNonResult === "function") {
-        return dependencies.recordOperationalNonResult(input);
+        return dependencies.recordOperationalNonResult(fencedInput);
     }
     const eventsFile = path.join(config.runner.stateDir, "events.sqlite");
     if (!fs.existsSync(eventsFile)) {
         return null;
     }
+    assertOwnership("operational non-result repository open");
     const repository = openRepository({ file: eventsFile });
     try {
+        assertOwnership("operational non-result append");
         const adapter = createDomainRepositoryAdapter({
             repository,
             investigationId: config.runner.investigationId,
         });
         return adapter.recordOperationalNonResult({
-            attemptId: `supervisor-${lock.nonce}-${input.code}-${input.restartCount ?? 0}`
+            attemptId: `supervisor-g${lock.supervisorGeneration}-${lock.nonce}-${input.code}-${input.restartCount ?? 0}`
                 .replace(/[^A-Za-z0-9._@-]/gu, "-")
                 .slice(0, 256),
-            code: input.code,
-            reason: input.reason,
-            details: input.details ?? null,
+            code: fencedInput.code,
+            reason: fencedInput.reason,
+            details: fencedInput.details,
         });
     } finally {
         repository.close();
     }
 }
 
-function readMatchingStopRequest(file, lock) {
+function readMatchingStopRequest(file, lock, assertOwnership) {
     if (!fs.existsSync(file)) return null;
     let request;
     try {
         request = readJsonFile(file, "supervisor stop request");
     } catch {
-        fs.rmSync(file, { force: true });
         return null;
     }
     if (!isPlainObject(request)
         || request.pid !== lock.pid
         || request.nonce !== lock.nonce
+        || request.supervisorGeneration !== lock.supervisorGeneration
         || typeof request.requestedAt !== "string"
         || !Number.isFinite(Date.parse(request.requestedAt))) {
-        fs.rmSync(file, { force: true });
         return null;
     }
+    assertOwnership("stop request consumption");
     fs.rmSync(file, { force: true });
     return request;
 }
@@ -436,18 +1114,41 @@ export async function runSupervisor(input, dependencies = {}) {
     const sleep = dependencies.sleep ?? ((milliseconds) => delay(milliseconds, timers));
     const spawnRunner = dependencies.spawnRunner ?? defaultSpawnRunner;
     const processTreeAdapter = dependencies.processTreeAdapter ?? createDefaultProcessAdapter();
+    const shutdownPolicy = normalizeShutdownPolicy(dependencies.shutdownPolicy);
+    const shutdownTimers = dependencies.shutdownTimers ?? globalThis;
     const signalSource = dependencies.signalSource ?? process;
     const lock = acquireSupervisorLock(config, {
         ...dependencies,
         clock,
     });
+    let authorityHandle;
+    try {
+        authorityHandle = openSupervisorAuthorityRepository(
+            config,
+            dependencies,
+            clock,
+        );
+    } catch (error) {
+        releaseSupervisorLock(lock);
+        throw error;
+    }
+    const scopedPaths = ownerRuntimePaths(config.paths, lock);
+    const ownedConfig = Object.freeze({
+        ...config,
+        paths: Object.freeze({
+            ...config.paths,
+            ...scopedPaths,
+        }),
+    });
     const startedAt = lock.startedAt;
     let status = null;
+    let statusRevision = 0;
     let heartbeatTimer = null;
     let controlTimer = null;
     let currentChild = null;
     let currentChildWait = null;
     let currentChildPid = null;
+    let currentRunnerIncarnation = null;
     let restartCount = 0;
     let shutdownRequest = null;
     let resolveShutdown;
@@ -456,6 +1157,9 @@ export async function runSupervisor(input, dependencies = {}) {
     });
     const crashes = [];
     const signalHandlers = new Map();
+    let scavenging = null;
+
+    const assertOwnership = (action) => assertSupervisorOwnership(lock, action);
 
     const requestShutdown = (request) => {
         if (shutdownRequest !== null) return;
@@ -463,21 +1167,52 @@ export async function runSupervisor(input, dependencies = {}) {
         resolveShutdown(request);
     };
 
+    const requestOwnershipLoss = (action, error = null) => {
+        const request = {
+            kind: "ownership_lost",
+            action,
+            error: error === null
+                ? null
+                : {
+                    code: error?.code ?? null,
+                    message: error?.message ?? String(error),
+                },
+            supervisorGeneration: lock.supervisorGeneration,
+            nonce: lock.nonce,
+        };
+        if (shutdownRequest?.kind !== "ownership_lost") {
+            shutdownRequest = request;
+            resolveShutdown(request);
+        }
+    };
+
     const writeStatus = (state, extra = {}) => {
-        status = {
-            version: 1,
+        assertOwnership(`${state} owner status write`);
+        const nextStatus = {
+            ...extra,
+            version: 2,
             investigationId: config.runner.investigationId,
             supervisorEpochId: config.supervisorEpochId,
             pid: lock.pid,
             nonce: lock.nonce,
+            supervisorGeneration: lock.supervisorGeneration,
             startedAt,
             heartbeatAt: clock.isoNow(),
             state,
             restartCount,
             childPid: currentChildPid,
-            ...extra,
+            runnerIncarnation: currentRunnerIncarnation,
+            statusRevision: statusRevision + 1,
         };
-        atomicWriteJson(config.paths.statusPath, status);
+        atomicWriteJson(ownedConfig.paths.statusPath, nextStatus, {
+            token: `status:${lock.supervisorGeneration}:${lock.nonce}:${nextStatus.statusRevision}`,
+        });
+        assertOwnership(`${state} shared status write`);
+        atomicWriteJson(config.paths.statusPath, nextStatus, {
+            token: `shared-status:${lock.supervisorGeneration}:${lock.nonce}:${nextStatus.statusRevision}`,
+        });
+        statusRevision = nextStatus.statusRevision;
+        status = nextStatus;
         return status;
     };
 
@@ -487,12 +1222,19 @@ export async function runSupervisor(input, dependencies = {}) {
             try {
                 writeStatus(status?.state ?? "running", {
                     ...(status ?? {}),
-                    heartbeatAt: clock.isoNow(),
-                    childPid: currentChildPid,
-                    restartCount,
                 });
-            } catch {
-                // The foreground control loop surfaces durable write failures.
+            } catch (error) {
+                if (isOwnershipLostError(error)) {
+                    requestOwnershipLoss("heartbeat", error);
+                } else {
+                    requestShutdown({
+                        kind: "control_failure",
+                        error: {
+                            code: error?.code ?? null,
+                            message: error?.message ?? String(error),
+                        },
+                    });
+                }
             }
         }, config.heartbeatIntervalMs);
         heartbeatTimer?.unref?.();
@@ -510,10 +1252,120 @@ export async function runSupervisor(input, dependencies = {}) {
         const child = currentChild;
         const wait = currentChildWait;
         const pid = currentChildPid;
-        if (Number.isSafeInteger(pid) && pid > 0) {
-            await processTreeAdapter.terminateTree(pid);
+        const started = Date.now();
+        const remaining = () => Math.max(
+            0,
+            shutdownPolicy.finalMs - (Date.now() - started),
+        );
+        const diagnostics = [];
+        let exit = null;
+        let jobObjectCloseAttempted = false;
+
+        const runPhase = async (phase, force, timeoutMs) => {
+            const budget = Math.max(1, Math.min(timeoutMs, remaining()));
+            const termination = Number.isSafeInteger(pid) && pid > 0
+                ? settleWithin(
+                    () => processTreeAdapter.terminateTree(pid, {
+                        force,
+                        timeoutMs: budget,
+                        phase,
+                    }),
+                    budget,
+                    { timers: shutdownTimers },
+                )
+                : Promise.resolve({ status: "fulfilled", value: false });
+            const childExit = settleWithin(wait, budget, { timers: shutdownTimers });
+            const [terminationOutcome, exitOutcome] = await Promise.all([
+                termination,
+                childExit,
+            ]);
+            diagnostics.push({
+                phase,
+                force,
+                terminationStatus: terminationOutcome.status,
+                terminationResult: terminationOutcome.value ?? null,
+                terminationError: terminationOutcome.error?.message ?? null,
+                childStatus: exitOutcome.status,
+            });
+            if (exitOutcome.status === "fulfilled") {
+                exit = exitOutcome.value;
+                return true;
+            }
+            return false;
+        };
+
+        if (!(await runPhase("drain", false, shutdownPolicy.drainMs))) {
+            const escalation = runPhase(
+                "escalation",
+                true,
+                shutdownPolicy.escalationMs,
+            );
+            let jobClose = null;
+            if (typeof processTreeAdapter.closeJobObject === "function") {
+                jobObjectCloseAttempted = true;
+                jobClose = settleWithin(
+                    () => processTreeAdapter.closeJobObject(pid),
+                    shutdownPolicy.escalationMs,
+                    { timers: shutdownTimers },
+                );
+            }
+            await escalation;
+            if (jobClose !== null) {
+                const closed = await jobClose;
+                diagnostics.push({
+                    phase: "job_object_close",
+                    status: closed.status,
+                    result: closed.value ?? null,
+                    error: closed.error?.message ?? null,
+                });
+            }
         }
-        const exit = await wait;
+        if (exit === null
+            && !jobObjectCloseAttempted
+            && typeof processTreeAdapter.closeJobObject === "function"
+            && remaining() > 0) {
+            const budget = Math.max(1, remaining());
+            const closed = await settleWithin(
+                () => processTreeAdapter.closeJobObject(pid),
+                budget,
+                { timers: shutdownTimers },
+            );
+            diagnostics.push({
+                phase: "job_object_close",
+                status: closed.status,
+                result: closed.value ?? null,
+                error: closed.error?.message ?? null,
+            });
+        }
+        if (exit === null && remaining() > 0) {
+            const finalWait = await settleWithin(wait, remaining(), {
+                timers: shutdownTimers,
+            });
+            diagnostics.push({ phase: "final_wait", status: finalWait.status });
+            if (finalWait.status === "fulfilled") {
+                exit = finalWait.value;
+            }
+        }
+        if (exit === null) {
+            exit = {
+                code: null,
+                signal: null,
+                error: {
+                    code: RUNTIME_ERROR_CODES.CHILD_CRASH,
+                    message: "Runner child did not exit before the supervisor shutdown bound",
+                },
+                cleanupTimedOut: true,
+            };
+        }
+        exit = {
+            ...exit,
+            shutdown: {
+                bounded: true,
+                elapsedMs: Date.now() - started,
+                policy: shutdownPolicy,
+                diagnostics,
+            },
+        };
         if (currentChild === child) {
             currentChild = null;
             currentChildWait = null;
@@ -522,45 +1374,152 @@ export async function runSupervisor(input, dependencies = {}) {
         return exit;
     };
 
-    for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"]) {
-        const handler = () => requestShutdown({ kind: "signal", signal });
-        signalHandlers.set(signal, handler);
-        signalSource.on?.(signal, handler);
-    }
-    fs.rmSync(config.paths.stopRequestPath, { force: true });
-    controlTimer = timers.setInterval(() => {
-        try {
-            const request = readMatchingStopRequest(config.paths.stopRequestPath, lock);
-            if (request !== null) {
-                requestShutdown({ kind: "stop_request", request });
-            }
-        } catch (error) {
-            requestShutdown({
-                kind: "control_failure",
-                error: { code: error?.code ?? null, message: error?.message ?? String(error) },
-            });
-        }
-    }, Math.min(config.heartbeatIntervalMs, 250));
-
     try {
-        writeStatus("starting");
+        const scavengeRuntime = dependencies.scavengeRuntime
+            ?? scavengeStaleGenerationOwnedPaths;
+        scavenging = scavengeRuntime({
+            tempRoot: config.runner.options.tempRoot,
+            supervisorDirectory: config.paths.directory,
+            investigationId: config.runner.investigationId,
+            currentGeneration: lock.supervisorGeneration,
+            currentNonce: lock.nonce,
+            currentPid: lock.pid,
+            referencedPaths: [
+                config.runner.stateDir,
+                config.runner.artifactRoot,
+                config.runner.allowlistPath,
+                config.runner.sdkPath,
+                config.runner.cliPath,
+                ...Object.values(config.paths),
+                ...Object.values(scopedPaths),
+            ],
+            isPidAlive: dependencies.isPidAlive ?? isExactPidAlive,
+            now: clock.now(),
+            minimumAgeMs: dependencies.scavengeMinimumAgeMs ?? 0,
+        });
+        for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"]) {
+            const handler = () => requestShutdown({ kind: "signal", signal });
+            signalHandlers.set(signal, handler);
+            signalSource.on?.(signal, handler);
+        }
+        assertOwnership("stale stop request cleanup");
+        fs.rmSync(ownedConfig.paths.stopRequestPath, { force: true });
+        controlTimer = timers.setInterval(() => {
+            try {
+                assertOwnership("supervisor control poll");
+                const request = readMatchingStopRequest(
+                    ownedConfig.paths.stopRequestPath,
+                    lock,
+                    assertOwnership,
+                );
+                if (request !== null) {
+                    requestShutdown({ kind: "stop_request", request });
+                }
+            } catch (error) {
+                if (isOwnershipLostError(error)) {
+                    requestOwnershipLoss("control_poll", error);
+                } else {
+                    requestShutdown({
+                        kind: "control_failure",
+                        error: {
+                            code: error?.code ?? null,
+                            message: error?.message ?? String(error),
+                        },
+                    });
+                }
+            }
+        }, Math.min(config.heartbeatIntervalMs, 250));
+
+        writeStatus("starting", {
+            scavenging: {
+                removedCount: scavenging?.removed?.length ?? 0,
+                preservedCount: scavenging?.preserved?.length ?? 0,
+            },
+        });
         for (let launchNumber = 1; ; launchNumber += 1) {
+            assertOwnership("supervisor control loop");
             if (shutdownRequest !== null) {
+                if (shutdownRequest.kind === "ownership_lost") {
+                    return {
+                        kind: "STOPPED",
+                        status,
+                        result: null,
+                        ownershipLost: true,
+                        shutdown: shutdownRequest,
+                    };
+                }
                 writeStatus("stopped", { shutdown: shutdownRequest });
                 return { kind: "STOPPED", status, result: null };
             }
             let launched;
+            let launchConfig = ownedConfig;
             try {
-                launched = await spawnRunner(config, {
+                assertOwnership(restartCount === 0 ? "runner launch" : "runner restart");
+                const runnerIncarnationFactory =
+                    dependencies.runnerIncarnationFactory ?? (() => randomUUID());
+                const runnerIncarnation = requireString(
+                    runnerIncarnationFactory({
+                        investigationId: config.runner.investigationId,
+                        supervisorGeneration: lock.supervisorGeneration,
+                        supervisorNonce: lock.nonce,
+                        launchNumber,
+                        restartCount,
+                    }),
+                    "runner incarnation",
+                    { max: 256 },
+                );
+                assertOwnership("runner incarnation persistence");
+                authorityHandle.repository.issueRunnerIncarnation({
+                    investigationId: config.runner.investigationId,
+                    supervisorGeneration: lock.supervisorGeneration,
+                    supervisorNonce: lock.nonce,
+                    runnerIncarnation,
+                });
+                assertOwnership("runner incarnation launch binding");
+                currentRunnerIncarnation = runnerIncarnation;
+                launchConfig = Object.freeze({
+                    ...ownedConfig,
+                    paths: Object.freeze({
+                        ...ownedConfig.paths,
+                        ...runnerLaunchPaths(
+                            ownedConfig.paths,
+                            runnerIncarnation,
+                        ),
+                    }),
+                });
+                const runnerConfig = runnerConfigForChild(
+                    launchConfig,
+                    lock,
+                    runnerIncarnation,
+                );
+                launched = await spawnRunner(launchConfig, {
                     launchNumber,
                     restartCount,
-                    runnerConfig: runnerConfigForChild(config),
+                    runnerConfig,
+                    supervisorGeneration: lock.supervisorGeneration,
+                    supervisorNonce: lock.nonce,
+                    runnerIncarnation,
+                    assertOwnership,
                 });
             } catch (error) {
-                launched = { error, child: null, resultPath: config.paths.childResultPath };
+                if (isOwnershipLostError(error)) {
+                    throw error;
+                }
+                launched = {
+                    error,
+                    child: null,
+                    resultPath: launchConfig.paths.childResultPath,
+                };
             }
 
-            if (launched?.child === null || launched?.child === undefined) {
+            if (launched?.child !== null && launched?.child !== undefined) {
+                currentChild = launched.child;
+                currentChildPid = launched.child.pid ?? null;
+                currentChildWait = waitForChild(launched.child);
+            }
+            assertOwnership("runner launch completion");
+
+            if (currentChild === null) {
                 const error = launched?.error ?? new Error("spawnRunner returned no child");
                 crashes.push(clock.now());
                 writeStatus("crashed", {
@@ -570,9 +1529,6 @@ export async function runSupervisor(input, dependencies = {}) {
                     },
                 });
             } else {
-                currentChild = launched.child;
-                currentChildPid = launched.child.pid ?? null;
-                currentChildWait = waitForChild(launched.child);
                 writeStatus("running", { launchNumber });
                 startHeartbeat();
                 const completed = await Promise.race([
@@ -582,6 +1538,16 @@ export async function runSupervisor(input, dependencies = {}) {
                 if (completed.kind === "shutdown") {
                     const exit = await terminateCurrentChild();
                     stopHeartbeat();
+                    if (completed.request.kind === "ownership_lost") {
+                        return {
+                            kind: "STOPPED",
+                            status,
+                            result: null,
+                            ownershipLost: true,
+                            shutdown: completed.request,
+                            exit,
+                        };
+                    }
                     writeStatus("stopped", { shutdown: completed.request, exit });
                     return { kind: "STOPPED", status, result: null };
                 }
@@ -590,12 +1556,19 @@ export async function runSupervisor(input, dependencies = {}) {
                 currentChildWait = null;
                 currentChildPid = null;
                 stopHeartbeat();
+                assertOwnership("runner result processing");
 
                 let envelope = null;
                 let envelopeError = null;
                 try {
-                    envelope = readChildEnvelope(launched.resultPath ?? config.paths.childResultPath);
+                    assertOwnership("runner result read");
+                    envelope = readChildEnvelope(
+                        launched.resultPath ?? launchConfig.paths.childResultPath,
+                    );
                 } catch (error) {
+                    if (isOwnershipLostError(error)) {
+                        throw error;
+                    }
                     envelopeError = error;
                 }
 
@@ -608,7 +1581,7 @@ export async function runSupervisor(input, dependencies = {}) {
                             reason,
                             restartCount,
                             details: { exit, result: envelope.result ?? null, recoverable: false },
-                        });
+                        }, assertOwnership);
                         writeStatus("failed", {
                             lastError: {
                                 code: RUNTIME_ERROR_CODES.RESULT_MISSING,
@@ -649,7 +1622,7 @@ export async function runSupervisor(input, dependencies = {}) {
                         reason: lastError.message ?? "Runner failed without a recoverable outcome.",
                         restartCount,
                         details: { exit, recoverable: false },
-                    });
+                    }, assertOwnership);
                     writeStatus("failed", { lastError, exit });
                     return { kind: "FAILED", status, error: lastError };
                 }
@@ -673,7 +1646,7 @@ export async function runSupervisor(input, dependencies = {}) {
                     reason,
                     restartCount,
                     details: { circuit, recoverable: false },
-                });
+                }, assertOwnership);
                 writeStatus("circuit_open", { circuit });
                 return {
                     kind: "CIRCUIT_OPEN",
@@ -686,20 +1659,51 @@ export async function runSupervisor(input, dependencies = {}) {
             }
 
             restartCount += 1;
-            const backoffMs = Math.min(
+            const configuredBackoffMs = Math.min(
                 config.maxBackoffMs,
                 config.baseBackoffMs * (2 ** (restartCount - 1)),
             );
+            const remainingBudget = remainingDeadlineMs(
+                config.runner.deadlineMs,
+                clock.now(),
+            );
+            const backoffMs = Number.isFinite(remainingBudget)
+                ? Math.min(configuredBackoffMs, remainingBudget)
+                : configuredBackoffMs;
             writeStatus("backoff", { backoffMs });
+            assertOwnership("runner restart backoff");
             const completed = await Promise.race([
                 sleep(backoffMs).then(() => ({ kind: "backoff_complete" })),
                 shutdownPromise.then((request) => ({ kind: "shutdown", request })),
             ]);
             if (completed.kind === "shutdown") {
+                if (completed.request.kind === "ownership_lost") {
+                    return {
+                        kind: "STOPPED",
+                        status,
+                        result: null,
+                        ownershipLost: true,
+                        shutdown: completed.request,
+                    };
+                }
                 writeStatus("stopped", { shutdown: completed.request });
                 return { kind: "STOPPED", status, result: null };
             }
         }
+    } catch (error) {
+        if (!isOwnershipLostError(error)) {
+            throw error;
+        }
+        requestOwnershipLoss(error?.details?.action ?? "supervisor action", error);
+        const exit = await terminateCurrentChild();
+        return {
+            kind: "STOPPED",
+            status,
+            result: null,
+            ownershipLost: true,
+            shutdown: shutdownRequest,
+            exit,
+        };
     } finally {
         stopHeartbeat();
         if (controlTimer !== null) {
@@ -714,16 +1718,36 @@ export async function runSupervisor(input, dependencies = {}) {
             }
         }
         await terminateCurrentChild();
-        releaseSupervisorLock(lock);
+        try {
+            closeSupervisorAuthorityRepository(authorityHandle);
+        } finally {
+            releaseSupervisorLock(lock);
+        }
     }
 }
 
 export function readSupervisorStatus(stateDir, investigationId) {
     const paths = supervisorPaths(stateDir, investigationId);
-    if (!fs.existsSync(paths.statusPath)) {
+    const generation = readLatestGenerationDocument(paths, investigationId);
+    const lock = fs.existsSync(paths.lockPath)
+        ? currentLockIfValid(paths.lockPath)
+        : null;
+    let expectedOwner = null;
+    if (generation !== null && lock !== null) {
+        expectedOwner = generation.supervisorGeneration >= lock.supervisorGeneration
+            ? generation
+            : lock;
+    } else {
+        expectedOwner = generation ?? lock;
+    }
+    const status = readStatusForOwnership(paths.statusPath, expectedOwner);
+    if (status === null) {
         return null;
     }
-    return readJsonFile(paths.statusPath, "supervisor status");
+    if (expectedOwner !== null && !statusMatchesOwner(status, expectedOwner)) {
+        return null;
+    }
+    return status;
 }
 
 export function terminateExactSupervisor({
@@ -731,12 +1755,16 @@ export function terminateExactSupervisor({
     statusPath,
     stopRequestPath,
     expectedNonce,
+    expectedGeneration,
     signal = "SIGTERM",
     processApi = process,
     clock = defaultClock(),
     staleAfterMs = 30_000,
 } = {}) {
-    const lock = validateLockDocument(readJsonFile(lockPath, "supervisor lock"), lockPath);
+    const lock = Object.freeze({
+        ...validateLockDocument(readJsonFile(lockPath, "supervisor lock"), lockPath),
+        lockPath,
+    });
     if (expectedNonce !== undefined && lock.nonce !== expectedNonce) {
         throw new SupervisorLockError(
             RUNTIME_ERROR_CODES.LOCK_HELD,
@@ -744,7 +1772,15 @@ export function terminateExactSupervisor({
             { lockPath },
         );
     }
-    const status = readStatusForOwnership(statusPath);
+    if (expectedGeneration !== undefined
+        && lock.supervisorGeneration !== expectedGeneration) {
+        throw new SupervisorLockError(
+            RUNTIME_ERROR_CODES.LOCK_HELD,
+            "Supervisor generation changed; refusing to terminate an unverified PID",
+            { lockPath, expectedGeneration, actualGeneration: lock.supervisorGeneration },
+        );
+    }
+    const status = readStatusForOwnership(statusPath, lock);
     if (!hasFreshMatchingHeartbeat(
         lock,
         status,
@@ -760,24 +1796,32 @@ export function terminateExactSupervisor({
                 statusPath,
                 pid: lock.pid,
                 nonce: lock.nonce,
+                supervisorGeneration: lock.supervisorGeneration,
             },
         );
     }
     if (typeof stopRequestPath !== "string" || !path.isAbsolute(stopRequestPath)) {
         throw new RuntimeConfigError("stopRequestPath must be an absolute path");
     }
-    atomicWriteJson(stopRequestPath, {
-        version: 1,
+    const ownedStopRequestPath = ownerScopedPath(stopRequestPath, lock);
+    assertSupervisorOwnership(lock, "supervisor stop request write");
+    atomicWriteJson(ownedStopRequestPath, {
+        version: 2,
         pid: lock.pid,
         nonce: lock.nonce,
+        supervisorGeneration: lock.supervisorGeneration,
         signal,
         requestedAt: clock.isoNow(),
+    }, {
+        token: `stop:${lock.supervisorGeneration}:${lock.nonce}`,
     });
+    assertSupervisorOwnership(lock, "supervisor stop request verification");
     return {
         action: "stop_requested",
         pid: lock.pid,
         nonce: lock.nonce,
+        supervisorGeneration: lock.supervisorGeneration,
         signal,
-        stopRequestPath,
+        stopRequestPath: ownedStopRequestPath,
     };
 }

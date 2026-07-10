@@ -16,6 +16,7 @@ import {
     MEASUREMENT_ERROR_CODES,
     createDefaultProcessAdapter,
     createMeasurementExecutor,
+    createSandboxProvider,
     hashReceipt,
     loadHarnessAllowlist,
     projectDeterministicReceipt,
@@ -84,6 +85,17 @@ function createMutationProcessAdapter(mutate) {
             return child;
         },
         terminateTree() {},
+    };
+}
+
+function mutableClock(start = 20_000) {
+    let now = start;
+    return {
+        now: () => now,
+        isoNow: () => new Date(now).toISOString(),
+        advance(milliseconds) {
+            now += milliseconds;
+        },
     };
 }
 
@@ -258,6 +270,141 @@ describe("MeasurementExecutor happy path", () => {
         expect(result.receipt.stagedExecutableHash).toBe(result.receipt.executableHash);
         expect(result.receipt.stagedDependencyHashes[0].sha256)
             .toBe(result.receipt.dependencyHashes[0].sha256);
+    });
+
+    it("propagates the remaining deadline to the harness and rejects late facts", async () => {
+        const root = tmp("deadline");
+        const scriptPath = writeHarnessScript(
+            root,
+            "deadline",
+            `process.stdout.write('{"pass":true}');`,
+        );
+        const allowlistPath = writeAllowlist(root, "deadline", {
+            argvTemplate: [scriptPath],
+            timeoutMs: 5_000,
+        });
+        const list = loadHarnessAllowlist(allowlistPath);
+        const verified = list.verifyEntry("deadline");
+        const snapshot = materializeCandidateSnapshot(root, "deadline-snap", "x");
+        const clock = mutableClock();
+        const deadlineMs = clock.now() + 500;
+        let spawnOptions = null;
+        const executor = createMeasurementExecutor({
+            allowlist: list,
+            scratchRoot: root,
+            clock,
+            processAdapter: {
+                spawn(_executable, _argv, options) {
+                    spawnOptions = options;
+                    const child = new EventEmitter();
+                    child.pid = 5050;
+                    child.stdout = new PassThrough();
+                    child.stderr = new PassThrough();
+                    setImmediate(() => {
+                        child.stdout.end(Buffer.from('{"pass":true}', "utf8"));
+                        child.stderr.end();
+                        clock.advance(501);
+                        child.emit("close", 0, null);
+                    });
+                    return child;
+                },
+                terminateTree() {
+                    return true;
+                },
+            },
+        });
+        await expect(executor.run({
+            verifiedEntry: verified,
+            candidateSnapshot: snapshot,
+            ...fixedIds(),
+            deadlineMs,
+        })).rejects.toMatchObject({
+            code: MEASUREMENT_ERROR_CODES.TIMEOUT,
+            details: {
+                deadlineExceeded: true,
+                deadlineMs,
+            },
+        });
+        expect(spawnOptions).toMatchObject({
+            timeoutMs: 500,
+            deadlineMs,
+        });
+    });
+
+    it("bounds hung capability termination and cleanup", async () => {
+        const root = tmp("capability-shutdown");
+        const scriptPath = writeHarnessScript(
+            root,
+            "capability-shutdown",
+            `process.stdout.write('{"pass":true}');`,
+        );
+        const allowlistPath = writeAllowlist(root, "capability-shutdown", {
+            argvTemplate: [scriptPath],
+            timeoutMs: 20,
+            executesCandidateCode: true,
+        });
+        const list = loadHarnessAllowlist(allowlistPath);
+        const verified = list.verifyEntry("capability-shutdown");
+        const snapshot = materializeCandidateSnapshot(
+            root,
+            "capability-shutdown-snap",
+            "x",
+        );
+        const calls = { terminate: 0, cleanup: 0, terminationStartedAt: null };
+        const provider = createSandboxProvider({
+            providerId: "hung-capability-provider",
+            providerVersion: "v1",
+            admitAndPrepare(request, issueLaunchCapability) {
+                const child = new EventEmitter();
+                child.pid = 6060;
+                child.stdout = new PassThrough();
+                child.stderr = new PassThrough();
+                return issueLaunchCapability({
+                    capabilityId: "hung-capability",
+                    policyId: "hung-policy",
+                    policyDigest: `sha256:hung-policy:${"a".repeat(64)}`,
+                    permittedStagedRoots: request.stagedRoots,
+                    launch() {
+                        return child;
+                    },
+                    terminate() {
+                        calls.terminate += 1;
+                        calls.terminationStartedAt ??= Date.now();
+                        return new Promise(() => {});
+                    },
+                    cleanup() {
+                        calls.cleanup += 1;
+                        return new Promise(() => {});
+                    },
+                });
+            },
+        });
+        const executor = createMeasurementExecutor({
+            allowlist: list,
+            sandboxProvider: provider,
+            scratchRoot: root,
+            terminationDrainMs: 10,
+            capabilityCleanupTimeoutMs: 10,
+            processAdapter: {
+                spawn() {
+                    throw new Error("host adapter must not launch candidate code");
+                },
+                terminateTree() {
+                    throw new Error("host adapter must not terminate candidate code");
+                },
+            },
+        });
+        await expect(executor.run({
+            verifiedEntry: verified,
+            candidateSnapshot: snapshot,
+            ...fixedIds(),
+        })).rejects.toMatchObject({
+            code: MEASUREMENT_ERROR_CODES.SANDBOX_LIFECYCLE,
+        });
+        expect(calls.terminationStartedAt).not.toBeNull();
+        expect(Date.now() - calls.terminationStartedAt).toBeLessThan(500);
+        expect(calls.terminate).toBeGreaterThanOrEqual(1);
+        expect(calls.cleanup).toBe(1);
     });
 
     it("reverifies executable and script bytes at run time after verifyEntry issuance", async () => {

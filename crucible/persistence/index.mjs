@@ -19,6 +19,7 @@ export {
     TerminalExistsError,
     IllegalTransitionError,
     FenceRejectedError,
+    AttemptIdentityError,
     ArtifactNotDurableError,
     StorageError,
 } from "./errors.mjs";

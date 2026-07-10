@@ -12,10 +12,13 @@ import {
 } from "./errors.mjs";
 import {
     ensureDirectory,
+    parseDeadline,
+    remainingDeadlineMs,
     requireAbsolutePath,
     requireIdentifier,
     requirePlainObject,
     requireString,
+    settleWithin,
 } from "./utils.mjs";
 
 export const SUBMIT_CANDIDATE_TOOL_NAME = "crucible_submit_candidate";
@@ -48,6 +51,25 @@ const PATH_CONTROL = /[\u0000-\u001f\u007f]/u;
 
 function protocolError(code, message, details) {
     return new WorkerProtocolError(code, message, details);
+}
+
+function deadlineError(deadlineMs, stage, now) {
+    const error = new CrucibleRuntimeError(
+        RUNTIME_ERROR_CODES.DEADLINE_EXCEEDED,
+        `The Crucible deadline expired during ${stage}`,
+        {
+            deadlineMs,
+            observedAtMs: now,
+            stage,
+        },
+    );
+    error.deadlineExceeded = true;
+    return error;
+}
+
+function earliestDeadline(...values) {
+    const deadlines = values.filter((value) => value !== null && value !== undefined);
+    return deadlines.length === 0 ? null : Math.min(...deadlines);
 }
 
 function hasUnpairedSurrogate(value) {
@@ -769,6 +791,7 @@ function buildParentReadTool({
     expectedChallenge,
     sessionId,
     dataNonce,
+    assertAvailable,
 }) {
     const state = { calls: 0, servedBytes: 0 };
     const deny = (reason, message, extra = {}) => ({
@@ -790,6 +813,13 @@ function buildParentReadTool({
         skipPermission: true,
         parameters: parentReadToolSchema(parentReadLimits),
         handler: async (args, invocation) => {
+            try {
+                assertAvailable();
+            } catch (error) {
+                return deny("deadline", error.message, {
+                    code: error?.code ?? null,
+                });
+            }
             if (state.calls >= parentReadLimits.maxCalls) {
                 return deny("limit", "Parent-read call budget for this session is exhausted", {
                     maxCalls: parentReadLimits.maxCalls,
@@ -813,6 +843,7 @@ function buildParentReadTool({
 
             let manifest;
             try {
+                assertAvailable();
                 manifest = reader.loadManifest(snapshotId);
             } catch (error) {
                 return deny("unavailable", "Parent snapshot manifest could not be loaded", {
@@ -874,6 +905,7 @@ function buildParentReadTool({
 
             let bytes;
             try {
+                assertAvailable();
                 bytes = reader.readObject(entry.object);
             } catch (error) {
                 return deny("unavailable", "Parent object could not be read", {
@@ -941,6 +973,8 @@ export class SdkWorkerPool {
     #sdk = null;
     #startPromise = null;
     #claimedCandidateIds;
+    #activeSessions = new Set();
+    #closing = false;
 
     constructor(options = {}) {
         const client = options.client ?? null;
@@ -969,6 +1003,10 @@ export class SdkWorkerPool {
             parentReadLimits: normalizeParentReadLimits(options.parentReadLimits ?? {}),
             parentReader: options.parentReader ?? null,
             sessionTimeoutMs: options.sessionTimeoutMs ?? 120_000,
+            shutdownTimeoutMs: options.shutdownTimeoutMs ?? 10_000,
+            deadlineMs: parseDeadline(options.deadlineMs, "deadlineMs"),
+            clock: options.clock ?? { now: () => Date.now() },
+            timers: options.timers ?? globalThis,
         };
         if (this.#options.parentReader !== null) {
             requireParentReader(this.#options.parentReader);
@@ -977,6 +1015,17 @@ export class SdkWorkerPool {
             || this.#options.sessionTimeoutMs < 1
             || this.#options.sessionTimeoutMs > 60 * 60 * 1000) {
             throw new RuntimeConfigError("sessionTimeoutMs must be a positive integer <= 3600000");
+        }
+        if (!Number.isSafeInteger(this.#options.shutdownTimeoutMs)
+            || this.#options.shutdownTimeoutMs < 1
+            || this.#options.shutdownTimeoutMs > 60 * 1000) {
+            throw new RuntimeConfigError("shutdownTimeoutMs must be a positive integer <= 60000");
+        }
+        if (typeof this.#options.clock?.now !== "function") {
+            throw new RuntimeConfigError("clock must expose now()");
+        }
+        if (typeof this.#options.timers?.setTimeout !== "function") {
+            throw new RuntimeConfigError("timers must expose setTimeout()");
         }
         this.#claimedCandidateIds = new Set(options.existingCandidateIds ?? []);
     }
@@ -1005,7 +1054,36 @@ export class SdkWorkerPool {
         this.#claimedCandidateIds.delete(candidateId);
     }
 
+    #requestDeadline(inputDeadline) {
+        return earliestDeadline(
+            this.#options.deadlineMs,
+            parseDeadline(inputDeadline, "proposal request.deadlineMs"),
+        );
+    }
+
+    #remaining(deadlineMs) {
+        return remainingDeadlineMs(deadlineMs, this.#options.clock.now());
+    }
+
+    #assertDeadline(deadlineMs, stage) {
+        if (this.#remaining(deadlineMs) === 0) {
+            throw deadlineError(deadlineMs, stage, this.#options.clock.now());
+        }
+    }
+
+    async #settleSessionOperation(operation, timeoutMs) {
+        return settleWithin(operation, timeoutMs, {
+            timers: this.#options.timers,
+        });
+    }
+
     async start() {
+        if (this.#closing) {
+            throw new CrucibleRuntimeError(
+                RUNTIME_ERROR_CODES.STOPPED,
+                "SDK worker pool is closing",
+            );
+        }
         if (this.#client !== null) {
             return this;
         }
@@ -1050,6 +1128,19 @@ export class SdkWorkerPool {
                 if (typeof client.start === "function") {
                     await client.start();
                 }
+                if (this.#closing) {
+                    if (typeof client.stop === "function") {
+                        await settleWithin(
+                            () => client.stop(),
+                            this.#options.shutdownTimeoutMs,
+                            { timers: this.#options.timers },
+                        );
+                    }
+                    throw new CrucibleRuntimeError(
+                        RUNTIME_ERROR_CODES.STOPPED,
+                        "SDK worker pool closed while startup was in progress",
+                    );
+                }
                 // Publish only after the SDK has fully started. Concurrent
                 // propose() calls await this same promise and cannot observe a
                 // half-started client.
@@ -1057,11 +1148,11 @@ export class SdkWorkerPool {
                 this.#client = client;
             } catch (error) {
                 if (client !== null && typeof client.stop === "function") {
-                    try {
-                        await client.stop();
-                    } catch {
-                        // Preserve the startup failure.
-                    }
+                    await settleWithin(
+                        () => client.stop(),
+                        this.#options.shutdownTimeoutMs,
+                        { timers: this.#options.timers },
+                    );
                 }
                 if (error instanceof CrucibleRuntimeError) {
                     throw error;
@@ -1083,23 +1174,87 @@ export class SdkWorkerPool {
     }
 
     async close() {
+        this.#closing = true;
         if (this.#startPromise !== null) {
-            try {
-                await this.#startPromise;
-            } catch {
-                // Failed startup already cleaned up its unpublished client.
-            }
+            await settleWithin(this.#startPromise, this.#options.shutdownTimeoutMs, {
+                timers: this.#options.timers,
+            });
         }
         const client = this.#client;
         this.#client = null;
+        const sessions = [...this.#activeSessions];
+        this.#activeSessions.clear();
+        const failures = [];
+        await Promise.all(sessions.map(async (session) => {
+            for (const method of ["abort", "disconnect"]) {
+                if (typeof session?.[method] !== "function") continue;
+                const outcome = await this.#settleSessionOperation(
+                    () => session[method](),
+                    this.#options.shutdownTimeoutMs,
+                );
+                if (outcome.status !== "fulfilled") {
+                    failures.push({ component: `session.${method}`, outcome });
+                }
+            }
+        }));
         if (client !== null && typeof client.stop === "function") {
-            await client.stop();
+            const outcome = await settleWithin(
+                () => client.stop(),
+                this.#options.shutdownTimeoutMs,
+                { timers: this.#options.timers },
+            );
+            if (outcome.status !== "fulfilled") {
+                failures.push({ component: "client.stop", outcome });
+            }
+        }
+        if (failures.length > 0) {
+            throw new CrucibleRuntimeError(
+                RUNTIME_ERROR_CODES.RUNTIME_FAILURE,
+                "SDK worker pool shutdown exceeded its bounded cleanup policy",
+                {
+                    failures: failures.map(({ component, outcome }) => ({
+                        component,
+                        status: outcome.status,
+                        error: outcome.error?.message ?? null,
+                    })),
+                },
+            );
         }
     }
 
     async propose(input) {
-        await this.start();
         requirePlainObject(input, "proposal request");
+        const deadlineMs = this.#requestDeadline(input.deadlineMs);
+        this.#assertDeadline(deadlineMs, "proposal admission");
+        const startupTimeoutMs = Math.max(
+            1,
+            Math.min(this.#options.sessionTimeoutMs, this.#remaining(deadlineMs)),
+        );
+        const startup = await settleWithin(
+            () => this.start(),
+            startupTimeoutMs,
+            { timers: this.#options.timers },
+        );
+        if (startup.status === "rejected") {
+            throw startup.error;
+        }
+        if (startup.status === "timed_out") {
+            if (this.#remaining(deadlineMs) === 0) {
+                throw deadlineError(
+                    deadlineMs,
+                    "worker-pool startup",
+                    this.#options.clock.now(),
+                );
+            }
+            const error = new CrucibleRuntimeError(
+                RUNTIME_ERROR_CODES.WORKER_STARTUP,
+                `SDK worker pool startup exceeded ${startupTimeoutMs}ms`,
+                { startupTimeoutMs, deadlineMs },
+            );
+            error.recoverable = true;
+            throw error;
+        }
+        this.#assertDeadline(deadlineMs, "worker-pool startup");
         const model = requireString(input.model, "model", { max: 128 });
         const sessionId = requireString(
             input.sessionId ?? this.#options.idFactory(),
@@ -1148,6 +1303,7 @@ export class SdkWorkerPool {
         let protocolFailure = null;
         let callCount = 0;
         let claimedByThisSession = null;
+        let acceptingSubmissions = true;
 
         const recordFailure = (error) => {
             if (protocolFailure === null) {
@@ -1168,6 +1324,18 @@ export class SdkWorkerPool {
             parameters: toolSchema(this.#options.candidateLimits),
             handler: async (args, invocation) => {
                 callCount += 1;
+                if (!acceptingSubmissions || this.#closing) {
+                    return recordFailure(protocolError(
+                        RUNTIME_ERROR_CODES.STOPPED,
+                        "Proposal submission arrived after the session was closed",
+                        { sessionId, callCount },
+                    ));
+                }
+                try {
+                    this.#assertDeadline(deadlineMs, "proposal submission");
+                } catch (error) {
+                    return recordFailure(error);
+                }
                 if (callCount > 1) {
                     return recordFailure(protocolError(
                         RUNTIME_ERROR_CODES.WORKER_MULTIPLE_SUBMISSIONS,
@@ -1199,6 +1367,11 @@ export class SdkWorkerPool {
                         "Candidate id has already been submitted",
                         { candidateId: candidate.candidateId },
                     ));
+                }
+                try {
+                    this.#assertDeadline(deadlineMs, "proposal acceptance");
+                } catch (error) {
+                    return recordFailure(error);
                 }
                 this.#claimedCandidateIds.add(candidate.candidateId);
                 claimedByThisSession = candidate.candidateId;
@@ -1238,6 +1411,15 @@ export class SdkWorkerPool {
                 expectedChallenge: challengeNonce,
                 sessionId,
                 dataNonce: untrustedDataNonce({ challengeNonce, sessionId }),
+                assertAvailable: () => {
+                    if (!acceptingSubmissions || this.#closing) {
+                        throw new CrucibleRuntimeError(
+                            RUNTIME_ERROR_CODES.STOPPED,
+                            "Parent artifact access is closed for this proposal session",
+                        );
+                    }
+                    this.#assertDeadline(deadlineMs, "parent artifact access");
+                },
             }));
             availableTools.push(`custom:${READ_PARENT_ARTIFACT_TOOL_NAME}`);
         }
@@ -1274,23 +1456,64 @@ export class SdkWorkerPool {
                     { max: 32 },
                 );
             }
+            this.#assertDeadline(deadlineMs, "proposal session creation");
             session = await this.#client.createSession(sessionConfig);
-            await session.sendAndWait({ prompt }, this.#options.sessionTimeoutMs);
+            this.#activeSessions.add(session);
+            this.#assertDeadline(deadlineMs, "proposal session dispatch");
+            const remaining = this.#remaining(deadlineMs);
+            const sessionTimeoutMs = Math.max(
+                1,
+                Math.min(this.#options.sessionTimeoutMs, remaining),
+            );
+            const send = await this.#settleSessionOperation(
+                () => session.sendAndWait({ prompt }, sessionTimeoutMs),
+                sessionTimeoutMs,
+            );
+            if (send.status === "rejected") {
+                throw send.error;
+            }
+            if (send.status === "timed_out") {
+                if (this.#remaining(deadlineMs) === 0) {
+                throw deadlineError(
+                    deadlineMs,
+                    "proposal session",
+                    this.#options.clock.now(),
+                );
+                }
+                const error = new CrucibleRuntimeError(
+                RUNTIME_ERROR_CODES.CHILD_CRASH,
+                `Proposal session exceeded its timeout of ${sessionTimeoutMs}ms`,
+                { sessionId, model, sessionTimeoutMs, deadlineMs },
+                );
+                error.recoverable = true;
+                throw error;
+            }
+            this.#assertDeadline(deadlineMs, "proposal output acceptance");
         } catch (error) {
             sessionError = error;
+            acceptingSubmissions = false;
             if (session !== undefined && typeof session.abort === "function") {
-                try {
-                    await session.abort();
-                } catch {
-                    // Preserve the original session failure.
-                }
+                await this.#settleSessionOperation(
+                () => session.abort(),
+                this.#options.shutdownTimeoutMs,
+                );
             }
         } finally {
+            acceptingSubmissions = false;
+            if (session !== undefined) {
+                this.#activeSessions.delete(session);
+            }
             if (session !== undefined && typeof session.disconnect === "function") {
-                try {
-                    await session.disconnect();
-                } catch (error) {
-                    disconnectError = error;
+                const disconnected = await this.#settleSessionOperation(
+                () => session.disconnect(),
+                this.#options.shutdownTimeoutMs,
+                );
+                if (disconnected.status !== "fulfilled") {
+                disconnectError = disconnected.error ?? new CrucibleRuntimeError(
+                    RUNTIME_ERROR_CODES.RUNTIME_FAILURE,
+                    "Proposal session disconnect exceeded its shutdown bound",
+                    { sessionId, status: disconnected.status },
+                );
                 }
             }
         }
