@@ -2,7 +2,11 @@
 //
 // Public surface of the Crucible persistence layer.
 
-export { EventRepository, openRepository } from "./repository.mjs";
+export {
+    EventRepository,
+    openRepository,
+    openRepositoryReadOnly,
+} from "./repository.mjs";
 export {
     ERROR_CODES,
     SQLITE_ERRCODE,
@@ -26,6 +30,7 @@ export { SCHEMA_VERSION, COMMAND_STATES, TERMINAL_KINDS } from "./schema.mjs";
 export {
     ArtifactStore,
     openArtifactStore,
+    openArtifactStoreReadOnly,
     ARTIFACT_STORE_ERROR_CODES,
     ArtifactStoreError,
     UnsafePathError,

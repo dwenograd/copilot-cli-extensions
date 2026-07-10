@@ -8,9 +8,14 @@ import {
     EVENT_TYPES,
     IMPOSSIBILITY_REQUEST_HASH_ALGORITHM,
     NON_RESULT_CODES,
+    OBSERVATION_STREAM_HASH_ALGORITHM,
+    SNAPSHOT_EXECUTION_HASH_ALGORITHM,
     buildCandidateArchive,
     canonicalEqual,
     canonicalJson,
+    createEvidenceProvenance,
+    createMeasurementProvenance,
+    createSnapshotProvenance,
     createExternalEvent,
     decideNext,
     deriveImpossibilityVerdict,
@@ -18,6 +23,7 @@ import {
     duplicateEvidenceId,
     hashCanonical,
     harnessCandidateEvidenceItems,
+    immutableCanonical,
 } from "../domain/index.mjs";
 import {
     openArtifactStore,
@@ -25,6 +31,7 @@ import {
 } from "../persistence/index.mjs";
 import {
     PARSER_VERSION,
+    RECEIPT_VERSION,
     STREAM_HASH_ALGORITHM,
     createMeasurementExecutor,
     createDefaultProcessAdapter,
@@ -59,7 +66,6 @@ import {
 } from "./utils.mjs";
 
 const VALIDATION_RECEIPT_HASH_ALGORITHM = "sha256:crucible-runtime-validation-receipts-v1";
-const OBSERVATION_STREAM_HASH_ALGORITHM = "sha256:crucible-runtime-observation-streams-v1";
 const LOGICAL_EFFECT_KEY_ALGORITHM = "sha256:crucible-runtime-logical-effect-v1";
 const IMPOSSIBILITY_CERTIFICATE_ARTIFACT_HASH_ALGORITHM =
     "sha256:crucible-impossibility-certificate-artifact-v1";
@@ -70,6 +76,67 @@ const IMPOSSIBILITY_STDOUT_ARTIFACT_HASH_ALGORITHM =
 const IMPOSSIBILITY_STDERR_ARTIFACT_HASH_ALGORITHM =
     "sha256:crucible-impossibility-stderr-artifact-v1";
 const IMPOSSIBILITY_REQUEST_FILENAME = "crucible-impossibility-request.json";
+const SNAPSHOT_CLOSURE_HASH =
+    /^sha256:crucible-measurement-snapshot-closure-v1:[a-f0-9]{64}$/u;
+
+function compareStable(left, right) {
+    return left < right ? -1 : left > right ? 1 : 0;
+}
+
+function stagedHarnessHashesMatch(receipt) {
+    if (receipt?.stagedExecutableHash !== receipt?.executableHash
+        || !Array.isArray(receipt?.dependencyHashes)
+        || !Array.isArray(receipt?.stagedDependencyHashes)
+        || receipt.dependencyHashes.length !== receipt.stagedDependencyHashes.length) {
+        return false;
+    }
+    const project = (items) => items
+        .map((item) => ({
+            role: item?.role ?? null,
+            sha256: item?.sha256 ?? null,
+        }))
+        .sort((left, right) =>
+            compareStable(
+                `${left.role ?? ""}\0${left.sha256 ?? ""}`,
+                `${right.role ?? ""}\0${right.sha256 ?? ""}`,
+            ));
+    return canonicalEqual(
+        project(receipt.dependencyHashes),
+        project(receipt.stagedDependencyHashes),
+    );
+}
+
+function receiptHasVerifiedSnapshotBytes(receipt, candidateSnapshotHash) {
+    const identity = receipt?.candidateSnapshotIdentitySummary;
+    const mutation = receipt?.candidateSnapshotMutationCheck;
+    return receipt?.version === RECEIPT_VERSION
+        && receipt.candidateSnapshotHash === candidateSnapshotHash
+        && SNAPSHOT_CLOSURE_HASH.test(
+            receipt.candidateSnapshotPreClosureHash ?? "",
+        )
+        && receipt.candidateSnapshotPreClosureHash
+            === receipt.candidateSnapshotPostClosureHash
+        && identity !== null
+        && typeof identity === "object"
+        && identity.pre !== undefined
+        && identity.post !== undefined
+        && canonicalEqual(identity.pre, identity.post)
+        && mutation?.status === "passed"
+        && mutation.closureStable === true
+        && mutation.identityStable === true
+        && mutation.openHandleRehashStable === true
+        && mutation.reparseStable === true
+        && stagedHarnessHashesMatch(receipt);
+}
+
+function snapshotExecutionHash(receipt) {
+    return hashCanonical({
+        candidateSnapshotPreClosureHash: receipt.candidateSnapshotPreClosureHash,
+        candidateSnapshotPostClosureHash: receipt.candidateSnapshotPostClosureHash,
+        candidateSnapshotIdentitySummary: receipt.candidateSnapshotIdentitySummary,
+        candidateSnapshotMutationCheck: receipt.candidateSnapshotMutationCheck,
+    }, SNAPSHOT_EXECUTION_HASH_ALGORITHM);
+}
 
 function defaultClock() {
     return {
@@ -565,7 +632,7 @@ export class AutonomousRunner {
         return { stdout, stderr };
     }
 
-    async #runHarnessMeasurement(input, { requireRawOutput = false } = {}) {
+    async #runHarnessMeasurement(input) {
         let measurement;
         try {
             measurement = await this.#executor.run(input);
@@ -574,9 +641,9 @@ export class AutonomousRunner {
             throw error;
         }
         const rawOutput = this.#takeCapturedOutput(input.attemptId, measurement);
-        if (requireRawOutput && rawOutput === null) {
+        if (rawOutput === null) {
             throw new RuntimeIntegrityError(
-                "The impossibility verifier completed without capturable raw output",
+                "The trusted harness completed without capturable raw output",
                 { attemptId: input.attemptId },
             );
         }
@@ -779,10 +846,20 @@ export class AutonomousRunner {
                     { logicalEffectKey, command },
                 );
             }
-            const result = await recover(committed, logicalEffectKey);
+            const recovered = await recover(committed, logicalEffectKey);
+            if (recovered === null
+                || typeof recovered !== "object"
+                || !Object.hasOwn(recovered, "result")
+                || !Object.hasOwn(recovered, "persisted")) {
+                throw new RuntimeIntegrityError(
+                    "Recovery decoder did not return canonical result and persistence state",
+                    { logicalEffectKey, command },
+                );
+            }
             return {
                 attemptId: committed.attempt.attemptId,
-                result,
+                result: recovered.result,
+                persisted: recovered.persisted,
                 logicalEffectKey,
                 recovered: true,
             };
@@ -835,9 +912,9 @@ export class AutonomousRunner {
         }
 
         this.#adapter.observeAttempt(attemptId, this.#lease);
-        if (persist !== null) {
-            await persist(result, attemptId, logicalEffectKey);
-        }
+        const persisted = persist === null
+            ? null
+            : await persist(result, attemptId, logicalEffectKey);
         await this.#fault("after_effect_artifact_persistence", {
             attemptId,
             command,
@@ -849,7 +926,13 @@ export class AutonomousRunner {
             command,
             logicalEffectKey,
         });
-        return { attemptId, result, logicalEffectKey, recovered: false };
+        return {
+            attemptId,
+            result,
+            persisted,
+            logicalEffectKey,
+            recovered: false,
+        };
     }
 
     #findCommittedEffect(logicalEffectKey, command) {
@@ -953,7 +1036,7 @@ export class AutonomousRunner {
         return value;
     }
 
-    #readRegisteredBytesArtifact(artifactId, label) {
+    #registeredArtifactRef(artifactId, label) {
         const artifact = this.#repository.getArtifact(artifactId);
         if (artifact === null
             || artifact.investigationId !== this.#config.investigationId
@@ -967,6 +1050,19 @@ export class AutonomousRunner {
             );
         }
         const objectId = `sha256:${artifact.hashValue}`;
+        return {
+            artifact: {
+                artifactId,
+                objectId,
+            },
+            metadata: artifact,
+        };
+    }
+
+    #readRegisteredBytesArtifact(artifactId, label) {
+        const registered = this.#registeredArtifactRef(artifactId, label);
+        const { artifact, metadata } = registered;
+        const objectId = artifact.objectId;
         let bytes;
         try {
             bytes = this.#artifactStore.readObject(objectId, { verify: true });
@@ -977,12 +1073,12 @@ export class AutonomousRunner {
                 { cause: error },
             );
         }
-        if (artifact.sizeBytes !== bytes.length) {
+        if (metadata.sizeBytes !== bytes.length) {
             throw new RuntimeIntegrityError(
                 `${label} artifact size disagrees with repository metadata`,
                 {
                     artifactId,
-                    expectedSize: artifact.sizeBytes,
+                    expectedSize: metadata.sizeBytes,
                     actualSize: bytes.length,
                 },
             );
@@ -1060,7 +1156,17 @@ export class AutonomousRunner {
                 );
             }
         }
-        return proposal;
+        const proposalArtifact = this.#registeredArtifactRef(
+            payload.artifactId,
+            "Committed proposal",
+        ).artifact;
+        return {
+            result: proposal,
+            persisted: {
+                proposalArtifact,
+                promptContextHash: request.promptContextHash,
+            },
+        };
     }
 
     #recoverMeasurementEffect({
@@ -1089,7 +1195,10 @@ export class AutonomousRunner {
             || payload.snapshotId !== snapshotId
             || payload.candidateArtifactHash !== candidateArtifactHash
             || payload.receipt?.attemptId !== committed.attempt.attemptId
-            || payload.receipt?.candidateSnapshotHash !== candidateArtifactHash
+            || !receiptHasVerifiedSnapshotBytes(
+                payload.receipt,
+                candidateArtifactHash,
+            )
             || payload.receipt?.parserVersion !== aggregate.contract.parserVersion
             || payload.stdoutHash !== payload.receipt?.stdoutHash
             || payload.stderrHash !== payload.receipt?.stderrHash
@@ -1138,12 +1247,178 @@ export class AutonomousRunner {
                 },
             );
         }
-        return {
+        const rawStdoutBytes = this.#readRegisteredBytesArtifact(
+            payload.rawStdoutArtifactId,
+            "Committed measurement stdout",
+        );
+        const rawStderrBytes = this.#readRegisteredBytesArtifact(
+            payload.rawStderrArtifactId,
+            "Committed measurement stderr",
+        );
+        if (sha256Bytes(rawStdoutBytes, STREAM_HASH_ALGORITHM) !== payload.stdoutHash
+            || sha256Bytes(rawStderrBytes, STREAM_HASH_ALGORITHM) !== payload.stderrHash) {
+            throw new RuntimeIntegrityError(
+                "Committed raw-output artifacts disagree with the measurement receipt",
+                { logicalEffectKey, attemptId: committed.attempt.attemptId },
+            );
+        }
+        const receiptArtifact = this.#registeredArtifactRef(
+            payload.receiptArtifactId,
+            "Committed measurement receipt",
+        ).artifact;
+        const rawStdoutArtifact = this.#registeredArtifactRef(
+            payload.rawStdoutArtifactId,
+            "Committed measurement stdout",
+        ).artifact;
+        const rawStderrArtifact = this.#registeredArtifactRef(
+            payload.rawStderrArtifactId,
+            "Committed measurement stderr",
+        ).artifact;
+        const snapshot = this.#verifySnapshotProvenance(
+            payload.measurementProvenance?.snapshot,
+            snapshotId,
+            "Committed measurement snapshot",
+        );
+        const measurementProvenance = createMeasurementProvenance({
+            subjectId: candidateId,
+            receiptArtifact,
+            receiptHash: payload.receiptHash,
+            rawStdoutArtifact,
+            rawStdoutHash: payload.stdoutHash,
+            rawStderrArtifact,
+            rawStderrHash: payload.stderrHash,
+            parserVersion: payload.receipt.parserVersion,
+            allowlistFileHash: payload.receipt.allowlistFileHash,
+            harnessEntryHash: payload.receipt.harnessEntryHash,
+            executableHash: payload.receipt.executableHash,
+            stagedExecutableHash: payload.receipt.stagedExecutableHash,
+            dependencyHashes: payload.receipt.dependencyHashes,
+            stagedDependencyHashes: payload.receipt.stagedDependencyHashes,
+            argvHash: payload.receipt.argvHash,
+            envHash: payload.receipt.envHash,
+            sandboxPolicy: payload.receipt.sandbox === null
+                ? {
+                    kind: "none",
+                    sandboxId: null,
+                    environmentHash: null,
+                }
+                : {
+                    kind: "sandbox",
+                    sandboxId: payload.receipt.sandbox.sandboxId,
+                    environmentHash: payload.receipt.sandbox.environmentHash,
+                },
+            snapshot,
+            snapshotExecutionHash: snapshotExecutionHash(payload.receipt),
+        });
+        if (!canonicalEqual(payload.measurementProvenance, measurementProvenance)) {
+            throw new RuntimeIntegrityError(
+                "Committed measurement provenance does not reproduce its artifact closure",
+                { logicalEffectKey, attemptId: committed.attempt.attemptId },
+            );
+        }
+        const measurement = {
             parsed: payload.parsed,
             receipt: payload.receipt,
             stdoutHash: payload.stdoutHash,
             stderrHash: payload.stderrHash,
         };
+        return {
+            measurement,
+            rawOutput: {
+                stdout: rawStdoutBytes,
+                stderr: rawStderrBytes,
+            },
+            persisted: {
+                measurementProvenance,
+            },
+        };
+    }
+
+    #verifySnapshotProvenance(snapshotProvenance, snapshotId, label) {
+        const snapshotStatus = this.#artifactStore.verifySnapshot(snapshotId);
+        if (!snapshotStatus.ok) {
+            throw new RuntimeIntegrityError(
+                `${label} failed ArtifactStore verification`,
+                { snapshotId, snapshotStatus },
+            );
+        }
+        const manifest = this.#artifactStore.loadManifest(snapshotId);
+        if (snapshotProvenance?.manifestArtifact?.objectId !== snapshotId) {
+            throw new RuntimeIntegrityError(
+                `${label} manifest artifact does not match its snapshot id`,
+                { snapshotId },
+            );
+        }
+        const registeredManifest = this.#registeredArtifactRef(
+            snapshotProvenance.manifestArtifact.artifactId,
+            `${label} manifest`,
+        );
+        const manifestArtifact = registeredManifest.artifact;
+        const manifestBytes = this.#artifactStore.readObject(snapshotId, { verify: true });
+        if (registeredManifest.metadata.sizeBytes !== manifestBytes.length) {
+            throw new RuntimeIntegrityError(
+                `${label} manifest size disagrees with repository metadata`,
+                {
+                    artifactId: manifestArtifact.artifactId,
+                    expectedSize: registeredManifest.metadata.sizeBytes,
+                    actualSize: manifestBytes.length,
+                },
+            );
+        }
+        const expectedObjects = [...new Set(manifest.entries.map((entry) => entry.object))]
+            .sort(compareStable);
+        const expectedSizes = new Map(
+            manifest.entries.map((entry) => [entry.object, entry.size]),
+        );
+        const suppliedObjects = (snapshotProvenance.objectArtifacts ?? [])
+            .map((artifact) => artifact.objectId)
+            .sort(compareStable);
+        if (!canonicalEqual(suppliedObjects, expectedObjects)) {
+            throw new RuntimeIntegrityError(
+                `${label} object artifact set does not match the canonical manifest closure`,
+                { snapshotId, suppliedObjects, expectedObjects },
+            );
+        }
+        const objectArtifacts = snapshotProvenance.objectArtifacts.map((artifact, index) => {
+            const registeredRecord = this.#registeredArtifactRef(
+                artifact.artifactId,
+                `${label} object ${index}`,
+            );
+            const registered = registeredRecord.artifact;
+            if (registered.objectId !== artifact.objectId) {
+                throw new RuntimeIntegrityError(
+                    `${label} object artifact metadata changed`,
+                    { artifactId: artifact.artifactId },
+                );
+            }
+            const bytes = this.#artifactStore.readObject(registered.objectId, { verify: true });
+            if (registeredRecord.metadata.sizeBytes !== bytes.length
+                || expectedSizes.get(registered.objectId) !== bytes.length) {
+                throw new RuntimeIntegrityError(
+                    `${label} object size disagrees with repository or manifest metadata`,
+                    {
+                        artifactId: artifact.artifactId,
+                        objectId: registered.objectId,
+                        repositorySize: registeredRecord.metadata.sizeBytes,
+                        manifestSize: expectedSizes.get(registered.objectId) ?? null,
+                        actualSize: bytes.length,
+                    },
+                );
+            }
+            return registered;
+        });
+        const rebuilt = createSnapshotProvenance({
+            snapshotHash: measurementSnapshotHash(snapshotId),
+            manifestArtifact,
+            objectArtifacts,
+        });
+        if (!canonicalEqual(snapshotProvenance, rebuilt)) {
+            throw new RuntimeIntegrityError(
+                `${label} provenance root is not canonical`,
+                { snapshotId },
+            );
+        }
+        return rebuilt;
     }
 
     #recoverImpossibilityVerification({
@@ -1154,7 +1429,7 @@ export class AutonomousRunner {
         command,
         snapshotId,
     }) {
-        const measurement = this.#recoverMeasurementEffect({
+        const recoveredMeasurement = this.#recoverMeasurementEffect({
             committed,
             logicalEffectKey,
             aggregate,
@@ -1163,6 +1438,7 @@ export class AutonomousRunner {
             candidateId: `impossibility-${command.attemptOrdinal}`,
             snapshotId,
         });
+        const measurement = recoveredMeasurement.measurement;
         const measurementEvent = this.#requireRecoveredEffectEvent(
             committed,
             "runtime:measurement",
@@ -1180,20 +1456,18 @@ export class AutonomousRunner {
             || payload.snapshotId !== snapshotId
             || payload.verificationSnapshotHash !== measurementSnapshotHash(snapshotId)
             || payload.measurementReceiptArtifactId
-                !== measurementEvent.payload.receiptArtifactId) {
+                !== measurementEvent.payload.receiptArtifactId
+            || payload.rawStdoutArtifactId
+                !== measurementEvent.payload.rawStdoutArtifactId
+            || payload.rawStderrArtifactId
+                !== measurementEvent.payload.rawStderrArtifactId) {
             throw new RuntimeIntegrityError(
                 "Committed impossibility certificate does not match the reserved verifier command",
                 { logicalEffectKey, attemptId: committed.attempt.attemptId },
             );
         }
-        const rawStdoutBytes = this.#readRegisteredBytesArtifact(
-            payload.rawStdoutArtifactId,
-            "Committed impossibility stdout",
-        );
-        const rawStderrBytes = this.#readRegisteredBytesArtifact(
-            payload.rawStderrArtifactId,
-            "Committed impossibility stderr",
-        );
+        const rawStdoutBytes = recoveredMeasurement.rawOutput.stdout;
+        const rawStderrBytes = recoveredMeasurement.rawOutput.stderr;
         const rebuilt = this.#buildImpossibilityVerificationResult({
             aggregate,
             command,
@@ -1215,13 +1489,28 @@ export class AutonomousRunner {
             || payload.measurementReceiptArtifactHash
                 !== rebuilt.measurementReceiptArtifactHash
             || payload.rawStdoutArtifactHash !== rebuilt.rawStdoutArtifactHash
-            || payload.rawStderrArtifactHash !== rebuilt.rawStderrArtifactHash) {
+            || payload.rawStderrArtifactHash !== rebuilt.rawStderrArtifactHash
+            || !canonicalEqual(
+                payload.measurementProvenance,
+                recoveredMeasurement.persisted.measurementProvenance,
+            )) {
             throw new RuntimeIntegrityError(
                 "Committed impossibility artifacts do not reproduce the trusted certificate",
                 { logicalEffectKey, attemptId: committed.attempt.attemptId },
             );
         }
-        return rebuilt;
+        const certificateArtifact = this.#registeredArtifactRef(
+            payload.certificateArtifactId,
+            "Committed impossibility certificate",
+        ).artifact;
+        return {
+            result: rebuilt,
+            persisted: {
+                measurementProvenance:
+                    recoveredMeasurement.persisted.measurementProvenance,
+                certificateArtifact,
+            },
+        };
     }
 
     async #runValidationCommand(aggregate, commandId, mainAttemptId) {
@@ -1242,29 +1531,26 @@ export class AutonomousRunner {
                     command,
                     async (attemptId) => {
                         const verifiedEntry = this.#allowlist.verifyEntry(contract.harnessId);
-                        return (await this.#runHarnessMeasurement({
+                        return this.#runHarnessMeasurement({
                             verifiedEntry,
-                            candidateSnapshot: Object.freeze({
-                                path: materialized.dest,
-                                hash: measurementSnapshotHash(validationCase.artifactHash),
-                            }),
+                            candidateSnapshot: materialized.candidateSnapshot,
                             attemptId,
                             runnerEpochId: this.#config.runnerEpochId,
-                        })).measurement;
+                        });
                     },
-                    async (measurement, attemptId, logicalEffectKey) => {
+                    async (executed, attemptId, logicalEffectKey) =>
                         this.#persistMeasurement({
-                            measurement,
+                            measurement: executed.measurement,
+                            rawOutput: executed.rawOutput,
                             attemptId,
                             logicalEffectKey,
                             purpose: "validation",
                             commandId,
                             candidateId: validationCase.id,
                             snapshotId: validationCase.artifactHash,
-                        });
-                    },
-                    async (committed, logicalEffectKey) =>
-                        this.#recoverMeasurementEffect({
+                        }),
+                    async (committed, logicalEffectKey) => {
+                        const recovered = this.#recoverMeasurementEffect({
                             committed,
                             logicalEffectKey,
                             aggregate,
@@ -1272,9 +1558,18 @@ export class AutonomousRunner {
                             commandId,
                             candidateId: validationCase.id,
                             snapshotId: validationCase.artifactHash,
-                        }),
+                        });
+                        return {
+                            result: {
+                                measurement: recovered.measurement,
+                                rawOutput: null,
+                            },
+                            persisted: recovered.persisted,
+                        };
+                    },
                 );
-                const outcome = effect.result.parsed.pass ? "accept" : "reject";
+                const measurement = effect.result.measurement;
+                const outcome = measurement.parsed.pass ? "accept" : "reject";
                 return {
                     id: validationCase.id,
                     artifactHash: validationCase.artifactHash,
@@ -1282,10 +1577,11 @@ export class AutonomousRunner {
                     outcome,
                     matched: outcome === validationCase.expectation,
                     attemptId: effect.attemptId,
-                    parsed: effect.result.parsed,
-                    receiptHash: ensureReceiptObservationHash(hashReceipt(effect.result.receipt)),
-                    stdoutHash: effect.result.stdoutHash,
-                    stderrHash: effect.result.stderrHash,
+                    parsed: measurement.parsed,
+                    receiptHash: ensureReceiptObservationHash(hashReceipt(measurement.receipt)),
+                    stdoutHash: measurement.stdoutHash,
+                    stderrHash: measurement.stderrHash,
+                    measurementProvenance: effect.persisted.measurementProvenance,
                 };
             } finally {
                 removeTreeInside(materialized.dest, this.#runTempRoot);
@@ -1358,6 +1654,14 @@ export class AutonomousRunner {
                 artifactId: compositeArtifact.artifactId,
             },
         });
+        const provenance = createEvidenceProvenance({
+            validationCompositeArtifact: compositeArtifact,
+            measurements: caseRuns.map((item) => item.measurementProvenance),
+        }, {
+            purpose: "validation",
+            command: aggregate.commands[commandId].command,
+            contract,
+        });
 
         return {
             commandId,
@@ -1366,6 +1670,7 @@ export class AutonomousRunner {
             }),
             purpose: "validation",
             receipt: {
+                version: 1,
                 attemptId: mainAttemptId,
                 runnerEpochId: this.#config.runnerEpochId,
                 rawStdoutHash: hashCanonical(
@@ -1377,6 +1682,7 @@ export class AutonomousRunner {
                     OBSERVATION_STREAM_HASH_ALGORITHM,
                 ),
                 candidateArtifactHash: null,
+                provenance,
             },
             data: {
                 caseResults: caseRuns.map((item) => ({
@@ -1428,12 +1734,10 @@ export class AutonomousRunner {
         command,
         snapshotId,
     }) {
-        const snapshotArtifact = this.#registerCasObject({
+        const snapshotProvenance = this.#persistSnapshotProvenance({
             attemptId,
             kind: `impossibility-request-${command.attemptOrdinal}`,
-            objectId: snapshotId,
-            size: this.#artifactStore.readObject(snapshotId, { verify: true }).length,
-            contentType: "application/vnd.crucible.snapshot+json",
+            snapshotId,
         });
         this.#adapter.ingestOperationalEvidence({
             attemptId,
@@ -1445,7 +1749,8 @@ export class AutonomousRunner {
                 requestHash: command.requestHash,
                 snapshotId,
                 verificationSnapshotHash: measurementSnapshotHash(snapshotId),
-                artifactId: snapshotArtifact.artifactId,
+                artifactId: snapshotProvenance.manifestArtifact.artifactId,
+                snapshotProvenance,
             },
         });
     }
@@ -1458,7 +1763,10 @@ export class AutonomousRunner {
         rawOutput,
     }) {
         const verificationSnapshotHash = measurementSnapshotHash(snapshotId);
-        if (measurement.receipt?.candidateSnapshotHash !== verificationSnapshotHash
+        if (!receiptHasVerifiedSnapshotBytes(
+            measurement.receipt,
+            verificationSnapshotHash,
+        )
             || measurement.receipt?.parserVersion !== command.parserVersion
             || measurement.receipt?.parsed === undefined
             || !canonicalEqual(measurement.receipt.parsed, measurement.parsed)
@@ -1564,13 +1872,10 @@ export class AutonomousRunner {
                     const verifiedEntry = this.#allowlist.verifyEntry(command.harnessId);
                     const executed = await this.#runHarnessMeasurement({
                         verifiedEntry,
-                        candidateSnapshot: Object.freeze({
-                            path: materialized.dest,
-                            hash: measurementSnapshotHash(requestSnapshot.snapshot),
-                        }),
+                        candidateSnapshot: materialized.candidateSnapshot,
                         attemptId,
                         runnerEpochId: this.#config.runnerEpochId,
-                    }, { requireRawOutput: true });
+                    });
                     return this.#buildImpossibilityVerificationResult({
                         aggregate,
                         command,
@@ -1579,7 +1884,7 @@ export class AutonomousRunner {
                         rawOutput: executed.rawOutput,
                     });
                 },
-                async (result, attemptId, logicalEffectKey) => {
+                async (result, attemptId, logicalEffectKey) =>
                     this.#persistImpossibilityVerification({
                         result,
                         attemptId,
@@ -1587,8 +1892,7 @@ export class AutonomousRunner {
                         commandId,
                         command,
                         snapshotId: requestSnapshot.snapshot,
-                    });
-                },
+                    }),
                 async (committed, logicalEffectKey) =>
                     this.#recoverImpossibilityVerification({
                         committed,
@@ -1600,6 +1904,15 @@ export class AutonomousRunner {
                     }),
             );
             const result = effect.result;
+            const provenance = createEvidenceProvenance({
+                impossibilityCertificateArtifact:
+                    effect.persisted.certificateArtifact,
+                measurements: [effect.persisted.measurementProvenance],
+            }, {
+                purpose: "impossibility",
+                command,
+                contract: aggregate.contract,
+            });
             return {
                 commandId,
                 observationId: this.#stableObservationId(commandId, {
@@ -1609,6 +1922,7 @@ export class AutonomousRunner {
                 }),
                 purpose: "impossibility",
                 receipt: {
+                    version: 1,
                     attemptId: effect.attemptId,
                     runnerEpochId: result.measurement.receipt.runnerEpochId,
                     rawStdoutHash: result.measurement.stdoutHash,
@@ -1622,6 +1936,7 @@ export class AutonomousRunner {
                     rawStdoutArtifactHash: result.rawStdoutArtifactHash,
                     verificationRequestHash: command.requestHash,
                     verificationSnapshotHash: result.verificationSnapshotHash,
+                    provenance,
                 },
                 data: {
                     certificateVersion: command.certificateVersion,
@@ -1711,6 +2026,10 @@ export class AutonomousRunner {
                             artifactId: artifact.artifactId,
                         },
                     });
+                    return {
+                        proposalArtifact: artifact,
+                        promptContextHash: request.promptContextHash,
+                    };
                 },
                 async (committed, logicalEffectKey) =>
                     this.#recoverProposalEffect({
@@ -1726,6 +2045,15 @@ export class AutonomousRunner {
         }
 
         const proposal = proposalEffect.result;
+        const proposalProvenance = proposalEffect.persisted;
+        if (proposalProvenance === null
+            || proposalProvenance.proposalArtifact === undefined
+            || proposalProvenance.promptContextHash !== request.promptContextHash) {
+            throw new RuntimeIntegrityError(
+                "Proposal effect completed without durable prompt/proposal provenance",
+                { commandId, candidateId: command.candidateId },
+            );
+        }
         const annotations = normalizeCandidateAnnotations(proposal, command);
         const snapshot = this.#ingestCandidate(proposal);
         const candidateArtifactHash = measurementSnapshotHash(snapshot.snapshot);
@@ -1752,6 +2080,8 @@ export class AutonomousRunner {
 
         let measurement;
         let measurementAttemptId;
+        let measurementProvenance;
+        let measurementReuseArtifact = null;
         if (reusable !== null) {
             measurement = {
                 parsed: reusable.observation.data,
@@ -1759,7 +2089,11 @@ export class AutonomousRunner {
                 stderrHash: reusable.observation.receipt.rawStderrHash,
             };
             measurementAttemptId = reusable.observation.receipt.attemptId;
-            this.#persistDuplicateMeasurementReuse({
+            measurementProvenance = createMeasurementProvenance({
+                ...reusable.measurementProvenance,
+                subjectId: command.candidateId,
+            });
+            measurementReuseArtifact = this.#persistDuplicateMeasurementReuse({
                 attemptId: mainAttemptId,
                 commandId,
                 command,
@@ -1767,7 +2101,7 @@ export class AutonomousRunner {
                 candidateArtifactHash,
                 duplicateOf,
                 reusable,
-            });
+            }).artifact;
         } else {
             const materialized = this.#materializeSnapshot(
                 snapshot.snapshot,
@@ -1787,19 +2121,17 @@ export class AutonomousRunner {
                         const verifiedEntry = this.#allowlist.verifyEntry(
                             aggregate.contract.harnessId,
                         );
-                        return (await this.#runHarnessMeasurement({
+                        return this.#runHarnessMeasurement({
                             verifiedEntry,
-                            candidateSnapshot: Object.freeze({
-                                path: materialized.dest,
-                                hash: candidateArtifactHash,
-                            }),
+                            candidateSnapshot: materialized.candidateSnapshot,
                             attemptId,
                             runnerEpochId: this.#config.runnerEpochId,
-                        })).measurement;
+                        });
                     },
-                    async (result, attemptId, logicalEffectKey) => {
+                    async (executed, attemptId, logicalEffectKey) =>
                         this.#persistMeasurement({
-                            measurement: result,
+                            measurement: executed.measurement,
+                            rawOutput: executed.rawOutput,
                             attemptId,
                             logicalEffectKey,
                             purpose: "candidate",
@@ -1808,10 +2140,9 @@ export class AutonomousRunner {
                             slotIndex: command.slotIndex,
                             candidateId: command.candidateId,
                             snapshotId: snapshot.snapshot,
-                        });
-                    },
-                    async (committed, logicalEffectKey) =>
-                        this.#recoverMeasurementEffect({
+                        }),
+                    async (committed, logicalEffectKey) => {
+                        const recovered = this.#recoverMeasurementEffect({
                             committed,
                             logicalEffectKey,
                             aggregate,
@@ -1821,14 +2152,34 @@ export class AutonomousRunner {
                             slotIndex: command.slotIndex,
                             candidateId: command.candidateId,
                             snapshotId: snapshot.snapshot,
-                        }),
+                        });
+                        return {
+                            result: {
+                                measurement: recovered.measurement,
+                                rawOutput: null,
+                            },
+                            persisted: recovered.persisted,
+                        };
+                    },
                 );
-                measurement = effect.result;
+                measurement = effect.result.measurement;
                 measurementAttemptId = effect.attemptId;
+                measurementProvenance = effect.persisted.measurementProvenance;
             } finally {
                 removeTreeInside(materialized.dest, this.#runTempRoot);
             }
         }
+
+        const provenance = createEvidenceProvenance({
+            proposalArtifact: proposalProvenance.proposalArtifact,
+            promptContextHash: proposalProvenance.promptContextHash,
+            measurementReuseArtifact,
+            measurements: [measurementProvenance],
+        }, {
+            purpose: "candidate",
+            command,
+            contract: aggregate.contract,
+        });
 
         return {
             commandId,
@@ -1847,12 +2198,14 @@ export class AutonomousRunner {
                 finding: annotations.finding ?? trustedHarnessFinding(measurement.parsed),
             },
             receipt: {
+                version: 1,
                 attemptId: measurementAttemptId,
                 runnerEpochId: reusable?.observation.receipt.runnerEpochId
                     ?? this.#config.runnerEpochId,
                 rawStdoutHash: measurement.stdoutHash,
                 rawStderrHash: measurement.stderrHash,
                 candidateArtifactHash,
+                provenance,
             },
             data: measurement.parsed,
         };
@@ -1956,12 +2309,10 @@ export class AutonomousRunner {
         snapshotId,
         candidateArtifactHash,
     }) {
-        const snapshotArtifact = this.#registerCasObject({
+        const snapshotProvenance = this.#persistSnapshotProvenance({
             attemptId,
             kind: `candidate-snapshot-${command.candidateId}`,
-            objectId: snapshotId,
-            size: this.#artifactStore.readObject(snapshotId, { verify: true }).length,
-            contentType: "application/vnd.crucible.snapshot+json",
+            snapshotId,
         });
         this.#adapter.ingestOperationalEvidence({
             attemptId,
@@ -1974,9 +2325,11 @@ export class AutonomousRunner {
                 candidateId: command.candidateId,
                 snapshotId,
                 candidateArtifactHash,
-                artifactId: snapshotArtifact.artifactId,
+                artifactId: snapshotProvenance.manifestArtifact.artifactId,
+                snapshotProvenance,
             },
         });
+        return snapshotProvenance;
     }
 
     #findReusableMeasurement(aggregate, duplicateOf, candidateArtifactHash) {
@@ -2024,8 +2377,15 @@ export class AutonomousRunner {
                 || payload.receipt.harnessEntryHash !== verifiedEntry.entryHash
                 || payload.receipt.executableHash !== verifiedEntry.executableHash
                 || payload.receipt.parserVersion !== aggregate.contract.parserVersion
-                || payload.receipt.candidateSnapshotHash !== candidateArtifactHash
-                || !canonicalEqual(payload.receipt.dependencyHashes, expectedDependencies)) {
+                || !receiptHasVerifiedSnapshotBytes(
+                    payload.receipt,
+                    candidateArtifactHash,
+                )
+                || !canonicalEqual(payload.receipt.dependencyHashes, expectedDependencies)
+                || !canonicalEqual(
+                    payload.measurementProvenance,
+                    observation.receipt.provenance.measurements[0],
+                )) {
                 continue;
             }
             const snapshotStatus = this.#artifactStore.verifySnapshot(payload.snapshotId);
@@ -2058,10 +2418,33 @@ export class AutonomousRunner {
             if (!canonicalEqual(persistedReceipt, payload.receipt)) {
                 continue;
             }
+            try {
+                const rawStdoutBytes = this.#readRegisteredBytesArtifact(
+                    payload.rawStdoutArtifactId,
+                    "Reusable measurement stdout",
+                );
+                const rawStderrBytes = this.#readRegisteredBytesArtifact(
+                    payload.rawStderrArtifactId,
+                    "Reusable measurement stderr",
+                );
+                if (sha256Bytes(rawStdoutBytes, STREAM_HASH_ALGORITHM) !== payload.stdoutHash
+                    || sha256Bytes(rawStderrBytes, STREAM_HASH_ALGORITHM)
+                        !== payload.stderrHash) {
+                    continue;
+                }
+                this.#verifySnapshotProvenance(
+                    payload.measurementProvenance.snapshot,
+                    payload.snapshotId,
+                    "Reusable measurement snapshot",
+                );
+            } catch {
+                continue;
+            }
             return {
                 evidence,
                 observation,
                 measurementRecord: row,
+                measurementProvenance: payload.measurementProvenance,
                 snapshotId: payload.snapshotId,
             };
         }
@@ -2111,6 +2494,7 @@ export class AutonomousRunner {
                 artifactId: artifact.artifactId,
             },
         });
+        return { artifact };
     }
 
     #parseParentAccessRequest(input, evidenceId, objectId = null) {
@@ -2312,15 +2696,33 @@ export class AutonomousRunner {
         }
         const root = ensureDirectory(path.join(this.#runTempRoot, "materialized"));
         const destDir = uniqueNonexistentPath(root, label, this.#idFactory());
-        return this.#artifactStore.materializeSnapshot({
+        const manifest = this.#artifactStore.loadManifest(snapshotId);
+        const materialized = this.#artifactStore.materializeSnapshot({
             snapshot: snapshotId,
             destDir,
             readOnly: true,
         });
+        const expectedObjectClosure = [
+            ...new Set([
+                snapshotId,
+                ...manifest.entries.map((entry) => entry.object),
+            ]),
+        ].sort(compareStable);
+        return {
+            ...materialized,
+            candidateSnapshot: immutableCanonical({
+                path: materialized.dest,
+                hash: measurementSnapshotHash(snapshotId),
+                snapshotId,
+                manifest,
+                expectedObjectClosure,
+            }),
+        };
     }
 
     #persistMeasurement({
         measurement,
+        rawOutput,
         attemptId,
         logicalEffectKey,
         purpose,
@@ -2331,9 +2733,12 @@ export class AutonomousRunner {
         snapshotId,
     }) {
         const candidateArtifactHash = measurementSnapshotHash(snapshotId);
-        if (measurement.receipt?.candidateSnapshotHash !== candidateArtifactHash) {
+        if (!receiptHasVerifiedSnapshotBytes(
+            measurement.receipt,
+            candidateArtifactHash,
+        )) {
             throw new RuntimeIntegrityError(
-                "Measurement receipt does not bind the ingested candidate snapshot",
+                "Measurement receipt does not bind the exact executed candidate bytes",
                 {
                     candidateId,
                     snapshotId,
@@ -2343,18 +2748,71 @@ export class AutonomousRunner {
                 },
             );
         }
+        if (rawOutput === null
+            || !Buffer.isBuffer(rawOutput.stdout)
+            || !Buffer.isBuffer(rawOutput.stderr)
+            || sha256Bytes(rawOutput.stdout, STREAM_HASH_ALGORITHM)
+                !== measurement.stdoutHash
+            || sha256Bytes(rawOutput.stderr, STREAM_HASH_ALGORITHM)
+                !== measurement.stderrHash) {
+            throw new RuntimeIntegrityError(
+                "Measurement raw output bytes do not match the trusted receipt",
+                { attemptId, candidateId },
+            );
+        }
         const receiptArtifact = this.#persistJsonArtifact({
             attemptId,
             kind: `measurement-receipt-${candidateId}`,
             value: measurement.receipt,
             contentType: "application/vnd.crucible.measurement-receipt+json",
         });
-        const snapshotArtifact = this.#registerCasObject({
+        const rawStdoutArtifact = this.#persistBytesArtifact({
             attemptId,
-            kind: `snapshot-${candidateId}`,
-            objectId: snapshotId,
-            size: this.#artifactStore.readObject(snapshotId, { verify: true }).length,
-            contentType: "application/vnd.crucible.snapshot+json",
+            kind: `measurement-stdout-${candidateId}`,
+            bytes: rawOutput.stdout,
+            contentType: "application/vnd.crucible.measurement-stdout",
+        });
+        const rawStderrArtifact = this.#persistBytesArtifact({
+            attemptId,
+            kind: `measurement-stderr-${candidateId}`,
+            bytes: rawOutput.stderr,
+            contentType: "application/vnd.crucible.measurement-stderr",
+        });
+        const snapshot = this.#persistSnapshotProvenance({
+            attemptId,
+            kind: `measurement-snapshot-${candidateId}`,
+            snapshotId,
+        });
+        const measurementProvenance = createMeasurementProvenance({
+            subjectId: candidateId,
+            receiptArtifact,
+            receiptHash: hashReceipt(measurement.receipt),
+            rawStdoutArtifact,
+            rawStdoutHash: measurement.stdoutHash,
+            rawStderrArtifact,
+            rawStderrHash: measurement.stderrHash,
+            parserVersion: measurement.receipt.parserVersion,
+            allowlistFileHash: measurement.receipt.allowlistFileHash,
+            harnessEntryHash: measurement.receipt.harnessEntryHash,
+            executableHash: measurement.receipt.executableHash,
+            stagedExecutableHash: measurement.receipt.stagedExecutableHash,
+            dependencyHashes: measurement.receipt.dependencyHashes,
+            stagedDependencyHashes: measurement.receipt.stagedDependencyHashes,
+            argvHash: measurement.receipt.argvHash,
+            envHash: measurement.receipt.envHash,
+            sandboxPolicy: measurement.receipt.sandbox === null
+                ? {
+                    kind: "none",
+                    sandboxId: null,
+                    environmentHash: null,
+                }
+                : {
+                    kind: "sandbox",
+                    sandboxId: measurement.receipt.sandbox.sandboxId,
+                    environmentHash: measurement.receipt.sandbox.environmentHash,
+                },
+            snapshot,
+            snapshotExecutionHash: snapshotExecutionHash(measurement.receipt),
         });
         this.#adapter.ingestOperationalEvidence({
             attemptId,
@@ -2372,15 +2830,20 @@ export class AutonomousRunner {
                 receipt: measurement.receipt,
                 receiptHash: hashReceipt(measurement.receipt),
                 receiptArtifactId: receiptArtifact.artifactId,
-                snapshotArtifactId: snapshotArtifact.artifactId,
+                rawStdoutArtifactId: rawStdoutArtifact.artifactId,
+                rawStderrArtifactId: rawStderrArtifact.artifactId,
                 snapshotId,
                 stdoutHash: measurement.stdoutHash,
                 stderrHash: measurement.stderrHash,
+                measurementProvenance,
             },
         });
         return {
+            measurementProvenance,
             receiptArtifact,
-            snapshotArtifact,
+            rawStdoutArtifact,
+            rawStderrArtifact,
+            snapshot,
         };
     }
 
@@ -2394,6 +2857,10 @@ export class AutonomousRunner {
     }) {
         const persistedMeasurement = this.#persistMeasurement({
             measurement: result.measurement,
+            rawOutput: {
+                stdout: result.rawStdoutBytes,
+                stderr: result.rawStderrBytes,
+            },
             attemptId,
             logicalEffectKey,
             purpose: "impossibility",
@@ -2415,18 +2882,6 @@ export class AutonomousRunner {
                 { attemptId },
             );
         }
-        const rawStdoutArtifact = this.#persistBytesArtifact({
-            attemptId,
-            kind: `impossibility-stdout-${command.attemptOrdinal}`,
-            bytes: result.rawStdoutBytes,
-            contentType: "application/vnd.crucible.impossibility-stdout",
-        });
-        const rawStderrArtifact = this.#persistBytesArtifact({
-            attemptId,
-            kind: `impossibility-stderr-${command.attemptOrdinal}`,
-            bytes: result.rawStderrBytes,
-            contentType: "application/vnd.crucible.impossibility-stderr",
-        });
         const certificateArtifact = this.#persistJsonArtifact({
             attemptId,
             kind: `impossibility-certificate-${command.attemptOrdinal}`,
@@ -2469,10 +2924,61 @@ export class AutonomousRunner {
                 measurementReceiptArtifactId:
                     persistedMeasurement.receiptArtifact.artifactId,
                 rawStdoutArtifactHash: result.rawStdoutArtifactHash,
-                rawStdoutArtifactId: rawStdoutArtifact.artifactId,
+                rawStdoutArtifactId: persistedMeasurement.rawStdoutArtifact.artifactId,
                 rawStderrArtifactHash: result.rawStderrArtifactHash,
-                rawStderrArtifactId: rawStderrArtifact.artifactId,
+                rawStderrArtifactId: persistedMeasurement.rawStderrArtifact.artifactId,
+                measurementProvenance: persistedMeasurement.measurementProvenance,
             },
+        });
+        return {
+            measurementProvenance: persistedMeasurement.measurementProvenance,
+            certificateArtifact,
+        };
+    }
+
+    #persistSnapshotProvenance({ attemptId, kind, snapshotId }) {
+        const status = this.#artifactStore.verifySnapshot(snapshotId);
+        if (!status.ok) {
+            throw new RuntimeIntegrityError(
+                "Snapshot closure failed verification before provenance persistence",
+                { snapshotId, status },
+            );
+        }
+        const manifest = this.#artifactStore.loadManifest(snapshotId);
+        const manifestBytes = this.#artifactStore.readObject(snapshotId, { verify: true });
+        const manifestArtifact = this.#registerCasObject({
+            attemptId,
+            kind: `${kind}-manifest`,
+            objectId: snapshotId,
+            size: manifestBytes.length,
+            contentType: "application/vnd.crucible.snapshot+json",
+        });
+        const byObjectId = new Map();
+        for (const entry of manifest.entries) {
+            byObjectId.set(entry.object, entry.size);
+        }
+        const objectArtifacts = [...byObjectId.entries()]
+            .sort(([left], [right]) => compareStable(left, right))
+            .map(([objectId, size], index) => {
+                const verified = this.#artifactStore.readObject(objectId, { verify: true });
+                if (verified.length !== size) {
+                    throw new RuntimeIntegrityError(
+                        "Snapshot object size changed before provenance persistence",
+                        { snapshotId, objectId, expectedSize: size, actualSize: verified.length },
+                    );
+                }
+                return this.#registerCasObject({
+                    attemptId,
+                    kind: `${kind}-object-${String(index).padStart(6, "0")}`,
+                    objectId,
+                    size,
+                    contentType: "application/octet-stream",
+                });
+            });
+        return createSnapshotProvenance({
+            snapshotHash: measurementSnapshotHash(snapshotId),
+            manifestArtifact,
+            objectArtifacts,
         });
     }
 
@@ -2515,16 +3021,22 @@ export class AutonomousRunner {
                 contentType,
             });
             this.#repository.markArtifactDurable(artifactId);
-            this.#repository.referenceArtifact({
-                investigationId: this.#config.investigationId,
-                artifactId,
-            });
-        } else if (existing.hashValue !== snapshotObjectHex(objectId)
-            || existing.investigationId !== this.#config.investigationId) {
-            throw new RuntimeIntegrityError("Artifact id collision", {
-                artifactId,
-                objectId,
-            });
+        } else {
+            if (existing.hashValue !== snapshotObjectHex(objectId)
+                || existing.investigationId !== this.#config.investigationId
+                || existing.storage !== "external"
+                || existing.hashAlgo !== "sha256"
+                || existing.sizeBytes !== size
+                || existing.contentType !== contentType) {
+                throw new RuntimeIntegrityError("Artifact id collision", {
+                    artifactId,
+                    objectId,
+                });
+            }
+            if (existing.durable !== true) {
+                this.#artifactStore.readObject(objectId, { verify: true });
+                this.#repository.markArtifactDurable(artifactId);
+            }
         }
         return { artifactId, objectId };
     }

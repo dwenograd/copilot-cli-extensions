@@ -7,6 +7,8 @@
 import { describe, it, expect, afterAll } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
+import { EventEmitter } from "node:events";
+import { PassThrough } from "node:stream";
 
 import {
     PARSER_VERSION,
@@ -60,6 +62,31 @@ async function runOnce({ root, entryId, script, snapshotBytes = "candidate-bytes
     return { result, verified, snapshot, list, allowlistPath, scriptPath };
 }
 
+function createMutationProcessAdapter(mutate) {
+    return {
+        spawn() {
+            const child = new EventEmitter();
+            child.pid = 4242;
+            child.stdout = new PassThrough();
+            child.stderr = new PassThrough();
+            setImmediate(() => {
+                try {
+                    mutate();
+                    child.stdout.end(Buffer.from('{"pass":true}', "utf8"));
+                    child.stderr.end();
+                    child.emit("close", 0, null);
+                } catch (error) {
+                    child.stdout.end();
+                    child.stderr.end(Buffer.from(error?.stack ?? String(error), "utf8"));
+                    child.emit("close", 1, null);
+                }
+            });
+            return child;
+        },
+        terminateTree() {},
+    };
+}
+
 describe("MeasurementExecutor happy path", () => {
     it("runs a trusted fixture that writes {pass:true} and produces a well-formed receipt", async () => {
         const root = tmp("hp");
@@ -74,11 +101,29 @@ describe("MeasurementExecutor happy path", () => {
         expect(result.stdoutBytes).toBeGreaterThan(0);
 
         const rec = result.receipt;
-        expect(rec.version).toBe(2);
+        expect(rec.version).toBe(3);
         expect(rec.harnessEntryHash).toBe(verified.entryHash);
         expect(rec.executableHash).toBe(verified.executableHash);
         expect(rec.stagedExecutableHash).toBe(verified.executableHash);
         expect(rec.candidateSnapshotHash).toBe(snapshot.hash);
+        expect(rec.candidateSnapshotPreClosureHash).toMatch(
+            /^sha256:crucible-measurement-snapshot-closure-v1:[a-f0-9]{64}$/,
+        );
+        expect(rec.candidateSnapshotPostClosureHash)
+            .toBe(rec.candidateSnapshotPreClosureHash);
+        expect(rec.candidateSnapshotIdentitySummary.pre)
+            .toEqual(rec.candidateSnapshotIdentitySummary.post);
+        expect(rec.candidateSnapshotMutationCheck).toMatchObject({
+            status: "passed",
+            closureStable: true,
+            identityStable: true,
+            openHandleRehashStable: true,
+            reparseStable: true,
+        });
+        expect(
+            rec.candidateSnapshotMutationCheck.readOnly.verifiedReadOnlyFiles
+            + rec.candidateSnapshotMutationCheck.readOnly.unverifiedReadOnlyFiles,
+        ).toBe(snapshot.manifest.fileCount);
         expect(rec.attemptId).toBe("att-0001");
         expect(rec.runnerEpochId).toBe("epoch-2026-07-09-a");
         expect(rec.parserVersion).toBe(PARSER_VERSION);
@@ -100,7 +145,7 @@ describe("MeasurementExecutor happy path", () => {
                 const envPath = process.env.CANDIDATE_SNAPSHOT_PATH;
                 const attempt = process.env.CRUCIBLE_ATTEMPT_ID;
                 const epoch = process.env.CRUCIBLE_RUNNER_EPOCH_ID;
-                const bytes = fs.readFileSync(argPath, "utf8");
+                const bytes = fs.readFileSync(path.join(argPath, "candidate.bin"), "utf8");
                 const same = argPath === envPath;
                 process.stdout.write(JSON.stringify({
                     pass: same && bytes === "candidate-bytes" && attempt === "att-0001" && epoch === "epoch-2026-07-09-a",
@@ -270,6 +315,117 @@ describe("MeasurementExecutor happy path", () => {
         })).rejects.toMatchObject({ code: MEASUREMENT_ERROR_CODES.FILE_HASH_MISMATCH });
         expect(spawned).toBe(false);
     });
+
+    it("rejects candidate bytes that no longer match the supplied immutable manifest before spawn", async () => {
+        const root = tmp("candidate-pre-mismatch");
+        const script = writeHarnessScript(
+            root,
+            "candidate-pre-mismatch",
+            `process.stdout.write('{"pass":true}');`,
+        );
+        const allowlistPath = writeAllowlist(root, "candidate-pre-mismatch", {
+            argvTemplate: [script, "{{candidatePath}}"],
+        });
+        const list = loadHarnessAllowlist(allowlistPath);
+        const verified = list.verifyEntry("candidate-pre-mismatch");
+        const snapshot = materializeCandidateSnapshot(
+            root,
+            "candidate-pre-mismatch-snap",
+            "original",
+        );
+        fs.writeFileSync(
+            path.join(snapshot.path, snapshot.manifest.entries[0].path),
+            "changed-before-spawn",
+        );
+        let spawned = false;
+        const executor = createMeasurementExecutor({
+            allowlist: list,
+            scratchRoot: root,
+            processAdapter: {
+                spawn() {
+                    spawned = true;
+                    throw new Error("must not spawn");
+                },
+                terminateTree() {},
+            },
+        });
+        await expect(executor.run({
+            verifiedEntry: verified,
+            candidateSnapshot: snapshot,
+            ...fixedIds(),
+        })).rejects.toMatchObject({
+            code: MEASUREMENT_ERROR_CODES.FILE_HASH_MISMATCH,
+        });
+        expect(spawned).toBe(false);
+    });
+
+    for (const mutation of [
+        {
+            label: "content mutation",
+            apply(filePath) {
+                fs.chmodSync(filePath, 0o666);
+                fs.writeFileSync(filePath, "mutated-during-run");
+            },
+        },
+        {
+            label: "replacement",
+            apply(filePath) {
+                const replacement = `${filePath}.replacement`;
+                fs.writeFileSync(replacement, fs.readFileSync(filePath));
+                fs.chmodSync(filePath, 0o666);
+                fs.unlinkSync(filePath);
+                fs.renameSync(replacement, filePath);
+            },
+        },
+        {
+            label: "unlink",
+            apply(filePath) {
+                fs.chmodSync(filePath, 0o666);
+                fs.unlinkSync(filePath);
+            },
+        },
+    ]) {
+        it(`rejects candidate ${mutation.label} during harness execution`, async () => {
+            const id = `candidate-${mutation.label.replace(/\s+/gu, "-")}`;
+            const root = tmp(id);
+            const script = writeHarnessScript(
+                root,
+                id,
+                `process.stdout.write('{"pass":true}');`,
+            );
+            const allowlistPath = writeAllowlist(root, id, {
+                argvTemplate: [script, "{{candidatePath}}"],
+            });
+            const list = loadHarnessAllowlist(allowlistPath);
+            const verified = list.verifyEntry(id);
+            const snapshot = materializeCandidateSnapshot(
+                root,
+                `${id}-snap`,
+                "stable-candidate-bytes",
+            );
+            const filePath = path.join(
+                snapshot.path,
+                snapshot.manifest.entries[0].path,
+            );
+            let mutationRan = false;
+            const executor = createMeasurementExecutor({
+                allowlist: list,
+                scratchRoot: root,
+                processAdapter: createMutationProcessAdapter(() => {
+                    mutation.apply(filePath);
+                    mutationRan = true;
+                }),
+            });
+            await expect(executor.run({
+                verifiedEntry: verified,
+                candidateSnapshot: snapshot,
+                ...fixedIds(),
+            })).rejects.toMatchObject({
+                code: MEASUREMENT_ERROR_CODES.FILE_CHANGED_DURING_VERIFICATION,
+            });
+            expect(mutationRan).toBe(true);
+        });
+    }
 
     it("rejects a genuine entry issued by a different loaded allowlist instance", async () => {
         const root = tmp("wrong-owner");

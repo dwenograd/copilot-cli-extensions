@@ -32,6 +32,7 @@ import {
     IllegalTransitionError,
     FenceRejectedError,
     ArtifactNotDurableError,
+    SchemaVersionError,
     StorageError,
 } from "./errors.mjs";
 import { assertLocalDatabasePath } from "./paths.mjs";
@@ -80,15 +81,21 @@ export function openRepository(options = {}) {
     return EventRepository.open(options);
 }
 
+export function openRepositoryReadOnly(options = {}) {
+    return EventRepository.open({ ...options, readOnly: true });
+}
+
 export class EventRepository {
     #db;
     #now;
     #file;
+    #readOnly;
 
-    constructor(db, { now, file }) {
+    constructor(db, { now, file, readOnly = false }) {
         this.#db = db;
         this.#now = now;
         this.#file = file;
+        this.#readOnly = readOnly;
     }
 
     static open(options = {}) {
@@ -98,26 +105,50 @@ export class EventRepository {
             now = () => new Date().toISOString(),
             denyRoots,
             env,
+            readOnly = false,
         } = options;
 
         const resolved = assertLocalDatabasePath(file, { denyRoots, env });
 
         let db;
         try {
-            db = new DatabaseSync(resolved);
+            db = new DatabaseSync(resolved, { readOnly: readOnly === true });
         } catch (err) {
             throw new StorageError(`failed to open database at ${resolved}: ${err.message}`, err);
         }
 
         try {
-            configureConnection(db, { busyTimeoutMs });
-            applySchema(db);
+            if (readOnly === true) {
+                db.exec(`PRAGMA query_only = ON; PRAGMA busy_timeout = ${Number(busyTimeoutMs)};`);
+                const userVersion = Number(db.prepare("PRAGMA user_version;").get()?.user_version ?? 0);
+                const schemaTable = db.prepare(
+                    "SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = 'schema_meta'",
+                ).get();
+                const metaVersion = schemaTable
+                    ? Number(db.prepare(
+                        "SELECT value FROM schema_meta WHERE key = 'schema_version'",
+                    ).get()?.value ?? Number.NaN)
+                    : Number.NaN;
+                if (userVersion !== SCHEMA_VERSION || metaVersion !== SCHEMA_VERSION) {
+                    throw new SchemaVersionError(
+                        `schema version mismatch: file has user_version=${userVersion}, schema_meta=${Number.isNaN(metaVersion) ? "<none>" : metaVersion}, expected ${SCHEMA_VERSION}`,
+                        {
+                            fileUserVersion: userVersion,
+                            fileMetaVersion: Number.isNaN(metaVersion) ? null : metaVersion,
+                            expected: SCHEMA_VERSION,
+                        },
+                    );
+                }
+            } else {
+                configureConnection(db, { busyTimeoutMs });
+                applySchema(db);
+            }
         } catch (err) {
             db.close();
             throw err;
         }
 
-        return new EventRepository(db, { now, file: resolved });
+        return new EventRepository(db, { now, file: resolved, readOnly: readOnly === true });
     }
 
     get databaseFile() {
@@ -126,6 +157,10 @@ export class EventRepository {
 
     get schemaVersion() {
         return SCHEMA_VERSION;
+    }
+
+    get readOnly() {
+        return this.#readOnly;
     }
 
     close() {
@@ -330,6 +365,9 @@ export class EventRepository {
 
         for (const [eventIndex, ev] of events.entries()) {
             const kind = requireNonEmptyString(ev.kind, "event.kind");
+            const artifactIds = ev.artifactIds === undefined || ev.artifactIds === null
+                ? []
+                : this.#normalizeArtifactIds(ev.artifactIds, "event.artifactIds");
             const terminalKind = this.#normalizeTerminalKind(ev.terminal ?? ev.terminalKind ?? null);
             const isTerminal = terminalKind ? 1 : 0;
             if (isTerminal && hasTerminal) {
@@ -383,11 +421,17 @@ export class EventRepository {
                 throw this.#translateEventInsert(err, { investigationId, seq });
             }
 
+            const artifactRefs = this.#referenceArtifactsInTransaction({
+                investigationId,
+                artifactIds,
+                seq,
+                createdAt,
+            });
             appended.push({
                 investigationId, seq, prevHash, eventHash, kind,
                 payload: JSON.parse(payloadCanonical),
                 isTerminal: isTerminal === 1,
-                terminalKind, createdAt,
+                terminalKind, createdAt, artifactRefs,
             });
             hasTerminal = hasTerminal || isTerminal === 1;
             prevSeq = seq;
@@ -984,47 +1028,133 @@ export class EventRepository {
         requireNonEmptyString(investigationId, "investigationId");
         requireNonEmptyString(artifactId, "artifactId");
 
-        return this.#tx(() => {
-            const art = this.#db
-                .prepare("SELECT * FROM artifacts WHERE artifact_id = ?")
-                .get(artifactId);
-            if (!art || art.investigation_id !== investigationId) {
-                throw new NotFoundError(ERROR_CODES.ARTIFACT_NOT_FOUND, `unknown artifact '${artifactId}'`, { artifactId });
-            }
-            if (art.storage === "external" && art.durable !== 1) {
-                throw new ArtifactNotDurableError(
-                    "external artifact must be marked durable before it can be referenced",
-                    { artifactId },
+        return this.#tx(() => this.#referenceArtifactInTransaction({
+            investigationId,
+            artifactId,
+            seq,
+            createdAt: this.#now(),
+        }));
+    }
+
+    #normalizeArtifactIds(value, field) {
+        if (!Array.isArray(value)) {
+            throw new InvalidArgumentError(`${field} must be an array`, { field });
+        }
+        const normalized = value.map((artifactId, index) =>
+            requireNonEmptyString(artifactId, `${field}[${index}]`));
+        return [...new Set(normalized)].sort();
+    }
+
+    #referenceArtifactsInTransaction({
+        investigationId,
+        artifactIds,
+        seq,
+        createdAt,
+    }) {
+        return artifactIds.map((artifactId) =>
+            this.#referenceArtifactInTransaction({
+                investigationId,
+                artifactId,
+                seq,
+                createdAt,
+            }));
+    }
+
+    #referenceArtifactInTransaction({
+        investigationId,
+        artifactId,
+        seq,
+        createdAt,
+    }) {
+        const art = this.#db
+            .prepare("SELECT * FROM artifacts WHERE artifact_id = ?")
+            .get(artifactId);
+        if (!art || art.investigation_id !== investigationId) {
+            throw new NotFoundError(
+                ERROR_CODES.ARTIFACT_NOT_FOUND,
+                `unknown artifact '${artifactId}'`,
+                { artifactId },
+            );
+        }
+        if (art.storage === "external" && art.durable !== 1) {
+            throw new ArtifactNotDurableError(
+                "external artifact must be marked durable before it can be referenced",
+                { artifactId },
+            );
+        }
+        if (seq !== null) {
+            const ev = this.#db
+                .prepare("SELECT 1 AS present FROM events WHERE investigation_id = ? AND seq = ?")
+                .get(investigationId, seq);
+            if (!ev) {
+                throw new NotFoundError(
+                    ERROR_CODES.NOT_FOUND,
+                    `no event at seq ${seq}`,
+                    { investigationId, seq },
                 );
             }
-            if (seq !== null) {
-                const ev = this.#db
-                    .prepare("SELECT 1 AS present FROM events WHERE investigation_id = ? AND seq = ?")
-                    .get(investigationId, seq);
-                if (!ev) {
-                    throw new NotFoundError(ERROR_CODES.NOT_FOUND, `no event at seq ${seq}`, { investigationId, seq });
+        }
+        const existing = seq === null
+            ? null
+            : this.#db
+                .prepare(`
+                    SELECT ref_id, created_at
+                    FROM artifact_refs
+                    WHERE investigation_id = ? AND artifact_id = ? AND seq = ?`)
+                .get(investigationId, artifactId, seq);
+        if (existing) {
+            return {
+                refId: Number(existing.ref_id),
+                artifactId,
+                investigationId,
+                seq,
+                createdAt: existing.created_at,
+                deduplicated: true,
+            };
+        }
+        try {
+            const result = this.#db
+                .prepare("INSERT INTO artifact_refs(investigation_id, artifact_id, seq, created_at) VALUES(:inv, :art, :seq, :at)")
+                .run({ inv: investigationId, art: artifactId, seq, at: createdAt });
+            return {
+                refId: Number(result.lastInsertRowid),
+                artifactId,
+                investigationId,
+                seq,
+                createdAt,
+                deduplicated: false,
+            };
+        } catch (err) {
+            if (isUniqueViolation(err) && seq !== null) {
+                const raced = this.#db
+                    .prepare(`
+                        SELECT ref_id, created_at
+                        FROM artifact_refs
+                        WHERE investigation_id = ? AND artifact_id = ? AND seq = ?`)
+                    .get(investigationId, artifactId, seq);
+                if (raced) {
+                    return {
+                        refId: Number(raced.ref_id),
+                        artifactId,
+                        investigationId,
+                        seq,
+                        createdAt: raced.created_at,
+                        deduplicated: true,
+                    };
                 }
             }
-            const createdAt = this.#now();
-            try {
-                this.#db
-                    .prepare("INSERT INTO artifact_refs(investigation_id, artifact_id, seq, created_at) VALUES(:inv, :art, :seq, :at)")
-                    .run({ inv: investigationId, art: artifactId, seq, at: createdAt });
-            } catch (err) {
-                if (isUniqueViolation(err)) {
-                    throw new CruciblePersistenceError(
-                        ERROR_CODES.ARTIFACT_CONFLICT,
-                        "artifact already referenced at this seq",
-                        { artifactId, seq },
-                    );
-                }
-                if (isSqliteError(err)) {
-                    throw new StorageError(`artifact reference failed: ${err.message}`, err);
-                }
-                throw err;
+            if (isUniqueViolation(err)) {
+                throw new CruciblePersistenceError(
+                    ERROR_CODES.ARTIFACT_CONFLICT,
+                    "artifact already referenced at this seq",
+                    { artifactId, seq },
+                );
             }
-            return { artifactId, investigationId, seq, createdAt };
-        });
+            if (isSqliteError(err)) {
+                throw new StorageError(`artifact reference failed: ${err.message}`, err);
+            }
+            throw err;
+        }
     }
 
     getArtifact(artifactId) {
@@ -1060,6 +1190,27 @@ export class EventRepository {
                 investigationId: r.investigation_id,
                 artifactId: r.artifact_id,
                 seq: r.seq === null ? null : Number(r.seq),
+                createdAt: r.created_at,
+            }));
+    }
+
+    listArtifactRefsForEvent(investigationId, seq) {
+        requireNonEmptyString(investigationId, "investigationId");
+        if (!Number.isSafeInteger(seq) || seq < 1) {
+            throw new InvalidArgumentError("seq must be a positive safe integer", { seq });
+        }
+        return this.#db
+            .prepare(`
+                SELECT ref_id, investigation_id, artifact_id, seq, created_at
+                FROM artifact_refs
+                WHERE investigation_id = ? AND seq = ?
+                ORDER BY artifact_id ASC`)
+            .all(investigationId, seq)
+            .map((r) => ({
+                refId: Number(r.ref_id),
+                investigationId: r.investigation_id,
+                artifactId: r.artifact_id,
+                seq: Number(r.seq),
                 createdAt: r.created_at,
             }));
     }
@@ -1240,6 +1391,15 @@ export class EventRepository {
                     code: ERROR_CODES.INTEGRITY_VIOLATION,
                     detail: `inline artifact '${ref.artifact_id}' has no blob`,
                 });
+            } else if (art.storage === "inline") {
+                const bytes = Buffer.from(art.inline_blob);
+                if (!Number.isSafeInteger(Number(art.size_bytes))
+                    || Number(art.size_bytes) !== bytes.length) {
+                    violations.push({
+                        code: ERROR_CODES.INTEGRITY_VIOLATION,
+                        detail: `inline artifact '${ref.artifact_id}' size metadata does not match its blob`,
+                    });
+                }
             }
             if (ref.seq !== null) {
                 const ev = this.#db

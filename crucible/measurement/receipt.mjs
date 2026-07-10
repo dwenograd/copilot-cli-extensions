@@ -12,6 +12,11 @@
 //   - argvHash             : hash of the *concrete* argv passed to spawn
 //   - envHash              : hash of the *concrete* env passed to spawn
 //   - candidateSnapshotHash: hash of the immutable candidate snapshot
+//   - candidateSnapshotPreClosureHash / PostClosureHash: exact on-disk
+//     closure hashes surrounding execution
+//   - candidateSnapshotIdentitySummary: stable root/directory/file identities
+//     observed before and after execution
+//   - candidateSnapshotMutationCheck: fail-closed post-run verification status
 //   - stdoutHash / stderrHash: hashes of raw output bytes actually captured
 //   - parserVersion        : version tag of the parser that produced facts
 //   - sandbox              : { sandboxId, environmentHash } | null
@@ -36,7 +41,7 @@ import {
 export const RECEIPT_HASH_ALGORITHM = "sha256:crucible-measurement-receipt-v1";
 export const ARGV_HASH_ALGORITHM = "sha256:crucible-measurement-argv-v1";
 export const ENV_HASH_ALGORITHM = "sha256:crucible-measurement-env-v1";
-export const RECEIPT_VERSION = 2;
+export const RECEIPT_VERSION = 3;
 
 // Keys within the receipt that are input-derived (deterministic given the
 // same inputs). Timing fields are excluded so callers can prove determinism
@@ -52,6 +57,10 @@ export const RECEIPT_DETERMINISM_KEYS = Object.freeze([
     "argvHash",
     "envHash",
     "candidateSnapshotHash",
+    "candidateSnapshotPreClosureHash",
+    "candidateSnapshotPostClosureHash",
+    "candidateSnapshotIdentitySummary",
+    "candidateSnapshotMutationCheck",
     "stdoutHash",
     "stderrHash",
     "parserVersion",
@@ -110,6 +119,10 @@ export function buildMeasurementReceipt(input) {
         argvHash: input.argvHash,
         envHash: input.envHash,
         candidateSnapshotHash: input.candidateSnapshotHash,
+        candidateSnapshotPreClosureHash: input.candidateSnapshotPreClosureHash,
+        candidateSnapshotPostClosureHash: input.candidateSnapshotPostClosureHash,
+        candidateSnapshotIdentitySummary: input.candidateSnapshotIdentitySummary,
+        candidateSnapshotMutationCheck: input.candidateSnapshotMutationCheck,
         stdoutHash: input.stdoutHash,
         stderrHash: input.stderrHash,
         parserVersion: input.parserVersion,

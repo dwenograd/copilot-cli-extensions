@@ -15,6 +15,7 @@ import { fileURLToPath } from "node:url";
 import {
     ArtifactStore,
     openArtifactStore,
+    openArtifactStoreReadOnly,
     ARTIFACT_STORE_ERROR_CODES,
     objectIdFor,
     parseObjectId,
@@ -46,6 +47,37 @@ function catchErr(fn) {
 
 function sha256Hex(bytes) {
     return createHash("sha256").update(bytes).digest("hex");
+}
+
+function makeSnapshotManifest(entries, overrides = {}) {
+    return {
+        type: "crucible-snapshot",
+        version: 1,
+        algo: "sha256",
+        fileCount: entries.length,
+        totalBytes: entries.reduce((sum, entry) => sum + entry.size, 0),
+        entries,
+        ...overrides,
+    };
+}
+
+function putSnapshotManifest(manifest, options = {}) {
+    const serialized = options.canonical === false
+        ? JSON.stringify(manifest, null, 2)
+        : canonicalize(manifest);
+    return store.putBytes(Buffer.from(serialized, "utf8")).id;
+}
+
+function expectRejectedManifest(snapshot, expectedCode = ARTIFACT_STORE_ERROR_CODES.SNAPSHOT_INVALID) {
+    const err = catchErr(() => store.loadManifest(snapshot));
+    expect(err.code).toBe(expectedCode);
+    expect(store.verifySnapshot(snapshot)).toMatchObject({
+        snapshot,
+        ok: false,
+        manifestOk: false,
+        reason: "invalid-manifest",
+        error: expectedCode,
+    });
 }
 
 describe("object writes", () => {
@@ -117,6 +149,23 @@ describe("object writes", () => {
 });
 
 describe("read/verify integrity", () => {
+    it("opens read-only without creating or repairing a missing store layout", () => {
+        const missingRoot = path.join(base, "missing-read-only-cas");
+        const readOnly = openArtifactStoreReadOnly({ root: missingRoot });
+        expect(readOnly.readOnly).toBe(true);
+        expect(fs.existsSync(missingRoot)).toBe(false);
+        expect(readOnly.verifyObject(`sha256:${"0".repeat(64)}`)).toMatchObject({
+            ok: false,
+            reason: "missing",
+        });
+        expect(() => readOnly.putBytes(Buffer.from("must-not-write"))).toThrow(
+            expect.objectContaining({
+                code: ARTIFACT_STORE_ERROR_CODES.IO_ERROR,
+            }),
+        );
+        expect(fs.existsSync(missingRoot)).toBe(false);
+    });
+
     it("detects a corrupt object on read and via verifyObject", () => {
         const meta = store.putBytes(Buffer.from("integrity-check"));
         fs.writeFileSync(meta.path, Buffer.from("integrity-CHECK"));
@@ -169,10 +218,159 @@ describe("directory snapshots", () => {
         const paths = snapA.manifest.entries.map((e) => e.path);
         expect(paths).toEqual(["a.txt", "b.txt", "sub/c.txt", "sub/deep/d.bin"]);
         expect([...paths]).toEqual([...paths].sort());
+        expect(Object.keys(snapA.manifest).sort()).toEqual([
+            "algo",
+            "entries",
+            "fileCount",
+            "totalBytes",
+            "type",
+            "version",
+        ]);
+        expect(snapA.manifest.entries.every(
+            (entry) => Object.keys(entry).sort().join(",") === "object,path,size",
+        )).toBe(true);
+        expect(store.readObject(snapA.snapshot).toString("utf8")).toBe(canonicalize(snapA.manifest));
+        expect(store.loadManifest(snapA.snapshot)).toEqual(snapA.manifest);
+        expect(store.verifySnapshot(snapA.snapshot)).toMatchObject({
+            ok: true,
+            manifestOk: true,
+            entries: 4,
+        });
         // Every entry references a real, verifiable CAS object.
         for (const e of snapA.manifest.entries) {
             expect(store.verifyObject(e.object).ok).toBe(true);
         }
+    });
+
+    it("rejects non-canonical schemas, versions, keys, and JSON bytes", () => {
+        const object = store.putBytes(Buffer.from("x"));
+        const entry = { path: "x.txt", size: object.size, object: object.id };
+        const valid = makeSnapshotManifest([entry]);
+        const variants = [
+            { manifest: { ...valid, extra: true } },
+            { manifest: { ...valid, entries: [{ ...entry, extra: true }] } },
+            { manifest: { ...valid, version: 2 } },
+            { manifest: valid, canonical: false },
+        ];
+
+        for (const variant of variants) {
+            const snapshot = putSnapshotManifest(variant.manifest, {
+                canonical: variant.canonical,
+            });
+            expectRejectedManifest(snapshot);
+        }
+    });
+
+    it("rejects duplicate paths before parent reads or materialization can choose different entries", () => {
+        const first = store.putBytes(Buffer.from("first"));
+        const second = store.putBytes(Buffer.from("second"));
+        const manifest = makeSnapshotManifest([
+            { path: "same.txt", size: first.size, object: first.id },
+            { path: "same.txt", size: second.size, object: second.id },
+        ]);
+        const snapshot = putSnapshotManifest(manifest);
+
+        expectRejectedManifest(snapshot);
+        const dest = path.join(base, "duplicate-out");
+        const err = catchErr(() => store.materializeSnapshot({ snapshot, destDir: dest }));
+        expect(err.code).toBe(ARTIFACT_STORE_ERROR_CODES.SNAPSHOT_INVALID);
+        expect(fs.existsSync(dest)).toBe(false);
+    });
+
+    it.each([
+        ["case-colliding", "A.txt", "a.txt", ARTIFACT_STORE_ERROR_CODES.SNAPSHOT_INVALID],
+        ["separator-variant", "dir/a.txt", "dir\\a.txt", ARTIFACT_STORE_ERROR_CODES.UNSAFE_PATH],
+    ])("rejects %s paths", (_label, firstPath, secondPath, expectedCode) => {
+        const first = store.putBytes(Buffer.from("a"));
+        const second = store.putBytes(Buffer.from("b"));
+        const manifest = makeSnapshotManifest([
+            { path: firstPath, size: first.size, object: first.id },
+            { path: secondPath, size: second.size, object: second.id },
+        ]);
+        const snapshot = putSnapshotManifest(manifest);
+
+        expectRejectedManifest(snapshot, expectedCode);
+    });
+
+    it.each([
+        ["fileCount", { fileCount: 2 }],
+        ["totalBytes", { totalBytes: 2 }],
+    ])("rejects an inexact %s even when the manifest hash is self-consistent", (_field, overrides) => {
+        const object = store.putBytes(Buffer.from("x"));
+        const manifest = makeSnapshotManifest(
+            [{ path: "x.txt", size: object.size, object: object.id }],
+            overrides,
+        );
+        const snapshot = putSnapshotManifest(manifest);
+
+        expectRejectedManifest(snapshot);
+    });
+
+    it("rejects malformed object metadata and conflicting sizes for one object", () => {
+        const object = store.putBytes(Buffer.from("x"));
+        const malformedId = makeSnapshotManifest([
+            { path: "a.txt", size: object.size, object: `sha256:${"A".repeat(64)}` },
+        ]);
+        const invalidSize = makeSnapshotManifest(
+            [{ path: "a.txt", size: -1, object: object.id }],
+            { totalBytes: 0 },
+        );
+        const conflictingSizes = makeSnapshotManifest([
+            { path: "a.txt", size: object.size, object: object.id },
+            { path: "b.txt", size: object.size + 1, object: object.id },
+        ]);
+
+        for (const manifest of [malformedId, invalidSize, conflictingSizes]) {
+            expectRejectedManifest(putSnapshotManifest(manifest));
+        }
+    });
+
+    it("allows one verified object to back multiple distinct paths when sizes agree", () => {
+        const object = store.putBytes(Buffer.from("shared"));
+        const manifest = makeSnapshotManifest([
+            { path: "a.txt", size: object.size, object: object.id },
+            { path: "b.txt", size: object.size, object: object.id },
+        ]);
+        const snapshot = putSnapshotManifest(manifest);
+
+        expect(store.loadManifest(snapshot)).toEqual(manifest);
+        expect(store.verifySnapshot(snapshot).ok).toBe(true);
+    });
+
+    it.each([
+        "CON",
+        "con.txt",
+        "dir/NUL.bin",
+        "safe.txt:stream",
+        "trailing.",
+        "trailing ",
+        "dir/../escape.txt",
+    ])("rejects unsafe or Windows-reserved manifest path %j", (unsafePath) => {
+        const object = store.putBytes(Buffer.from("x"));
+        const manifest = makeSnapshotManifest([
+            { path: unsafePath, size: object.size, object: object.id },
+        ]);
+
+        expectRejectedManifest(
+            putSnapshotManifest(manifest),
+            ARTIFACT_STORE_ERROR_CODES.UNSAFE_PATH,
+        );
+    });
+
+    it("rejects unsorted entries and file/directory prefix ambiguity", () => {
+        const first = store.putBytes(Buffer.from("a"));
+        const second = store.putBytes(Buffer.from("b"));
+        const unsorted = makeSnapshotManifest([
+            { path: "b.txt", size: first.size, object: first.id },
+            { path: "a.txt", size: second.size, object: second.id },
+        ]);
+        const prefixConflict = makeSnapshotManifest([
+            { path: "node", size: first.size, object: first.id },
+            { path: "node/child.txt", size: second.size, object: second.id },
+        ]);
+
+        expectRejectedManifest(putSnapshotManifest(unsorted));
+        expectRejectedManifest(putSnapshotManifest(prefixConflict));
     });
 
     it("rejects a symlink/junction inside the source tree", () => {
@@ -294,6 +492,26 @@ describe("materialization", () => {
         const evil = store.putBytes(Buffer.from(canonicalize(manifest), "utf8"));
         const err = catchErr(() => store.materializeSnapshot({ snapshot: evil.id, destDir: path.join(base, "out2") }));
         expect(err.code).toBe(ARTIFACT_STORE_ERROR_CODES.UNSAFE_PATH);
+    });
+
+    it("rejects an object whose verified byte size disagrees with the canonical manifest", () => {
+        const inner = store.putBytes(Buffer.from("x"));
+        const manifest = makeSnapshotManifest(
+            [{ path: "x.txt", size: inner.size + 1, object: inner.id }],
+        );
+        const snapshot = putSnapshotManifest(manifest);
+
+        expect(store.loadManifest(snapshot)).toEqual(manifest);
+        expect(store.verifySnapshot(snapshot)).toMatchObject({
+            ok: false,
+            manifestOk: true,
+            corrupt: [inner.id],
+        });
+        const err = catchErr(() => store.materializeSnapshot({
+            snapshot,
+            destDir: path.join(base, "wrong-size-out"),
+        }));
+        expect(err.code).toBe(ARTIFACT_STORE_ERROR_CODES.OBJECT_CORRUPT);
     });
 
     it("verifySnapshot reports missing and corrupt closure members", () => {

@@ -11,6 +11,8 @@
 
 export const TERMINAL_BANNER = "===== ORACLE V3 TERMINAL RESULT =====";
 export const NON_RESULT_BANNER = "NOT A RESULT — DO NOT REPORT AS COMPLETE";
+export const INTEGRITY_NON_RESULT_BANNER =
+    "===== CRUCIBLE INTEGRITY BLOCKED — NOT A RESULT =====";
 
 export function success(data) {
     return {

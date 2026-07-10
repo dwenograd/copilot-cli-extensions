@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import {
     DEFAULT_SEARCH_POLICY,
     ESCAPE_SEARCH_OPERATORS,
+    artifactRefsFromProvenance,
     createInvestigationContract,
     harnessCandidateEvidenceItems,
     impossibilityEvidenceItems,
@@ -373,11 +374,87 @@ describe("Crucible autonomous runner", () => {
             /^sha256:crucible-runtime-validation-receipts-v1:[a-f0-9]{64}$/,
         );
         expect(harnessCandidateEvidenceItems(replayed.aggregate)).toHaveLength(4);
+        const validationEvidence = replayed.aggregate.evidence[
+            replayed.aggregate.validation.currentEvidenceId
+        ];
+        expect(validationEvidence.receipt.provenance).toMatchObject({
+            proposalArtifact: null,
+            validationCompositeArtifact: {
+                artifactId: expect.any(String),
+                objectId: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
+            },
+        });
+        expect(validationEvidence.receipt.provenance.measurements).toHaveLength(2);
+        const candidateEvidence = harnessCandidateEvidenceItems(replayed.aggregate)[0];
+        expect(candidateEvidence.receipt.provenance).toMatchObject({
+            proposalArtifact: {
+                artifactId: expect.any(String),
+                objectId: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
+            },
+            promptContextHash: expect.stringMatching(
+                /^sha256:[a-z0-9][a-z0-9._-]*:[a-f0-9]{64}$/,
+            ),
+        });
+        expect(candidateEvidence.receipt.provenance.measurements[0]).toMatchObject({
+            parserVersion: PARSER_VERSION,
+            sandboxPolicy: { kind: "none" },
+            receiptArtifact: { artifactId: expect.any(String) },
+            rawStdoutArtifact: { artifactId: expect.any(String) },
+            rawStderrArtifact: { artifactId: expect.any(String) },
+            snapshot: {
+                manifestArtifact: { artifactId: expect.any(String) },
+                objectArtifacts: expect.any(Array),
+            },
+        });
+        expect(replayed.aggregate.terminal.evidenceClosure).toMatchObject({
+            decisive: {
+                kind: "winner",
+                evidence: {
+                    evidenceId: replayed.aggregate.terminal.evidenceId,
+                },
+            },
+            receipts: { count: 6, evidenceCount: 5 },
+        });
+        expect(replayed.aggregate.terminal.evidenceClosure.closureRoot).toMatch(
+            /^sha256:crucible-terminal-evidence-closure-v1:[a-f0-9]{64}$/,
+        );
+        for (const evidenceId of replayed.aggregate.evidenceOrder) {
+            const evidence = replayed.aggregate.evidence[evidenceId];
+            const expectedArtifactIds = artifactRefsFromProvenance(
+                evidence.receipt.provenance,
+            ).map((artifact) => artifact.artifactId).sort();
+            expect(
+                replayed.repository
+                    .listArtifactRefsForEvent(
+                        "runtime-investigation",
+                        evidence.committedSeq,
+                    )
+                    .map((ref) => ref.artifactId)
+                    .sort(),
+            ).toEqual(expectedArtifactIds);
+        }
 
         const operational = replayed.repository.listEvents(replayed.adapter.operationalInvestigationId);
         const candidateMeasurements = operational.filter((row) =>
             row.kind === "runtime:measurement" && row.payload.purpose === "candidate");
         expect(candidateMeasurements).toHaveLength(4);
+        const persistedReceipt = candidateMeasurements[0].payload.receipt;
+        expect(persistedReceipt.version).toBe(3);
+        expect(persistedReceipt.candidateSnapshotPreClosureHash).toMatch(
+            /^sha256:crucible-measurement-snapshot-closure-v1:[a-f0-9]{64}$/,
+        );
+        expect(persistedReceipt.candidateSnapshotPostClosureHash)
+            .toBe(persistedReceipt.candidateSnapshotPreClosureHash);
+        expect(persistedReceipt.candidateSnapshotIdentitySummary.pre)
+            .toEqual(persistedReceipt.candidateSnapshotIdentitySummary.post);
+        expect(persistedReceipt.candidateSnapshotMutationCheck.status).toBe("passed");
+        expect(persistedReceipt.stagedExecutableHash)
+            .toBe(persistedReceipt.executableHash);
+        expect(
+            persistedReceipt.stagedDependencyHashes.map((item) => item.sha256).sort(),
+        ).toEqual(
+            persistedReceipt.dependencyHashes.map((item) => item.sha256).sort(),
+        );
         expect(replayed.repository.listArtifactRefs("runtime-investigation").length)
             .toBeGreaterThanOrEqual(12);
         replayed.repository.close();
@@ -456,10 +533,17 @@ describe("Crucible autonomous runner", () => {
             ["candidate-b"],
         ]);
         const replayed = replaySetup(setup);
-        expect(replayed.aggregate.terminal.basis.boundedCandidateIds).toEqual([
-            "candidate-a",
-            "candidate-b",
-        ]);
+        expect(replayed.aggregate.terminal.basis).toMatchObject({
+            boundedCandidateCount: 2,
+            searchSpaceExhausted: true,
+        });
+        expect(replayed.aggregate.terminal.basis.boundedCandidateIdsHash).toMatch(
+            /^sha256:crucible-bounded-candidate-set-v1:[a-f0-9]{64}$/,
+        );
+        expect(replayed.aggregate.terminal.evidenceClosure).toMatchObject({
+            decisive: { kind: "bounded_search", evidence: null },
+            receipts: { count: 4, evidenceCount: 3 },
+        });
         replayed.repository.close();
     }, 60_000);
 
@@ -508,6 +592,27 @@ describe("Crucible autonomous runner", () => {
             kind: "verified_impossibility_certificate",
             certificateArtifactHash:
                 certificateEvidence.unreachableBasis.certificateArtifactHash,
+        });
+        expect(certificateEvidence.receipt.provenance).toMatchObject({
+            proposalArtifact: null,
+            validationCompositeArtifact: null,
+            measurementReuseArtifact: null,
+            impossibilityCertificateArtifact: {
+                artifactId: certificateEvidence.unreachableBasis.certificateArtifactId,
+            },
+        });
+        expect(replayed.aggregate.terminal.evidenceClosure).toMatchObject({
+            validation: {
+                evidenceId: replayed.aggregate.validation.currentEvidenceId,
+            },
+            decisive: {
+                kind: "impossibility_certificate",
+                evidence: {
+                    evidenceId: certificateEvidence.evidenceId,
+                    provenanceRoot: certificateEvidence.provenanceRoot,
+                },
+            },
+            receipts: { count: 4, evidenceCount: 3 },
         });
         const operational = replayed.adapter.listOperationalEvidence();
         const certificateRow = operational.find((row) =>
@@ -1160,6 +1265,12 @@ describe("Crucible autonomous runner", () => {
         expect(replayedA.aggregate.terminal.eventHash).toBe(
             replayedB.aggregate.terminal.eventHash,
         );
+        expect(replayedA.aggregate.terminal.evidenceClosure.closureRoot).toBe(
+            replayedB.aggregate.terminal.evidenceClosure.closureRoot,
+        );
+        expect(replayedA.aggregate.terminal.evidenceClosure.receipts.root).toBe(
+            replayedB.aggregate.terminal.evidenceClosure.receipts.root,
+        );
         const effects = replayedA.adapter.listOperationalEvidence().filter((row) =>
             row.kind === "runtime:model_proposal" || row.kind === "runtime:measurement");
         expect(effects.every((row) =>
@@ -1178,6 +1289,48 @@ describe("Crucible autonomous runner", () => {
         })).toBe(true);
         replayedA.repository.close();
         replayedB.repository.close();
+    }, 120_000);
+
+    it("refuses committed-effect recovery when a required raw artifact is missing", async () => {
+        const setup = setupInvestigation(
+            "committed-effect-missing-artifact",
+            { maxRounds: 1 },
+            { countHarnessCalls: true },
+        );
+        let injected = false;
+        await expect(runAutonomousInvestigation(
+            setup.config,
+            runnerDependencies(new FakeWorkerPool([95]), {
+                faultInjector(point, details) {
+                    if (!injected
+                        && point === "after_effect_commit"
+                        && details.command?.kind === "candidate-measurement") {
+                        injected = true;
+                        throw new InjectedCrashError(point);
+                    }
+                },
+            }),
+        )).rejects.toMatchObject({
+            code: "CRUCIBLE_RUNTIME_INJECTED_CRASH",
+        });
+
+        const persisted = replaySetup(setup);
+        const measurement = persisted.adapter.listOperationalEvidence().find((row) =>
+            row.kind === "runtime:measurement" && row.payload.purpose === "candidate");
+        const stdoutArtifact = persisted.repository.getArtifact(
+            measurement.payload.rawStdoutArtifactId,
+        );
+        persisted.repository.close();
+        const store = openArtifactStore({ root: setup.artifactRoot });
+        fs.rmSync(store.objectPath(`sha256:${stdoutArtifact.hashValue}`), { force: true });
+
+        await expect(runAutonomousInvestigation(
+            setup.config,
+            runnerDependencies(new FakeWorkerPool([])),
+        )).rejects.toMatchObject({
+            code: "CRUCIBLE_RUNTIME_INTEGRITY_FAILURE",
+        });
+        expect(harnessCallCount(setup)).toBe(3);
     }, 120_000);
 
     it("reruns an uncertain observed effect instead of treating artifact persistence as committed", async () => {

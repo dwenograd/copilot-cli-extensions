@@ -60,6 +60,24 @@ export {
     isImpossibilityVerdict,
 } from "./impossibility.mjs";
 
+export {
+    EVIDENCE_PROVENANCE_HASH_ALGORITHM,
+    EVIDENCE_PROVENANCE_VERSION,
+    MEASUREMENT_PROVENANCE_HASH_ALGORITHM,
+    OBSERVATION_STREAM_HASH_ALGORITHM,
+    SNAPSHOT_EXECUTION_HASH_ALGORITHM,
+    SNAPSHOT_PROVENANCE_HASH_ALGORITHM,
+    artifactIdsFromProvenance,
+    artifactRefsFromProvenance,
+    createEvidenceProvenance,
+    createMeasurementProvenance,
+    createSnapshotProvenance,
+    deriveEvidenceProvenanceRoot,
+    deriveMeasurementProvenanceRoot,
+    deriveSnapshotProvenanceRoot,
+    normalizeEvidenceProvenance,
+} from "./evidence.mjs";
+
 export { decideNext } from "./decision.mjs";
 
 export {

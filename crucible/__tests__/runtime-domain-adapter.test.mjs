@@ -6,11 +6,15 @@ import { fileURLToPath } from "node:url";
 import {
     DEFAULT_SEARCH_POLICY,
     EVENT_TYPES,
+    artifactRefsFromProvenance,
     constructEvidenceCommittedEvent,
     constructHarnessObservedEvent,
     constructKernelDecisionEvent,
     createExternalEvent,
+    createEvidenceProvenance,
     createInvestigationContract,
+    createMeasurementProvenance,
+    createSnapshotProvenance,
     hashCanonical,
 } from "../domain/index.mjs";
 import {
@@ -149,15 +153,143 @@ function openAdapter(label = "db") {
     return { root, repository, adapter };
 }
 
-function harnessReceipt(attemptId, candidate = false) {
+function digestOf(value) {
+    return value.split(":").at(-1);
+}
+
+function fakeArtifact(label, hash) {
     return {
+        artifactId: `artifact-${label}-${digestOf(hash).slice(0, 16)}`,
+        objectId: `sha256:${digestOf(hash)}`,
+    };
+}
+
+function registerProvenanceArtifacts(repository, provenance) {
+    for (const artifact of artifactRefsFromProvenance(provenance)) {
+        if (repository.getArtifact(artifact.artifactId) !== null) continue;
+        repository.registerExternalArtifact({
+            investigationId: "inv-runtime",
+            artifactId: artifact.artifactId,
+            algo: "sha256",
+            hash: artifact.objectId.slice("sha256:".length),
+            sizeBytes: 0,
+            contentType: "application/octet-stream",
+        });
+        repository.markArtifactDurable(artifact.artifactId);
+    }
+}
+
+function harnessReceipt(repository, contract, command, attemptId, purpose) {
+    const subjectIds = purpose === "validation"
+        ? contract.validationCases.map((item) => item.id)
+        : [command.candidateId];
+    const measurements = subjectIds.map((subjectId) => {
+        const snapshotId = purpose === "validation"
+            ? contract.validationCases.find((item) => item.id === subjectId).artifactHash
+            : `sha256:${digestOf(hashCanonical({ attemptId, artifact: true }))}`;
+        const stdoutHash = hashCanonical(
+            { attemptId, subjectId, stream: "stdout" },
+            "sha256:crucible-measurement-stream-v1",
+        );
+        const stderrHash = hashCanonical(
+            { attemptId, subjectId, stream: "stderr" },
+            "sha256:crucible-measurement-stream-v1",
+        );
+        const receiptHash = hashCanonical(
+            { attemptId, subjectId, receipt: true },
+            "sha256:crucible-measurement-receipt-v1",
+        );
+        const executableHash = hashCanonical(
+            { harness: "executable" },
+            "sha256:crucible-measurement-file-v1",
+        );
+        return createMeasurementProvenance({
+            subjectId,
+            receiptArtifact: fakeArtifact(`${subjectId}-receipt`, receiptHash),
+            receiptHash,
+            rawStdoutArtifact: fakeArtifact(`${subjectId}-stdout`, stdoutHash),
+            rawStdoutHash: stdoutHash,
+            rawStderrArtifact: fakeArtifact(`${subjectId}-stderr`, stderrHash),
+            rawStderrHash: stderrHash,
+            parserVersion: contract.parserVersion,
+            allowlistFileHash: hashCanonical(
+                { harness: "allowlist" },
+                "sha256:crucible-measurement-file-v1",
+            ),
+            harnessEntryHash: hashCanonical(
+                { harness: "entry" },
+                "sha256:crucible-measurement-entry-v1",
+            ),
+            executableHash,
+            stagedExecutableHash: executableHash,
+            dependencyHashes: [],
+            stagedDependencyHashes: [],
+            argvHash: hashCanonical(
+                { attemptId, subjectId, argv: true },
+                "sha256:crucible-measurement-argv-v1",
+            ),
+            envHash: hashCanonical(
+                { attemptId, subjectId, env: true },
+                "sha256:crucible-measurement-env-v1",
+            ),
+            sandboxPolicy: { kind: "none", sandboxId: null, environmentHash: null },
+            snapshot: createSnapshotProvenance({
+                snapshotHash:
+                    `sha256:crucible-measurement-snapshot-v1:${digestOf(snapshotId)}`,
+                manifestArtifact: fakeArtifact(`${subjectId}-manifest`, snapshotId),
+                objectArtifacts: [],
+            }),
+            snapshotExecutionHash: hashCanonical(
+                { attemptId, subjectId, execution: true },
+                "sha256:crucible-evidence-snapshot-execution-v1",
+            ),
+        });
+    });
+    const provenance = createEvidenceProvenance({
+        proposalArtifact: purpose === "candidate"
+            ? fakeArtifact(
+                `${command.candidateId}-proposal`,
+                hashCanonical({ attemptId, proposal: true }),
+            )
+            : null,
+        promptContextHash: purpose === "candidate"
+            ? hashCanonical({ attemptId, prompt: true })
+            : null,
+        validationCompositeArtifact: purpose === "validation"
+            ? fakeArtifact(
+                `${attemptId}-validation`,
+                hashCanonical({ attemptId, validation: true }),
+            )
+            : null,
+        measurements,
+    }, { purpose, command, contract });
+    registerProvenanceArtifacts(repository, provenance);
+    return {
+        version: 1,
         attemptId,
         runnerEpochId: "runner-epoch",
-        rawStdoutHash: hashCanonical({ attemptId, stream: "stdout" }),
-        rawStderrHash: hashCanonical({ attemptId, stream: "stderr" }),
-        candidateArtifactHash: candidate
-            ? hashCanonical({ attemptId, artifact: true })
+        rawStdoutHash: purpose === "validation"
+            ? hashCanonical(
+                provenance.measurements.map((item) => ({
+                    id: item.subjectId,
+                    hash: item.rawStdoutHash,
+                })),
+                "sha256:crucible-runtime-observation-streams-v1",
+            )
+            : provenance.measurements[0].rawStdoutHash,
+        rawStderrHash: purpose === "validation"
+            ? hashCanonical(
+                provenance.measurements.map((item) => ({
+                    id: item.subjectId,
+                    hash: item.rawStderrHash,
+                })),
+                "sha256:crucible-runtime-observation-streams-v1",
+            )
+            : provenance.measurements[0].rawStderrHash,
+        candidateArtifactHash: purpose === "candidate"
+            ? provenance.measurements[0].snapshot.snapshotHash
             : null,
+        provenance,
     };
 }
 
@@ -183,7 +315,13 @@ function appendFullVerifiedHistory(adapter) {
             commandId: "cmd-000001",
             observationId: "validation-observation",
             purpose: "validation",
-            receipt: harnessReceipt("validation-attempt"),
+            receipt: harnessReceipt(
+                adapter.repository,
+                aggregate.contract,
+                aggregate.commands["cmd-000001"].command,
+                "validation-attempt",
+                "validation",
+            ),
             data: {
                 caseResults: [
                     { id: "good", artifactHash: artifactHash("a"), outcome: "accept" },
@@ -222,7 +360,13 @@ function appendFullVerifiedHistory(adapter) {
             purpose: "candidate",
             // round/slotIndex/candidateId default to the kernel-reserved
             // search-candidate assignment; supplying our own would be rejected.
-            receipt: harnessReceipt("candidate-attempt", true),
+            receipt: harnessReceipt(
+                adapter.repository,
+                aggregate.contract,
+                aggregate.commands["cmd-000002"].command,
+                "candidate-attempt",
+                "candidate",
+            ),
             data: { pass: true, metrics: { score: 95 } },
         }),
         { aggregate },
@@ -347,6 +491,64 @@ describe("Crucible domain/persistence adapter", () => {
         releaseRepository(reopened);
     });
 
+    it("prevents evidence commitment when an observation artifact ref is missing", () => {
+        const { root, repository, adapter } = openAdapter("missing-artifact-ref");
+        let aggregate = adapter.openInvestigation(
+            createInvestigationContract(contractInput()),
+        ).aggregate;
+        const reserved = adapter.appendKernelDecision();
+        aggregate = reserved.aggregate;
+        aggregate = adapter.appendExternal(EVENT_TYPES.COMMAND_DISPATCHED, {
+            commandId: reserved.domainEvent.payload.commandId,
+        }).aggregate;
+        const receipt = harnessReceipt(
+            repository,
+            aggregate.contract,
+            reserved.domainEvent.payload.command,
+            "missing-ref-attempt",
+            "validation",
+        );
+        const observed = adapter.appendHarnessObservation({
+            commandId: reserved.domainEvent.payload.commandId,
+            observationId: "missing-ref-observation",
+            purpose: "validation",
+            receipt,
+            data: {
+                caseResults: [
+                    { id: "good", artifactHash: artifactHash("a"), outcome: "accept" },
+                    { id: "bad", artifactHash: artifactHash("b"), outcome: "reject" },
+                ],
+            },
+        });
+        const observationSeq = observed.domainEvent.seq;
+        expect(repository.listArtifactRefsForEvent("inv-runtime", observationSeq).length)
+            .toBeGreaterThan(0);
+
+        const raw = new DatabaseSync(path.join(root, "events.sqlite"));
+        try {
+            raw.exec("PRAGMA journal_mode=WAL;");
+            raw.prepare(`
+                DELETE FROM artifact_refs
+                WHERE ref_id = (
+                    SELECT ref_id FROM artifact_refs
+                    WHERE investigation_id = ? AND seq = ?
+                    ORDER BY ref_id ASC LIMIT 1
+                )`).run("inv-runtime", observationSeq);
+        } finally {
+            raw.close();
+        }
+
+        expect(() => adapter.appendEvidenceCommit({
+            evidenceId: "missing-ref-evidence",
+            observationId: "missing-ref-observation",
+        })).toThrow(expect.objectContaining({
+            code: RUNTIME_ERROR_CODES.INTEGRITY_FAILURE,
+        }));
+        expect(repository.listEvents("inv-runtime").some((row) =>
+            row.kind === "domain:evidence_committed")).toBe(false);
+        releaseRepository(repository);
+    });
+
     it("abandons stale reserved/dispatched attempts before replacement work", () => {
         const { repository, adapter } = openAdapter("recovery");
         adapter.openInvestigation(createInvestigationContract(contractInput()));
@@ -404,7 +606,13 @@ describe("Crucible domain/persistence adapter", () => {
             commandId: reserved.commandId,
             observationId: "stale-validation-observation",
             purpose: "validation",
-            receipt: harnessReceipt("attempt-one"),
+            receipt: harnessReceipt(
+                repository,
+                before.contract,
+                reserved.command,
+                "attempt-one",
+                "validation",
+            ),
             data: {
                 caseResults: [
                     { id: "good", artifactHash: artifactHash("a"), outcome: "accept" },
@@ -440,11 +648,18 @@ describe("Crucible domain/persistence adapter", () => {
             lease: first.lease,
         });
         adapter.dispatchAttempt("attempt-one", first.lease);
+        const beforeObservation = adapter.replay().aggregate;
         adapter.appendHarnessObservationFenced({
             commandId: reserved.commandId,
             observationId: "validation-observation",
             purpose: "validation",
-            receipt: harnessReceipt("attempt-one"),
+            receipt: harnessReceipt(
+                repository,
+                beforeObservation.contract,
+                reserved.command,
+                "attempt-one",
+                "validation",
+            ),
             data: {
                 caseResults: [
                     { id: "good", artifactHash: artifactHash("a"), outcome: "accept" },

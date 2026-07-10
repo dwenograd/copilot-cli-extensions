@@ -1,6 +1,7 @@
 import {
     canonicalClone,
     deepFreeze,
+    hashCanonical,
     immutableCanonical,
 } from "./canonical.mjs";
 import {
@@ -9,6 +10,11 @@ import {
 } from "./archive.mjs";
 import { DOMAIN_VERSION } from "./constants.mjs";
 import { impossibilitySearchEvidenceHash } from "./impossibility.mjs";
+
+const BOUNDED_CANDIDATE_SET_HASH_ALGORITHM =
+    "sha256:crucible-bounded-candidate-set-v1";
+const BOUNDED_EVIDENCE_CLOSURE_HASH_ALGORITHM =
+    "sha256:crucible-bounded-evidence-closure-v1";
 
 const AGGREGATE_MAP_FIELDS = Object.freeze([
     "capabilityEpochs",
@@ -299,19 +305,28 @@ export function boundedSearchExhaustion(aggregate) {
     const byCandidateId = new Map(
         progress.candidates.map((evidence) => [evidence.candidateId, evidence]),
     );
+    const evidenceClosure = boundedCandidateIds.map((candidateId) => {
+        const evidence = byCandidateId.get(candidateId);
+        return {
+            candidateId,
+            evidenceId: evidence.evidenceId,
+            evidenceHash: evidence.commitEventHash,
+            provenanceRoot: evidence.provenanceRoot,
+        };
+    });
     return {
         kind: "search_space_exhausted",
         searchSpaceExhausted: true,
         topology: aggregate.contract.hypothesisTopology,
-        boundedCandidateIds,
-        evidenceClosure: boundedCandidateIds.map((candidateId) => {
-            const evidence = byCandidateId.get(candidateId);
-            return {
-                candidateId,
-                evidenceId: evidence.evidenceId,
-                evidenceHash: evidence.commitEventHash,
-            };
-        }),
+        boundedCandidateCount: boundedCandidateIds.length,
+        boundedCandidateIdsHash: hashCanonical(
+            boundedCandidateIds,
+            BOUNDED_CANDIDATE_SET_HASH_ALGORITHM,
+        ),
+        evidenceClosureHash: hashCanonical(
+            evidenceClosure,
+            BOUNDED_EVIDENCE_CLOSURE_HASH_ALGORITHM,
+        ),
     };
 }
 

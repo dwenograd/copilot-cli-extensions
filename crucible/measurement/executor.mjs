@@ -10,11 +10,10 @@
 //   - The executable and every declared dependency are copied from their
 //     verified open handles into a private per-attempt directory, fsync'd,
 //     re-hashed, and only those staged paths reach spawn().
-//   - Caller supplies a materialised, immutable candidate snapshot with an
-//     algorithm-tagged snapshot hash. The executor treats the snapshot as
-//     opaque data — it passes the snapshot path into the harness via argv
-//     substitution and/or the CANDIDATE_SNAPSHOT_PATH env var; it does NOT
-//     read the snapshot contents itself.
+//   - Caller supplies a materialised candidate directory plus the immutable
+//     snapshot id, canonical manifest, and expected CAS object closure. Every
+//     path is identity-pinned and hashed before spawn, held open through the
+//     run, then identity-checked and re-hashed before any result is accepted.
 //   - If executesCandidateCode is true and no SandboxProvider was
 //     configured, the executor throws SandboxRequiredError immediately —
 //     before any spawn. cwd/env/timeout ARE NOT a sandbox.
@@ -50,6 +49,9 @@ import {
     StagingRefusedError,
 } from "./errors.mjs";
 import {
+    closeVerifiedSnapshotClosure,
+    openVerifiedSnapshotClosure,
+    reverifySnapshotClosure,
     sha256Bytes,
     STREAM_HASH_ALGORITHM,
 } from "./fs-verify.mjs";
@@ -291,6 +293,7 @@ async function runOnce({
     const runnerEpochId = validateIdentifier(runInput.runnerEpochId, "runnerEpochId");
     let runLease = null;
     let stageRoot = null;
+    let snapshotLease = null;
     try {
         // Re-open and re-hash through the issuing allowlist instance for this
         // exact run, then keep those verified handles live through staging.
@@ -298,6 +301,7 @@ async function runOnce({
         stageRoot = makeAttemptStage(scratchRoot, attemptId);
         const stagedRun = stageVerifiedHarnessRun(runLease, stageRoot);
         const entry = stagedRun.entry;
+        snapshotLease = openVerifiedSnapshotClosure(snapshot);
 
         // Fail-closed sandbox gate.
         let admission = null;
@@ -401,6 +405,7 @@ async function runOnce({
             timeoutMs: entry.timeoutMs,
             adapter,
         });
+        const snapshotBinding = reverifySnapshotClosure(snapshotLease);
 
         const completedAt = clock.isoNow();
         const durationMs = clock.now() - startTimeMs;
@@ -479,6 +484,10 @@ async function runOnce({
         argvHash,
         envHash,
         candidateSnapshotHash: snapshot.hash,
+        candidateSnapshotPreClosureHash: snapshotBinding.preClosureHash,
+        candidateSnapshotPostClosureHash: snapshotBinding.postClosureHash,
+        candidateSnapshotIdentitySummary: snapshotBinding.identitySummary,
+        candidateSnapshotMutationCheck: snapshotBinding.mutationCheck,
         stdoutHash,
         stderrHash,
         parserVersion: PARSER_VERSION,
@@ -515,11 +524,20 @@ async function runOnce({
         // return prevents accidental persistence of unvetted bytes.
         });
     } finally {
-        if (runLease !== null) {
-            releaseVerifiedHarnessRun(runLease);
-        }
-        if (stageRoot !== null) {
-            fs.rmSync(stageRoot, { recursive: true, force: true });
+        try {
+            if (snapshotLease !== null) {
+                closeVerifiedSnapshotClosure(snapshotLease);
+            }
+        } finally {
+            try {
+                if (runLease !== null) {
+                    releaseVerifiedHarnessRun(runLease);
+                }
+            } finally {
+                if (stageRoot !== null) {
+                    fs.rmSync(stageRoot, { recursive: true, force: true });
+                }
+            }
         }
     }
 }

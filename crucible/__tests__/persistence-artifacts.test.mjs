@@ -9,7 +9,13 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { openRepository, ERROR_CODES, sha256Hex } from "../persistence/index.mjs";
+import {
+    openRepository,
+    openRepositoryReadOnly,
+    ERROR_CODES,
+    sha256Hex,
+} from "../persistence/index.mjs";
+import { DatabaseSync } from "../persistence/sqlite.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 
@@ -73,6 +79,55 @@ describe("inline artifacts", () => {
         const err = catchCode(() => repo.getInlineArtifact("art-ext"));
         expect(err.code).toBe(ERROR_CODES.INVALID_ARGUMENT);
     });
+
+    it("reports referenced inline blob size corruption during read-only verification", () => {
+        repo.putInlineArtifact({
+            investigationId: "inv-1",
+            artifactId: "art-inline",
+            bytes: Buffer.from("inline-integrity"),
+        });
+        repo.referenceArtifact({ investigationId: "inv-1", artifactId: "art-inline" });
+        repo.close();
+        repo = null;
+
+        const db = new DatabaseSync(path.join(dir, "events.sqlite"));
+        try {
+            db.prepare(
+                "UPDATE artifacts SET size_bytes = size_bytes + 1 WHERE artifact_id = 'art-inline'",
+            ).run();
+        } finally {
+            db.close();
+        }
+        repo = openRepository({ file: path.join(dir, "events.sqlite") });
+        const report = repo.verifyInvestigation("inv-1");
+        expect(report.ok).toBe(false);
+        expect(report.violations.some((item) =>
+            item.detail.includes("size metadata does not match"))).toBe(true);
+    });
+});
+
+describe("read-only repository", () => {
+    it("verifies existing state without permitting mutation", () => {
+        repo.putInlineArtifact({
+            investigationId: "inv-1",
+            artifactId: "art-inline",
+            bytes: Buffer.from("read-only"),
+        });
+        repo.referenceArtifact({ investigationId: "inv-1", artifactId: "art-inline" });
+        const readOnly = openRepositoryReadOnly({
+            file: path.join(dir, "events.sqlite"),
+        });
+        try {
+            expect(readOnly.readOnly).toBe(true);
+            expect(readOnly.verifyInvestigation("inv-1").ok).toBe(true);
+            expect(() => readOnly.ensureInvestigation({
+                investigationId: "must-not-write",
+            })).toThrow();
+        } finally {
+            readOnly.close();
+        }
+        expect(repo.getInvestigation("must-not-write")).toBeNull();
+    });
 });
 
 describe("external artifacts durable gate", () => {
@@ -107,5 +162,83 @@ describe("external artifacts durable gate", () => {
     it("reports ARTIFACT_NOT_FOUND when marking a missing artifact durable", () => {
         const err = catchCode(() => repo.markArtifactDurable("nope"));
         expect(err.code).toBe(ERROR_CODES.ARTIFACT_NOT_FOUND);
+    });
+
+    it("atomically binds durable artifact refs to the appended event sequence", () => {
+        for (const [artifactId, hash] of [
+            ["receipt-artifact", "12".repeat(32)],
+            ["stdout-artifact", "34".repeat(32)],
+        ]) {
+            repo.registerExternalArtifact({
+                investigationId: "inv-1",
+                artifactId,
+                algo: "sha256",
+                hash,
+                sizeBytes: 1,
+            });
+            repo.markArtifactDurable(artifactId);
+        }
+
+        const appended = repo.appendEvents({
+            investigationId: "inv-1",
+            expectedHead: null,
+            events: [{
+                kind: "evidence",
+                payload: { closure: "root" },
+                artifactIds: ["stdout-artifact", "receipt-artifact", "receipt-artifact"],
+            }],
+        });
+
+        expect(appended.events[0].artifactRefs.map((ref) => ref.artifactId)).toEqual([
+            "receipt-artifact",
+            "stdout-artifact",
+        ]);
+        expect(repo.listArtifactRefsForEvent("inv-1", 1).map((ref) => ref.artifactId))
+            .toEqual(["receipt-artifact", "stdout-artifact"]);
+
+        const duplicate = repo.referenceArtifact({
+            investigationId: "inv-1",
+            artifactId: "receipt-artifact",
+            seq: 1,
+        });
+        expect(duplicate.deduplicated).toBe(true);
+        expect(repo.listArtifactRefsForEvent("inv-1", 1)).toHaveLength(2);
+    });
+
+    it("rolls back an event append when any required artifact is missing or non-durable", () => {
+        repo.registerExternalArtifact({
+            investigationId: "inv-1",
+            artifactId: "not-durable",
+            algo: "sha256",
+            hash: "56".repeat(32),
+        });
+
+        expect(() => repo.appendEvents({
+            investigationId: "inv-1",
+            expectedHead: null,
+            events: [{
+                kind: "evidence",
+                payload: {},
+                artifactIds: ["not-durable"],
+            }],
+        })).toThrow(expect.objectContaining({
+            code: ERROR_CODES.ARTIFACT_NOT_DURABLE,
+        }));
+        expect(repo.countEvents("inv-1")).toBe(0);
+        expect(repo.listArtifactRefs("inv-1")).toEqual([]);
+
+        expect(() => repo.appendEvents({
+            investigationId: "inv-1",
+            expectedHead: null,
+            events: [{
+                kind: "evidence",
+                payload: {},
+                artifactIds: ["missing-artifact"],
+            }],
+        })).toThrow(expect.objectContaining({
+            code: ERROR_CODES.ARTIFACT_NOT_FOUND,
+        }));
+        expect(repo.countEvents("inv-1")).toBe(0);
+        expect(repo.listArtifactRefs("inv-1")).toEqual([]);
     });
 });

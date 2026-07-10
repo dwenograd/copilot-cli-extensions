@@ -33,7 +33,9 @@ import {
 import {
     assertLocalDatabasePath,
     openArtifactStore,
+    openArtifactStoreReadOnly,
     openRepository,
+    openRepositoryReadOnly,
 } from "../persistence/index.mjs";
 import { PARSER_VERSION, loadHarnessAllowlist } from "../measurement/index.mjs";
 import {
@@ -61,6 +63,7 @@ import { TOOL_SPECS } from "./schema.mjs";
 import {
     NON_RESULT_BANNER,
     TERMINAL_BANNER,
+    INTEGRITY_NON_RESULT_BANNER,
     failure,
     success,
 } from "./result.mjs";
@@ -85,7 +88,9 @@ export function makeDefaultDeps(env = process.env, log = () => {}) {
         isPidAlive: isExactPidAlive,
         loadHarnessAllowlist,
         openRepository,
+        openRepositoryReadOnly,
         openArtifactStore,
+        openArtifactStoreReadOnly,
         createDomainRepositoryAdapter,
         ensureSupervisor,
         readStatus,
@@ -184,24 +189,36 @@ function ingestValidationCases(store, projectRoot, cases, env) {
     });
 }
 
-function openInvestigationForRead(deps, investigationId, eventsDbPath) {
+function openInvestigationForRead(deps, investigationId, paths) {
+    const { eventsDbPath, artifactRoot } = paths;
     if (!fs.existsSync(eventsDbPath)) {
         throw new InvestigationNotFoundError("no Crucible investigation with this id", {
             investigationId,
         });
     }
-    const repository = deps.openRepository({ file: eventsDbPath, env: deps.env });
+    const repository = deps.openRepositoryReadOnly({
+        file: eventsDbPath,
+        env: deps.env,
+    });
     try {
         const adapter = deps.createDomainRepositoryAdapter({
             repository,
             investigationId,
             ensure: false,
         });
-        // replay() runs repository structural verification + domain hash-chain
-        // and reducer replay; it does not mutate domain state.
-        const replay = adapter.replay();
+        const artifactStore = deps.openArtifactStoreReadOnly({
+            root: artifactRoot,
+            env: deps.env,
+        });
+        // This performs repository/domain replay plus complete terminal artifact
+        // closure verification. Both persistence handles are read-only.
+        const replay = adapter.verifyTerminalArtifactClosure({ artifactStore });
         const operationalNonResult = adapter.latestOperationalNonResult();
-        return { aggregate: replay.aggregate, operationalNonResult };
+        return {
+            aggregate: replay.aggregate,
+            operationalNonResult,
+            artifactClosureReport: replay.artifactClosureReport,
+        };
     } finally {
         repository.close();
     }
@@ -581,14 +598,58 @@ function tryRestartSupervisor(deps, env, paths, investigationId) {
     }
 }
 
+function integrityBlockedPayload(investigationId) {
+    return {
+        is_result: false,
+        banner: INTEGRITY_NON_RESULT_BANNER,
+        investigation_id: investigationId,
+        integrity_blocked: true,
+        non_result: true,
+        non_result_code: "INTEGRITY_BLOCKED",
+        reason: "Persisted investigation evidence failed integrity verification. No result is available.",
+        message: `${INTEGRITY_NON_RESULT_BANNER}\n${NON_RESULT_BANNER}`,
+    };
+}
+
+function readInvestigationOrIntegrityBlock(deps, investigationId, paths) {
+    try {
+        return {
+            blocked: null,
+            read: openInvestigationForRead(deps, investigationId, paths),
+        };
+    } catch (error) {
+        if (error instanceof InvestigationNotFoundError) throw error;
+        deps.log?.(
+            `[crucible] integrity verification blocked read for ${investigationId}: ${error?.message ?? String(error)}`,
+        );
+        return {
+            blocked: integrityBlockedPayload(investigationId),
+            read: null,
+        };
+    }
+}
+
 export function statusInvestigation(args, deps) {
     const env = deps.env;
     const investigationId = args.investigation_id;
     const stateRoot = resolveStateRoot(env);
     const paths = resolveInvestigationPaths(stateRoot, investigationId);
 
-    const { aggregate, operationalNonResult } =
-        openInvestigationForRead(deps, investigationId, paths.eventsDbPath);
+    const verifiedRead = readInvestigationOrIntegrityBlock(
+        deps,
+        investigationId,
+        paths,
+    );
+    if (verifiedRead.blocked !== null) {
+        return {
+            ...verifiedRead.blocked,
+            terminal_available: false,
+            paused: false,
+            status: "integrity_blocked",
+            note: "Integrity verification failed; status cannot expose or trust a terminal decision.",
+        };
+    }
+    const { aggregate, operationalNonResult } = verifiedRead.read;
 
     const recommendation = aggregate.contract === null
         || aggregate.terminal !== null
@@ -623,6 +684,7 @@ export function statusInvestigation(args, deps) {
     return {
         is_result: false,
         investigation_id: investigationId,
+        integrity_blocked: false,
         terminal_available: aggregate.terminal !== null,
         non_result: aggregate.nonResults.length > 0 || operationalNonResult !== null,
         non_result_code:
@@ -724,8 +786,15 @@ export function resultInvestigation(args, deps) {
     const stateRoot = resolveStateRoot(env);
     const paths = resolveInvestigationPaths(stateRoot, investigationId);
 
-    const { aggregate, operationalNonResult } =
-        openInvestigationForRead(deps, investigationId, paths.eventsDbPath);
+    const verifiedRead = readInvestigationOrIntegrityBlock(
+        deps,
+        investigationId,
+        paths,
+    );
+    if (verifiedRead.blocked !== null) {
+        return verifiedRead.blocked;
+    }
+    const { aggregate, operationalNonResult } = verifiedRead.read;
     const terminal = aggregate.terminal;
     const isTerminalResult = terminal !== null && TERMINAL_DECISIONS.includes(terminal.decision);
 
@@ -733,6 +802,7 @@ export function resultInvestigation(args, deps) {
         return {
             is_result: true,
             banner: TERMINAL_BANNER,
+            integrity_verified: true,
             investigation_id: investigationId,
             decision: terminal.decision,
             terminal_seq: terminal.seq,

@@ -17,6 +17,11 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 
+import {
+    canonicalJson,
+    immutableCanonical,
+} from "../domain/canonical.mjs";
+
 export const HERE = path.dirname(fileURLToPath(import.meta.url));
 export const NODE_EXE = process.execPath;
 
@@ -99,16 +104,38 @@ export function writeAllowlist(root, entryId, entryOverrides = {}, { fileName = 
     return p;
 }
 
-// Materialise a frozen candidate snapshot at a real path with a real
-// hash. `bytes` may be a string or Buffer.
+// Materialise a frozen candidate snapshot directory with the same manifest /
+// object-closure shape supplied by the runtime runner.
 export function materializeCandidateSnapshot(root, name, bytes) {
     const p = path.join(root, `${name}.snapshot`);
+    fs.mkdirSync(p);
     const buf = typeof bytes === "string" ? Buffer.from(bytes, "utf8") : bytes;
-    fs.writeFileSync(p, buf);
-    const hash = createHash("sha256").update(buf).digest("hex");
-    return Object.freeze({
+    const relPath = "candidate.bin";
+    fs.writeFileSync(path.join(p, relPath), buf);
+    const objectId =
+        `sha256:${createHash("sha256").update(buf).digest("hex")}`;
+    const manifest = {
+        type: "crucible-snapshot",
+        version: 1,
+        algo: "sha256",
+        fileCount: 1,
+        totalBytes: buf.length,
+        entries: [{
+            path: relPath,
+            size: buf.length,
+            object: objectId,
+        }],
+    };
+    const snapshotId =
+        `sha256:${createHash("sha256")
+            .update(canonicalJson(manifest), "utf8")
+            .digest("hex")}`;
+    return immutableCanonical({
         path: p,
-        hash: `sha256:crucible-measurement-snapshot-v1:${hash}`,
+        hash: `sha256:crucible-measurement-snapshot-v1:${snapshotId.slice("sha256:".length)}`,
+        snapshotId,
+        manifest,
+        expectedObjectClosure: [objectId, snapshotId].sort(),
     });
 }
 

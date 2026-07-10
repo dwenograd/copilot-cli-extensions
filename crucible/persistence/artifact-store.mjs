@@ -50,6 +50,17 @@ const OBJECT_ID_RE = /^([a-z0-9]+):([0-9a-f]+)$/u;
 const HEX64_RE = /^[0-9a-f]{64}$/u;
 const SNAPSHOT_TYPE = "crucible-snapshot";
 const SNAPSHOT_VERSION = 1;
+const SNAPSHOT_MANIFEST_KEYS = Object.freeze([
+    "algo",
+    "entries",
+    "fileCount",
+    "totalBytes",
+    "type",
+    "version",
+]);
+const SNAPSHOT_ENTRY_KEYS = Object.freeze(["object", "path", "size"]);
+const WINDOWS_RESERVED_DEVICE_RE =
+    /^(?:aux|clock\$|com[1-9¹²³]|con|conin\$|conout\$|lpt[1-9¹²³]|nul|prn)(?:\..*)?$/iu;
 const STAGE_CHUNK = 1 << 16;
 
 const DEFAULT_LIMITS = Object.freeze({
@@ -190,6 +201,18 @@ function assertSafeComponent(name, context) {
     if (name.includes(":")) {
         throw new UnsafePathError("path component contains a colon", { context, name });
     }
+    if (/[\u0000-\u001f<>"|?*]/u.test(name)) {
+        throw new UnsafePathError("path component contains a Windows-reserved character", { context, name });
+    }
+    if (name.endsWith(".") || name.endsWith(" ")) {
+        throw new UnsafePathError("path component has a Windows-ambiguous trailing dot or space", {
+            context,
+            name,
+        });
+    }
+    if (WINDOWS_RESERVED_DEVICE_RE.test(name)) {
+        throw new UnsafePathError("path component is a reserved Windows device name", { context, name });
+    }
 }
 
 // Validate an untrusted relative posix path (from a manifest). Returns the
@@ -201,14 +224,216 @@ function safeRelSegments(relPath, maxPathLength) {
     if (relPath.length > maxPathLength) {
         throw new LimitExceededError("relative path exceeds maximum length", { relPath, maxPathLength });
     }
-    if (path.isAbsolute(relPath) || /^[A-Za-z]:/u.test(relPath)) {
+    if (path.posix.isAbsolute(relPath) || path.win32.isAbsolute(relPath) || /^[A-Za-z]:/u.test(relPath)) {
         throw new UnsafePathError("absolute paths are not permitted in a snapshot", { relPath });
+    }
+    if (relPath.includes("\\")) {
+        throw new UnsafePathError("snapshot paths must use canonical forward-slash separators", { relPath });
     }
     const segments = relPath.split("/");
     for (const seg of segments) {
         assertSafeComponent(seg, relPath);
     }
     return segments;
+}
+
+function hasExactKeys(value, expectedKeys) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+        return false;
+    }
+    const actual = Object.keys(value).sort();
+    return actual.length === expectedKeys.length
+        && actual.every((key, index) => key === expectedKeys[index]);
+}
+
+function windowsPathIdentity(relPath) {
+    return relPath.replaceAll("\\", "/").toLowerCase();
+}
+
+function validateSnapshotManifest(manifest, options = {}) {
+    const { snapshotId = null, rawBytes = null, limits = DEFAULT_LIMITS } = options;
+    const at = snapshotId === null ? {} : { snapshotId };
+
+    if (!hasExactKeys(manifest, SNAPSHOT_MANIFEST_KEYS)) {
+        throw new SnapshotInvalidError("snapshot manifest must use the canonical schema", {
+            ...at,
+            expectedKeys: SNAPSHOT_MANIFEST_KEYS,
+            actualKeys: manifest && typeof manifest === "object" && !Array.isArray(manifest)
+                ? Object.keys(manifest).sort()
+                : [],
+        });
+    }
+    if (manifest.type !== SNAPSHOT_TYPE
+        || manifest.version !== SNAPSHOT_VERSION
+        || manifest.algo !== ALGO
+        || !Array.isArray(manifest.entries)) {
+        throw new SnapshotInvalidError("snapshot manifest has an unexpected type, version, algorithm, or entries", at);
+    }
+    if (!Number.isSafeInteger(manifest.fileCount) || manifest.fileCount < 0) {
+        throw new SnapshotInvalidError("snapshot manifest fileCount must be a non-negative safe integer", at);
+    }
+    if (!Number.isSafeInteger(manifest.totalBytes) || manifest.totalBytes < 0) {
+        throw new SnapshotInvalidError("snapshot manifest totalBytes must be a non-negative safe integer", at);
+    }
+    if (manifest.entries.length > limits.maxFiles || manifest.fileCount > limits.maxFiles) {
+        throw new SnapshotInvalidError("snapshot manifest exceeds the configured file-count limit", {
+            ...at,
+            maxFiles: limits.maxFiles,
+        });
+    }
+    if (manifest.totalBytes > limits.maxTotalBytes) {
+        throw new SnapshotInvalidError("snapshot manifest exceeds the configured total-byte limit", {
+            ...at,
+            maxTotalBytes: limits.maxTotalBytes,
+        });
+    }
+
+    const entries = [];
+    const pathsByIdentity = new Map();
+    const filePathIdentities = new Set();
+    const directoryPathIdentities = new Set();
+    const objectSizes = new Map();
+    let previousPath = null;
+    let computedTotalBytes = 0;
+
+    for (let index = 0; index < manifest.entries.length; index += 1) {
+        const entry = manifest.entries[index];
+        if (!hasExactKeys(entry, SNAPSHOT_ENTRY_KEYS)) {
+            throw new SnapshotInvalidError("snapshot manifest entry must use the canonical schema", {
+                ...at,
+                index,
+                expectedKeys: SNAPSHOT_ENTRY_KEYS,
+                actualKeys: entry && typeof entry === "object" && !Array.isArray(entry)
+                    ? Object.keys(entry).sort()
+                    : [],
+            });
+        }
+        if (typeof entry.path !== "string" || typeof entry.object !== "string") {
+            throw new SnapshotInvalidError("snapshot manifest entry path and object must be strings", {
+                ...at,
+                index,
+            });
+        }
+        if (!Number.isSafeInteger(entry.size) || entry.size < 0 || entry.size > limits.maxFileBytes) {
+            throw new SnapshotInvalidError("snapshot manifest entry size is invalid", {
+                ...at,
+                index,
+                size: entry.size,
+                maxFileBytes: limits.maxFileBytes,
+            });
+        }
+
+        const segments = safeRelSegments(entry.path, limits.maxPathLength);
+        const pathIdentity = windowsPathIdentity(entry.path);
+        const priorPath = pathsByIdentity.get(pathIdentity);
+        if (priorPath !== undefined) {
+            throw new SnapshotInvalidError(
+                "snapshot manifest contains duplicate or Windows-colliding paths",
+                { ...at, index, path: entry.path, priorPath },
+            );
+        }
+        pathsByIdentity.set(pathIdentity, entry.path);
+        if (previousPath !== null && previousPath >= entry.path) {
+            throw new SnapshotInvalidError("snapshot manifest entries are not strictly sorted by path", {
+                ...at,
+                index,
+                previousPath,
+                path: entry.path,
+            });
+        }
+        previousPath = entry.path;
+
+        const identitySegments = segments.map((segment) => segment.toLowerCase());
+        const entryIdentity = identitySegments.join("/");
+        if (directoryPathIdentities.has(entryIdentity)) {
+            throw new SnapshotInvalidError("snapshot path is both a file and a directory", {
+                ...at,
+                index,
+                path: entry.path,
+            });
+        }
+        for (let depth = 1; depth < identitySegments.length; depth += 1) {
+            const parentIdentity = identitySegments.slice(0, depth).join("/");
+            if (filePathIdentities.has(parentIdentity)) {
+                throw new SnapshotInvalidError("snapshot path descends through another file entry", {
+                    ...at,
+                    index,
+                    path: entry.path,
+                });
+            }
+            directoryPathIdentities.add(parentIdentity);
+        }
+        filePathIdentities.add(entryIdentity);
+
+        let canonicalObject;
+        try {
+            const { hex } = parseObjectId(entry.object);
+            canonicalObject = objectIdFor(hex);
+        } catch (err) {
+            throw new SnapshotInvalidError("snapshot manifest entry has an invalid object id", {
+                ...at,
+                index,
+                object: entry.object,
+                cause: err.message,
+            });
+        }
+        if (canonicalObject !== entry.object) {
+            throw new SnapshotInvalidError("snapshot manifest entry object id is not canonical", {
+                ...at,
+                index,
+                object: entry.object,
+            });
+        }
+        const priorSize = objectSizes.get(canonicalObject);
+        if (priorSize !== undefined && priorSize !== entry.size) {
+            throw new SnapshotInvalidError("snapshot manifest assigns conflicting sizes to one object", {
+                ...at,
+                index,
+                object: canonicalObject,
+                priorSize,
+                size: entry.size,
+            });
+        }
+        objectSizes.set(canonicalObject, entry.size);
+
+        if (computedTotalBytes > Number.MAX_SAFE_INTEGER - entry.size) {
+            throw new SnapshotInvalidError("snapshot manifest byte total exceeds safe integer range", at);
+        }
+        computedTotalBytes += entry.size;
+        entries.push({ path: entry.path, size: entry.size, object: canonicalObject });
+    }
+
+    if (manifest.fileCount !== entries.length) {
+        throw new SnapshotInvalidError("snapshot manifest fileCount does not match entries", {
+            ...at,
+            fileCount: manifest.fileCount,
+            actualFileCount: entries.length,
+        });
+    }
+    if (manifest.totalBytes !== computedTotalBytes) {
+        throw new SnapshotInvalidError("snapshot manifest totalBytes does not match entry sizes", {
+            ...at,
+            totalBytes: manifest.totalBytes,
+            actualTotalBytes: computedTotalBytes,
+        });
+    }
+
+    const validated = {
+        type: SNAPSHOT_TYPE,
+        version: SNAPSHOT_VERSION,
+        algo: ALGO,
+        fileCount: manifest.fileCount,
+        totalBytes: manifest.totalBytes,
+        entries,
+    };
+    if (rawBytes !== null) {
+        const sourceBytes = Buffer.isBuffer(rawBytes) ? rawBytes : Buffer.from(rawBytes);
+        const canonicalBytes = Buffer.from(canonicalize(validated), "utf8");
+        if (!sourceBytes.equals(canonicalBytes)) {
+            throw new SnapshotInvalidError("snapshot manifest bytes are not canonical JSON", at);
+        }
+    }
+    return validated;
 }
 
 function toPosix(p) {
@@ -298,19 +523,28 @@ export class ArtifactStore {
     #limits;
     #now;
     #verifyExistingOnPut;
+    #readOnly;
 
-    constructor({ root, now, limits, verifyExistingOnPut }) {
+    constructor({ root, now, limits, verifyExistingOnPut, readOnly = false }) {
         this.#root = root;
         this.#objectsRoot = path.join(root, "objects", ALGO);
         this.#stagingRoot = path.join(root, "staging");
         this.#limits = limits;
         this.#now = now;
         this.#verifyExistingOnPut = verifyExistingOnPut;
+        this.#readOnly = readOnly;
     }
 
     static open(options = {}) {
-        const { root, denyRoots, env, limits, now = () => new Date().toISOString(), verifyExistingOnPut = true } =
-            options;
+        const {
+            root,
+            denyRoots,
+            env,
+            limits,
+            now = () => new Date().toISOString(),
+            verifyExistingOnPut = true,
+            readOnly = false,
+        } = options;
         if (typeof root !== "string" || root.trim().length === 0) {
             throw new InvalidArgumentError("artifact store root must be a non-empty string", { root });
         }
@@ -335,8 +569,11 @@ export class ArtifactStore {
             now,
             limits: normalizeLimits(limits),
             verifyExistingOnPut: verifyExistingOnPut !== false,
+            readOnly: readOnly === true,
         });
-        store.#ensureLayout();
+        if (readOnly !== true) {
+            store.#ensureLayout();
+        }
         return store;
     }
 
@@ -346,6 +583,10 @@ export class ArtifactStore {
 
     get limits() {
         return this.#limits;
+    }
+
+    get readOnly() {
+        return this.#readOnly;
     }
 
     #ensureLayout() {
@@ -373,7 +614,18 @@ export class ArtifactStore {
 
     // --- staging -----------------------------------------------------------
 
+    #assertWritable() {
+        if (this.#readOnly) {
+            throw new ArtifactStoreError(
+                ARTIFACT_STORE_ERROR_CODES.IO_ERROR,
+                "artifact store was opened read-only",
+                { root: this.#root },
+            );
+        }
+    }
+
     #newStagingPath() {
+        this.#assertWritable();
         const unique = `${Date.now().toString(36)}-${process.pid.toString(36)}-${randomBytes(12).toString("hex")}`;
         return path.join(this.#stagingRoot, `${unique}.tmp`);
     }
@@ -775,14 +1027,14 @@ export class ArtifactStore {
         // Deterministic order: sort by posix relative path.
         entries.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
 
-        const manifest = {
+        const manifest = validateSnapshotManifest({
             type: SNAPSHOT_TYPE,
             version: SNAPSHOT_VERSION,
             algo: ALGO,
             fileCount: entries.length,
             totalBytes: counters.bytes,
             entries,
-        };
+        }, { limits: this.#limits });
         const manifestBytes = Buffer.from(canonicalize(manifest), "utf8");
         const manifestMeta = this.putBytes(manifestBytes, { contentType: "application/vnd.crucible.snapshot+json" });
 
@@ -909,21 +1161,11 @@ export class ArtifactStore {
         } catch (err) {
             throw new SnapshotInvalidError("snapshot manifest is not valid JSON", { snapshotId, cause: err.message });
         }
-        if (
-            !parsed ||
-            parsed.type !== SNAPSHOT_TYPE ||
-            parsed.version !== SNAPSHOT_VERSION ||
-            parsed.algo !== ALGO ||
-            !Array.isArray(parsed.entries)
-        ) {
-            throw new SnapshotInvalidError("snapshot manifest has an unexpected shape", { snapshotId });
-        }
-        for (const e of parsed.entries) {
-            if (!e || typeof e.path !== "string" || typeof e.object !== "string" || !Number.isInteger(e.size)) {
-                throw new SnapshotInvalidError("snapshot manifest entry is malformed", { snapshotId, entry: e });
-            }
-        }
-        return parsed;
+        return validateSnapshotManifest(parsed, {
+            snapshotId,
+            rawBytes: bytes,
+            limits: this.#limits,
+        });
     }
 
     // Materialize a snapshot read-only into a fresh destination directory by
@@ -941,14 +1183,17 @@ export class ArtifactStore {
             });
         }
         const manifest = this.loadManifest(snapshot);
+        const resolvedEntries = manifest.entries.map((entry) => ({
+            entry,
+            segments: entry.path.split("/"),
+        }));
 
         fs.mkdirSync(destResolved, { recursive: true });
         const destReal = fs.realpathSync.native(destResolved);
 
         let fileCount = 0;
         let totalBytes = 0;
-        for (const entry of manifest.entries) {
-            const segments = safeRelSegments(entry.path, this.#limits.maxPathLength);
+        for (const { entry, segments } of resolvedEntries) {
             const targetAbs = path.join(destReal, ...segments);
             if (!isInsideDir(targetAbs, destReal)) {
                 throw new UnsafePathError("snapshot entry escapes destination", {
@@ -1089,6 +1334,7 @@ export class ArtifactStore {
     // taken exclusively from the caller (explicit ids and/or verified snapshot
     // closures); nothing is inferred from untrusted on-disk manifests.
     reconcile(options = {}) {
+        this.#assertWritable();
         const { referenced = [], snapshots = [], olderThanMs, now = Date.now(), dryRun = false } = options;
         if (!Number.isFinite(olderThanMs) || olderThanMs < 0) {
             throw new InvalidArgumentError("olderThanMs must be a non-negative finite number", { olderThanMs });
@@ -1191,6 +1437,10 @@ export class ArtifactStore {
 
 export function openArtifactStore(options = {}) {
     return ArtifactStore.open(options);
+}
+
+export function openArtifactStoreReadOnly(options = {}) {
+    return ArtifactStore.open({ ...options, readOnly: true });
 }
 
 // --- small internal utilities ---------------------------------------------

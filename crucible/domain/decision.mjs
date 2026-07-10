@@ -8,6 +8,7 @@ import {
 import { impossibilitySearchEvidenceHash } from "./impossibility.mjs";
 import { DecisionError, ERROR_CODES } from "./errors.mjs";
 import { detectPlateau, buildSearchCandidateCommand } from "./strategy.mjs";
+import { buildCandidateArchive } from "./archive.mjs";
 import {
     activeCommand,
     boundedSearchExhaustion,
@@ -16,12 +17,24 @@ import {
     latestUnhandledStopRequest,
     latestApplicableImpossibilityEvidence,
     qualifyingCandidateEvidence,
-    qualifyingCandidateEvidenceItems,
     qualifyingUnreachableEvidence,
     qualifyingValidationEvidence,
     searchProgress,
     uncommittedObservation,
 } from "./state.mjs";
+
+const TERMINAL_RECEIPT_ROOTS_HASH_ALGORITHM =
+    "sha256:crucible-terminal-receipt-roots-v1";
+const TERMINAL_FRONTIER_HASH_ALGORITHM =
+    "sha256:crucible-terminal-frontier-v1";
+const TERMINAL_ARCHIVE_HASH_ALGORITHM =
+    "sha256:crucible-terminal-archive-v1";
+const TERMINAL_BASIS_HASH_ALGORITHM =
+    "sha256:crucible-terminal-basis-v1";
+const TERMINAL_STRATEGY_HISTORY_HASH_ALGORITHM =
+    "sha256:crucible-terminal-strategy-history-v1";
+const TERMINAL_EVIDENCE_CLOSURE_HASH_ALGORITHM =
+    "sha256:crucible-terminal-evidence-closure-v1";
 
 function nextCommandId(aggregate) {
     return `cmd-${String(aggregate.commandOrder.length + 1).padStart(6, "0")}`;
@@ -82,18 +95,130 @@ function impossibilityNonResultRecommendation(aggregate, evidence) {
     };
 }
 
-function evidenceClosure(aggregate) {
-    const validation = currentValidationEvidence(aggregate);
+function evidenceReference(evidence) {
     return {
-        validation: {
-            evidenceId: validation.evidenceId,
-            evidenceHash: validation.commitEventHash,
-        },
-        candidates: qualifyingCandidateEvidenceItems(aggregate).map((evidence) => ({
-            candidateId: evidence.candidateId,
+        evidenceId: evidence.evidenceId,
+        evidenceHash: evidence.commitEventHash,
+        provenanceRoot: evidence.provenanceRoot,
+    };
+}
+
+function projectArchiveEvidence(evidence) {
+    return {
+        candidateId: evidence.candidateId,
+        evidenceId: evidence.evidenceId,
+        evidenceHash: evidence.commitEventHash,
+        provenanceRoot: evidence.provenanceRoot,
+        outcomeClass: evidence.outcomeClass,
+        rankable: evidence.rankable,
+        metrics: evidence.metrics,
+        round: evidence.round,
+        slotIndex: evidence.slotIndex,
+    };
+}
+
+function terminalEvidenceClosure(
+    aggregate,
+    {
+        basis,
+        decisiveKind,
+        decisiveEvidence = null,
+    },
+) {
+    const validation = currentValidationEvidence(aggregate);
+    const receiptRoots = aggregate.evidenceOrder.flatMap((evidenceId) => {
+        const evidence = aggregate.evidence[evidenceId];
+        if (evidence.receipt?.provenance?.measurements === undefined) {
+            return [];
+        }
+        return evidence.receipt.provenance.measurements.map((measurement) => ({
+            evidenceId,
+            evidenceHash: evidence.commitEventHash,
+            provenanceRoot: evidence.provenanceRoot,
+            subjectId: measurement.subjectId,
+            measurementRoot: measurement.measurementRoot,
+            invalidated: evidence.invalidated,
+            invalidatedSeq: evidence.invalidatedSeq,
+        }));
+    });
+    const progress = searchProgress(aggregate);
+    const frontierProjection = {
+        active: progress.candidates.map((evidence) => projectArchiveEvidence(evidence)),
+        attempted: progress.attemptedCandidates.map((evidence) => ({
             evidenceId: evidence.evidenceId,
             evidenceHash: evidence.commitEventHash,
+            provenanceRoot: evidence.provenanceRoot,
+            invalidated: evidence.invalidated,
+            invalidatedSeq: evidence.invalidatedSeq,
+            round: evidence.round,
+            slotIndex: evidence.slotIndex,
         })),
+        completedRounds: progress.completedRounds,
+        nextRound: progress.nextRound,
+        nextSlot: progress.nextSlot,
+        roundsExhausted: progress.roundsExhausted,
+        boundedComplete: progress.boundedComplete,
+        boundedAttempted: progress.boundedAttempted,
+    };
+    const archive = buildCandidateArchive(aggregate);
+    const archiveProjection = {
+        accepted: archive.accepted.map(projectArchiveEvidence),
+        nearMisses: archive.nearMisses.map(projectArchiveEvidence),
+        rejected: archive.rejected.map(projectArchiveEvidence),
+        invalidMetrics: archive.invalidMetrics.map(projectArchiveEvidence),
+        mechanismGroups: archive.mechanismGroups,
+        lessonGroups: archive.lessonGroups,
+        duplicateIndex: archive.duplicateIndex,
+        incumbent: archive.incumbent === null
+            ? null
+            : projectArchiveEvidence(archive.incumbent),
+    };
+    const core = {
+        version: 1,
+        validation: evidenceReference(validation),
+        decisive: {
+            kind: decisiveKind,
+            evidence: decisiveEvidence === null ? null : evidenceReference(decisiveEvidence),
+        },
+        termination: {
+            kind: basis.kind,
+            basisHash: hashCanonical(basis, TERMINAL_BASIS_HASH_ALGORITHM),
+            strategyRevision: aggregate.searchStrategy.revision,
+            strategyHistoryHash: hashCanonical(
+                aggregate.searchStrategy.history,
+                TERMINAL_STRATEGY_HISTORY_HASH_ALGORITHM,
+            ),
+        },
+        receipts: {
+            count: receiptRoots.length,
+            evidenceCount: aggregate.evidenceOrder.length,
+            root: hashCanonical(
+                receiptRoots,
+                TERMINAL_RECEIPT_ROOTS_HASH_ALGORITHM,
+            ),
+        },
+        frontier: {
+            activeCandidateCount: progress.candidates.length,
+            attemptedCandidateCount: progress.attemptedCandidates.length,
+            digest: hashCanonical(
+                frontierProjection,
+                TERMINAL_FRONTIER_HASH_ALGORITHM,
+            ),
+        },
+        archive: {
+            acceptedCount: archive.accepted.length,
+            nearMissCount: archive.nearMisses.length,
+            rejectedCount: archive.rejected.length,
+            invalidMetricsCount: archive.invalidMetrics.length,
+            digest: hashCanonical(
+                archiveProjection,
+                TERMINAL_ARCHIVE_HASH_ALGORITHM,
+            ),
+        },
+    };
+    return {
+        ...core,
+        closureRoot: hashCanonical(core, TERMINAL_EVIDENCE_CLOSURE_HASH_ALGORITHM),
     };
 }
 
@@ -105,7 +230,11 @@ function verifiedRecommendation(aggregate, incumbent, basis) {
         evidenceHash: incumbent.commitEventHash,
         contractHash: aggregate.contractHash,
         basis,
-        evidenceClosure: evidenceClosure(aggregate),
+        evidenceClosure: terminalEvidenceClosure(aggregate, {
+            basis,
+            decisiveKind: "winner",
+            decisiveEvidence: incumbent,
+        }),
     };
     return {
         kind: "TERMINAL",
@@ -126,6 +255,10 @@ function unreachableRecommendation(aggregate) {
     }
     const boundedBasis = boundedSearchExhaustion(aggregate);
     if (boundedBasis !== null) {
+        const evidenceClosure = terminalEvidenceClosure(aggregate, {
+            basis: boundedBasis,
+            decisiveKind: "bounded_search",
+        });
         return {
             kind: "TERMINAL",
             decision: "TARGET_UNREACHABLE",
@@ -135,6 +268,7 @@ function unreachableRecommendation(aggregate) {
                 payload: {
                     decision: "TARGET_UNREACHABLE",
                     basis: boundedBasis,
+                    evidenceClosure,
                 },
             },
         };
@@ -151,24 +285,16 @@ function unreachableRecommendation(aggregate) {
         ...evidence.unreachableBasis,
         evidenceId: evidence.evidenceId,
         evidenceHash: evidence.commitEventHash,
-        evidenceClosure: {
-            validation: {
-                evidenceId: validation.evidenceId,
-                evidenceHash: validation.commitEventHash,
-            },
-            search: {
-                candidateCount: verifierCommand.request.trigger.candidateCount,
-                candidateEvidenceHash:
-                    verifierCommand.request.trigger.candidateEvidenceHash,
-            },
-            certificate: {
-                evidenceId: evidence.evidenceId,
-                evidenceHash: evidence.commitEventHash,
-                certificateArtifactHash:
-                    evidence.unreachableBasis.certificateArtifactHash,
-            },
-        },
+        validationEvidenceId: validation.evidenceId,
+        validationEvidenceHash: validation.commitEventHash,
+        candidateCount: verifierCommand.request.trigger.candidateCount,
+        candidateEvidenceHash: verifierCommand.request.trigger.candidateEvidenceHash,
     };
+    const evidenceClosure = terminalEvidenceClosure(aggregate, {
+        basis,
+        decisiveKind: "impossibility_certificate",
+        decisiveEvidence: evidence,
+    });
     return {
         kind: "TERMINAL",
         decision: "TARGET_UNREACHABLE",
@@ -180,6 +306,7 @@ function unreachableRecommendation(aggregate) {
                 basis,
                 evidenceId: evidence.evidenceId,
                 evidenceHash: evidence.commitEventHash,
+                evidenceClosure,
             },
         },
     };

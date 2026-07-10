@@ -43,6 +43,13 @@ function ownEntry(record, key) {
     return hasOwnEntry(record, key) ? record[key] : null;
 }
 
+function objectIdMatchesTaggedHash(objectId, taggedHash) {
+    return typeof objectId === "string"
+        && /^sha256:[a-f0-9]{64}$/u.test(objectId)
+        && isAlgorithmTaggedSha256(taggedHash)
+        && objectId.slice("sha256:".length) === taggedHash.split(":").at(-1);
+}
+
 function assertEventEnvelope(aggregate, event) {
     if (event === null || typeof event !== "object" || Array.isArray(event)) {
         throw new EventChainError(ERROR_CODES.INVALID_EVENT, "Event must be an object");
@@ -265,6 +272,9 @@ function applyCommandObserved(next, event) {
         );
     }
     if (payload.purpose === "impossibility") {
+        const measurement = payload.receipt.provenance.measurements[0];
+        const certificateArtifact =
+            payload.receipt.provenance.impossibilityCertificateArtifact;
         if (command.command.kind !== "verify_impossibility"
             || next.contract.hypothesisTopology !== "certified_impossibility") {
             throw new TransitionError(
@@ -282,7 +292,27 @@ function applyCommandObserved(next, event) {
                 !== payload.data.verificationRequestHash
             || payload.receipt.verificationSnapshotHash
                 !== payload.data.verificationSnapshotHash
-            || payload.data.verifiedFacts.parserVersion !== command.command.parserVersion) {
+            || payload.data.verifiedFacts.parserVersion !== command.command.parserVersion
+            || measurement.receiptHash !== payload.data.measurementReceiptHash
+            || measurement.snapshot.snapshotHash
+                !== payload.data.verificationSnapshotHash
+            || !objectIdMatchesTaggedHash(
+                measurement.receiptArtifact.objectId,
+                payload.receipt.measurementReceiptArtifactHash,
+            )
+            || !objectIdMatchesTaggedHash(
+                measurement.rawStdoutArtifact.objectId,
+                payload.receipt.rawStdoutArtifactHash,
+            )
+            || !objectIdMatchesTaggedHash(
+                measurement.rawStderrArtifact.objectId,
+                payload.receipt.rawStderrArtifactHash,
+            )
+            || certificateArtifact === null
+            || !objectIdMatchesTaggedHash(
+                certificateArtifact.objectId,
+                payload.data.certificateArtifactHash,
+            )) {
             throw new TransitionError(
                 ERROR_CODES.INVALID_EVIDENCE,
                 "Impossibility observation receipt and verifier facts do not match the reserved command",

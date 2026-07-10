@@ -26,7 +26,11 @@ import {
     EventChainError,
     TransitionError,
 } from "./errors.mjs";
-import { deriveEvidencePayload } from "./evidence.mjs";
+import {
+    OBSERVATION_STREAM_HASH_ALGORITHM,
+    deriveEvidencePayload,
+    normalizeEvidenceProvenance,
+} from "./evidence.mjs";
 import { deriveImpossibilityVerdict } from "./impossibility.mjs";
 import { createInitialAggregate } from "./state.mjs";
 
@@ -37,10 +41,12 @@ const FORBIDDEN_IDENTIFIERS = new Set([
 ]);
 const RECEIPT_FIELDS = Object.freeze([
     "attemptId",
-    "runnerEpochId",
-    "rawStdoutHash",
-    "rawStderrHash",
     "candidateArtifactHash",
+    "provenance",
+    "rawStderrHash",
+    "rawStdoutHash",
+    "runnerEpochId",
+    "version",
 ]);
 const IMPOSSIBILITY_RECEIPT_FIELDS = Object.freeze([
     "certificateArtifactHash",
@@ -263,15 +269,24 @@ function normalizeAnnotations(value, maximumCitations = ANNOTATION_LIMITS.citedE
     };
 }
 
-function normalizeHarnessReceipt(value, purpose) {
+function normalizeHarnessReceipt(value, purpose, { command = null, contract = null } = {}) {
     const receipt = requirePlainObject(value, "receipt");
-    for (const field of RECEIPT_FIELDS) {
-        requireOwnField(receipt, field, `receipt.${field}`);
+    const expectedFields = purpose === "impossibility"
+        ? [...RECEIPT_FIELDS, ...IMPOSSIBILITY_RECEIPT_FIELDS]
+        : RECEIPT_FIELDS;
+    const actualFields = Object.keys(receipt).sort();
+    if (!canonicalEqual(actualFields, [...expectedFields].sort())) {
+        throw new TransitionError(
+            ERROR_CODES.INVALID_EVENT,
+            "receipt must contain exactly the canonical purpose-specific fields",
+            { actualFields, expectedFields },
+        );
     }
-    if (purpose === "impossibility") {
-        for (const field of IMPOSSIBILITY_RECEIPT_FIELDS) {
-            requireOwnField(receipt, field, `receipt.${field}`);
-        }
+    if (receipt.version !== 1) {
+        throw new TransitionError(
+            ERROR_CODES.INVALID_EVENT,
+            "receipt.version must be 1",
+        );
     }
     const candidateArtifactHash = receipt.candidateArtifactHash;
     if (purpose === "candidate") {
@@ -282,13 +297,59 @@ function normalizeHarnessReceipt(value, purpose) {
             "Non-candidate harness receipts require candidateArtifactHash=null",
         );
     }
+    const provenance = normalizeEvidenceProvenance(receipt.provenance, {
+        purpose,
+        command,
+        contract,
+    });
     const normalized = {
+        version: 1,
         attemptId: normalizeEventIdentifier(receipt.attemptId, "receipt.attemptId"),
         runnerEpochId: normalizeEventIdentifier(receipt.runnerEpochId, "receipt.runnerEpochId"),
         rawStdoutHash: requireAlgorithmHash(receipt.rawStdoutHash, "receipt.rawStdoutHash"),
         rawStderrHash: requireAlgorithmHash(receipt.rawStderrHash, "receipt.rawStderrHash"),
         candidateArtifactHash,
+        provenance,
     };
+    if (purpose === "validation") {
+        const expectedStdoutHash = hashCanonical(
+            provenance.measurements.map((item) => ({
+                id: item.subjectId,
+                hash: item.rawStdoutHash,
+            })),
+            OBSERVATION_STREAM_HASH_ALGORITHM,
+        );
+        const expectedStderrHash = hashCanonical(
+            provenance.measurements.map((item) => ({
+                id: item.subjectId,
+                hash: item.rawStderrHash,
+            })),
+            OBSERVATION_STREAM_HASH_ALGORITHM,
+        );
+        if (normalized.rawStdoutHash !== expectedStdoutHash
+            || normalized.rawStderrHash !== expectedStderrHash) {
+            throw new TransitionError(
+                ERROR_CODES.INVALID_EVENT,
+                "Validation receipt stream roots are not derived from all case outputs",
+            );
+        }
+    } else {
+        const measurement = provenance.measurements[0];
+        if (normalized.rawStdoutHash !== measurement.rawStdoutHash
+            || normalized.rawStderrHash !== measurement.rawStderrHash) {
+            throw new TransitionError(
+                ERROR_CODES.INVALID_EVENT,
+                "Harness receipt stream hashes do not match the persisted raw-output artifacts",
+            );
+        }
+    }
+    if (purpose === "candidate"
+        && candidateArtifactHash !== provenance.measurements[0].snapshot.snapshotHash) {
+        throw new TransitionError(
+            ERROR_CODES.INVALID_EVENT,
+            "Candidate receipt artifact hash does not match the persisted snapshot closure",
+        );
+    }
     if (purpose === "impossibility") {
         for (const field of IMPOSSIBILITY_RECEIPT_FIELDS) {
             normalized[field] = requireAlgorithmHash(receipt[field], `receipt.${field}`);
@@ -419,7 +480,10 @@ export function normalizeCommandObservedPayload(payload, aggregate = null) {
     );
     const command = ownEntry(aggregate?.commands, commandId)?.command ?? null;
     const receipt = sourceKind === "harness"
-        ? normalizeHarnessReceipt(requireOwnField(input, "receipt", "receipt"), purpose)
+        ? normalizeHarnessReceipt(requireOwnField(input, "receipt", "receipt"), purpose, {
+            command,
+            contract: aggregate?.contract ?? null,
+        })
         : null;
     const round = Object.hasOwn(input, "round") ? input.round : undefined;
     const slotIndex = Object.hasOwn(input, "slotIndex") ? input.slotIndex : undefined;

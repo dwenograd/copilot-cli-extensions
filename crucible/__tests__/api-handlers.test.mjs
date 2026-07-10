@@ -19,13 +19,28 @@ import {
     DEFAULT_SEARCH_POLICY,
     DOMAIN_VERSION,
     EVENT_TYPES,
+    createEvidenceProvenance,
     createInvestigationContract,
+    createMeasurementProvenance,
+    createSnapshotProvenance,
+    canonicalJson,
+    computeEventHash as computeDomainEventHash,
     decideNext,
     deriveImpossibilityVerdict,
     hashCanonical,
 } from "../domain/index.mjs";
-import { openArtifactStore, openRepository } from "../persistence/index.mjs";
 import {
+    canonicalize,
+    computeEventHash as computeRepositoryEventHash,
+    openArtifactStore,
+    openArtifactStoreReadOnly,
+    openRepository,
+    openRepositoryReadOnly,
+    sha256Hex,
+} from "../persistence/index.mjs";
+import { DatabaseSync } from "../persistence/sqlite.mjs";
+import {
+    PROMPT_CONTEXT_HASH_ALGORITHM,
     createDomainRepositoryAdapter,
     loadSupervisorConfig,
     readSupervisorLock,
@@ -33,7 +48,13 @@ import {
     requestStop,
     supervisorPaths,
 } from "../runtime/index.mjs";
-import { loadHarnessAllowlist } from "../measurement/index.mjs";
+import {
+    STREAM_HASH_ALGORITHM,
+    buildMeasurementReceipt,
+    hashReceipt,
+    loadHarnessAllowlist,
+    sha256Bytes,
+} from "../measurement/index.mjs";
 
 import {
     deriveInvestigationId,
@@ -46,7 +67,11 @@ import {
     statusInvestigation,
     stopInvestigation,
 } from "../api/handlers.mjs";
-import { NON_RESULT_BANNER, TERMINAL_BANNER } from "../api/result.mjs";
+import {
+    INTEGRITY_NON_RESULT_BANNER,
+    NON_RESULT_BANNER,
+    TERMINAL_BANNER,
+} from "../api/result.mjs";
 import {
     ContractConflictError,
     EnvironmentError,
@@ -67,7 +92,8 @@ afterEach(() => {
 });
 
 function makeWorkspace(label) {
-    const root = fs.mkdtempSync(path.join(HERE, `.api-handlers-${label}-`));
+    const safeLabel = label.replace(/[^A-Za-z0-9._-]/gu, "-");
+    const root = fs.mkdtempSync(path.join(HERE, `.api-handlers-${safeLabel}-`));
     roots.push(root);
     const stateRoot = path.join(root, "state-root");
     const projectDir = path.join(root, "project");
@@ -111,7 +137,9 @@ function makeDeps(env, overrides = {}) {
         isPidAlive: () => false,
         loadHarnessAllowlist,
         openRepository,
+        openRepositoryReadOnly,
         openArtifactStore,
+        openArtifactStoreReadOnly,
         createDomainRepositoryAdapter,
         ensureSupervisor: (input, opts) => {
             calls.ensure.push({ input, opts });
@@ -177,68 +205,542 @@ function searchPolicy(overrides = {}) {
     };
 }
 
-function seedReceipt(observationId, isCandidate) {
+function seedDigest(value) {
+    return value.split(":").at(-1);
+}
+
+function seedArtifact(label, hash) {
+    const safeLabel = label.replace(/[^A-Za-z0-9._-]/gu, "-").slice(0, 48);
     return {
-        attemptId: `attempt-${observationId}`,
-        runnerEpochId: "runner-epoch-seed",
-        rawStdoutHash: hashCanonical({ observationId, stream: "stdout" }),
-        rawStderrHash: hashCanonical({ observationId, stream: "stderr" }),
-        candidateArtifactHash: isCandidate ? hashCanonical({ observationId, artifact: true }) : null,
+        artifactId: `seed-${safeLabel}-${seedDigest(hash).slice(0, 16)}`,
+        objectId: `sha256:${seedDigest(hash)}`,
     };
 }
 
-function seedImpossibilityObservation(reserved, observationId, facts) {
-    const verifiedFacts = {
-        pass: facts.pass,
-        searchSpaceExhausted: facts.searchSpaceExhausted,
-        parserVersion: reserved.parserVersion,
+function registerStoredArtifact(adapter, label, stored, contentType) {
+    const artifact = seedArtifact(label, stored.id);
+    const existing = adapter.repository.getArtifact(artifact.artifactId);
+    if (existing === null) {
+        adapter.repository.registerExternalArtifact({
+            investigationId: adapter.investigationId,
+            artifactId: artifact.artifactId,
+            algo: "sha256",
+            hash: stored.hash,
+            sizeBytes: stored.size,
+            contentType,
+        });
+        adapter.repository.markArtifactDurable(artifact.artifactId);
+    }
+    return artifact;
+}
+
+function persistSeedBytes(adapter, store, label, bytes, contentType) {
+    return registerStoredArtifact(
+        adapter,
+        label,
+        store.putBytes(bytes, { contentType }),
+        contentType,
+    );
+}
+
+function createSeedSnapshot(store, files) {
+    const entries = files.map((file) => {
+        const bytes = Buffer.from(file.content, "utf8");
+        const stored = store.putBytes(bytes, { contentType: "application/octet-stream" });
+        return { path: file.path, size: stored.size, object: stored.id };
+    }).sort((left, right) => left.path.localeCompare(right.path));
+    const manifest = {
+        type: "crucible-snapshot",
+        version: 1,
+        algo: "sha256",
+        fileCount: entries.length,
+        totalBytes: entries.reduce((sum, entry) => sum + entry.size, 0),
+        entries,
     };
-    const certificateArtifactHash = hashCanonical({
-        observationId,
-        artifact: "certificate",
+    const stored = store.putBytes(
+        Buffer.from(canonicalize(manifest), "utf8"),
+        { contentType: "application/vnd.crucible.snapshot+json" },
+    );
+    return { snapshotId: stored.id, manifest };
+}
+
+function seedSnapshotClosureHash(snapshotId, manifest) {
+    const directories = new Set();
+    for (const entry of manifest.entries) {
+        const segments = entry.path.split("/");
+        for (let depth = 1; depth < segments.length; depth += 1) {
+            directories.add(segments.slice(0, depth).join("/"));
+        }
+    }
+    return hashCanonical({
+        version: 1,
+        snapshotId,
+        expectedObjectClosure: [...new Set([
+            snapshotId,
+            ...manifest.entries.map((entry) => entry.object),
+        ])].sort(),
+        directories: [...directories].sort(),
+        files: manifest.entries.map((entry) => ({
+            path: entry.path,
+            size: entry.size,
+            object: entry.object,
+        })),
+    }, "sha256:crucible-measurement-snapshot-closure-v1");
+}
+
+function persistSeedSnapshot(adapter, store, label, snapshotId) {
+    const manifest = store.loadManifest(snapshotId);
+    const manifestBytes = store.readObject(snapshotId);
+    const manifestArtifact = registerStoredArtifact(
+        adapter,
+        `${label}-manifest`,
+        {
+            id: snapshotId,
+            hash: seedDigest(snapshotId),
+            size: manifestBytes.length,
+        },
+        "application/vnd.crucible.snapshot+json",
+    );
+    const objectArtifacts = [...new Map(
+        manifest.entries.map((entry) => [entry.object, entry.size]),
+    ).entries()].sort(([left], [right]) => left.localeCompare(right))
+        .map(([objectId, size], index) =>
+            registerStoredArtifact(
+                adapter,
+                `${label}-object-${index}`,
+                { id: objectId, hash: seedDigest(objectId), size },
+                "application/octet-stream",
+            ));
+    return createSnapshotProvenance({
+        snapshotHash: `sha256:crucible-measurement-snapshot-v1:${seedDigest(snapshotId)}`,
+        manifestArtifact,
+        objectArtifacts,
     });
-    const measurementReceiptHash = hashCanonical({
-        observationId,
-        receipt: "measurement",
+}
+
+function seedValidationCases(store) {
+    return [
+        {
+            id: "good",
+            expectation: "accept",
+            artifactHash: createSeedSnapshot(store, [
+                { path: "input.txt", content: "good-case" },
+            ]).snapshotId,
+        },
+        {
+            id: "bad",
+            expectation: "reject",
+            artifactHash: createSeedSnapshot(store, [
+                { path: "input.txt", content: "bad-case" },
+            ]).snapshotId,
+        },
+    ];
+}
+
+function seedMeasurementReceipt({
+    aggregate,
+    observationId,
+    subjectId,
+    snapshotHash,
+    snapshotId,
+    snapshotManifest,
+    parsed,
+    stdoutHash,
+    stderrHash,
+}) {
+    const executableHash = hashCanonical(
+        { harness: "executable" },
+        "sha256:crucible-measurement-file-v1",
+    );
+    const dependencyHash = hashCanonical(
+        { harness: "dependency" },
+        "sha256:crucible-measurement-file-v1",
+    );
+    const closureHash = seedSnapshotClosureHash(snapshotId, snapshotManifest);
+    const identity = {
+        root: snapshotHash,
+        files: [{ subjectId, snapshotHash }],
+    };
+    return buildMeasurementReceipt({
+        allowlistFileHash: hashCanonical(
+            { harness: "allowlist" },
+            "sha256:crucible-measurement-file-v1",
+        ),
+        harnessEntryHash: hashCanonical(
+            { harness: "entry" },
+            "sha256:crucible-measurement-entry-v1",
+        ),
+        executableHash,
+        stagedExecutableHash: executableHash,
+        dependencyHashes: [{
+            path: "C:\\fake\\dependency.bin",
+            role: "support",
+            sha256: dependencyHash,
+        }],
+        stagedDependencyHashes: [{
+            path: "C:\\stage\\dependency.bin",
+            role: "support",
+            sha256: dependencyHash,
+        }],
+        argvHash: hashCanonical(
+            { observationId, subjectId, argv: true },
+            "sha256:crucible-measurement-argv-v1",
+        ),
+        envHash: hashCanonical(
+            { observationId, subjectId, env: true },
+            "sha256:crucible-measurement-env-v1",
+        ),
+        candidateSnapshotHash: snapshotHash,
+        candidateSnapshotPreClosureHash: closureHash,
+        candidateSnapshotPostClosureHash: closureHash,
+        candidateSnapshotIdentitySummary: { pre: identity, post: identity },
+        candidateSnapshotMutationCheck: {
+            status: "passed",
+            closureStable: true,
+            identityStable: true,
+            openHandleRehashStable: true,
+            reparseStable: true,
+        },
+        stdoutHash,
+        stderrHash,
+        parserVersion: aggregate.contract.parserVersion,
+        sandbox: null,
+        attemptId: `attempt-${observationId}-${subjectId}`,
+        runnerEpochId: "runner-epoch-seed",
+        startedAt: "2026-01-01T00:00:00.000Z",
+        completedAt: "2026-01-01T00:00:00.001Z",
+        durationMs: 1,
+        exit: { code: 0, signal: null, timedOut: false },
+        parsed,
     });
-    const verificationSnapshotHash = hashCanonical({
-        observationId,
-        snapshot: "verification",
+}
+
+function seedReceipt(adapter, store, aggregate, reserved, observationId, purpose, options = {}) {
+    const subjectIds = purpose === "validation"
+        ? aggregate.contract.validationCases.map((item) => item.id)
+        : [purpose === "candidate"
+            ? reserved.candidateId
+            : `impossibility-${reserved.attemptOrdinal}`];
+    let candidateProposalArtifact = null;
+    let promptContextHash = null;
+    let candidateSnapshot = null;
+    if (purpose === "candidate") {
+        const assignment = {
+            operator: reserved.operator,
+            round: reserved.round,
+            slotIndex: reserved.slotIndex,
+            candidateId: reserved.candidateId,
+            model: reserved.model,
+            seed: reserved.seed,
+            parentEvidenceIds: reserved.parentEvidenceIds,
+            promptContextRefs: reserved.promptContextRefs,
+            ...(reserved.boundedCandidateId === null
+                || reserved.boundedCandidateId === undefined
+                ? {}
+                : { boundedCandidateId: reserved.boundedCandidateId }),
+        };
+        const promptContext = {
+            version: "crucible-runtime-prompt-context-v1",
+            assignment,
+            objective: aggregate.contract.objective,
+            priorWork: {},
+        };
+        promptContextHash = hashCanonical(
+            promptContext,
+            PROMPT_CONTEXT_HASH_ALGORITHM,
+        );
+        const proposal = {
+            candidateId: reserved.candidateId,
+            files: [{
+                path: "candidate.txt",
+                content: `candidate-${reserved.candidateId}-${observationId}`,
+            }],
+            identity: null,
+        };
+        candidateSnapshot = createSeedSnapshot(store, proposal.files);
+        candidateProposalArtifact = persistSeedBytes(
+            adapter,
+            store,
+            `${observationId}-proposal`,
+            Buffer.from(canonicalJson({
+                assignment,
+                promptContext,
+                promptContextHash,
+                proposal,
+            }), "utf8"),
+            "application/vnd.crucible.candidate-proposal+json",
+        );
+    }
+    const measurementDetails = subjectIds.map((subjectId) => {
+        const snapshotId = purpose === "validation"
+            ? aggregate.contract.validationCases.find((item) => item.id === subjectId)
+                .artifactHash
+            : purpose === "candidate"
+                ? candidateSnapshot.snapshotId
+                : createSeedSnapshot(store, [{
+                    path: "request.json",
+                    content: canonicalJson(reserved.request),
+                }]).snapshotId;
+        const parsed = purpose === "validation"
+            ? {
+                pass: aggregate.contract.validationCases.find(
+                    (item) => item.id === subjectId,
+                ).expectation === "accept",
+                metrics: {},
+            }
+            : purpose === "candidate"
+                ? options.candidateData
+                : {
+                    pass: options.impossibilityFacts.pass,
+                    searchSpaceExhausted: options.impossibilityFacts.searchSpaceExhausted,
+                    metrics: {},
+                };
+        const stdoutBytes = Buffer.from(canonicalJson(parsed), "utf8");
+        const stderrBytes = Buffer.from(`stderr-${observationId}-${subjectId}`, "utf8");
+        const stdoutHash = sha256Bytes(stdoutBytes, STREAM_HASH_ALGORITHM);
+        const stderrHash = sha256Bytes(stderrBytes, STREAM_HASH_ALGORITHM);
+        const snapshot = persistSeedSnapshot(
+            adapter,
+            store,
+            `${observationId}-${subjectId}`,
+            snapshotId,
+        );
+        const fullReceipt = seedMeasurementReceipt({
+            aggregate,
+            observationId,
+            subjectId,
+            snapshotHash: snapshot.snapshotHash,
+            snapshotId,
+            snapshotManifest: store.loadManifest(snapshotId),
+            parsed,
+            stdoutHash,
+            stderrHash,
+        });
+        const receiptArtifact = persistSeedBytes(
+            adapter,
+            store,
+            `${observationId}-${subjectId}-receipt`,
+            Buffer.from(canonicalJson(fullReceipt), "utf8"),
+            "application/vnd.crucible.measurement-receipt+json",
+        );
+        const rawStdoutArtifact = persistSeedBytes(
+            adapter,
+            store,
+            `${observationId}-${subjectId}-stdout`,
+            stdoutBytes,
+            "application/vnd.crucible.measurement-stdout",
+        );
+        const rawStderrArtifact = persistSeedBytes(
+            adapter,
+            store,
+            `${observationId}-${subjectId}-stderr`,
+            stderrBytes,
+            "application/vnd.crucible.measurement-stderr",
+        );
+        const measurement = createMeasurementProvenance({
+            subjectId,
+            receiptArtifact,
+            receiptHash: hashReceipt(fullReceipt),
+            rawStdoutArtifact,
+            rawStdoutHash: stdoutHash,
+            rawStderrArtifact,
+            rawStderrHash: stderrHash,
+            parserVersion: aggregate.contract.parserVersion,
+            allowlistFileHash: fullReceipt.allowlistFileHash,
+            harnessEntryHash: fullReceipt.harnessEntryHash,
+            executableHash: fullReceipt.executableHash,
+            stagedExecutableHash: fullReceipt.stagedExecutableHash,
+            dependencyHashes: fullReceipt.dependencyHashes,
+            stagedDependencyHashes: fullReceipt.stagedDependencyHashes,
+            argvHash: fullReceipt.argvHash,
+            envHash: fullReceipt.envHash,
+            sandboxPolicy: { kind: "none", sandboxId: null, environmentHash: null },
+            snapshot,
+            snapshotExecutionHash: hashCanonical(
+                {
+                    candidateSnapshotPreClosureHash:
+                        fullReceipt.candidateSnapshotPreClosureHash,
+                    candidateSnapshotPostClosureHash:
+                        fullReceipt.candidateSnapshotPostClosureHash,
+                    candidateSnapshotIdentitySummary:
+                        fullReceipt.candidateSnapshotIdentitySummary,
+                    candidateSnapshotMutationCheck:
+                        fullReceipt.candidateSnapshotMutationCheck,
+                },
+                "sha256:crucible-evidence-snapshot-execution-v1",
+            ),
+        });
+        return {
+            measurement,
+            fullReceipt,
+            stdoutBytes,
+            stderrBytes,
+        };
+    });
+    const measurements = measurementDetails.map((item) => item.measurement);
+    let validationCompositeArtifact = null;
+    let impossibilityCertificateArtifact = null;
+    let data;
+    let impossibilityReceiptFields = {};
+    if (purpose === "validation") {
+        const caseMap = {};
+        const cases = [];
+        const sortedDetails = [...measurementDetails].sort((left, right) =>
+            left.measurement.subjectId.localeCompare(right.measurement.subjectId));
+        for (const detail of sortedDetails) {
+            const validationCase = aggregate.contract.validationCases.find(
+                (item) => item.id === detail.measurement.subjectId,
+            );
+            const outcome = detail.fullReceipt.parsed.pass ? "accept" : "reject";
+            caseMap[validationCase.id] = {
+                artifactHash: validationCase.artifactHash,
+                expectation: validationCase.expectation,
+                outcome,
+                matched: outcome === validationCase.expectation,
+                attemptId: detail.fullReceipt.attemptId,
+                parsed: detail.fullReceipt.parsed,
+                receiptHash: detail.measurement.receiptHash,
+            };
+            cases.push({
+                id: validationCase.id,
+                receiptHash: detail.measurement.receiptHash,
+                attemptId: detail.fullReceipt.attemptId,
+            });
+        }
+        const compositeReceiptHash = hashCanonical(
+            { cases },
+            "sha256:crucible-runtime-validation-receipts-v1",
+        );
+        validationCompositeArtifact = persistSeedBytes(
+            adapter,
+            store,
+            `${observationId}-validation`,
+            Buffer.from(canonicalJson({ caseMap, compositeReceiptHash }), "utf8"),
+            "application/vnd.crucible.validation-receipt+json",
+        );
+        data = {
+            caseResults: [...aggregate.contract.validationCases]
+                .sort((left, right) => left.id.localeCompare(right.id))
+                .map((validationCase) => ({
+                id: validationCase.id,
+                artifactHash: validationCase.artifactHash,
+                outcome: caseMap[validationCase.id].outcome,
+                })),
+            caseMap,
+            compositeReceiptHash,
+        };
+    } else if (purpose === "candidate") {
+        data = options.candidateData;
+    } else {
+        const detail = measurementDetails[0];
+        const verifiedFacts = {
+            pass: options.impossibilityFacts.pass,
+            searchSpaceExhausted: options.impossibilityFacts.searchSpaceExhausted,
+            parserVersion: reserved.parserVersion,
+        };
+        const certificateVerdict = deriveImpossibilityVerdict(verifiedFacts);
+        const certificate = {
+            version: reserved.certificateVersion,
+            verdict: certificateVerdict,
+            contractHash: aggregate.contractHash,
+            harnessId: reserved.harnessId,
+            parserVersion: reserved.parserVersion,
+            verificationRequestHash: reserved.requestHash,
+            verificationSnapshotHash: detail.measurement.snapshot.snapshotHash,
+            measurementReceiptHash: detail.measurement.receiptHash,
+            verifiedFacts,
+            parsedResult: detail.fullReceipt.parsed,
+        };
+        const certificateBytes = Buffer.from(canonicalJson(certificate), "utf8");
+        impossibilityCertificateArtifact = persistSeedBytes(
+            adapter,
+            store,
+            `${observationId}-certificate`,
+            certificateBytes,
+            "application/vnd.crucible.impossibility-certificate+json",
+        );
+        data = {
+            certificateVersion: reserved.certificateVersion,
+            certificateVerdict,
+            certificateArtifactHash: `sha256:crucible-impossibility-certificate-artifact-v1:${sha256Hex(certificateBytes)}`,
+            measurementReceiptHash: detail.measurement.receiptHash,
+            verificationRequestHash: reserved.requestHash,
+            verificationSnapshotHash: detail.measurement.snapshot.snapshotHash,
+            verifiedFacts,
+        };
+        impossibilityReceiptFields = {
+            certificateArtifactHash: data.certificateArtifactHash,
+            measurementReceiptArtifactHash:
+                `sha256:crucible-impossibility-receipt-artifact-v1:${sha256Hex(Buffer.from(canonicalJson(detail.fullReceipt), "utf8"))}`,
+            measurementReceiptHash: detail.measurement.receiptHash,
+            rawStderrArtifactHash:
+                `sha256:crucible-impossibility-stderr-artifact-v1:${sha256Hex(detail.stderrBytes)}`,
+            rawStdoutArtifactHash:
+                `sha256:crucible-impossibility-stdout-artifact-v1:${sha256Hex(detail.stdoutBytes)}`,
+            verificationRequestHash: reserved.requestHash,
+            verificationSnapshotHash: detail.measurement.snapshot.snapshotHash,
+        };
+    }
+    const provenance = createEvidenceProvenance({
+        proposalArtifact: candidateProposalArtifact,
+        promptContextHash,
+        validationCompositeArtifact,
+        impossibilityCertificateArtifact,
+        measurements,
+    }, {
+        purpose,
+        command: reserved,
+        contract: aggregate.contract,
     });
     return {
-        purpose: "impossibility",
         receipt: {
-            attemptId: `attempt-${observationId}`,
-            runnerEpochId: "runner-epoch-seed",
-            rawStdoutHash: hashCanonical({ observationId, stream: "stdout" }),
-            rawStderrHash: hashCanonical({ observationId, stream: "stderr" }),
-            candidateArtifactHash: null,
-            certificateArtifactHash,
-            measurementReceiptArtifactHash: hashCanonical({
-                observationId,
-                artifact: "measurement-receipt",
-            }),
-            measurementReceiptHash,
-            rawStderrArtifactHash: hashCanonical({
-                observationId,
-                artifact: "stderr",
-            }),
-            rawStdoutArtifactHash: hashCanonical({
-                observationId,
-                artifact: "stdout",
-            }),
-            verificationRequestHash: reserved.requestHash,
-            verificationSnapshotHash,
+        version: 1,
+        attemptId: purpose === "validation"
+            ? `attempt-${observationId}`
+            : measurementDetails[0].fullReceipt.attemptId,
+        runnerEpochId: "runner-epoch-seed",
+        rawStdoutHash: purpose === "validation"
+            ? hashCanonical(
+                provenance.measurements.map((item) => ({
+                    id: item.subjectId,
+                    hash: item.rawStdoutHash,
+                })),
+                "sha256:crucible-runtime-observation-streams-v1",
+            )
+            : provenance.measurements[0].rawStdoutHash,
+        rawStderrHash: purpose === "validation"
+            ? hashCanonical(
+                provenance.measurements.map((item) => ({
+                    id: item.subjectId,
+                    hash: item.rawStderrHash,
+                })),
+                "sha256:crucible-runtime-observation-streams-v1",
+            )
+            : provenance.measurements[0].rawStderrHash,
+        candidateArtifactHash: purpose === "candidate"
+            ? provenance.measurements[0].snapshot.snapshotHash
+            : null,
+        provenance,
+        ...impossibilityReceiptFields,
         },
-        data: {
-            certificateVersion: reserved.certificateVersion,
-            certificateVerdict: deriveImpossibilityVerdict(verifiedFacts),
-            certificateArtifactHash,
-            measurementReceiptHash,
-            verificationRequestHash: reserved.requestHash,
-            verificationSnapshotHash,
-            verifiedFacts,
-        },
+        data,
+    };
+}
+
+function seedImpossibilityObservation(adapter, store, aggregate, reserved, observationId, facts) {
+    const seeded = seedReceipt(
+        adapter,
+        store,
+        aggregate,
+        reserved,
+        observationId,
+        "impossibility",
+        { impossibilityFacts: facts },
+    );
+    return {
+        purpose: "impossibility",
+        receipt: seeded.receipt,
+        data: seeded.data,
     };
 }
 
@@ -274,7 +776,7 @@ function baseSeedContract(overrides = {}) {
 // slot; each queue entry supplies only the harness `data` (and optional
 // annotations) for the next candidate slot, while round/slot/candidateId are
 // inherited from the reserved assignment.
-function driveToTerminal(adapter, candidateQueue) {
+function driveToTerminal(adapter, store, candidateQueue) {
     let observations = 0;
     let stops = 0;
     for (let iteration = 0; iteration < 500; iteration += 1) {
@@ -314,31 +816,43 @@ function driveToTerminal(adapter, candidateQueue) {
                 const reserved = command.reservedCommand;
                 const observationId = `obs-${observations += 1}`;
                 if (reserved.kind === "run_validation") {
-                    const caseResults = aggregate.contract.validationCases.map((validationCase) => ({
-                        id: validationCase.id,
-                        artifactHash: validationCase.artifactHash,
-                        outcome: validationCase.expectation,
-                    }));
+                    const seeded = seedReceipt(
+                        adapter,
+                        store,
+                        aggregate,
+                        reserved,
+                        observationId,
+                        "validation",
+                    );
                     adapter.appendHarnessObservation({
                         commandId: recommendation.commandId,
                         observationId,
                         purpose: "validation",
-                        receipt: seedReceipt(observationId, false),
-                        data: { caseResults },
+                        receipt: seeded.receipt,
+                        data: seeded.data,
                     });
                 } else if (reserved.kind === "search_candidate") {
                     const spec = candidateQueue.shift();
                     if (spec === undefined) {
                         throw new Error("candidate queue exhausted");
                     }
+                    const seeded = seedReceipt(
+                        adapter,
+                        store,
+                        aggregate,
+                        reserved,
+                        observationId,
+                        "candidate",
+                        { candidateData: spec.data },
+                    );
                     adapter.appendHarnessObservation({
                         commandId: recommendation.commandId,
                         observationId,
                         purpose: "candidate",
                         // round/slotIndex/candidateId are inherited from the
                         // reserved search-candidate assignment.
-                        receipt: seedReceipt(observationId, true),
-                        data: spec.data,
+                        receipt: seeded.receipt,
+                        data: seeded.data,
                         ...(spec.annotations === undefined ? {} : { annotations: spec.annotations }),
                     });
                 } else if (reserved.kind === "verify_impossibility") {
@@ -350,6 +864,9 @@ function driveToTerminal(adapter, candidateQueue) {
                         commandId: recommendation.commandId,
                         observationId,
                         ...seedImpossibilityObservation(
+                            adapter,
+                            store,
+                            aggregate,
                             reserved,
                             observationId,
                             spec.certificateFacts,
@@ -370,11 +887,15 @@ function driveToTerminal(adapter, candidateQueue) {
 function seedInvestigation(stateRoot, investigationId, contractInput, seedFn) {
     const paths = resolveInvestigationPaths(stateRoot, investigationId);
     fs.mkdirSync(paths.stateDir, { recursive: true });
+    const store = openArtifactStore({ root: paths.artifactRoot });
     const repository = openRepository({ file: paths.eventsDbPath });
     try {
         const adapter = createDomainRepositoryAdapter({ repository, investigationId });
-        adapter.openInvestigation(createInvestigationContract(contractInput));
-        return seedFn(adapter);
+        const resolvedContract = typeof contractInput === "function"
+            ? contractInput(store)
+            : contractInput;
+        adapter.openInvestigation(createInvestigationContract(resolvedContract));
+        return seedFn(adapter, store);
     } finally {
         repository.close();
     }
@@ -384,15 +905,16 @@ function seedVerifiedResult(stateRoot, investigationId) {
     return seedInvestigation(
         stateRoot,
         investigationId,
-        baseSeedContract({
+        (store) => baseSeedContract({
             hypothesisTopology: "open_generative",
             workerModels: ["model-a"],
             candidatesPerRound: 1,
             maxRounds: 3,
+            validationCases: seedValidationCases(store),
             // Immediate terminal: the first accepted candidate verifies.
             searchPolicy: searchPolicy({ stopOnFirstAccept: true }),
         }),
-        (adapter) => driveToTerminal(adapter, [
+        (adapter, store) => driveToTerminal(adapter, store, [
             { data: { pass: true, metrics: { score: 95 } } },
         ]),
     );
@@ -406,14 +928,15 @@ function seedTargetUnreachable(stateRoot, investigationId) {
     return seedInvestigation(
         stateRoot,
         investigationId,
-        baseSeedContract({
+        (store) => baseSeedContract({
             hypothesisTopology: "finite_enumerable",
             workerModels: ["model-a"],
             candidatesPerRound: 2,
             maxRounds: 1,
             boundedCandidateIds: ["cand-a", "cand-b"],
+            validationCases: seedValidationCases(store),
         }),
-        (adapter) => driveToTerminal(adapter, [
+        (adapter, store) => driveToTerminal(adapter, store, [
             { data: { pass: false, metrics: { score: 10 } } },
             { data: { pass: false, metrics: { score: 20 } } },
         ]),
@@ -424,13 +947,14 @@ function seedCertifiedTargetUnreachable(stateRoot, investigationId) {
     return seedInvestigation(
         stateRoot,
         investigationId,
-        baseSeedContract({
+        (store) => baseSeedContract({
             hypothesisTopology: "certified_impossibility",
             workerModels: ["model-a"],
             candidatesPerRound: 1,
             maxRounds: 1,
+            validationCases: seedValidationCases(store),
         }),
-        (adapter) => driveToTerminal(adapter, [
+        (adapter, store) => driveToTerminal(adapter, store, [
             { data: { pass: false, metrics: { score: 20 } } },
             {
                 certificateFacts: {
@@ -446,13 +970,14 @@ function seedCertifiedNonResult(stateRoot, investigationId) {
     return seedInvestigation(
         stateRoot,
         investigationId,
-        baseSeedContract({
+        (store) => baseSeedContract({
             hypothesisTopology: "certified_impossibility",
             workerModels: ["model-a"],
             candidatesPerRound: 1,
             maxRounds: 1,
+            validationCases: seedValidationCases(store),
         }),
-        (adapter) => driveToTerminal(adapter, [
+        (adapter, store) => driveToTerminal(adapter, store, [
             { data: { pass: false, metrics: { score: 20 } } },
             {
                 certificateFacts: {
@@ -468,13 +993,14 @@ function seedPaused(stateRoot, investigationId) {
     return seedInvestigation(
         stateRoot,
         investigationId,
-        baseSeedContract({
+        (store) => baseSeedContract({
             hypothesisTopology: "open_generative",
             workerModels: ["model-a"],
             candidatesPerRound: 1,
             maxRounds: 3,
+            validationCases: seedValidationCases(store),
         }),
-        (adapter) => {
+        (adapter, store) => {
             const reserve = adapter.appendKernelDecision();
             const validationCommandId = reserve.domainEvent.payload.commandId;
             adapter.appendExternal(EVENT_TYPES.COMMAND_DISPATCHED, { commandId: validationCommandId });
@@ -482,13 +1008,17 @@ function seedPaused(stateRoot, investigationId) {
                 commandId: validationCommandId,
                 observationId: "validation-obs",
                 purpose: "validation",
-                receipt: seedReceipt("validation-obs", false),
-                data: {
-                    caseResults: [
-                        { id: "good", artifactHash: seedArtifactHash("a"), outcome: "accept" },
-                        { id: "bad", artifactHash: seedArtifactHash("b"), outcome: "reject" },
-                    ],
-                },
+                ...(() => {
+                    const seeded = seedReceipt(
+                        adapter,
+                        store,
+                        adapter.replay().aggregate,
+                        reserve.domainEvent.payload.command,
+                        "validation-obs",
+                        "validation",
+                    );
+                    return { receipt: seeded.receipt, data: seeded.data };
+                })(),
             });
             adapter.appendEvidenceCommit({ evidenceId: "validation-evidence", observationId: "validation-obs" });
             adapter.appendKernelDecision(); // VALIDATION_COMPLETED
@@ -513,8 +1043,114 @@ function replayAggregate(stateRoot, investigationId) {
     }
 }
 
+function terminalArtifactClasses(stateRoot, investigationId) {
+    const aggregate = replayAggregate(stateRoot, investigationId);
+    const evidence = aggregate.evidenceOrder.map((id) => aggregate.evidence[id]);
+    const validation = evidence.find((item) => item.purpose === "validation");
+    const candidate = evidence.find((item) => item.purpose === "candidate");
+    const impossibility = evidence.find((item) => item.purpose === "impossibility");
+    const candidateMeasurement = candidate?.receipt.provenance.measurements[0] ?? null;
+    return {
+        aggregate,
+        artifacts: {
+            "validation composite": validation?.receipt.provenance.validationCompositeArtifact,
+            "proposal/context": candidate?.receipt.provenance.proposalArtifact,
+            "measurement receipt": candidateMeasurement?.receiptArtifact,
+            "raw stdout": candidateMeasurement?.rawStdoutArtifact,
+            "raw stderr": candidateMeasurement?.rawStderrArtifact,
+            "snapshot manifest": candidateMeasurement?.snapshot.manifestArtifact,
+            "snapshot object": candidateMeasurement?.snapshot.objectArtifacts[0],
+            "impossibility certificate":
+                impossibility?.receipt.provenance.impossibilityCertificateArtifact,
+        },
+    };
+}
+
+function corruptCasArtifact(stateRoot, investigationId, artifact, mode) {
+    const paths = resolveInvestigationPaths(stateRoot, investigationId);
+    const store = openArtifactStoreReadOnly({ root: paths.artifactRoot });
+    const objectPath = store.objectPath(artifact.objectId);
+    if (mode === "missing") {
+        fs.rmSync(objectPath);
+        return;
+    }
+    const original = fs.readFileSync(objectPath);
+    const corrupted = original.length === 0
+        ? Buffer.from([1])
+        : Buffer.concat([
+            Buffer.from([original[0] ^ 0xff]),
+            original.subarray(1),
+        ]);
+    fs.writeFileSync(objectPath, corrupted);
+}
+
+function expectIntegrityBlocked(result) {
+    expect(result).toMatchObject({
+        is_result: false,
+        banner: INTEGRITY_NON_RESULT_BANNER,
+        integrity_blocked: true,
+        non_result: true,
+        non_result_code: "INTEGRITY_BLOCKED",
+    });
+    expect(result.message).toContain(NON_RESULT_BANNER);
+    for (const forbidden of [
+        "decision",
+        "candidate_id",
+        "evidence_id",
+        "evidence_hash",
+        "evidence_closure",
+        "contract_hash",
+        "terminal_event_hash",
+        "event_head_hash",
+        "basis",
+    ]) {
+        expect(result).not.toHaveProperty(forbidden);
+    }
+    expect(JSON.stringify(result)).not.toContain("sha256:");
+    expect(JSON.stringify(result)).not.toContain("VERIFIED_RESULT");
+    expect(JSON.stringify(result)).not.toContain("TARGET_UNREACHABLE");
+}
+
+function rewriteTerminalEvent(stateRoot, investigationId, mutatePayload) {
+    const paths = resolveInvestigationPaths(stateRoot, investigationId);
+    const db = new DatabaseSync(paths.eventsDbPath);
+    try {
+        const row = db.prepare(
+            "SELECT * FROM events WHERE investigation_id = ? ORDER BY seq DESC LIMIT 1",
+        ).get(investigationId);
+        const payload = JSON.parse(row.payload);
+        mutatePayload(payload.domainEvent.payload);
+        payload.domainEvent.eventHash = computeDomainEventHash(payload.domainEvent);
+        const payloadCanonical = canonicalize(payload);
+        const repositoryHash = computeRepositoryEventHash({
+            investigationId,
+            seq: Number(row.seq),
+            prevHash: row.prev_hash,
+            kind: row.kind,
+            payloadCanonical,
+            isTerminal: row.is_terminal,
+            terminalKind: row.terminal_kind,
+            attemptId: row.attempt_id,
+            evidenceKind: row.evidence_kind,
+            createdAt: row.created_at,
+        });
+        db.prepare(
+            "UPDATE events SET payload = ?, event_hash = ? WHERE investigation_id = ? AND seq = ?",
+        ).run(payloadCanonical, repositoryHash, investigationId, Number(row.seq));
+    } finally {
+        db.close();
+    }
+}
+
+function rewriteTerminalWithoutClosure(stateRoot, investigationId) {
+    rewriteTerminalEvent(stateRoot, investigationId, (payload) => {
+        delete payload.evidenceClosure;
+    });
+}
+
 function persistPauseForStarted(workspace, started) {
     const paths = resolveInvestigationPaths(workspace.stateRoot, started.investigation_id);
+    const store = openArtifactStore({ root: paths.artifactRoot });
     const repository = openRepository({ file: paths.eventsDbPath });
     try {
         const adapter = createDomainRepositoryAdapter({
@@ -527,18 +1163,20 @@ function persistPauseForStarted(workspace, started) {
         aggregate = adapter.appendExternal(EVENT_TYPES.COMMAND_DISPATCHED, {
             commandId,
         }).aggregate;
+        const seeded = seedReceipt(
+            adapter,
+            store,
+            aggregate,
+            aggregate.commands[commandId].command,
+            "pause-validation-observation",
+            "validation",
+        );
         aggregate = adapter.appendHarnessObservation({
             commandId,
             observationId: "pause-validation-observation",
             purpose: "validation",
-            receipt: seedReceipt("pause-validation-observation", false),
-            data: {
-                caseResults: aggregate.contract.validationCases.map((validationCase) => ({
-                    id: validationCase.id,
-                    artifactHash: validationCase.artifactHash,
-                    outcome: validationCase.expectation,
-                })),
-            },
+            receipt: seeded.receipt,
+            data: seeded.data,
         }).aggregate;
         aggregate = adapter.appendEvidenceCommit({
             evidenceId: "pause-validation-evidence",
@@ -627,7 +1265,7 @@ describe("environment: path + state resolution", () => {
         const legacyId = `find-a-candidate-${legacySuffix}`;
         const currentId = deriveInvestigationId({ objective, projectDir, harnessId });
 
-        expect(DOMAIN_VERSION).toBe(2);
+        expect(DOMAIN_VERSION).toBe(3);
         expect(currentId).not.toBe(legacyId);
         expect(currentId).toBe(deriveInvestigationId({ objective, projectDir, harnessId }));
     });
@@ -789,13 +1427,14 @@ describe("crucible_start", () => {
         });
         const started = startInvestigation(args, deps);
         const paths = resolveInvestigationPaths(workspace.stateRoot, started.investigation_id);
+        const store = openArtifactStore({ root: paths.artifactRoot });
         const repository = openRepository({ file: paths.eventsDbPath });
         try {
             const adapter = createDomainRepositoryAdapter({
                 repository,
                 investigationId: started.investigation_id,
             });
-            driveToTerminal(adapter, [
+            driveToTerminal(adapter, store, [
                 { data: { pass: true, metrics: { score: 95 } } },
             ]);
         } finally {
@@ -1122,6 +1761,17 @@ describe("crucible_result", () => {
         expect(result.contract_hash).toMatch(/^sha256:crucible-contract-v1:/u);
         expect(typeof result.terminal_event_hash).toBe("string");
         expect(result.message).toContain("VERIFIED_RESULT");
+        const persisted = replayAggregate(workspace.stateRoot, "verified-inv").terminal;
+        expect(result).toMatchObject({
+            decision: persisted.decision,
+            terminal_seq: persisted.seq,
+            terminal_event_hash: persisted.eventHash,
+            candidate_id: persisted.candidateId,
+            evidence_id: persisted.evidenceId,
+            evidence_hash: persisted.evidenceHash,
+            evidence_closure: persisted.evidenceClosure,
+            basis: persisted.basis,
+        });
     });
 
     it("returns is_result:true for a target-unreachable terminal decision", () => {
@@ -1134,6 +1784,14 @@ describe("crucible_result", () => {
         expect(result.banner).toBe(TERMINAL_BANNER);
         expect(result.decision).toBe("TARGET_UNREACHABLE");
         expect(result.basis.kind).toBe("search_space_exhausted");
+        const persisted = replayAggregate(workspace.stateRoot, "unreach-inv").terminal;
+        expect(result).toMatchObject({
+            decision: persisted.decision,
+            terminal_seq: persisted.seq,
+            terminal_event_hash: persisted.eventHash,
+            evidence_closure: persisted.evidenceClosure,
+            basis: persisted.basis,
+        });
     });
 
     it("returns a persisted certificate-backed TARGET_UNREACHABLE only at result", () => {
@@ -1156,6 +1814,215 @@ describe("crucible_result", () => {
         expect(result.basis.certificateArtifactHash).toMatch(
             /^sha256:[a-z0-9][a-z0-9._-]*:[a-f0-9]{64}$/u,
         );
+    });
+
+    for (const artifactClass of [
+        "validation composite",
+        "proposal/context",
+        "measurement receipt",
+        "raw stdout",
+        "raw stderr",
+        "snapshot manifest",
+        "snapshot object",
+    ]) {
+        for (const mode of ["missing", "corrupt"]) {
+            it(`refuses a terminal result when the ${artifactClass} artifact is ${mode}`, () => {
+                const workspace = makeWorkspace(`result-${artifactClass}-${mode}`);
+                seedVerifiedResult(workspace.stateRoot, "verified-inv");
+                const { artifacts } = terminalArtifactClasses(
+                    workspace.stateRoot,
+                    "verified-inv",
+                );
+                expect(artifacts[artifactClass]).toBeTruthy();
+                corruptCasArtifact(
+                    workspace.stateRoot,
+                    "verified-inv",
+                    artifacts[artifactClass],
+                    mode,
+                );
+                const { deps } = makeDeps(workspace.env);
+                expectIntegrityBlocked(resultInvestigation({
+                    investigation_id: "verified-inv",
+                }, deps));
+            });
+        }
+    }
+
+    for (const mode of ["missing", "corrupt"]) {
+        it(`refuses a certified terminal result when the impossibility certificate is ${mode}`, () => {
+            const workspace = makeWorkspace(`result-certificate-${mode}`);
+            seedCertifiedTargetUnreachable(
+                workspace.stateRoot,
+                "certified-unreach-inv",
+            );
+            const { artifacts } = terminalArtifactClasses(
+                workspace.stateRoot,
+                "certified-unreach-inv",
+            );
+            corruptCasArtifact(
+                workspace.stateRoot,
+                "certified-unreach-inv",
+                artifacts["impossibility certificate"],
+                mode,
+            );
+            const { deps } = makeDeps(workspace.env);
+            expectIntegrityBlocked(resultInvestigation({
+                investigation_id: "certified-unreach-inv",
+            }, deps));
+        });
+    }
+
+    it("refuses external artifact size metadata that does not match CAS bytes", () => {
+        const workspace = makeWorkspace("result-size-mismatch");
+        seedVerifiedResult(workspace.stateRoot, "verified-inv");
+        const { artifacts } = terminalArtifactClasses(
+            workspace.stateRoot,
+            "verified-inv",
+        );
+        const paths = resolveInvestigationPaths(workspace.stateRoot, "verified-inv");
+        const db = new DatabaseSync(paths.eventsDbPath);
+        try {
+            db.prepare(
+                "UPDATE artifacts SET size_bytes = size_bytes + 1 WHERE artifact_id = ?",
+            ).run(artifacts["measurement receipt"].artifactId);
+        } finally {
+            db.close();
+        }
+        const { deps } = makeDeps(workspace.env);
+        expectIntegrityBlocked(resultInvestigation({
+            investigation_id: "verified-inv",
+        }, deps));
+    });
+
+    it("refuses an external artifact with incomplete size metadata", () => {
+        const workspace = makeWorkspace("result-size-missing");
+        seedVerifiedResult(workspace.stateRoot, "verified-inv");
+        const { artifacts } = terminalArtifactClasses(
+            workspace.stateRoot,
+            "verified-inv",
+        );
+        const paths = resolveInvestigationPaths(workspace.stateRoot, "verified-inv");
+        const db = new DatabaseSync(paths.eventsDbPath);
+        try {
+            db.prepare(
+                "UPDATE artifacts SET size_bytes = NULL WHERE artifact_id = ?",
+            ).run(artifacts["measurement receipt"].artifactId);
+        } finally {
+            db.close();
+        }
+        const { deps } = makeDeps(workspace.env);
+        expectIntegrityBlocked(resultInvestigation({
+            investigation_id: "verified-inv",
+        }, deps));
+    });
+
+    it("does not recreate or repair a missing artifact store during result", () => {
+        const workspace = makeWorkspace("result-no-artifact-repair");
+        seedVerifiedResult(workspace.stateRoot, "verified-inv");
+        const paths = resolveInvestigationPaths(workspace.stateRoot, "verified-inv");
+        fs.rmSync(paths.artifactRoot, { recursive: true, force: true });
+        const { deps } = makeDeps(workspace.env);
+        expectIntegrityBlocked(resultInvestigation({
+            investigation_id: "verified-inv",
+        }, deps));
+        expect(fs.existsSync(paths.artifactRoot)).toBe(false);
+    });
+
+    it("verifies inline artifact checksums and refuses same-size byte corruption", () => {
+        const workspace = makeWorkspace("result-inline-corruption");
+        seedVerifiedResult(workspace.stateRoot, "verified-inv");
+        const { artifacts } = terminalArtifactClasses(
+            workspace.stateRoot,
+            "verified-inv",
+        );
+        const proposal = artifacts["proposal/context"];
+        const paths = resolveInvestigationPaths(workspace.stateRoot, "verified-inv");
+        const store = openArtifactStoreReadOnly({ root: paths.artifactRoot });
+        const bytes = store.readObject(proposal.objectId);
+        const db = new DatabaseSync(paths.eventsDbPath);
+        try {
+            db.prepare(`
+                UPDATE artifacts
+                SET storage = 'inline',
+                    inline_blob = ?,
+                    hash_algo = NULL,
+                    hash_value = NULL,
+                    durable = 1,
+                    size_bytes = ?
+                WHERE artifact_id = ?`).run(bytes, bytes.length, proposal.artifactId);
+        } finally {
+            db.close();
+        }
+        const { deps } = makeDeps(workspace.env);
+        expect(resultInvestigation({
+            investigation_id: "verified-inv",
+        }, deps).is_result).toBe(true);
+
+        const corrupted = Buffer.from(bytes);
+        corrupted[0] ^= 0xff;
+        const corruptDb = new DatabaseSync(paths.eventsDbPath);
+        try {
+            corruptDb.prepare(
+                "UPDATE artifacts SET inline_blob = ? WHERE artifact_id = ?",
+            ).run(corrupted, proposal.artifactId);
+        } finally {
+            corruptDb.close();
+        }
+        expectIntegrityBlocked(resultInvestigation({
+            investigation_id: "verified-inv",
+        }, deps));
+    });
+
+    it("refuses a synthetic terminal event that omits its evidence closure", () => {
+        const workspace = makeWorkspace("result-synthetic-terminal");
+        seedVerifiedResult(workspace.stateRoot, "verified-inv");
+        rewriteTerminalWithoutClosure(workspace.stateRoot, "verified-inv");
+        const { deps } = makeDeps(workspace.env);
+        expectIntegrityBlocked(resultInvestigation({
+            investigation_id: "verified-inv",
+        }, deps));
+    });
+
+    it("refuses a terminal event whose persisted closure root is inconsistent", () => {
+        const workspace = makeWorkspace("result-terminal-closure-root");
+        seedVerifiedResult(workspace.stateRoot, "verified-inv");
+        rewriteTerminalEvent(workspace.stateRoot, "verified-inv", (payload) => {
+            payload.evidenceClosure.closureRoot =
+                `sha256:crucible-terminal-evidence-closure-v1:${"0".repeat(64)}`;
+        });
+        const { deps } = makeDeps(workspace.env);
+        expectIntegrityBlocked(resultInvestigation({
+            investigation_id: "verified-inv",
+        }, deps));
+    });
+
+    it("status exposes only integrity_blocked when terminal artifacts are corrupt", () => {
+        const workspace = makeWorkspace("status-integrity-blocked");
+        seedVerifiedResult(workspace.stateRoot, "verified-inv");
+        const { artifacts } = terminalArtifactClasses(
+            workspace.stateRoot,
+            "verified-inv",
+        );
+        corruptCasArtifact(
+            workspace.stateRoot,
+            "verified-inv",
+            artifacts["proposal/context"],
+            "corrupt",
+        );
+        const { deps } = makeDeps(workspace.env);
+        const status = statusInvestigation({
+            investigation_id: "verified-inv",
+        }, deps);
+        expect(status).toMatchObject({
+            is_result: false,
+            integrity_blocked: true,
+            terminal_available: false,
+            status: "integrity_blocked",
+        });
+        expect(JSON.stringify(status)).not.toContain("VERIFIED_RESULT");
+        expect(status).not.toHaveProperty("decision");
+        expect(status).not.toHaveProperty("candidate_id");
+        expect(status).not.toHaveProperty("evidence_id");
     });
 
     it("keeps an inconclusive certificate behind the strict non-result boundary", () => {

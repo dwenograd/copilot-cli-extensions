@@ -17,8 +17,11 @@ import {
     constructModelObservedEvent,
     createExternalEvent,
     createInitialAggregate,
+    createEvidenceProvenance,
     createInvestigationContract,
     createInvestigationOpenedEvent,
+    createMeasurementProvenance,
+    createSnapshotProvenance,
     decideNext,
     detectPlateau,
     hashCanonical,
@@ -84,6 +87,186 @@ function validationData() {
     };
 }
 
+function digestOf(value) {
+    return value.split(":").at(-1);
+}
+
+function snapshotHashFor(value) {
+    return `sha256:crucible-measurement-snapshot-v1:${digestOf(value)}`;
+}
+
+function fakeArtifact(label, hash = hashCanonical({ label, artifact: true })) {
+    const safeLabel = label.replace(/[^A-Za-z0-9._-]/gu, "-").slice(0, 48);
+    return {
+        artifactId: `artifact-${safeLabel}-${digestOf(hash).slice(0, 16)}`,
+        objectId: `sha256:${digestOf(hash)}`,
+    };
+}
+
+function fakeMeasurement({
+    subjectId,
+    snapshotId,
+    observationId,
+    parserVersion,
+}) {
+    const stdoutHash = hashCanonical(
+        { observationId, subjectId, stream: "stdout" },
+        "sha256:crucible-measurement-stream-v1",
+    );
+    const stderrHash = hashCanonical(
+        { observationId, subjectId, stream: "stderr" },
+        "sha256:crucible-measurement-stream-v1",
+    );
+    const receiptHash = hashCanonical(
+        { observationId, subjectId, receipt: true },
+        "sha256:crucible-measurement-receipt-v1",
+    );
+    const executableHash = hashCanonical(
+        { harness: "executable" },
+        "sha256:crucible-measurement-file-v1",
+    );
+    const dependencyHash = hashCanonical(
+        { harness: "dependency" },
+        "sha256:crucible-measurement-file-v1",
+    );
+    const snapshot = createSnapshotProvenance({
+        snapshotHash: snapshotHashFor(snapshotId),
+        manifestArtifact: fakeArtifact(`${subjectId}-manifest`, snapshotId),
+        objectArtifacts: [
+            fakeArtifact(`${subjectId}-object`, hashCanonical({ subjectId, object: true })),
+        ],
+    });
+    const measurement = createMeasurementProvenance({
+        subjectId,
+        receiptArtifact: fakeArtifact(`${subjectId}-receipt`, receiptHash),
+        receiptHash,
+        rawStdoutArtifact: fakeArtifact(`${subjectId}-stdout`, stdoutHash),
+        rawStdoutHash: stdoutHash,
+        rawStderrArtifact: fakeArtifact(`${subjectId}-stderr`, stderrHash),
+        rawStderrHash: stderrHash,
+        parserVersion,
+        allowlistFileHash: hashCanonical(
+            { harness: "allowlist" },
+            "sha256:crucible-measurement-file-v1",
+        ),
+        harnessEntryHash: hashCanonical(
+            { harness: "entry" },
+            "sha256:crucible-measurement-entry-v1",
+        ),
+        executableHash,
+        stagedExecutableHash: executableHash,
+        dependencyHashes: [{
+            path: "C:\\fixture\\harness.mjs",
+            role: "harness-script",
+            sha256: dependencyHash,
+        }],
+        stagedDependencyHashes: [{
+            path: "C:\\fixture\\stage\\harness.mjs",
+            role: "harness-script",
+            sha256: dependencyHash,
+        }],
+        argvHash: hashCanonical(
+            { observationId, subjectId, argv: true },
+            "sha256:crucible-measurement-argv-v1",
+        ),
+        envHash: hashCanonical(
+            { observationId, subjectId, env: true },
+            "sha256:crucible-measurement-env-v1",
+        ),
+        sandboxPolicy: {
+            kind: "none",
+            sandboxId: null,
+            environmentHash: null,
+        },
+        snapshot,
+        snapshotExecutionHash: hashCanonical(
+            { observationId, subjectId, snapshotExecution: true },
+            "sha256:crucible-evidence-snapshot-execution-v1",
+        ),
+    });
+    return { measurement, receiptHash, stdoutHash, stderrHash };
+}
+
+function fullHarnessReceipt(context, command, {
+    purpose,
+    observationId,
+    candidateArtifactHash = null,
+    certificateArtifactHash = null,
+}) {
+    const parserVersion = context.contract.parserVersion;
+    const measurements = purpose === "validation"
+        ? context.contract.validationCases.map((validationCase) =>
+            fakeMeasurement({
+                subjectId: validationCase.id,
+                snapshotId: validationCase.artifactHash,
+                observationId,
+                parserVersion,
+            }))
+        : [fakeMeasurement({
+            subjectId: purpose === "candidate"
+                ? command.candidateId
+                : `impossibility-${command.attemptOrdinal ?? ""}`,
+            snapshotId: purpose === "candidate"
+                ? `sha256:${digestOf(candidateArtifactHash)}`
+                : `sha256:${digestOf(command.requestHash)}`,
+            observationId,
+            parserVersion,
+        })];
+    const normalizedCandidateHash = purpose === "candidate"
+        ? measurements[0].measurement.snapshot.snapshotHash
+        : null;
+    const certificateArtifact = purpose === "impossibility"
+        ? fakeArtifact(
+            `${observationId}-certificate`,
+            certificateArtifactHash,
+        )
+        : null;
+    const provenance = createEvidenceProvenance({
+        proposalArtifact: purpose === "candidate"
+            ? fakeArtifact(`${observationId}-proposal`)
+            : null,
+        promptContextHash: purpose === "candidate"
+            ? hashCanonical({ observationId, prompt: true })
+            : null,
+        validationCompositeArtifact: purpose === "validation"
+            ? fakeArtifact(`${observationId}-validation-composite`)
+            : null,
+        impossibilityCertificateArtifact: certificateArtifact,
+        measurements: measurements.map((item) => item.measurement),
+    }, {
+        purpose,
+        command,
+        contract: context.contract,
+    });
+    const rawStdoutHash = purpose === "validation"
+        ? hashCanonical(
+            provenance.measurements.map((item) => ({
+                id: item.subjectId,
+                hash: item.rawStdoutHash,
+            })),
+            "sha256:crucible-runtime-observation-streams-v1",
+        )
+        : measurements[0].stdoutHash;
+    const rawStderrHash = purpose === "validation"
+        ? hashCanonical(
+            provenance.measurements.map((item) => ({
+                id: item.subjectId,
+                hash: item.rawStderrHash,
+            })),
+            "sha256:crucible-runtime-observation-streams-v1",
+        )
+        : measurements[0].stderrHash;
+    return {
+        version: 1,
+        attemptId: `attempt-${observationId}`,
+        runnerEpochId: "runner-epoch-1",
+        rawStdoutHash,
+        rawStderrHash,
+        candidateArtifactHash: normalizedCandidateHash,
+        provenance,
+    };
+}
+
 function append(context, event) {
     context.history.push(event);
     context.aggregate = reduceEvent(context.aggregate, event);
@@ -129,6 +312,13 @@ function observeAndCommit(context, commandId, {
     candidateArtifactHash,
 } = {}) {
     const command = context.aggregate.commands[commandId].command;
+    const receipt = fullHarnessReceipt(context, command, {
+        purpose,
+        observationId,
+        candidateArtifactHash: purpose === "candidate"
+            ? candidateArtifactHash ?? hashCanonical({ observationId, artifact: true })
+            : null,
+    });
     const observed = constructHarnessObservedEvent(context.aggregate, {
         commandId,
         observationId,
@@ -141,15 +331,7 @@ function observeAndCommit(context, commandId, {
                 annotations,
             }
             : {}),
-        receipt: {
-            attemptId: `attempt-${observationId}`,
-            runnerEpochId: "runner-epoch-1",
-            rawStdoutHash: hashCanonical({ observationId, stream: "stdout" }),
-            rawStderrHash: hashCanonical({ observationId, stream: "stderr" }),
-            candidateArtifactHash: purpose === "candidate"
-                ? candidateArtifactHash ?? hashCanonical({ observationId, artifact: true })
-                : null,
-        },
+        receipt,
         data,
     });
     append(context, observed);
@@ -193,15 +375,23 @@ function commitCandidate(context, {
     return { command: reserved.command, evidence };
 }
 
-function impossibilityObservationInput(command, label, {
+function impossibilityObservationInput(context, command, label, {
     pass = true,
     searchSpaceExhausted = true,
     certificateVerdict,
 } = {}) {
     const requestHash = command.requestHash ?? hashCanonical({ label, request: "legacy" });
     const certificateArtifactHash = hashCanonical({ label, artifact: "certificate" });
-    const measurementReceiptHash = hashCanonical({ label, receipt: "measurement" });
-    const verificationSnapshotHash = hashCanonical({ label, snapshot: "verification" });
+    const observationId = `impossibility-observation-${label}`;
+    const effectiveCommand = { ...command, requestHash };
+    const receipt = fullHarnessReceipt(context, effectiveCommand, {
+        purpose: "impossibility",
+        observationId,
+        certificateArtifactHash,
+    });
+    const measurement = receipt.provenance.measurements[0];
+    const measurementReceiptHash = measurement.receiptHash;
+    const verificationSnapshotHash = measurement.snapshot.snapshotHash;
     const verifiedFacts = {
         pass,
         searchSpaceExhausted,
@@ -214,22 +404,18 @@ function impossibilityObservationInput(command, label, {
             : "not_proven";
     return {
         commandId: command.commandId,
-        observationId: `impossibility-observation-${label}`,
+        observationId,
         purpose: "impossibility",
         receipt: {
-            attemptId: `impossibility-attempt-${label}`,
-            runnerEpochId: "runner-epoch-1",
-            rawStdoutHash: hashCanonical({ label, stream: "stdout" }),
-            rawStderrHash: hashCanonical({ label, stream: "stderr" }),
-            candidateArtifactHash: null,
+            ...receipt,
             certificateArtifactHash,
-            measurementReceiptArtifactHash: hashCanonical({
-                label,
-                artifact: "measurement-receipt",
-            }),
+            measurementReceiptArtifactHash:
+                `sha256:crucible-impossibility-receipt-artifact-v1:${digestOf(measurement.receiptArtifact.objectId)}`,
             measurementReceiptHash,
-            rawStderrArtifactHash: hashCanonical({ label, artifact: "stderr" }),
-            rawStdoutArtifactHash: hashCanonical({ label, artifact: "stdout" }),
+            rawStderrArtifactHash:
+                `sha256:crucible-impossibility-stderr-artifact-v1:${digestOf(measurement.rawStderrArtifact.objectId)}`,
+            rawStdoutArtifactHash:
+                `sha256:crucible-impossibility-stdout-artifact-v1:${digestOf(measurement.rawStdoutArtifact.objectId)}`,
             verificationRequestHash: requestHash,
             verificationSnapshotHash,
         },
@@ -247,7 +433,7 @@ function impossibilityObservationInput(command, label, {
 }
 
 function commitImpossibility(context, reserved, label, facts = {}) {
-    const input = impossibilityObservationInput({
+    const input = impossibilityObservationInput(context, {
         ...reserved.command,
         commandId: reserved.commandId,
     }, label, facts);
@@ -261,12 +447,12 @@ function commitImpossibility(context, reserved, label, facts = {}) {
     return context.aggregate.evidence[evidenceId];
 }
 
-describe("Crucible domain version 2 kernel", () => {
-    it("stamps investigation_opened with DOMAIN_VERSION=2 and replays deterministically", () => {
+describe("Crucible domain version 3 kernel", () => {
+    it("stamps investigation_opened with DOMAIN_VERSION=3 and replays deterministically", () => {
         const context = validateInvestigation(openInvestigation());
         const opened = context.history[0];
-        expect(DOMAIN_VERSION).toBe(2);
-        expect(opened.payload.domainVersion).toBe(2);
+        expect(DOMAIN_VERSION).toBe(3);
+        expect(opened.payload.domainVersion).toBe(3);
 
         const replayed = replayEvents(context.history);
         expect(canonicalJson(replayed)).toBe(canonicalJson(context.aggregate));
@@ -282,7 +468,7 @@ describe("Crucible domain version 2 kernel", () => {
         const opened = JSON.parse(JSON.stringify(
             createInvestigationOpenedEvent(createInvestigationContract(contractInput())),
         ));
-        opened.payload.domainVersion = 1;
+        opened.payload.domainVersion = 2;
         opened.eventHash = computeEventHash(opened);
 
         for (const operation of [
@@ -417,13 +603,10 @@ describe("Crucible domain version 2 kernel", () => {
             commandId: validationCommand.commandId,
             observationId: "forged-validation-observation",
             purpose: "validation",
-            receipt: {
-                attemptId: "forged-validation-attempt",
-                runnerEpochId: "runner-epoch-1",
-                rawStdoutHash: hashCanonical({ forged: "validation-stdout" }),
-                rawStderrHash: hashCanonical({ forged: "validation-stderr" }),
-                candidateArtifactHash: null,
-            },
+            receipt: fullHarnessReceipt(validation, validationCommand.command, {
+                purpose: "validation",
+                observationId: "forged-validation-observation",
+            }),
             data: validationData(),
         });
         const validationReceipts = [
@@ -450,13 +633,11 @@ describe("Crucible domain version 2 kernel", () => {
             commandId: candidateCommand.commandId,
             observationId: "forged-candidate-observation",
             purpose: "candidate",
-            receipt: {
-                attemptId: "forged-candidate-attempt",
-                runnerEpochId: "runner-epoch-1",
-                rawStdoutHash: hashCanonical({ forged: "candidate-stdout" }),
-                rawStderrHash: hashCanonical({ forged: "candidate-stderr" }),
+            receipt: fullHarnessReceipt(candidate, candidateCommand.command, {
+                purpose: "candidate",
+                observationId: "forged-candidate-observation",
                 candidateArtifactHash: hashCanonical({ forged: "candidate-artifact" }),
-            },
+            }),
             data: { pass: false },
         });
         const candidateReceipts = [
@@ -465,6 +646,13 @@ describe("Crucible domain version 2 kernel", () => {
             {
                 ...candidateObserved.payload.receipt,
                 candidateArtifactHash: null,
+            },
+            {
+                ...candidateObserved.payload.receipt,
+                provenance: {
+                    ...candidateObserved.payload.receipt.provenance,
+                    closureRoot: hashCanonical({ forged: "provenance-root" }),
+                },
             },
         ];
         for (const receipt of candidateReceipts) {
@@ -653,13 +841,11 @@ describe("Crucible domain version 2 kernel", () => {
             annotations: {
                 citedEvidenceIds: ["evidence-not-in-prompt"],
             },
-            receipt: {
-                attemptId: "bad-citation-attempt",
-                runnerEpochId: "runner-epoch-1",
-                rawStdoutHash: hashCanonical({ bad: "stdout" }),
-                rawStderrHash: hashCanonical({ bad: "stderr" }),
+            receipt: fullHarnessReceipt(context, reserved.command, {
+                purpose: "candidate",
+                observationId: "bad-citation-observation",
                 candidateArtifactHash: hashCanonical({ bad: "artifact" }),
-            },
+            }),
             data: { pass: false },
         });
         expect(() => reduceEvent(context.aggregate, badObservation)).toThrow(
@@ -713,7 +899,34 @@ describe("Crucible domain version 2 kernel", () => {
             decision: "VERIFIED_RESULT",
             candidateId: accepted.candidateId,
             basis: { kind: "first_passing_candidate" },
+            event: {
+                payload: {
+                    evidenceClosure: {
+                        version: 1,
+                        validation: {
+                            evidenceId: "validation-evidence",
+                        },
+                        decisive: {
+                            kind: "winner",
+                            evidence: {
+                                evidenceId: accepted.evidenceId,
+                                provenanceRoot: accepted.provenanceRoot,
+                            },
+                        },
+                        receipts: { count: 3, evidenceCount: 2 },
+                    },
+                },
+            },
         });
+        expect(recommendation.event.payload.evidenceClosure.closureRoot).toMatch(
+            /^sha256:crucible-terminal-evidence-closure-v1:[a-f0-9]{64}$/,
+        );
+        expect(recommendation.event.payload.evidenceClosure.frontier.digest).toMatch(
+            /^sha256:crucible-terminal-frontier-v1:[a-f0-9]{64}$/,
+        );
+        expect(recommendation.event.payload.evidenceClosure.archive.digest).toMatch(
+            /^sha256:crucible-terminal-archive-v1:[a-f0-9]{64}$/,
+        );
     });
 
     it("retains the best incumbent until round exhaustion", () => {
@@ -842,7 +1055,7 @@ describe("Crucible domain version 2 kernel", () => {
         expect(search.command.kind).toBe("search_candidate");
         const legacyObserved = constructHarnessObservedEvent(
             context.aggregate,
-            impossibilityObservationInput({
+            impossibilityObservationInput(context, {
                 ...search.command,
                 commandId: search.commandId,
             }, "legacy"),
@@ -911,8 +1124,24 @@ describe("Crucible domain version 2 kernel", () => {
                     certificateVerdict: "target_unreachable",
                 },
                 evidenceId: "impossibility-evidence-positive",
+                evidenceClosure: {
+                    validation: {
+                        evidenceId: "validation-evidence",
+                    },
+                    decisive: {
+                        kind: "impossibility_certificate",
+                        evidence: {
+                            evidenceId: evidence.evidenceId,
+                            provenanceRoot: evidence.provenanceRoot,
+                        },
+                    },
+                    receipts: { count: 4, evidenceCount: 3 },
+                },
             },
         });
+        expect(terminal.payload.evidenceClosure.closureRoot).toMatch(
+            /^sha256:crucible-terminal-evidence-closure-v1:[a-f0-9]{64}$/,
+        );
         append(context, terminal);
         expect(replayEvents(context.history)).toEqual(context.aggregate);
     });
@@ -979,7 +1208,7 @@ describe("Crucible domain version 2 kernel", () => {
             data: { pass: false },
         });
         const verifier = reserveAndDispatch(context);
-        const input = impossibilityObservationInput({
+        const input = impossibilityObservationInput(context, {
             ...verifier.command,
             commandId: verifier.commandId,
         }, "forged");
@@ -1152,10 +1381,22 @@ describe("Crucible domain version 2 kernel", () => {
         });
         expect(replacement.command.replacementOrdinal).toBe(1);
         expect(context.aggregate.evidence[first.evidence.evidenceId].invalidated).toBe(true);
-        expect(decideNext(context.aggregate)).toMatchObject({
+        const terminal = decideNext(context.aggregate);
+        expect(terminal).toMatchObject({
             decision: "TARGET_UNREACHABLE",
             basis: { kind: "search_space_exhausted" },
+            event: {
+                payload: {
+                    evidenceClosure: {
+                        decisive: { kind: "bounded_search", evidence: null },
+                        receipts: { count: 4, evidenceCount: 3 },
+                    },
+                },
+            },
         });
+        expect(terminal.event.payload.evidenceClosure.receipts.root).toMatch(
+            /^sha256:crucible-terminal-receipt-roots-v1:[a-f0-9]{64}$/,
+        );
     });
 
     it("uses a deterministic replacement candidate id and removes invalidated rounds from plateau accounting", () => {

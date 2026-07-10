@@ -1,4 +1,4 @@
-export const DOMAIN_VERSION = 2;
+export const DOMAIN_VERSION = 3;
 
 export const HYPOTHESIS_TOPOLOGIES = Object.freeze([
     "finite_enumerable",
