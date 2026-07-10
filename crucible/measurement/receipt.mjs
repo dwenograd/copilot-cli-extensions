@@ -19,7 +19,7 @@
 //   - candidateSnapshotMutationCheck: fail-closed post-run verification status
 //   - stdoutHash / stderrHash: hashes of raw output bytes actually captured
 //   - parserVersion        : version tag of the parser that produced facts
-//   - sandbox              : { sandboxId, environmentHash } | null
+//   - sandbox              : enforced capability/provider/policy binding | null
 //   - attemptId / runnerEpochId: caller-supplied stable identifiers
 //   - startedAt / completedAt / durationMs
 //   - exit                 : { code | signal | timedOut }
@@ -131,6 +131,14 @@ export function buildMeasurementReceipt(input) {
             : {
                 sandboxId: input.sandbox.sandboxId,
                 environmentHash: input.sandbox.environmentHash,
+                providerId: input.sandbox.providerId,
+                providerVersion: input.sandbox.providerVersion,
+                policyId: input.sandbox.policyId,
+                policyDigest: input.sandbox.policyDigest,
+                capabilityId: input.sandbox.capabilityId,
+                launchPath: input.sandbox.launchPath,
+                capabilityLaunchUsed: input.sandbox.capabilityLaunchUsed,
+                permittedStagedRoots: [...input.sandbox.permittedStagedRoots],
             },
         attemptId: input.attemptId,
         runnerEpochId: input.runnerEpochId,

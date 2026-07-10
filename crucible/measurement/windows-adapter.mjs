@@ -23,7 +23,11 @@
 import { spawn as childSpawn } from "node:child_process";
 import path from "node:path";
 
-import { MEASUREMENT_ERROR_CODES, MeasurementError } from "./errors.mjs";
+import {
+    MEASUREMENT_ERROR_CODES,
+    MeasurementError,
+    SandboxRequiredError,
+} from "./errors.mjs";
 
 // System path to taskkill.exe. We resolve it via SystemRoot rather than
 // trusting PATH — the whole point of the boundary is to not depend on
@@ -38,6 +42,17 @@ export function createDefaultProcessAdapter() {
     return Object.freeze({
         platform: process.platform,
         spawn(executable, argv, options) {
+            if (options?.executesCandidateCode !== false
+                || options?.launchPath !== "host-process-adapter") {
+                throw new SandboxRequiredError(
+                    "ordinary host process adapters cannot launch candidate code",
+                    {
+                        executesCandidateCode:
+                            options?.executesCandidateCode ?? null,
+                        launchPath: options?.launchPath ?? null,
+                    },
+                );
+            }
             if (typeof executable !== "string" || !path.isAbsolute(executable)) {
                 throw new MeasurementError(
                     MEASUREMENT_ERROR_CODES.INVALID_ARGUMENT,

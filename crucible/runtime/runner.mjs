@@ -35,6 +35,7 @@ import {
     STREAM_HASH_ALGORITHM,
     createMeasurementExecutor,
     createDefaultProcessAdapter,
+    createWindowsSandboxProvider,
     hashReceipt,
     loadHarnessAllowlist,
     sha256Bytes,
@@ -458,13 +459,40 @@ export class AutonomousRunner {
             baseProcessAdapter,
             this.#capturedOutputs,
         );
+        const sandboxProvider = Object.hasOwn(
+            this.#dependencies,
+            "sandboxProvider",
+        )
+            ? this.#dependencies.sandboxProvider
+            : (this.#dependencies.windowsSandboxProviderFactory
+                ?? createWindowsSandboxProvider)({
+                controlRoot: path.join(
+                    this.#runTempRoot,
+                    "windows-sandbox-control",
+                ),
+            });
         this.#executor = this.#dependencies.executor
             ?? (this.#dependencies.executorFactory ?? createMeasurementExecutor)({
                 allowlist: this.#allowlist,
-                sandboxProvider: this.#dependencies.sandboxProvider ?? null,
+                sandboxProvider,
                 processAdapter,
                 clock: this.#clock,
                 scratchRoot: this.#runTempRoot,
+                onCapturedOutput: ({
+                    attemptId,
+                    stdout,
+                    stderr,
+                    launchPath,
+                }) => {
+                    if (launchPath === "host-process-adapter"
+                        && this.#capturedOutputs.has(attemptId)) {
+                        return;
+                    }
+                    this.#capturedOutputs.set(attemptId, {
+                        stdout: [Buffer.from(stdout)],
+                        stderr: [Buffer.from(stderr)],
+                    });
+                },
             });
 
         const previousLease = this.#repository.getActiveLease(this.#config.investigationId);

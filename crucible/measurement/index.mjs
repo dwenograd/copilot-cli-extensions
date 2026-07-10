@@ -5,7 +5,9 @@
 export {
     MEASUREMENT_ERROR_CODES,
     MeasurementError,
+    SandboxCapabilityError,
     SandboxRequiredError,
+    SandboxUnavailableError,
     SandboxRefusedError,
     AllowlistInvalidError,
     FileVerificationError,
@@ -51,8 +53,16 @@ export {
     projectDeterministicReceipt,
 } from "./receipt.mjs";
 
-export { normalizeAdmission } from "./sandbox.mjs";
+export { createSandboxProvider } from "./sandbox.mjs";
 
 export { createDefaultProcessAdapter } from "./windows-adapter.mjs";
+
+export {
+    WINDOWS_SANDBOX_POLICY_ID,
+    WINDOWS_SANDBOX_PRIMITIVE,
+    WINDOWS_SANDBOX_LIMITATIONS,
+    createWindowsSandboxProvider,
+    probeWindowsSandboxAvailability,
+} from "./windows-sandbox-provider.mjs";
 
 export { createMeasurementExecutor, toFileUrl } from "./executor.mjs";

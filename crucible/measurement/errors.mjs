@@ -31,8 +31,13 @@ export const MEASUREMENT_ERROR_CODES = Object.freeze({
 
     // Sandbox boundary.
     SANDBOX_REQUIRED: "CRUCIBLE_MEASURE_SANDBOX_REQUIRED",
+    SANDBOX_UNAVAILABLE: "CRUCIBLE_MEASURE_SANDBOX_UNAVAILABLE",
     SANDBOX_REFUSED: "CRUCIBLE_MEASURE_SANDBOX_REFUSED",
     SANDBOX_MALFORMED: "CRUCIBLE_MEASURE_SANDBOX_MALFORMED",
+    SANDBOX_CAPABILITY_INVALID: "CRUCIBLE_MEASURE_SANDBOX_CAPABILITY_INVALID",
+    SANDBOX_CAPABILITY_BINDING: "CRUCIBLE_MEASURE_SANDBOX_CAPABILITY_BINDING",
+    SANDBOX_CAPABILITY_REPLAY: "CRUCIBLE_MEASURE_SANDBOX_CAPABILITY_REPLAY",
+    SANDBOX_LIFECYCLE: "CRUCIBLE_MEASURE_SANDBOX_LIFECYCLE",
 
     // Runtime.
     SPAWN_FAILED: "CRUCIBLE_MEASURE_SPAWN_FAILED",
@@ -71,10 +76,24 @@ export class SandboxRequiredError extends MeasurementError {
     }
 }
 
+export class SandboxUnavailableError extends MeasurementError {
+    constructor(message, details = null) {
+        super(MEASUREMENT_ERROR_CODES.SANDBOX_UNAVAILABLE, message, details);
+        this.name = "SandboxUnavailableError";
+    }
+}
+
 export class SandboxRefusedError extends MeasurementError {
     constructor(message, details = null) {
         super(MEASUREMENT_ERROR_CODES.SANDBOX_REFUSED, message, details);
         this.name = "SandboxRefusedError";
+    }
+}
+
+export class SandboxCapabilityError extends MeasurementError {
+    constructor(code, message, details = null) {
+        super(code, message, details);
+        this.name = "SandboxCapabilityError";
     }
 }
 

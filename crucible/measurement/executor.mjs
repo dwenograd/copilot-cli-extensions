@@ -14,14 +14,13 @@
 //     snapshot id, canonical manifest, and expected CAS object closure. Every
 //     path is identity-pinned and hashed before spawn, held open through the
 //     run, then identity-checked and re-hashed before any result is accepted.
-//   - If executesCandidateCode is true and no SandboxProvider was
-//     configured, the executor throws SandboxRequiredError immediately —
-//     before any spawn. cwd/env/timeout ARE NOT a sandbox.
-//   - Spawn is via the injected process adapter with shell:false,
-//     windowsHide:true, an explicit absolute executable, an explicit cwd
-//     (the entry's cwd or a temp scratch dir), and a minimal env built
-//     ONLY from the entry's allowedEnv plus a small fixed set of
-//     platform-required keys (SystemRoot, ComSpec on Windows).
+//   - If executesCandidateCode is true, launch is possible only through a
+//     genuine one-shot SandboxLaunchCapability issued by the configured
+//     SandboxProvider for this exact attempt and staged root. The ordinary
+//     host process adapter is never used for that path.
+//   - Non-candidate-code launch is via the injected host process adapter with
+//     shell:false, windowsHide:true, an explicit absolute executable, an
+//     explicit cwd, and a minimal env.
 //   - Output is captured with hard byte caps; exceeding either cap
 //     triggers a process-tree termination and OUTPUT_OVERFLOW. Similarly
 //     for the timeout.
@@ -61,7 +60,14 @@ import {
     hashArgv,
     hashEnv,
 } from "./receipt.mjs";
-import { normalizeAdmission } from "./sandbox.mjs";
+import {
+    cleanupSandboxCapability,
+    describeSandboxCapability,
+    isSandboxProvider,
+    isSandboxRefusal,
+    launchSandboxCapability,
+    terminateSandboxCapability,
+} from "./sandbox.mjs";
 import { createDefaultProcessAdapter } from "./windows-adapter.mjs";
 
 const SAFE_ID = /^[a-z0-9][a-z0-9._-]{0,127}$/u;
@@ -150,10 +156,11 @@ function validateIdentifier(value, field) {
 }
 
 // Build a MeasurementExecutor. Options:
-//   sandboxProvider    : { admitAndPrepare(entry, snapshot) } | null
+//   sandboxProvider    : registered provider from createSandboxProvider() | null
 //   processAdapter     : injected for tests; defaults to real Windows adapter
 //   clock              : { now(): number, isoNow(): string } for tests
 //   scratchRoot        : operator-owned root for private per-attempt staging
+//   onCapturedOutput   : trusted raw-output observer used by the runtime runner
 export function createMeasurementExecutor(options = {}) {
     const allowlist = options.allowlist;
     if (!isLoadedHarnessAllowlist(allowlist)) {
@@ -163,13 +170,11 @@ export function createMeasurementExecutor(options = {}) {
         );
     }
     const sandboxProvider = options.sandboxProvider ?? null;
-    if (sandboxProvider !== null) {
-        if (typeof sandboxProvider !== "object" || typeof sandboxProvider.admitAndPrepare !== "function") {
-            throw new MeasurementError(
-                MEASUREMENT_ERROR_CODES.INVALID_ARGUMENT,
-                "sandboxProvider must expose admitAndPrepare(entry, snapshot)",
-            );
-        }
+    if (sandboxProvider !== null && !isSandboxProvider(sandboxProvider)) {
+        throw new MeasurementError(
+            MEASUREMENT_ERROR_CODES.INVALID_ARGUMENT,
+            "sandboxProvider must be an opaque provider created by createSandboxProvider()",
+        );
     }
     const adapter = options.processAdapter ?? createDefaultProcessAdapter();
     if (typeof adapter?.spawn !== "function" || typeof adapter?.terminateTree !== "function") {
@@ -188,6 +193,13 @@ export function createMeasurementExecutor(options = {}) {
             "clock must expose now() and isoNow()",
         );
     }
+    const onCapturedOutput = options.onCapturedOutput ?? null;
+    if (onCapturedOutput !== null && typeof onCapturedOutput !== "function") {
+        throw new MeasurementError(
+            MEASUREMENT_ERROR_CODES.INVALID_ARGUMENT,
+            "onCapturedOutput must be a function or null",
+        );
+    }
     const scratchRoot = normalizeScratchRoot(options.scratchRoot);
 
     return Object.freeze({
@@ -202,6 +214,7 @@ export function createMeasurementExecutor(options = {}) {
                 clock,
                 scratchRoot,
                 allowlist,
+                onCapturedOutput,
             });
         },
     });
@@ -274,6 +287,7 @@ async function runOnce({
     clock,
     scratchRoot,
     allowlist,
+    onCapturedOutput,
 }) {
     if (runInput === null || typeof runInput !== "object" || Array.isArray(runInput)) {
         throw new MeasurementError(
@@ -294,6 +308,9 @@ async function runOnce({
     let runLease = null;
     let stageRoot = null;
     let snapshotLease = null;
+    let capability = null;
+    let capabilityBinding = null;
+    let capabilityCleaned = false;
     try {
         // Re-open and re-hash through the issuing allowlist instance for this
         // exact run, then keep those verified handles live through staging.
@@ -302,43 +319,6 @@ async function runOnce({
         const stagedRun = stageVerifiedHarnessRun(runLease, stageRoot);
         const entry = stagedRun.entry;
         snapshotLease = openVerifiedSnapshotClosure(snapshot);
-
-        // Fail-closed sandbox gate.
-        let admission = null;
-        if (entry.executesCandidateCode) {
-            if (sandboxProvider === null) {
-                throw new SandboxRequiredError(
-                    `harness ${JSON.stringify(entry.id)} executes candidate code; a SandboxProvider is required`,
-                    { harnessId: entry.id },
-                );
-            }
-        }
-        if (sandboxProvider !== null) {
-            let raw;
-            try {
-                raw = sandboxProvider.admitAndPrepare(verifiedEntry, snapshot);
-            } catch (err) {
-                throw new MeasurementError(
-                    MEASUREMENT_ERROR_CODES.SANDBOX_REFUSED,
-                    `SandboxProvider threw: ${err?.message ?? String(err)}`,
-                    { cause: err?.code ?? null },
-                );
-            }
-            const normalized = normalizeAdmission(raw);
-            if (!normalized.admitted) {
-                throw new SandboxRefusedError(
-                    `SandboxProvider refused: ${normalized.reason}`,
-                    { harnessId: entry.id, reason: normalized.reason },
-                );
-            }
-            if (normalized.wrap !== null) {
-                throw new StagingRefusedError(
-                    "sandbox wrapper executables are refused unless the sandbox is enforced by the process adapter; source-path wrapper execution is forbidden",
-                    { harnessId: entry.id },
-                );
-            }
-            admission = normalized;
-        }
 
         // Substitute only data placeholders, then replace every declared
         // static file reference with its private staged path.
@@ -370,26 +350,116 @@ async function runOnce({
 
         const argvHash = hashArgv(spawnArgv);
         const envHash = hashEnv(env);
+        const stagedPaths = [
+            stagedRun.executable.path,
+            stagedRun.cwd,
+            ...stagedRun.dependencies.map((dependency) => dependency.path),
+        ];
+
+        // Fail closed before launch. A successful provider result must be the
+        // opaque capability issued for this exact admission; ordinary objects
+        // and host process adapters cannot satisfy the private capability
+        // identity check.
+        if (entry.executesCandidateCode) {
+            if (sandboxProvider === null) {
+                throw new SandboxRequiredError(
+                    `harness ${JSON.stringify(entry.id)} executes candidate code; a SandboxProvider is required`,
+                    { harnessId: entry.id },
+                );
+            }
+            let admission;
+            try {
+                admission = await sandboxProvider.admitAndPrepare(Object.freeze({
+                    verifiedEntry,
+                    candidateSnapshot: snapshot,
+                    attemptId,
+                    runnerEpochId,
+                    harnessId: entry.id,
+                    stagedRoots: Object.freeze([stageRoot]),
+                    launch: Object.freeze({
+                        executable: spawnExecutable,
+                        argv: Object.freeze([...spawnArgv]),
+                        argvHash,
+                        cwd,
+                        envHash,
+                        stagedPaths: Object.freeze([...stagedPaths]),
+                    }),
+                }));
+            } catch (error) {
+                if (error instanceof MeasurementError) throw error;
+                throw new SandboxRefusedError(
+                    `SandboxProvider threw: ${error?.message ?? String(error)}`,
+                    { harnessId: entry.id, cause: error?.code ?? null },
+                );
+            }
+            if (isSandboxRefusal(admission)) {
+                throw new SandboxRefusedError(
+                    `SandboxProvider refused: ${admission.reason}`,
+                    { harnessId: entry.id, reason: admission.reason },
+                );
+            }
+            capability = admission;
+            capabilityBinding = Object.freeze({
+                provider: sandboxProvider,
+                attemptId,
+                runnerEpochId,
+                harnessId: entry.id,
+                stagedRoots: Object.freeze([stageRoot]),
+            });
+            // Validate identity and staged-root binding before any launch.
+            describeSandboxCapability(capability, capabilityBinding);
+        }
 
         const startedAt = clock.isoNow();
         const startTimeMs = clock.now();
 
         let child;
-        try {
-            child = adapter.spawn(spawnExecutable, spawnArgv, {
-                cwd,
-                env,
-                stdio: ["ignore", "pipe", "pipe"],
-            });
-        } catch (err) {
-            throw new StagingRefusedError(
-                `staged executable cannot be launched on this platform: ${err?.message ?? String(err)}`,
+        let terminationController;
+        if (capability !== null) {
+            child = await launchSandboxCapability(
+                capability,
+                capabilityBinding,
                 {
                     executable: spawnExecutable,
-                    cause: err?.code ?? null,
-                    originalCode: err instanceof MeasurementError ? err.code : null,
+                    argv: spawnArgv,
+                    cwd,
+                    env,
+                    stagedPaths,
                 },
             );
+            terminationController = Object.freeze({
+                terminate(pid, reason) {
+                    return terminateSandboxCapability(
+                        capability,
+                        capabilityBinding,
+                        { pid, reason },
+                    );
+                },
+            });
+        } else {
+            try {
+                child = adapter.spawn(spawnExecutable, spawnArgv, {
+                    cwd,
+                    env,
+                    stdio: ["ignore", "pipe", "pipe"],
+                    executesCandidateCode: false,
+                    launchPath: "host-process-adapter",
+                });
+            } catch (err) {
+                throw new StagingRefusedError(
+                    `staged executable cannot be launched on this platform: ${err?.message ?? String(err)}`,
+                    {
+                        executable: spawnExecutable,
+                        cause: err?.code ?? null,
+                        originalCode: err instanceof MeasurementError ? err.code : null,
+                    },
+                );
+            }
+            terminationController = Object.freeze({
+                terminate(pid) {
+                    return adapter.terminateTree(pid);
+                },
+            });
         }
         if (child?.pid === undefined || child?.pid === null) {
             throw new MeasurementError(
@@ -403,8 +473,16 @@ async function runOnce({
             maxStdoutBytes: entry.maxStdoutBytes,
             maxStderrBytes: entry.maxStderrBytes,
             timeoutMs: entry.timeoutMs,
-            adapter,
+            terminationController,
         });
+
+        // Containment cleanup is part of the measured operation. Complete it
+        // before the post-run candidate closure check so cleanup cannot mutate
+        // candidate bytes outside the receipt's before/after binding.
+        if (capability !== null) {
+            await cleanupSandboxCapability(capability, capabilityBinding);
+            capabilityCleaned = true;
+        }
         const snapshotBinding = reverifySnapshotClosure(snapshotLease);
 
         const completedAt = clock.isoNow();
@@ -414,34 +492,49 @@ async function runOnce({
         const stderrBytes = outcome.stderr;
         const stdoutHash = sha256Bytes(stdoutBytes, STREAM_HASH_ALGORITHM);
         const stderrHash = sha256Bytes(stderrBytes, STREAM_HASH_ALGORITHM);
+        if (onCapturedOutput !== null) {
+            await onCapturedOutput(Object.freeze({
+                attemptId,
+                runnerEpochId,
+                stdout: Buffer.from(stdoutBytes),
+                stderr: Buffer.from(stderrBytes),
+                stdoutHash,
+                stderrHash,
+                launchPath: capability === null
+                    ? "host-process-adapter"
+                    : "sandbox-capability",
+            }));
+        }
 
-    // Timeout / overflow: reject BEFORE attempting to parse. Even if the
-    // partial output happens to contain valid JSON, the run itself was not
-    // a valid measurement.
+        // Timeout / overflow: reject BEFORE attempting to parse. Even if the
+        // partial output happens to contain valid JSON, the run itself was not
+        // a valid measurement.
         if (outcome.timedOut) {
-        throw new MeasurementError(
-            MEASUREMENT_ERROR_CODES.TIMEOUT,
-            `harness ${entry.id} exceeded timeout of ${entry.timeoutMs}ms`,
-            {
-                harnessId: entry.id,
-                timeoutMs: entry.timeoutMs,
-                stdoutBytes: stdoutBytes.length,
-                stderrBytes: stderrBytes.length,
-            },
-        );
+            throw new MeasurementError(
+                MEASUREMENT_ERROR_CODES.TIMEOUT,
+                `harness ${entry.id} exceeded timeout of ${entry.timeoutMs}ms`,
+                {
+                    harnessId: entry.id,
+                    timeoutMs: entry.timeoutMs,
+                    stdoutBytes: stdoutBytes.length,
+                    stderrBytes: stderrBytes.length,
+                    terminationError: outcome.terminationError?.message ?? null,
+                },
+            );
         }
         if (outcome.overflowStream !== null) {
-        throw new MeasurementError(
-            MEASUREMENT_ERROR_CODES.OUTPUT_OVERFLOW,
-            `harness ${entry.id} exceeded ${outcome.overflowStream} cap`,
-            {
-                harnessId: entry.id,
-                stream: outcome.overflowStream,
-                capBytes: outcome.overflowStream === "stdout"
-                    ? entry.maxStdoutBytes
-                    : entry.maxStderrBytes,
-            },
-        );
+            throw new MeasurementError(
+                MEASUREMENT_ERROR_CODES.OUTPUT_OVERFLOW,
+                `harness ${entry.id} exceeded ${outcome.overflowStream} cap`,
+                {
+                    harnessId: entry.id,
+                    stream: outcome.overflowStream,
+                    capBytes: outcome.overflowStream === "stdout"
+                        ? entry.maxStdoutBytes
+                        : entry.maxStderrBytes,
+                    terminationError: outcome.terminationError?.message ?? null,
+                },
+            );
         }
         if (outcome.exit.error !== undefined) {
             throw new StagingRefusedError(
@@ -450,92 +543,102 @@ async function runOnce({
             );
         }
         if (outcome.exit.code !== 0 || outcome.exit.signal !== null) {
-        throw new MeasurementError(
-            MEASUREMENT_ERROR_CODES.NONZERO_EXIT,
-            `harness ${entry.id} exited non-zero`,
-            {
-                harnessId: entry.id,
-                exit: outcome.exit,
-                stderr: safeStderrPreview(stderrBytes),
-            },
-        );
+            throw new MeasurementError(
+                MEASUREMENT_ERROR_CODES.NONZERO_EXIT,
+                `harness ${entry.id} exited non-zero`,
+                {
+                    harnessId: entry.id,
+                    exit: outcome.exit,
+                    stderr: safeStderrPreview(stderrBytes),
+                },
+            );
         }
 
-    // Parse result. The parser is strict — anything wrong throws
-    // ResultParseError which the caller sees directly.
+        // Parse result. The parser is strict — anything wrong throws
+        // ResultParseError which the caller sees directly.
         const rawStdoutText = stdoutBytes.toString("utf8");
         const parsed = parseHarnessResult(rawStdoutText);
+        const sandbox = capability === null
+            ? null
+            : describeSandboxCapability(capability, capabilityBinding);
+        if (sandbox !== null && sandbox.capabilityLaunchUsed !== true) {
+            throw new MeasurementError(
+                MEASUREMENT_ERROR_CODES.SANDBOX_LIFECYCLE,
+                "Sandbox receipt cannot attest a capability launch that was not used",
+                { attemptId, capabilityId: sandbox.capabilityId },
+            );
+        }
 
         const receipt = buildMeasurementReceipt({
-        allowlistFileHash: stagedRun.allowlistFileHash,
-        harnessEntryHash: stagedRun.entryHash,
-        executableHash: stagedRun.executable.sourceHash,
-        stagedExecutableHash: stagedRun.executable.stagedHash,
-        dependencyHashes: stagedRun.dependencies.map((d) => ({
-            path: d.sourcePath,
-            role: d.role,
-            sha256: d.sourceHash,
-        })),
-        stagedDependencyHashes: stagedRun.dependencies.map((d) => ({
-            path: d.path,
-            role: d.role,
-            sha256: d.stagedHash,
-        })),
-        argvHash,
-        envHash,
-        candidateSnapshotHash: snapshot.hash,
-        candidateSnapshotPreClosureHash: snapshotBinding.preClosureHash,
-        candidateSnapshotPostClosureHash: snapshotBinding.postClosureHash,
-        candidateSnapshotIdentitySummary: snapshotBinding.identitySummary,
-        candidateSnapshotMutationCheck: snapshotBinding.mutationCheck,
-        stdoutHash,
-        stderrHash,
-        parserVersion: PARSER_VERSION,
-        sandbox: admission === null
-            ? null
-            : {
-                sandboxId: admission.sandboxId,
-                environmentHash: admission.environmentHash,
+            allowlistFileHash: stagedRun.allowlistFileHash,
+            harnessEntryHash: stagedRun.entryHash,
+            executableHash: stagedRun.executable.sourceHash,
+            stagedExecutableHash: stagedRun.executable.stagedHash,
+            dependencyHashes: stagedRun.dependencies.map((d) => ({
+                path: d.sourcePath,
+                role: d.role,
+                sha256: d.sourceHash,
+            })),
+            stagedDependencyHashes: stagedRun.dependencies.map((d) => ({
+                path: d.path,
+                role: d.role,
+                sha256: d.stagedHash,
+            })),
+            argvHash,
+            envHash,
+            candidateSnapshotHash: snapshot.hash,
+            candidateSnapshotPreClosureHash: snapshotBinding.preClosureHash,
+            candidateSnapshotPostClosureHash: snapshotBinding.postClosureHash,
+            candidateSnapshotIdentitySummary: snapshotBinding.identitySummary,
+            candidateSnapshotMutationCheck: snapshotBinding.mutationCheck,
+            stdoutHash,
+            stderrHash,
+            parserVersion: PARSER_VERSION,
+            sandbox,
+            attemptId,
+            runnerEpochId,
+            startedAt,
+            completedAt,
+            durationMs,
+            exit: {
+                code: outcome.exit.code,
+                signal: outcome.exit.signal,
+                timedOut: false,
             },
-        attemptId,
-        runnerEpochId,
-        startedAt,
-        completedAt,
-        durationMs,
-        exit: {
-            code: outcome.exit.code,
-            signal: outcome.exit.signal,
-            timedOut: false,
-        },
-        parsed,
+            parsed,
         });
 
         return immutableCanonical({
-        receipt,
-        parsed,
-        exit: outcome.exit,
-        stdoutBytes: stdoutBytes.length,
-        stderrBytes: stderrBytes.length,
-        stdoutHash,
-        stderrHash,
-        // NB: we do NOT expose the raw stdout/stderr text in the result.
-        // Callers that need it can hash-check against stdoutHash/stderrHash
-        // by re-capturing from their own log. Keeping raw output out of the
-        // return prevents accidental persistence of unvetted bytes.
+            receipt,
+            parsed,
+            exit: outcome.exit,
+            stdoutBytes: stdoutBytes.length,
+            stderrBytes: stderrBytes.length,
+            stdoutHash,
+            stderrHash,
+            // NB: we do NOT expose the raw stdout/stderr text in the result.
+            // The trusted observer receives byte copies before this canonical
+            // result is built; raw unvetted output is not persisted here.
         });
     } finally {
         try {
-            if (snapshotLease !== null) {
-                closeVerifiedSnapshotClosure(snapshotLease);
+            if (capability !== null && !capabilityCleaned) {
+                await cleanupSandboxCapability(capability, capabilityBinding);
             }
         } finally {
             try {
-                if (runLease !== null) {
-                    releaseVerifiedHarnessRun(runLease);
+                if (snapshotLease !== null) {
+                    closeVerifiedSnapshotClosure(snapshotLease);
                 }
             } finally {
-                if (stageRoot !== null) {
-                    fs.rmSync(stageRoot, { recursive: true, force: true });
+                try {
+                    if (runLease !== null) {
+                        releaseVerifiedHarnessRun(runLease);
+                    }
+                } finally {
+                    if (stageRoot !== null) {
+                        fs.rmSync(stageRoot, { recursive: true, force: true });
+                    }
                 }
             }
         }
@@ -548,11 +651,20 @@ function safeStderrPreview(bytes) {
 }
 
 // Consume a child process's stdout/stderr up to per-stream byte caps, with
-// a wall-clock timeout, terminating the process tree via `adapter` on
+// a wall-clock timeout, terminating the process through its launch owner on
 // overflow or timeout. Resolves with { stdout, stderr, exit, timedOut,
 // overflowStream } — never rejects for these reasons; the executor
 // interprets the shape.
-function captureChild(child, { pid, maxStdoutBytes, maxStderrBytes, timeoutMs, adapter }) {
+function captureChild(
+    child,
+    {
+        pid,
+        maxStdoutBytes,
+        maxStderrBytes,
+        timeoutMs,
+        terminationController,
+    },
+) {
     return new Promise((resolve) => {
         const stdoutChunks = [];
         const stderrChunks = [];
@@ -562,30 +674,53 @@ function captureChild(child, { pid, maxStdoutBytes, maxStderrBytes, timeoutMs, a
         let timedOut = false;
         let settled = false;
         let exit = { code: null, signal: null };
+        let terminationError = null;
+        const terminationPromises = [];
+
+        function requestTermination(reason) {
+            try {
+                const pending = Promise.resolve(
+                    terminationController.terminate(pid, reason),
+                ).catch((error) => {
+                    terminationError = error;
+                });
+                terminationPromises.push(pending);
+            } catch (error) {
+                terminationError = error;
+            }
+        }
 
         const timer = setTimeout(() => {
             timedOut = true;
-            adapter.terminateTree(pid);
+            requestTermination("timeout");
         }, timeoutMs);
         timer.unref?.();
 
-        function finalize() {
+        async function finalize() {
             if (settled) return;
             settled = true;
             clearTimeout(timer);
+            await Promise.all(terminationPromises);
             resolve({
                 stdout: Buffer.concat(stdoutChunks, stdoutBytes),
                 stderr: Buffer.concat(stderrChunks, stderrBytes),
                 exit,
                 timedOut,
                 overflowStream,
+                terminationError,
             });
         }
 
         function attachStream(stream, chunks, sinkName, cap) {
             stream.on("data", (chunk) => {
                 const remaining = cap - (sinkName === "stdout" ? stdoutBytes : stderrBytes);
-                if (remaining <= 0) return;
+                if (remaining <= 0) {
+                    if (chunk.length > 0 && overflowStream === null) {
+                        overflowStream = sinkName;
+                        requestTermination(`${sinkName}-overflow`);
+                    }
+                    return;
+                }
                 let toAppend = chunk;
                 if (chunk.length > remaining) {
                     toAppend = chunk.subarray(0, remaining);
@@ -596,7 +731,7 @@ function captureChild(child, { pid, maxStdoutBytes, maxStderrBytes, timeoutMs, a
                 // If the original chunk overflowed the cap, tree-kill and mark.
                 if (chunk.length > remaining) {
                     if (overflowStream === null) overflowStream = sinkName;
-                    adapter.terminateTree(pid);
+                    requestTermination(`${sinkName}-overflow`);
                 }
             });
             stream.on("error", () => { /* surfaced via child.on('error') */ });
@@ -609,14 +744,14 @@ function captureChild(child, { pid, maxStdoutBytes, maxStderrBytes, timeoutMs, a
             // Spawn/comm-level error before or during run. Record it as a
             // non-zero exit so the executor's downstream check surfaces it.
             exit = { code: exit.code ?? -1, signal: exit.signal ?? null, error: err?.message ?? String(err) };
-            adapter.terminateTree(pid);
+            requestTermination("child-error");
             // Give any pending data events a tick to flush.
-            setImmediate(finalize);
+            setImmediate(() => { void finalize(); });
         });
         child.on("close", (code, signal) => {
             exit = { code: code ?? null, signal: signal ?? null };
             // Wait a tick for late data events.
-            setImmediate(finalize);
+            setImmediate(() => { void finalize(); });
         });
     });
 }

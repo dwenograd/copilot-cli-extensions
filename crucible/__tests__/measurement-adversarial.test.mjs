@@ -19,6 +19,7 @@ import {
     MEASUREMENT_ERROR_CODES,
     SandboxRequiredError,
     createMeasurementExecutor,
+    createSandboxProvider,
     loadHarnessAllowlist,
     projectDeterministicReceipt,
 } from "../measurement/index.mjs";
@@ -105,9 +106,14 @@ describe("SANDBOX_REQUIRED for candidate-code harnesses without a provider", () 
         const list = loadHarnessAllowlist(allowlistPath);
         const verified = list.verifyEntry("runcode3");
         const snapshot = materializeCandidateSnapshot(root, "snap3", "x");
-        const refuser = {
-            admitAndPrepare: () => ({ admitted: false, reason: "sandbox quota exhausted" }),
-        };
+        const refuser = createSandboxProvider({
+            providerId: "fixture-refuser",
+            providerVersion: "v1",
+            admitAndPrepare: () => ({
+                admitted: false,
+                reason: "sandbox quota exhausted",
+            }),
+        });
         const executor = createMeasurementExecutor({ allowlist: list, sandboxProvider: refuser, scratchRoot: root });
         const err = await catchAsync(() => executor.run({
             verifiedEntry: verified, candidateSnapshot: snapshot, ...ids(),

@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
+import { spawn as childSpawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -13,6 +14,7 @@ import {
 } from "../domain/index.mjs";
 import {
     PARSER_VERSION,
+    createSandboxProvider,
 } from "../measurement/index.mjs";
 import {
     openArtifactStore,
@@ -55,7 +57,13 @@ function seedSnapshot(store, root, name, score) {
     return store.ingestDirectory({ sourceDir: source }).snapshot;
 }
 
-function writeRuntimeAllowlist(root, harnessId, scriptPath, validationCases) {
+function writeRuntimeAllowlist(
+    root,
+    harnessId,
+    scriptPath,
+    validationCases,
+    executesCandidateCode = false,
+) {
     const allowlistPath = path.join(root, "harness.allowlist.json");
     fs.writeFileSync(allowlistPath, JSON.stringify({
         version: 1,
@@ -72,7 +80,7 @@ function writeRuntimeAllowlist(root, harnessId, scriptPath, validationCases) {
                 timeoutMs: 15_000,
                 maxStdoutBytes: 1024 * 1024,
                 maxStderrBytes: 256 * 1024,
-                executesCandidateCode: false,
+                executesCandidateCode,
                 validationCases: Object.fromEntries(
                     Object.entries(validationCases).map(([id, snapshot]) => [
                         id,
@@ -194,6 +202,7 @@ class FakeWorkerPool {
 function setupInvestigation(label, contractOptions = {}, {
     countHarnessCalls = false,
     impossibilityResult = null,
+    executesCandidateCode = false,
 } = {}) {
     const root = makeRoot(label);
     const stateDir = path.join(root, "state");
@@ -231,7 +240,7 @@ function setupInvestigation(label, contractOptions = {}, {
     const allowlistPath = writeRuntimeAllowlist(root, "score-harness", scriptPath, {
         "known-good": goodSnapshot,
         "known-bad": badSnapshot,
-    });
+    }, executesCandidateCode);
     const contract = makeContract({
         goodSnapshot,
         badSnapshot,
@@ -316,6 +325,52 @@ function runnerDependencies(workerPool, extra = {}) {
         idFactory: deterministicIds(),
         ...extra,
     };
+}
+
+function createRunnerContainmentProvider(calls) {
+    let nextCapability = 0;
+    return createSandboxProvider({
+        providerId: "runner-fixture-containment",
+        providerVersion: "v1",
+        admitAndPrepare(request, issueLaunchCapability) {
+            calls.admissions.push(request);
+            let child = null;
+            return issueLaunchCapability({
+                capabilityId: `runner-capability-${++nextCapability}`,
+                policyId: "runner-fixture-policy",
+                policyDigest:
+                    `sha256:runner-fixture-policy-v1:${"c".repeat(64)}`,
+                permittedStagedRoots: request.stagedRoots,
+                launch(launchRequest) {
+                    calls.launches.push(launchRequest);
+                    child = childSpawn(
+                        launchRequest.executable,
+                        launchRequest.argv,
+                        {
+                            cwd: launchRequest.options.cwd,
+                            env: launchRequest.options.env,
+                            stdio: launchRequest.options.stdio,
+                            shell: false,
+                            windowsHide: true,
+                            detached: true,
+                        },
+                    );
+                    return child;
+                },
+                terminate(terminationRequest) {
+                    calls.terminations.push(terminationRequest);
+                    if (child?.pid === terminationRequest.pid && !child.killed) {
+                        child.kill("SIGKILL");
+                    }
+                    return true;
+                },
+                cleanup(cleanupRequest) {
+                    calls.cleanups.push(cleanupRequest);
+                    return true;
+                },
+            });
+        },
+    });
 }
 
 describe("Crucible autonomous runner", () => {
@@ -462,6 +517,84 @@ describe("Crucible autonomous runner", () => {
         const tempRoot = path.join(setup.stateDir, "runtime-temp");
         expect(fs.existsSync(tempRoot)).toBe(true);
         expect(fs.readdirSync(tempRoot)).toEqual([]);
+    }, 60_000);
+
+    it("configures and persists capability-launched measurements from the Windows provider factory", async () => {
+        const setup = setupInvestigation(
+            "sandbox-capability",
+            { maxRounds: 1 },
+            { executesCandidateCode: true },
+        );
+        const calls = {
+            admissions: [],
+            launches: [],
+            terminations: [],
+            cleanups: [],
+            hostLaunches: 0,
+            hostTerminations: 0,
+        };
+        const providerControlRoots = [];
+        const result = await runAutonomousInvestigation(
+            setup.config,
+            runnerDependencies(new FakeWorkerPool([95]), {
+                windowsSandboxProviderFactory(options) {
+                    providerControlRoots.push(options.controlRoot);
+                    return createRunnerContainmentProvider(calls);
+                },
+                processAdapter: {
+                    spawn() {
+                        calls.hostLaunches += 1;
+                        throw new Error("host adapter must not launch candidate code");
+                    },
+                    terminateTree() {
+                        calls.hostTerminations += 1;
+                        return false;
+                    },
+                },
+            }),
+        );
+
+        expect(result).toMatchObject({
+            kind: "TERMINAL",
+            decision: "VERIFIED_RESULT",
+        });
+        expect(calls.hostLaunches).toBe(0);
+        expect(calls.hostTerminations).toBe(0);
+        expect(providerControlRoots).toHaveLength(1);
+        expect(providerControlRoots[0]).toContain(
+            path.join("runtime-temp", "run-runner-epoch-1"),
+        );
+        expect(calls.admissions.length).toBeGreaterThanOrEqual(3);
+        expect(calls.launches).toHaveLength(calls.admissions.length);
+        expect(calls.cleanups).toHaveLength(calls.admissions.length);
+        expect(calls.terminations).toHaveLength(0);
+
+        const replayed = replaySetup(setup);
+        const measurements = replayed.adapter.listOperationalEvidence()
+            .filter((row) => row.kind === "runtime:measurement");
+        expect(measurements).toHaveLength(calls.launches.length);
+        for (const measurement of measurements) {
+            expect(measurement.payload.receipt.sandbox).toMatchObject({
+                providerId: "runner-fixture-containment",
+                providerVersion: "v1",
+                policyId: "runner-fixture-policy",
+                policyDigest:
+                    `sha256:runner-fixture-policy-v1:${"c".repeat(64)}`,
+                capabilityId: expect.stringMatching(/^runner-capability-\d+$/u),
+                launchPath: "sandbox-capability",
+                capabilityLaunchUsed: true,
+            });
+            expect(measurement.payload.measurementProvenance.sandboxPolicy)
+                .toMatchObject({
+                    kind: "sandbox",
+                    environmentHash:
+                        `sha256:runner-fixture-policy-v1:${"c".repeat(64)}`,
+                });
+        }
+        expect(replayed.aggregate.terminal.evidenceClosure.closureRoot).toMatch(
+            /^sha256:crucible-terminal-evidence-closure-v1:[a-f0-9]{64}$/u,
+        );
+        replayed.repository.close();
     }, 60_000);
 
     it("persists a command-budget non-result after successful validation", async () => {
