@@ -8,6 +8,7 @@ import {
     createInvestigationContract,
 } from "./contract.mjs";
 import {
+    DOMAIN_VERSION,
     EVENT_TYPES,
     EVENT_VOCABULARY,
     KERNEL_DECISION_EVENT_TYPES,
@@ -15,6 +16,7 @@ import {
 import { decisionEventMatches, computeEventHash } from "./events.mjs";
 import {
     ERROR_CODES,
+    DomainVersionRestartRequiredError,
     EventChainError,
     TransitionError,
 } from "./errors.mjs";
@@ -92,6 +94,15 @@ function duplicate(kind, id) {
 }
 
 function applyInvestigationOpened(next, event) {
+    if (event.payload?.domainVersion !== DOMAIN_VERSION) {
+        throw new DomainVersionRestartRequiredError(
+            "Investigation event history uses an incompatible domain version; start a new investigation",
+            {
+                expectedDomainVersion: DOMAIN_VERSION,
+                actualDomainVersion: event.payload?.domainVersion ?? null,
+            },
+        );
+    }
     if (event.payload?.contract === null || typeof event.payload?.contract !== "object") {
         throw new TransitionError(ERROR_CODES.INVALID_CONTRACT, "Opened event has no contract");
     }
@@ -200,16 +211,31 @@ function applyCommandObserved(next, event) {
             "Validation commands require harness validation observations",
         );
     }
-    if (payload.sourceKind === "model_review"
-        && (command.command.kind !== "search" || payload.purpose !== "candidate")) {
+    if (command.command.kind === "search_candidate"
+        && (payload.sourceKind !== "harness" || payload.purpose !== "candidate")) {
         throw new TransitionError(
             ERROR_CODES.INVALID_EVIDENCE,
-            "Model observations are search-only and cannot establish validation or impossibility",
+            "Search-candidate commands require authoritative harness candidate observations",
         );
+    }
+    if (payload.purpose === "candidate") {
+        const promptRefs = new Set(command.command.promptContextRefs ?? []);
+        if (payload.annotations.citedEvidenceIds.some((evidenceId) => !promptRefs.has(evidenceId))) {
+            throw new TransitionError(
+                ERROR_CODES.INVALID_EVIDENCE,
+                "Candidate annotations may cite only evidence included in promptContextRefs",
+                {
+                    citedEvidenceIds: payload.annotations.citedEvidenceIds,
+                    promptContextRefs: command.command.promptContextRefs ?? [],
+                },
+            );
+        }
     }
     if (payload.sourceKind === "harness" && payload.purpose === "candidate") {
         if (!Number.isSafeInteger(payload.round)
             || payload.round < 1
+            || !Number.isSafeInteger(payload.slotIndex)
+            || payload.slotIndex < 0
             || typeof payload.candidateId !== "string"
             || !/^[A-Za-z0-9][A-Za-z0-9._@-]*$/u.test(payload.candidateId)
             || payload.candidateId.includes("..")
@@ -219,10 +245,13 @@ function applyCommandObserved(next, event) {
                 "Harness candidate observation has invalid round, candidateId, or artifact receipt",
             );
         }
-        if (command.command.kind !== "search" || payload.round !== command.command.round) {
+        if (command.command.kind !== "search_candidate"
+            || payload.round !== command.command.round
+            || payload.slotIndex !== command.command.slotIndex
+            || payload.candidateId !== command.command.candidateId) {
             throw new TransitionError(
                 ERROR_CODES.INVALID_EVIDENCE,
-                "Harness candidate observations must match the reserved search round",
+                "Harness candidate observations must match the reserved search-candidate assignment",
             );
         }
         if (payload.round > next.contract.maxRounds) {
@@ -237,6 +266,13 @@ function applyCommandObserved(next, event) {
                 ERROR_CODES.INVALID_EVIDENCE,
                 "Harness candidate is outside the frozen bounded search space",
                 { candidateId: payload.candidateId },
+            );
+        }
+        if ((command.command.boundedCandidateId ?? null)
+            !== (boundedIds === undefined ? null : payload.candidateId)) {
+            throw new TransitionError(
+                ERROR_CODES.INVALID_EVIDENCE,
+                "Harness candidate observation does not match its bounded candidate assignment",
             );
         }
     }
@@ -266,9 +302,19 @@ function applyEvidenceCommitted(next, event) {
         const duplicateCandidate = next.evidenceOrder.some((evidenceId) =>
             next.evidence[evidenceId].sourceKind === "harness"
             && next.evidence[evidenceId].purpose === "candidate"
+            && !next.evidence[evidenceId].invalidated
             && next.evidence[evidenceId].candidateId === observation.candidateId);
         if (duplicateCandidate) {
             duplicate("candidate", observation.candidateId);
+        }
+        const duplicateSlot = next.evidenceOrder.some((evidenceId) =>
+            next.evidence[evidenceId].sourceKind === "harness"
+            && next.evidence[evidenceId].purpose === "candidate"
+            && !next.evidence[evidenceId].invalidated
+            && next.evidence[evidenceId].round === observation.round
+            && next.evidence[evidenceId].slotIndex === observation.slotIndex);
+        if (duplicateSlot) {
+            duplicate("candidate slot", `${observation.round}:${observation.slotIndex}`);
         }
     }
     const expected = deriveEvidencePayload(next, observation, payload.evidenceId);
@@ -471,6 +517,15 @@ function applyTransition(next, event) {
 }
 
 export function reduceEvent(aggregate, event) {
+    if (aggregate?.domainVersion !== DOMAIN_VERSION) {
+        throw new DomainVersionRestartRequiredError(
+            "Aggregate domain version is incompatible; start a new investigation",
+            {
+                expectedDomainVersion: DOMAIN_VERSION,
+                actualDomainVersion: aggregate?.domainVersion ?? null,
+            },
+        );
+    }
     assertEventEnvelope(aggregate, event);
     if (aggregate.terminal !== null) {
         throw new TransitionError(
@@ -521,6 +576,17 @@ export function verifyEventChain(events) {
     let lastEventHash = null;
     for (const event of events) {
         assertEventEnvelope({ lastSeq, lastEventHash }, event);
+        if (event.seq === 1
+            && event.type === EVENT_TYPES.INVESTIGATION_OPENED
+            && event.payload?.domainVersion !== DOMAIN_VERSION) {
+            throw new DomainVersionRestartRequiredError(
+                "Investigation event history uses an incompatible domain version; start a new investigation",
+                {
+                    expectedDomainVersion: DOMAIN_VERSION,
+                    actualDomainVersion: event.payload?.domainVersion ?? null,
+                },
+            );
+        }
         lastSeq = event.seq;
         lastEventHash = event.eventHash;
     }

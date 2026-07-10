@@ -289,108 +289,208 @@ export class EventRepository {
             throw new InvalidArgumentError("events must be a non-empty array", { events });
         }
 
-        return this.#tx(() => {
-            this.#requireInvestigation(investigationId);
+        return this.#tx(() =>
+            this.#appendEventsInTransaction({ investigationId, expectedHead, events }));
+    }
 
-            const head = this.getHead(investigationId);
-            const currentHeadHash = head.eventHash;
-            if ((expectedHead ?? null) !== (currentHeadHash ?? null)) {
-                throw new CasConflictError(
-                    "append rejected: expected head does not match current head",
-                    { expectedHead: expectedHead ?? null, actualHead: currentHeadHash ?? null },
-                );
-            }
+    #appendEventsInTransaction({ investigationId, expectedHead, events }) {
+        this.#requireInvestigation(investigationId);
 
-            let hasTerminal = Boolean(
-                this.#db
-                    .prepare("SELECT 1 AS present FROM events WHERE investigation_id = ? AND is_terminal = 1 LIMIT 1")
-                    .get(investigationId),
+        const head = this.getHead(investigationId);
+        const currentHeadHash = head.eventHash;
+        if ((expectedHead ?? null) !== (currentHeadHash ?? null)) {
+            throw new CasConflictError(
+                "append rejected: expected head does not match current head",
+                { expectedHead: expectedHead ?? null, actualHead: currentHeadHash ?? null },
             );
-            if (hasTerminal) {
+        }
+
+        let hasTerminal = Boolean(
+            this.#db
+                .prepare("SELECT 1 AS present FROM events WHERE investigation_id = ? AND is_terminal = 1 LIMIT 1")
+                .get(investigationId),
+        );
+        if (hasTerminal) {
+            throw new TerminalExistsError(
+                "terminal investigations reject subsequent events",
+                { investigationId },
+            );
+        }
+
+        let prevSeq = head.seq;
+        let prevHash = currentHeadHash ?? GENESIS_PREV_HASH;
+        const appended = [];
+
+        const insert = this.#db.prepare(`
+            INSERT INTO events(
+                investigation_id, seq, prev_hash, event_hash, kind, payload,
+                is_terminal, terminal_kind, attempt_id, evidence_kind, created_at)
+            VALUES(:inv, :seq, :prev, :hash, :kind, :payload,
+                :isTerminal, :tkind, NULL, NULL, :createdAt)`);
+
+        for (const [eventIndex, ev] of events.entries()) {
+            const kind = requireNonEmptyString(ev.kind, "event.kind");
+            const terminalKind = this.#normalizeTerminalKind(ev.terminal ?? ev.terminalKind ?? null);
+            const isTerminal = terminalKind ? 1 : 0;
+            if (isTerminal && hasTerminal) {
                 throw new TerminalExistsError(
-                    "terminal investigations reject subsequent events",
+                    "investigation already has a terminal event",
                     { investigationId },
                 );
             }
-
-            let prevSeq = head.seq;
-            let prevHash = currentHeadHash ?? GENESIS_PREV_HASH;
-            const appended = [];
-
-            const insert = this.#db.prepare(`
-                INSERT INTO events(
-                    investigation_id, seq, prev_hash, event_hash, kind, payload,
-                    is_terminal, terminal_kind, attempt_id, evidence_kind, created_at)
-                VALUES(:inv, :seq, :prev, :hash, :kind, :payload,
-                    :isTerminal, :tkind, NULL, NULL, :createdAt)`);
-
-            for (const [eventIndex, ev] of events.entries()) {
-                const kind = requireNonEmptyString(ev.kind, "event.kind");
-                const terminalKind = this.#normalizeTerminalKind(ev.terminal ?? ev.terminalKind ?? null);
-                const isTerminal = terminalKind ? 1 : 0;
-                if (isTerminal && hasTerminal) {
-                    throw new TerminalExistsError(
-                        "investigation already has a terminal event",
-                        { investigationId },
-                    );
-                }
-                if (isTerminal && eventIndex !== events.length - 1) {
-                    throw new InvalidArgumentError(
-                        "a terminal event must be the final event in its batch",
-                        { investigationId, eventIndex },
-                    );
-                }
-                const payloadCanonical = canonicalize(ev.payload === undefined ? {} : ev.payload);
-                const createdAt = ev.createdAt ?? this.#now();
-                const seq = prevSeq + 1;
-                const eventHash = computeEventHash({
-                    investigationId,
-                    seq,
-                    prevHash,
-                    kind,
-                    payloadCanonical,
-                    isTerminal,
-                    terminalKind,
-                    attemptId: null,
-                    evidenceKind: null,
-                    createdAt,
-                });
-                if (ev.expectedEventHash != null && ev.expectedEventHash !== eventHash) {
-                    throw new CruciblePersistenceError(
-                        ERROR_CODES.EVENT_HASH_MISMATCH,
-                        "supplied event hash does not match canonical computation",
-                        { seq, expected: ev.expectedEventHash, computed: eventHash },
-                    );
-                }
-
-                try {
-                    insert.run({
-                        inv: investigationId,
-                        seq,
-                        prev: prevHash,
-                        hash: eventHash,
-                        kind,
-                        payload: payloadCanonical,
-                        isTerminal,
-                        tkind: terminalKind,
-                        createdAt,
-                    });
-                } catch (err) {
-                    throw this.#translateEventInsert(err, { investigationId, seq });
-                }
-
-                appended.push({
-                    investigationId, seq, prevHash, eventHash, kind,
-                    payload: JSON.parse(payloadCanonical),
-                    isTerminal: isTerminal === 1,
-                    terminalKind, createdAt,
-                });
-                hasTerminal = hasTerminal || isTerminal === 1;
-                prevSeq = seq;
-                prevHash = eventHash;
+            if (isTerminal && eventIndex !== events.length - 1) {
+                throw new InvalidArgumentError(
+                    "a terminal event must be the final event in its batch",
+                    { investigationId, eventIndex },
+                );
+            }
+            const payloadCanonical = canonicalize(ev.payload === undefined ? {} : ev.payload);
+            const createdAt = ev.createdAt ?? this.#now();
+            const seq = prevSeq + 1;
+            const eventHash = computeEventHash({
+                investigationId,
+                seq,
+                prevHash,
+                kind,
+                payloadCanonical,
+                isTerminal,
+                terminalKind,
+                attemptId: null,
+                evidenceKind: null,
+                createdAt,
+            });
+            if (ev.expectedEventHash != null && ev.expectedEventHash !== eventHash) {
+                throw new CruciblePersistenceError(
+                    ERROR_CODES.EVENT_HASH_MISMATCH,
+                    "supplied event hash does not match canonical computation",
+                    { seq, expected: ev.expectedEventHash, computed: eventHash },
+                );
             }
 
-            return { head: { seq: prevSeq, eventHash: prevHash }, events: appended };
+            try {
+                insert.run({
+                    inv: investigationId,
+                    seq,
+                    prev: prevHash,
+                    hash: eventHash,
+                    kind,
+                    payload: payloadCanonical,
+                    isTerminal,
+                    tkind: terminalKind,
+                    createdAt,
+                });
+            } catch (err) {
+                throw this.#translateEventInsert(err, { investigationId, seq });
+            }
+
+            appended.push({
+                investigationId, seq, prevHash, eventHash, kind,
+                payload: JSON.parse(payloadCanonical),
+                isTerminal: isTerminal === 1,
+                terminalKind, createdAt,
+            });
+            hasTerminal = hasTerminal || isTerminal === 1;
+            prevSeq = seq;
+            prevHash = eventHash;
+        }
+
+        return { head: { seq: prevSeq, eventHash: prevHash }, events: appended };
+    }
+
+    appendEventsWithAttemptTransition({
+        investigationId,
+        expectedHead,
+        events,
+        attemptId,
+        leaseId,
+        fencingToken,
+        owner,
+        fromState,
+        toState,
+    } = {}) {
+        requireNonEmptyString(investigationId, "investigationId");
+        requireNonEmptyString(attemptId, "attemptId");
+        requireNonEmptyString(leaseId, "leaseId");
+        requireNonEmptyString(owner, "owner");
+        requireNonEmptyString(fromState, "fromState");
+        requireNonEmptyString(toState, "toState");
+        if (expectedHead !== null && typeof expectedHead !== "string") {
+            throw new InvalidArgumentError(
+                "expectedHead is required for CAS append: pass null (empty log) or the current head hash",
+                { expectedHead },
+            );
+        }
+        if (!Array.isArray(events) || events.length === 0) {
+            throw new InvalidArgumentError("events must be a non-empty array", { events });
+        }
+        if (!COMMAND_STATES.includes(fromState)
+            || !COMMAND_STATES.includes(toState)
+            || NEXT_STATE[fromState] !== toState) {
+            throw new InvalidArgumentError(
+                "attempt transition must be one legal forward lifecycle step",
+                { fromState, toState },
+            );
+        }
+
+        return this.#tx(() => {
+            const attempt = this.#db
+                .prepare("SELECT * FROM command_attempts WHERE attempt_id = ?")
+                .get(attemptId);
+            if (!attempt || attempt.investigation_id !== investigationId) {
+                throw new NotFoundError(
+                    ERROR_CODES.NOT_FOUND,
+                    `unknown command attempt '${attemptId}'`,
+                    { attemptId },
+                );
+            }
+            if (attempt.lease_id !== leaseId
+                || Number(attempt.fencing_token) !== fencingToken
+                || attempt.owner !== owner) {
+                throw new FenceRejectedError(
+                    "attempt identity does not match the presented runner lease",
+                    {
+                        attemptId,
+                        leaseId,
+                        fencingToken,
+                        owner,
+                    },
+                );
+            }
+            const lease = this.#db
+                .prepare("SELECT * FROM runner_leases WHERE lease_id = ?")
+                .get(leaseId);
+            if (!lease
+                || lease.investigation_id !== investigationId
+                || lease.owner !== owner
+                || Number(lease.fencing_token) !== fencingToken
+                || lease.released_at !== null) {
+                throw new FenceRejectedError(
+                    "presented runner lease is not active for this investigation",
+                    { investigationId, leaseId, fencingToken, owner },
+                );
+            }
+            this.#assertFencingCurrent(investigationId, fencingToken, { attemptId, leaseId });
+            if (attempt.state !== fromState) {
+                throw new IllegalTransitionError(
+                    `attempt must be ${fromState} before fenced domain append`,
+                    { attemptId, state: attempt.state, expected: fromState },
+                );
+            }
+
+            const appended = this.#appendEventsInTransaction({
+                investigationId,
+                expectedHead,
+                events,
+            });
+            const ts = this.#now();
+            const tsColumn = STATE_TIMESTAMP_COLUMN[toState];
+            this.#db
+                .prepare(`UPDATE command_attempts SET state = :state, ${tsColumn} = :ts, updated_at = :ts WHERE attempt_id = :id`)
+                .run({ state: toState, ts, id: attemptId });
+            return {
+                ...appended,
+                attempt: this.getCommandAttempt(attemptId),
+            };
         });
     }
 

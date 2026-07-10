@@ -4,10 +4,10 @@ import {
     NON_RESULT_CODES,
 } from "./constants.mjs";
 import { DecisionError, ERROR_CODES } from "./errors.mjs";
+import { detectPlateau, buildSearchCandidateCommand } from "./strategy.mjs";
 import {
     activeCommand,
     boundedSearchExhaustion,
-    candidateSelectionReady,
     currentValidationEvidence,
     latestUnhandledStopRequest,
     qualifyingCandidateEvidence,
@@ -31,52 +31,84 @@ function budgetIsExhausted(aggregate) {
     return budget !== null && aggregate.commandOrder.length >= budget;
 }
 
-function budgetRecommendation(aggregate, stopRequest = null) {
+function budgetRecommendation(aggregate, reason) {
     const budget = commandBudget(aggregate.contract);
-    return {
-        kind: "NON_RESULT",
+    const payload = {
         code: NON_RESULT_CODES.BUDGET_EXHAUSTED_INCONCLUSIVE,
-        reason: "Declared command budget was exhausted without terminal evidence.",
+        reason,
         commandCount: aggregate.commandOrder.length,
         commandBudget: budget,
-        sourceStopRequestSeq: stopRequest?.seq ?? null,
+        maxRounds: aggregate.contract.maxRounds,
+        sourceStopRequestSeq: null,
+    };
+    return {
+        kind: "NON_RESULT",
+        ...payload,
         event: {
             type: EVENT_TYPES.NON_RESULT_RECORDED,
-            payload: {
-                code: NON_RESULT_CODES.BUDGET_EXHAUSTED_INCONCLUSIVE,
-                reason: "Declared command budget was exhausted without terminal evidence.",
-                commandCount: aggregate.commandOrder.length,
-                commandBudget: budget,
-                sourceStopRequestSeq: stopRequest?.seq ?? null,
-            },
+            payload,
         },
     };
 }
 
-function unreachableRecommendation(aggregate, stopRequest) {
-    const topology = aggregate.contract.hypothesisTopology;
-    if (topology === "open_generative") {
+function evidenceClosure(aggregate) {
+    const validation = currentValidationEvidence(aggregate);
+    return {
+        validation: {
+            evidenceId: validation.evidenceId,
+            evidenceHash: validation.commitEventHash,
+        },
+        candidates: qualifyingCandidateEvidenceItems(aggregate).map((evidence) => ({
+            candidateId: evidence.candidateId,
+            evidenceId: evidence.evidenceId,
+            evidenceHash: evidence.commitEventHash,
+        })),
+    };
+}
+
+function verifiedRecommendation(aggregate, incumbent, basis) {
+    const payload = {
+        decision: "VERIFIED_RESULT",
+        candidateId: incumbent.candidateId,
+        evidenceId: incumbent.evidenceId,
+        evidenceHash: incumbent.commitEventHash,
+        contractHash: aggregate.contractHash,
+        basis,
+        evidenceClosure: evidenceClosure(aggregate),
+    };
+    return {
+        kind: "TERMINAL",
+        decision: "VERIFIED_RESULT",
+        candidateId: incumbent.candidateId,
+        evidenceId: incumbent.evidenceId,
+        basis,
+        event: {
+            type: EVENT_TYPES.VERIFIED_RESULT,
+            payload,
+        },
+    };
+}
+
+function unreachableRecommendation(aggregate) {
+    if (aggregate.contract.hypothesisTopology === "open_generative") {
         return null;
     }
     const boundedBasis = boundedSearchExhaustion(aggregate);
     if (boundedBasis !== null) {
-        const basis = {
-            ...boundedBasis,
-            stopRequestSeq: stopRequest.seq,
-        };
         return {
             kind: "TERMINAL",
             decision: "TARGET_UNREACHABLE",
-            basis,
+            basis: boundedBasis,
             event: {
                 type: EVENT_TYPES.TARGET_UNREACHABLE,
                 payload: {
                     decision: "TARGET_UNREACHABLE",
-                    basis,
+                    basis: boundedBasis,
                 },
             },
         };
     }
+
     const evidence = qualifyingUnreachableEvidence(aggregate);
     if (evidence === null) {
         return null;
@@ -85,9 +117,7 @@ function unreachableRecommendation(aggregate, stopRequest) {
         ...evidence.unreachableBasis,
         evidenceId: evidence.evidenceId,
         evidenceHash: evidence.commitEventHash,
-        stopRequestSeq: stopRequest.seq,
     };
-
     return {
         kind: "TERMINAL",
         decision: "TARGET_UNREACHABLE",
@@ -104,25 +134,41 @@ function unreachableRecommendation(aggregate, stopRequest) {
     };
 }
 
+function pauseRecommendation(stopRequest) {
+    const payload = {
+        reason: stopRequest.reason,
+        sourceStopRequestSeq: stopRequest.seq,
+    };
+    return {
+        kind: "NON_RESULT",
+        code: NON_RESULT_CODES.INVESTIGATION_PAUSED,
+        event: {
+            type: EVENT_TYPES.INVESTIGATION_PAUSED,
+            payload,
+        },
+    };
+}
+
 function reserveCommandRecommendation(aggregate) {
-    const validationEvidence = currentValidationEvidence(aggregate);
     const commandId = nextCommandId(aggregate);
-    const command = validationEvidence === null
-        ? {
+    const validationEvidence = currentValidationEvidence(aggregate);
+    let command;
+    if (validationEvidence === null) {
+        command = {
             kind: "run_validation",
             harnessId: aggregate.contract.harnessId,
             parserVersion: aggregate.contract.parserVersion,
             validationCases: aggregate.contract.validationCases,
-        }
-        : {
-            kind: "search",
-            harnessId: aggregate.contract.harnessId,
-            parserVersion: aggregate.contract.parserVersion,
-            strategyRevision: aggregate.searchStrategy.revision,
-            round: searchProgress(aggregate).nextRound,
-            workerModels: aggregate.contract.workerModels,
-            candidatesPerRound: aggregate.contract.candidatesPerRound,
         };
+    } else {
+        command = buildSearchCandidateCommand(aggregate, searchProgress(aggregate));
+        if (command === null) {
+            throw new DecisionError(
+                ERROR_CODES.NO_DECISION_EVENT,
+                "Search is exhausted and cannot reserve another candidate slot",
+            );
+        }
+    }
     return {
         kind: "COMMAND",
         commandId,
@@ -153,7 +199,6 @@ export function decideNext(aggregate) {
             event: null,
         };
     }
-
     if (aggregate.pause !== null) {
         return {
             kind: "NON_RESULT",
@@ -162,7 +207,6 @@ export function decideNext(aggregate) {
             event: null,
         };
     }
-
     const recordedNonResult = aggregate.nonResults.at(-1) ?? null;
     if (recordedNonResult !== null) {
         return {
@@ -199,6 +243,11 @@ export function decideNext(aggregate) {
         };
     }
 
+    const stopRequest = latestUnhandledStopRequest(aggregate);
+    if (stopRequest !== null) {
+        return pauseRecommendation(stopRequest);
+    }
+
     const validationEvidence = qualifyingValidationEvidence(aggregate);
     const latestCompletion = aggregate.validation.completions.at(-1) ?? null;
     if (validationEvidence !== null
@@ -221,117 +270,65 @@ export function decideNext(aggregate) {
     const currentValidation = currentValidationEvidence(aggregate);
     const validationCurrent = currentValidation !== null
         && latestCompletion?.evidenceId === currentValidation.evidenceId;
-    if (validationCurrent) {
-        const accepted = qualifyingCandidateEvidence(aggregate);
-        if (accepted !== null && candidateSelectionReady(aggregate)) {
-            const acceptedEvidence = qualifyingCandidateEvidenceItems(aggregate);
-            const evidenceClosure = {
-                validation: {
-                    evidenceId: currentValidation.evidenceId,
-                    evidenceHash: currentValidation.commitEventHash,
-                },
-                candidates: acceptedEvidence.map((evidence) => ({
-                    candidateId: evidence.candidateId,
-                    evidenceId: evidence.evidenceId,
-                    evidenceHash: evidence.commitEventHash,
-                })),
-            };
-            const payload = {
-                decision: "VERIFIED_RESULT",
-                candidateId: accepted.candidateId,
-                evidenceId: accepted.evidenceId,
-                evidenceHash: accepted.commitEventHash,
-                contractHash: aggregate.contractHash,
-                evidenceClosure,
-            };
-            return {
-                kind: "TERMINAL",
-                decision: "VERIFIED_RESULT",
-                candidateId: accepted.candidateId,
-                evidenceId: accepted.evidenceId,
-                event: {
-                    type: EVENT_TYPES.VERIFIED_RESULT,
-                    payload,
-                },
-            };
+    if (!validationCurrent) {
+        if (budgetIsExhausted(aggregate)) {
+            return budgetRecommendation(
+                aggregate,
+                "Declared command budget was exhausted before current validation completed.",
+            );
         }
-
-        const stopRequest = latestUnhandledStopRequest(aggregate);
-        if (stopRequest !== null) {
-            const unreachable = unreachableRecommendation(aggregate, stopRequest);
-            if (unreachable !== null) {
-                return unreachable;
-            }
-            if (budgetIsExhausted(aggregate)) {
-                return budgetRecommendation(aggregate, stopRequest);
-            }
-            if (stopRequest.pauseRequested === true) {
-                const payload = {
-                    reason: stopRequest.reason,
-                    sourceStopRequestSeq: stopRequest.seq,
-                };
-                return {
-                    kind: "NON_RESULT",
-                    code: NON_RESULT_CODES.INVESTIGATION_PAUSED,
-                    event: {
-                        type: EVENT_TYPES.INVESTIGATION_PAUSED,
-                        payload,
-                    },
-                };
-            }
-
-            const payload = {
-                revision: aggregate.searchStrategy.revision + 1,
-                reason: "Stop criteria were not met; continue with a revised search strategy.",
-                strategy: "continue_search",
-                sourceStopRequestSeq: stopRequest.seq,
-            };
-            return {
-                kind: "DECISION",
-                decision: "SEARCH_STRATEGY_REVISED",
-                event: {
-                    type: EVENT_TYPES.SEARCH_STRATEGY_REVISED,
-                    payload,
-                },
-            };
-        }
-
-        const boundedExhaustion = boundedSearchExhaustion(aggregate);
-        if (boundedExhaustion !== null) {
-            return {
-                kind: "COMMAND",
-                commandId: null,
-                command: {
-                    kind: "await_stop_request",
-                    reason: "Bounded search space is exhausted; a stop request is required to trigger a terminal decision.",
-                },
-                event: null,
-            };
-        }
+        return reserveCommandRecommendation(aggregate);
     }
 
+    const incumbent = qualifyingCandidateEvidence(aggregate);
+    if (incumbent !== null && aggregate.contract.searchPolicy.stopOnFirstAccept) {
+        return verifiedRecommendation(aggregate, incumbent, {
+            kind: "first_passing_candidate",
+            stopOnFirstAccept: true,
+            round: incumbent.round,
+            slotIndex: incumbent.slotIndex,
+        });
+    }
+
+    const unreachable = unreachableRecommendation(aggregate);
+    if (unreachable !== null) {
+        return unreachable;
+    }
+
+    const progress = searchProgress(aggregate);
     if (budgetIsExhausted(aggregate)) {
-        return budgetRecommendation(aggregate);
+        return incumbent === null
+            ? budgetRecommendation(
+                aggregate,
+                "Declared command budget was exhausted without a qualifying incumbent.",
+            )
+            : verifiedRecommendation(aggregate, incumbent, {
+                kind: "budget_exhausted_with_incumbent",
+                commandCount: aggregate.commandOrder.length,
+                commandBudget: commandBudget(aggregate.contract),
+            });
     }
 
-    if (currentValidationEvidence(aggregate) !== null && searchProgress(aggregate).roundsExhausted) {
-        const maxRounds = aggregate.contract.maxRounds;
-        const payload = {
-            code: NON_RESULT_CODES.BUDGET_EXHAUSTED_INCONCLUSIVE,
-            reason: "Frozen search rounds were exhausted without terminal evidence.",
-            commandCount: aggregate.commandOrder.length,
-            commandBudget: commandBudget(aggregate.contract),
-            maxRounds,
-            sourceStopRequestSeq: null,
-        };
-        return {
-            kind: "NON_RESULT",
-            ...payload,
-            event: {
-                type: EVENT_TYPES.NON_RESULT_RECORDED,
-                payload,
-            },
-        };
+    if (progress.roundsExhausted) {
+        return incumbent === null
+            ? budgetRecommendation(
+                aggregate,
+                "Frozen search rounds were exhausted without a qualifying incumbent.",
+            )
+            : verifiedRecommendation(aggregate, incumbent, {
+                kind: "rounds_exhausted_with_incumbent",
+                maxRounds: aggregate.contract.maxRounds,
+            });
+    }
+
+    const plateau = detectPlateau(aggregate);
+    if (incumbent !== null && plateau.plateauComplete) {
+        return verifiedRecommendation(aggregate, incumbent, {
+            kind: "plateau_after_mandatory_escape",
+            triggerRound: plateau.triggerRound,
+            escapeRoundsCompleted: plateau.escapeRoundsCompleted,
+            mandatoryEscapeRounds: plateau.escapeRoundsRequired,
+        });
     }
 
     return reserveCommandRecommendation(aggregate);

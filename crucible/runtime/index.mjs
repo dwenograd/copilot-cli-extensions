@@ -21,13 +21,23 @@ export {
 
 export {
     SUBMIT_CANDIDATE_TOOL_NAME,
+    READ_PARENT_ARTIFACT_TOOL_NAME,
     DEFAULT_CANDIDATE_LIMITS,
+    DEFAULT_PARENT_READ_LIMITS,
     SdkWorkerPool,
     createSdkWorkerPool,
     validateCandidateSubmission,
     buildProposalPrompt,
     assertWorkerSessionsAreNonTerminal,
 } from "./worker-pool.mjs";
+
+export {
+    PROMPT_CONTEXT_VERSION,
+    PROMPT_CONTEXT_HASH_ALGORITHM,
+    DEFAULT_PROMPT_CONTEXT_BYTE_CAP,
+    buildPromptContext,
+    createPromptContext,
+} from "./prompt-context.mjs";
 
 export {
     DomainRepositoryAdapter,

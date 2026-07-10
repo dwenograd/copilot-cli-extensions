@@ -1,4 +1,8 @@
 import { immutableCanonical } from "./canonical.mjs";
+import {
+    compareCandidateEvidence,
+    selectIncumbent,
+} from "./archive.mjs";
 import { DOMAIN_VERSION } from "./constants.mjs";
 
 export function createInitialAggregate() {
@@ -79,86 +83,118 @@ export function uncommittedObservation(aggregate) {
 }
 
 export function qualifyingCandidateEvidence(aggregate) {
-    return qualifyingCandidateEvidenceItems(aggregate)[0] ?? null;
+    return selectIncumbent(aggregate.contract, harnessCandidateEvidenceItems(aggregate));
 }
 
 export function qualifyingCandidateEvidenceItems(aggregate) {
     return harnessCandidateEvidenceItems(aggregate)
-        .filter((evidence) => evidence.acceptanceSatisfied === true)
+        .filter((evidence) =>
+            evidence.rankable === true
+            && evidence.outcomeClass === "accepted")
         .sort((left, right) => compareCandidateEvidence(aggregate.contract.metrics, left, right));
 }
 
-export function harnessCandidateEvidenceItems(aggregate) {
+export function harnessCandidateEvidenceItems(aggregate, { includeInvalidated = false } = {}) {
     return aggregate.evidenceOrder
         .map((evidenceId) => aggregate.evidence[evidenceId])
         .filter((evidence) =>
-            !evidence.invalidated
-            && evidence.sourceKind === "harness"
-            && evidence.purpose === "candidate");
-}
-
-function compareCandidateEvidence(metrics, left, right) {
-    for (const metric of metrics) {
-        const epsilon = metric.epsilon > 0 ? metric.epsilon : 0;
-        let leftValue = left.metrics[metric.key];
-        let rightValue = right.metrics[metric.key];
-        if (epsilon > 0) {
-            leftValue = Math.round(leftValue / epsilon);
-            rightValue = Math.round(rightValue / epsilon);
-        }
-        if (leftValue === rightValue) {
-            continue;
-        }
-        return metric.direction === "min"
-            ? leftValue - rightValue
-            : rightValue - leftValue;
-    }
-    return left.candidateId < right.candidateId
-        ? -1
-        : left.candidateId > right.candidateId
-            ? 1
-            : 0;
+            evidence.sourceKind === "harness"
+            && evidence.purpose === "candidate"
+            && (includeInvalidated || !evidence.invalidated));
 }
 
 export function searchProgress(aggregate) {
     const candidates = harnessCandidateEvidenceItems(aggregate);
-    const countsByRound = new Map();
-    for (const evidence of candidates) {
-        countsByRound.set(evidence.round, (countsByRound.get(evidence.round) ?? 0) + 1);
-    }
+    const attemptedCandidates = harnessCandidateEvidenceItems(
+        aggregate,
+        { includeInvalidated: true },
+    );
+    const occupied = new Set(
+        candidates.map((evidence) => `${evidence.round}:${evidence.slotIndex}`),
+    );
+    const capacity = aggregate.contract.candidatesPerRound * aggregate.contract.maxRounds;
+    const boundedCandidateIds = aggregate.contract.boundedCandidateIds;
+    const maxSlots = boundedCandidateIds === undefined
+        ? capacity
+        : boundedCandidateIds.length;
     let nextRound = null;
-    for (let round = 1; round <= aggregate.contract.maxRounds; round += 1) {
-        if ((countsByRound.get(round) ?? 0) < aggregate.contract.candidatesPerRound) {
+    let nextSlot = null;
+    for (let globalSlot = 0; globalSlot < maxSlots; globalSlot += 1) {
+        const round = Math.floor(globalSlot / aggregate.contract.candidatesPerRound) + 1;
+        const slot = globalSlot % aggregate.contract.candidatesPerRound;
+        if (!occupied.has(`${round}:${slot}`)) {
             nextRound = round;
+            nextSlot = slot;
             break;
         }
     }
-    const boundedCandidateIds = aggregate.contract.boundedCandidateIds;
-    const evidencedCandidateIds = new Set(candidates.map((evidence) => evidence.candidateId));
+    const evidencedCandidateIds = new Set(
+        candidates
+            .filter((evidence) => evidence.outcomeClass !== "invalid_metrics")
+            .map((evidence) => evidence.candidateId),
+    );
     const boundedComplete = boundedCandidateIds !== undefined
         && boundedCandidateIds.every((candidateId) => evidencedCandidateIds.has(candidateId));
-    return {
+    const attemptedCandidateIds = new Set(
+        candidates.map((evidence) => evidence.candidateId),
+    );
+    const boundedAttempted = boundedCandidateIds !== undefined
+        && boundedCandidateIds.every((candidateId) => attemptedCandidateIds.has(candidateId));
+    const roundProgress = [];
+    const totalRoundCount = Math.ceil(maxSlots / aggregate.contract.candidatesPerRound);
+    const roundCount = nextRound === null ? totalRoundCount : nextRound;
+    for (let round = 1; round <= roundCount; round += 1) {
+        const firstGlobalSlot = (round - 1) * aggregate.contract.candidatesPerRound;
+        const expectedSlots = Math.min(
+            aggregate.contract.candidatesPerRound,
+            maxSlots - firstGlobalSlot,
+        );
+        const completedSlots = [];
+        for (let slot = 0; slot < expectedSlots; slot += 1) {
+            if (occupied.has(`${round}:${slot}`)) {
+                completedSlots.push(slot);
+            }
+        }
+        roundProgress.push({
+            round,
+            expectedSlots,
+            completedSlots,
+            missingSlots: Array.from(
+                { length: expectedSlots },
+                (_, slot) => slot,
+            ).filter((slot) => !completedSlots.includes(slot)),
+            complete: completedSlots.length === expectedSlots,
+            partial: completedSlots.length > 0 && completedSlots.length < expectedSlots,
+        });
+    }
+    const partialRounds = roundProgress.filter((round) => round.partial);
+    const slotsCompletedInRound = nextRound === null
+        ? 0
+        : candidates.filter((evidence) => evidence.round === nextRound).length;
+    const progress = {
         candidates,
+        attemptedCandidates,
         nextRound,
+        nextSlot,
+        partialRound: nextRound !== null && nextSlot > 0,
+        partialRounds,
+        roundProgress,
+        slotsCompletedInRound,
+        completedRounds: roundProgress.filter((round) => round.complete).length,
         roundsExhausted: nextRound === null,
         boundedComplete,
+        boundedAttempted,
+        maxSlots,
     };
+    return immutableCanonical(progress);
 }
 
 export function candidateSelectionReady(aggregate) {
-    const accepted = qualifyingCandidateEvidenceItems(aggregate);
-    if (accepted.length === 0) {
-        return false;
-    }
-    const progress = searchProgress(aggregate);
-    if (aggregate.contract.boundedCandidateIds !== undefined) {
-        return progress.boundedComplete;
-    }
-    const firstAcceptedRound = Math.min(...accepted.map((evidence) => evidence.round));
-    const candidateCount = progress.candidates.filter(
-        (evidence) => evidence.round === firstAcceptedRound,
-    ).length;
-    return candidateCount >= aggregate.contract.candidatesPerRound;
+    const incumbent = qualifyingCandidateEvidence(aggregate);
+    return incumbent !== null && (
+        aggregate.contract.searchPolicy.stopOnFirstAccept
+        || searchProgress(aggregate).roundsExhausted
+    );
 }
 
 export function boundedSearchExhaustion(aggregate) {
@@ -168,7 +204,8 @@ export function boundedSearchExhaustion(aggregate) {
     }
     const progress = searchProgress(aggregate);
     if (!progress.boundedComplete
-        || progress.candidates.some((evidence) => evidence.acceptanceSatisfied === true)) {
+        || progress.candidates.some((evidence) =>
+            evidence.rankable === true && evidence.outcomeClass === "accepted")) {
         return null;
     }
     const byCandidateId = new Map(

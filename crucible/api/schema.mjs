@@ -7,15 +7,19 @@
 // advertised to Copilot and the runtime parser can never drift apart — there
 // is no hand-maintained duplicate JSON Schema or Zod schema anywhere.
 //
-// Dependency-free: this module imports only the domain topology vocabulary
-// (a shared constant) and the API's own typed error. It never touches I/O.
+// Dependency-free: this module imports only shared domain constants and the
+// API's own typed error. It never touches I/O.
 
-import { HYPOTHESIS_TOPOLOGIES } from "../domain/constants.mjs";
+import {
+    DEFAULT_SEARCH_POLICY,
+    HYPOTHESIS_TOPOLOGIES,
+} from "../domain/constants.mjs";
 import { SchemaValidationError } from "./errors.mjs";
 
 // Re-exported so the schema module's public surface includes the error its
 // parser throws (callers/tests import it from here, the single source).
 export { SchemaValidationError };
+export { DEFAULT_SEARCH_POLICY };
 
 const IDENTIFIER_PATTERN = "^[A-Za-z0-9][A-Za-z0-9._@-]{0,127}$";
 const IDENTIFIER_RE = /^[A-Za-z0-9][A-Za-z0-9._@-]{0,127}$/u;
@@ -103,11 +107,17 @@ export function identifier({ description, optional = false } = {}) {
     });
 }
 
-export function enumField(values, { description, optional = false } = {}) {
+export function enumField(values, {
+    description,
+    optional = false,
+    default: defaultValue,
+} = {}) {
     const allowed = Object.freeze([...values]);
     return makeField({
         jsonSchema: commonOptions({ type: "string", enum: allowed }, { description }),
         optional,
+        hasDefault: defaultValue !== undefined,
+        defaultValue,
         parse(value, pathLabel) {
             if (typeof value !== "string" || !allowed.includes(value)) {
                 fail(pathLabel, `must be one of ${allowed.join(", ")}`);
@@ -155,11 +165,16 @@ export function integer({
 export function number({
     description,
     minimum,
+    maximum,
     optional = false,
     default: defaultValue,
 } = {}) {
     const jsonSchema = commonOptions(
-        { type: "number", ...(minimum === undefined ? {} : { minimum }) },
+        {
+            type: "number",
+            ...(minimum === undefined ? {} : { minimum }),
+            ...(maximum === undefined ? {} : { maximum }),
+        },
         { description },
     );
     return makeField({
@@ -173,6 +188,9 @@ export function number({
             }
             if (minimum !== undefined && value < minimum) {
                 fail(pathLabel, `must be >= ${minimum}`);
+            }
+            if (maximum !== undefined && value > maximum) {
+                fail(pathLabel, `must be <= ${maximum}`);
             }
             return value;
         },
@@ -263,7 +281,11 @@ export function rawObject({ description, optional = false } = {}) {
 
 // Compose a set of named field descriptors into an object descriptor that
 // yields BOTH a strict Copilot JSON Schema and a runtime parser.
-export function object(fields, { description } = {}) {
+export function object(fields, {
+    description,
+    optional = false,
+    default: defaultValue,
+} = {}) {
     const entries = Object.entries(fields);
 
     function toJsonSchema() {
@@ -308,7 +330,15 @@ export function object(fields, { description } = {}) {
         return out;
     }
 
-    return Object.freeze({ entries, toJsonSchema, parse });
+    return Object.freeze({
+        entries,
+        toJsonSchema,
+        jsonSchema: toJsonSchema(),
+        optional,
+        hasDefault: defaultValue !== undefined,
+        defaultValue: cloneDefault(defaultValue),
+        parse,
+    });
 }
 
 // A tool spec is the single source for one Copilot tool: name + description +
@@ -326,6 +356,103 @@ export function defineTool({ name, description, args }) {
 }
 
 // --- the four public tool specs -------------------------------------------
+
+const searchPolicyShape = object({
+    stopOnFirstAccept: boolean({
+        description: "If true, the first accepted rankable candidate terminates immediately.",
+        default: DEFAULT_SEARCH_POLICY.stopOnFirstAccept,
+    }),
+    plateauWindow: integer({
+        description: "Consecutive completed non-improving rounds required to detect a plateau.",
+        minimum: 1,
+        maximum: 1000,
+        default: DEFAULT_SEARCH_POLICY.plateauWindow,
+    }),
+    minRoundsBeforePlateau: integer({
+        description: "Minimum completed rounds before plateau detection is permitted.",
+        minimum: 1,
+        maximum: 100000,
+        default: DEFAULT_SEARCH_POLICY.minRoundsBeforePlateau,
+    }),
+    plateauMinImprovement: number({
+        description: "Minimum primary ranking-metric improvement that resets plateau detection.",
+        minimum: 0,
+        maximum: Number.MAX_SAFE_INTEGER,
+        default: DEFAULT_SEARCH_POLICY.plateauMinImprovement,
+    }),
+    mandatoryEscapeRounds: integer({
+        description: "Full escape-phase rounds required after plateau detection.",
+        minimum: 1,
+        maximum: 1000,
+        default: DEFAULT_SEARCH_POLICY.mandatoryEscapeRounds,
+    }),
+    operatorWeights: object({
+        fresh: integer({ minimum: 0, maximum: 1000000, default: DEFAULT_SEARCH_POLICY.operatorWeights.fresh }),
+        refinement: integer({ minimum: 0, maximum: 1000000, default: DEFAULT_SEARCH_POLICY.operatorWeights.refinement }),
+        crossover: integer({ minimum: 0, maximum: 1000000, default: DEFAULT_SEARCH_POLICY.operatorWeights.crossover }),
+        diversification: integer({ minimum: 0, maximum: 1000000, default: DEFAULT_SEARCH_POLICY.operatorWeights.diversification }),
+        adversarial: integer({ minimum: 0, maximum: 1000000, default: DEFAULT_SEARCH_POLICY.operatorWeights.adversarial }),
+        restart: integer({ minimum: 0, maximum: 1000000, default: DEFAULT_SEARCH_POLICY.operatorWeights.restart }),
+    }, { default: DEFAULT_SEARCH_POLICY.operatorWeights }),
+    archiveCaps: object({
+        accepted: integer({ minimum: 1, maximum: 100000, default: DEFAULT_SEARCH_POLICY.archiveCaps.accepted }),
+        nearMisses: integer({ minimum: 1, maximum: 100000, default: DEFAULT_SEARCH_POLICY.archiveCaps.nearMisses }),
+        rejected: integer({ minimum: 1, maximum: 100000, default: DEFAULT_SEARCH_POLICY.archiveCaps.rejected }),
+        invalidMetrics: integer({ minimum: 1, maximum: 100000, default: DEFAULT_SEARCH_POLICY.archiveCaps.invalidMetrics }),
+        mechanismGroups: integer({ minimum: 1, maximum: 100000, default: DEFAULT_SEARCH_POLICY.archiveCaps.mechanismGroups }),
+        lessonGroups: integer({ minimum: 1, maximum: 100000, default: DEFAULT_SEARCH_POLICY.archiveCaps.lessonGroups }),
+        duplicateIndex: integer({ minimum: 1, maximum: 100000, default: DEFAULT_SEARCH_POLICY.archiveCaps.duplicateIndex }),
+    }, { default: DEFAULT_SEARCH_POLICY.archiveCaps }),
+    promptCaps: object({
+        parentEvidenceIds: integer({
+            minimum: 1,
+            maximum: 16,
+            default: DEFAULT_SEARCH_POLICY.promptCaps.parentEvidenceIds,
+        }),
+        promptContextRefs: integer({
+            minimum: 1,
+            maximum: 256,
+            default: DEFAULT_SEARCH_POLICY.promptCaps.promptContextRefs,
+        }),
+    }, { default: DEFAULT_SEARCH_POLICY.promptCaps }),
+    dedupPolicy: enumField(["mark"], {
+        description: "Duplicate candidate artifacts are committed and linked, never silently dropped.",
+        default: "mark",
+    }),
+});
+
+const searchPolicyField = makeField({
+    jsonSchema: searchPolicyShape.jsonSchema,
+    hasDefault: true,
+    defaultValue: DEFAULT_SEARCH_POLICY,
+    parse(value, pathLabel) {
+        const parsed = searchPolicyShape.parse(value, pathLabel);
+        if (parsed.minRoundsBeforePlateau < parsed.plateauWindow) {
+            fail(
+                `${pathLabel}.minRoundsBeforePlateau`,
+                "must be at least plateauWindow",
+            );
+        }
+        if (parsed.operatorWeights.fresh < 1) {
+            fail(`${pathLabel}.operatorWeights.fresh`, "must be at least 1");
+        }
+        if (parsed.operatorWeights.diversification
+            + parsed.operatorWeights.adversarial
+            + parsed.operatorWeights.restart < 1) {
+            fail(
+                `${pathLabel}.operatorWeights`,
+                "must enable at least one mandatory-escape operator",
+            );
+        }
+        if (parsed.promptCaps.parentEvidenceIds > parsed.promptCaps.promptContextRefs) {
+            fail(
+                `${pathLabel}.promptCaps.parentEvidenceIds`,
+                "cannot exceed promptContextRefs",
+            );
+        }
+        return parsed;
+    },
+});
 
 const investigationIdField = identifier({
     description:
@@ -403,6 +530,7 @@ export const crucibleStartSpec = defineTool({
             minimum: 1,
             maximum: 100000,
         }),
+        search_policy: searchPolicyField,
         bounded_candidate_ids: array(
             identifier({ description: "A declared candidate id for a finite/bounded search space." }),
             {

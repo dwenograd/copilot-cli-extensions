@@ -1,4 +1,4 @@
-export const DOMAIN_VERSION = 1;
+export const DOMAIN_VERSION = 2;
 
 export const HYPOTHESIS_TOPOLOGIES = Object.freeze([
     "finite_enumerable",
@@ -6,6 +6,67 @@ export const HYPOTHESIS_TOPOLOGIES = Object.freeze([
     "open_generative",
     "certified_impossibility",
 ]);
+
+export const CANDIDATE_OUTCOME_CLASSES = Object.freeze([
+    "accepted",
+    "near_miss",
+    "rejected",
+    "invalid_metrics",
+]);
+
+export const SEARCH_OPERATORS = Object.freeze([
+    "fresh",
+    "refinement",
+    "crossover",
+    "diversification",
+    "adversarial",
+    "restart",
+]);
+
+export const ESCAPE_SEARCH_OPERATORS = Object.freeze([
+    "diversification",
+    "adversarial",
+    "restart",
+]);
+
+export const DEFAULT_SEARCH_POLICY = Object.freeze({
+    stopOnFirstAccept: false,
+    plateauWindow: 3,
+    minRoundsBeforePlateau: 3,
+    plateauMinImprovement: 0,
+    mandatoryEscapeRounds: 2,
+    operatorWeights: Object.freeze({
+        fresh: 30,
+        refinement: 25,
+        crossover: 15,
+        diversification: 15,
+        adversarial: 10,
+        restart: 5,
+    }),
+    archiveCaps: Object.freeze({
+        accepted: 8,
+        nearMisses: 16,
+        rejected: 8,
+        invalidMetrics: 8,
+        mechanismGroups: 12,
+        lessonGroups: 12,
+        duplicateIndex: 256,
+    }),
+    promptCaps: Object.freeze({
+        parentEvidenceIds: 2,
+        promptContextRefs: 12,
+    }),
+    dedupPolicy: "mark",
+});
+
+export const ANNOTATION_LIMITS = Object.freeze({
+    mechanismLength: 256,
+    hypothesisLength: 2048,
+    expectedEffectCount: 16,
+    expectedEffectLength: 512,
+    citedEvidenceCount: 64,
+    findingLength: 2048,
+});
 
 export const EVENT_TYPES = Object.freeze({
     INVESTIGATION_OPENED: "investigation_opened",

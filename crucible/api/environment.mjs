@@ -16,6 +16,7 @@ import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 
 import { assertLocalDatabasePath } from "../persistence/index.mjs";
+import { DOMAIN_VERSION } from "../domain/index.mjs";
 import { EnvironmentError } from "./errors.mjs";
 
 // Fixed contract defaults the tool surface does not expose as arguments. These
@@ -160,7 +161,8 @@ function slugify(text) {
 }
 
 // Deterministic, filesystem-safe investigationId: safe slug of the objective
-// plus a SHA-256 suffix over canonical objective + projectDir + harnessId.
+// plus a SHA-256 suffix over domain version + canonical objective + projectDir
+// + harnessId. A domain-version change must never reopen an older identity.
 export function deriveInvestigationId({ objective, projectDir, harnessId }) {
     const canonicalObj = canonicalObjective(objective);
     if (!hasText(projectDir)) {
@@ -170,7 +172,7 @@ export function deriveInvestigationId({ objective, projectDir, harnessId }) {
         throw new EnvironmentError("harness_id must be a safe identifier", { field: "harness_id" });
     }
     const material = [
-        "crucible-investigation-v1",
+        `crucible-investigation-domain-v${DOMAIN_VERSION}`,
         harnessId,
         canonicalObj,
         normalizeProjectDirForHash(projectDir),

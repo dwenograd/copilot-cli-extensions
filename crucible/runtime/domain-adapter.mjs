@@ -105,6 +105,7 @@ export class DomainRepositoryAdapter {
         if (repository === null
             || typeof repository !== "object"
             || typeof repository.appendEvents !== "function"
+            || typeof repository.appendEventsWithAttemptTransition !== "function"
             || typeof repository.verifyInvestigation !== "function") {
             throw new RuntimeConfigError("repository must be an EventRepository");
         }
@@ -230,7 +231,7 @@ export class DomainRepositoryAdapter {
             );
         }
         const terminalKind = expectedTerminalKind(domainEvent);
-        const result = this.#repository.appendEvents({
+        const appendInput = {
             investigationId: this.#investigationId,
             expectedHead: head.eventHash,
             events: [{
@@ -238,7 +239,14 @@ export class DomainRepositoryAdapter {
                 payload: { domainEvent },
                 ...(terminalKind === null ? {} : { terminal: { kind: terminalKind } }),
             }],
-        });
+        };
+        const attemptTransition = options.attemptTransition ?? null;
+        const result = attemptTransition === null
+            ? this.#repository.appendEvents(appendInput)
+            : this.#repository.appendEventsWithAttemptTransition({
+                ...appendInput,
+                ...attemptTransition,
+            });
         const row = result.events[0];
         if (row.seq !== domainEvent.seq) {
             throw new CrucibleRuntimeError(
@@ -250,7 +258,7 @@ export class DomainRepositoryAdapter {
         return { aggregate: nextAggregate, domainEvent, repositoryEvent: row };
     }
 
-    appendFromFactory(factory, { maxCasRetries = 8 } = {}) {
+    appendFromFactory(factory, { maxCasRetries = 8, attemptTransition = null } = {}) {
         if (typeof factory !== "function") {
             throw new RuntimeConfigError("appendFromFactory requires a function");
         }
@@ -261,7 +269,10 @@ export class DomainRepositoryAdapter {
                 return { aggregate, domainEvent: null, repositoryEvent: null };
             }
             try {
-                return this.appendDomainEvent(domainEvent, { aggregate });
+                return this.appendDomainEvent(domainEvent, {
+                    aggregate,
+                    attemptTransition,
+                });
             } catch (error) {
                 if (!isCasConflict(error) || attempt === maxCasRetries) {
                     throw error;
@@ -291,9 +302,45 @@ export class DomainRepositoryAdapter {
             constructHarnessObservedEvent(aggregate, payload));
     }
 
+    appendHarnessObservationFenced(payload, { attemptId, lease } = {}) {
+        requireString(attemptId, "attemptId", { max: 256 });
+        requirePlainObject(lease, "lease");
+        return this.appendFromFactory(
+            (aggregate) => constructHarnessObservedEvent(aggregate, payload),
+            {
+                attemptTransition: {
+                    attemptId,
+                    leaseId: lease.leaseId,
+                    fencingToken: lease.fencingToken,
+                    owner: lease.owner,
+                    fromState: "dispatched",
+                    toState: "observed",
+                },
+            },
+        );
+    }
+
     appendEvidenceCommit(input) {
         return this.appendFromFactory((aggregate) =>
             constructEvidenceCommittedEvent(aggregate, input));
+    }
+
+    appendEvidenceCommitFenced(input, { attemptId, lease } = {}) {
+        requireString(attemptId, "attemptId", { max: 256 });
+        requirePlainObject(lease, "lease");
+        return this.appendFromFactory(
+            (aggregate) => constructEvidenceCommittedEvent(aggregate, input),
+            {
+                attemptTransition: {
+                    attemptId,
+                    leaseId: lease.leaseId,
+                    fencingToken: lease.fencingToken,
+                    owner: lease.owner,
+                    fromState: "observed",
+                    toState: "committed",
+                },
+            },
+        );
     }
 
     requestStop({ requestId, reason, pauseRequested = true } = {}) {

@@ -14,15 +14,25 @@ export {
 
 export {
     acceptanceSatisfied,
+    availableCandidateMetricValues,
+    assessAcceptancePredicate,
     candidateMetricValues,
+    candidateMetricsRankable,
     commandBudget,
     contractHash,
     createInvestigationContract,
+    createSearchPolicy,
+    defaultSearchPolicy,
+    normalizeSearchPolicy,
     validationSatisfied,
 } from "./contract.mjs";
 
 export {
+    ANNOTATION_LIMITS,
+    CANDIDATE_OUTCOME_CLASSES,
+    DEFAULT_SEARCH_POLICY,
     DOMAIN_VERSION,
+    ESCAPE_SEARCH_OPERATORS,
     EVIDENCE_EVENT_TYPES,
     EVIDENCE_PURPOSES,
     EVENT_CATEGORIES,
@@ -33,6 +43,7 @@ export {
     KERNEL_DECISION_EVENT_TYPES,
     KERNEL_CONTROL_EVENT_TYPES,
     NON_RESULT_CODES,
+    SEARCH_OPERATORS,
     SOURCE_KINDS,
     TERMINAL_EVENT_TYPES,
 } from "./constants.mjs";
@@ -54,11 +65,44 @@ export {
     CanonicalizationError,
     ContractError,
     DecisionError,
+    DomainVersionRestartRequiredError,
     DomainError,
     ERROR_CODES,
     EventChainError,
+    RestartRequiredError,
     TransitionError,
 } from "./errors.mjs";
+
+export {
+    boundedSelect,
+    buildArchive,
+    buildCandidateArchive,
+    buildDuplicateIndex,
+    classifyCandidateOutcome,
+    classifyOutcome,
+    compareCandidateEvidence,
+    createCandidateArchive,
+    duplicateEvidenceId,
+    metricImprovement,
+    selectArchive,
+    selectIncumbent,
+    selectPromptEvidence,
+} from "./archive.mjs";
+
+export {
+    adaptiveOperatorWeights,
+    analyzePlateau,
+    assignSearchOperator,
+    buildSearchCandidateCommand,
+    createSearchCandidateCommand,
+    deriveSearchCandidateCommand,
+    detectPlateau,
+    detectSearchPlateau,
+    deterministicHashInteger,
+    deterministicSeed,
+    selectAdaptiveOperator,
+    selectOperator,
+} from "./strategy.mjs";
 
 export {
     reduceEvent,

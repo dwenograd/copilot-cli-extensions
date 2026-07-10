@@ -4,11 +4,15 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
+    DEFAULT_PARENT_READ_LIMITS,
+    READ_PARENT_ARTIFACT_TOOL_NAME,
     RUNTIME_ERROR_CODES,
     SUBMIT_CANDIDATE_TOOL_NAME,
+    assertWorkerSessionsAreNonTerminal,
     createSdkWorkerPool,
     validateCandidateSubmission,
 } from "../runtime/index.mjs";
+import { hashCanonical } from "../domain/index.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const roots = [];
@@ -25,11 +29,18 @@ afterEach(() => {
     }
 });
 
-function validPayload(candidateId, challenge = "challenge-1") {
+function validAnnotations(overrides = {}) {
+    return {
+        mechanism: "Write a deterministic score fixture.",
+        ...overrides,
+    };
+}
+
+function validPayload(candidateId, challenge = "challenge-1", annotationOverrides = {}) {
     return {
         challenge,
         candidateId,
-        mechanism: "Write a deterministic score fixture.",
+        annotations: validAnnotations(annotationOverrides),
         files: [{ path: "score.txt", content: "95\n" }],
     };
 }
@@ -48,7 +59,7 @@ function fakeClient(mode, captured) {
                 async sendAndWait() {
                     const tool = config.tools[0];
                     if (mode === "valid") {
-                        await tool.handler(validPayload(config.__candidateId ?? "candidate-a"), {
+                        await tool.handler(validPayload("candidate-a"), {
                             sessionId: config.sessionId,
                             toolCallId: "call-1",
                             toolName: tool.name,
@@ -99,6 +110,28 @@ function fakeClient(mode, captured) {
     };
 }
 
+// A client that hands the live session config to a driver callback, letting a
+// test invoke the worker tools directly and inspect their results.
+function driverClient(onSession, captured = { configs: [], disconnected: 0 }) {
+    return {
+        captured,
+        async start() {},
+        async stop() {},
+        async createSession(config) {
+            captured.configs.push(config);
+            return {
+                async sendAndWait() {
+                    await onSession(config);
+                    return { data: { content: "" } };
+                },
+                async disconnect() {
+                    captured.disconnected += 1;
+                },
+            };
+        },
+    };
+}
+
 async function makePool(mode = "valid") {
     const root = makeRoot(mode);
     const captured = { configs: [], disconnected: 0 };
@@ -121,22 +154,108 @@ function request(candidateId = "candidate-a") {
     };
 }
 
+// In-memory parent snapshot reader that exposes ONLY the two read callbacks the
+// worker is allowed to use. There is no write/execute surface at all.
+const SNAPSHOT_A = `sha256:${"a".repeat(64)}`;
+const SNAPSHOT_B = `sha256:${"b".repeat(64)}`;
+
+function makeReader(snapshots) {
+    const manifests = new Map();
+    const objects = new Map();
+    let counter = 0;
+    for (const [snapshotId, entries] of Object.entries(snapshots)) {
+        const manifestEntries = entries.map((entry) => {
+            const object = `object-${counter}`;
+            counter += 1;
+            objects.set(object, entry.bytes);
+            return { path: entry.path, size: entry.bytes.length, object };
+        });
+        manifests.set(snapshotId, {
+            type: "crucible.snapshot",
+            version: 1,
+            algo: "sha256",
+            entries: manifestEntries,
+        });
+    }
+    const reads = [];
+    return {
+        reads,
+        loadManifest(snapshotId) {
+            if (!manifests.has(snapshotId)) {
+                const error = new Error("no such snapshot");
+                error.code = "ENOENT";
+                throw error;
+            }
+            return manifests.get(snapshotId);
+        },
+        readObject(objectId) {
+            reads.push(objectId);
+            if (!objects.has(objectId)) {
+                const error = new Error("no such object");
+                error.code = "ENOENT";
+                throw error;
+            }
+            return objects.get(objectId);
+        },
+    };
+}
+
+// Drive a single proposal that issues a scripted list of parent-read calls and
+// then submits a valid candidate so propose() resolves. Returns the parent-read
+// tool results plus the resolved proposal.
+async function runParentReads({ parents, reader, parentReadLimits = {}, calls }) {
+    const root = makeRoot("parent");
+    const results = [];
+    const client = driverClient(async (config) => {
+        const parentTool = config.tools.find((tool) => tool.name === READ_PARENT_ARTIFACT_TOOL_NAME);
+        const submitTool = config.tools.find((tool) => tool.name === SUBMIT_CANDIDATE_TOOL_NAME);
+        const baseInvocation = { sessionId: config.sessionId, toolName: parentTool?.name };
+        for (const call of calls) {
+            const args = { challenge: "challenge-1", ...call.args };
+            const invocation = call.invocation ?? baseInvocation;
+            results.push(await parentTool.handler(args, invocation));
+        }
+        await submitTool.handler(validPayload("candidate-a"), {
+            sessionId: config.sessionId,
+            toolName: submitTool.name,
+        });
+    });
+    const pool = createSdkWorkerPool({
+        client,
+        baseDirectory: path.join(root, "sdk"),
+        workingDirectory: path.join(root, "work"),
+        parentReader: reader,
+        parentReadLimits,
+    });
+    const proposal = await pool.propose({ ...request("candidate-a"), parents });
+    await pool.close();
+    return { results: results.map((result) => ({
+        resultType: result.resultType,
+        parsed: JSON.parse(result.textResultForLlm),
+    })), proposal };
+}
+
 describe("Crucible SDK worker pool", () => {
     it("uses one non-deferred custom tool and code-stamps worker identity", async () => {
         const { pool, captured } = await makePool("valid");
         const proposal = await pool.propose(request());
 
         expect(proposal.candidateId).toBe("candidate-a");
+        expect(proposal.annotations.mechanism).toBe("Write a deterministic score fixture.");
         expect(proposal.identity).toMatchObject({
             invocationSessionId: "session-a",
             configuredModel: "gpt-test",
             challengeNonce: "challenge-1",
+            contextHash: null,
         });
         expect(proposal.identity.promptHash).toMatch(
             /^sha256:crucible-runtime-worker-prompt-v1:[a-f0-9]{64}$/,
         );
         expect(proposal.identity.payloadHash).toMatch(
             /^sha256:crucible-runtime-candidate-payload-v1:[a-f0-9]{64}$/,
+        );
+        expect(proposal.identity.annotationsHash).toBe(
+            hashCanonical(proposal.annotations, "sha256:crucible-runtime-candidate-annotations-v1"),
         );
 
         const config = captured.configs[0];
@@ -204,6 +323,326 @@ describe("Crucible SDK worker pool", () => {
         })).toThrow(expect.objectContaining({
             code: RUNTIME_ERROR_CODES.WORKER_INVALID_CANDIDATE,
         }));
+    });
+
+    describe("structured annotations and citations", () => {
+        const options = {
+            challengeNonce: "challenge-1",
+            allowedCandidateIds: ["candidate-a"],
+            visibleEvidenceIds: ["ev-1", "ev-2"],
+        };
+
+        it("accepts bounded annotations and returns them normalized", () => {
+            const submission = validateCandidateSubmission({
+                ...validPayload("candidate-a"),
+                annotations: {
+                    mechanism: "raise the score",
+                    hypothesis: "a higher constant passes",
+                    expectedEffects: ["score increases"],
+                    citedEvidenceIds: ["ev-1"],
+                    finding: "constant fixtures dominate",
+                },
+            }, options);
+            expect(submission.annotations).toEqual({
+                mechanism: "raise the score",
+                hypothesis: "a higher constant passes",
+                expectedEffects: ["score increases"],
+                citedEvidenceIds: ["ev-1"],
+                finding: "constant fixtures dominate",
+            });
+        });
+
+        it("rejects citations outside the visible evidence set", () => {
+            expect(() => validateCandidateSubmission({
+                ...validPayload("candidate-a"),
+                annotations: { mechanism: "cite the invisible", citedEvidenceIds: ["ev-9"] },
+            }, options)).toThrow(expect.objectContaining({
+                code: RUNTIME_ERROR_CODES.WORKER_INVALID_CANDIDATE,
+            }));
+
+            // With no evidence visible, any citation is out of bounds.
+            expect(() => validateCandidateSubmission({
+                ...validPayload("candidate-a"),
+                annotations: { mechanism: "cite anything", citedEvidenceIds: ["ev-1"] },
+            }, { ...options, visibleEvidenceIds: [] })).toThrow(expect.objectContaining({
+                code: RUNTIME_ERROR_CODES.WORKER_INVALID_CANDIDATE,
+            }));
+        });
+
+        it("rejects missing mechanism, unknown fields, and over-count annotations", () => {
+            const bad = [
+                { annotations: { hypothesis: "no mechanism" } },
+                { annotations: { mechanism: "m", surprise: "x" } },
+                { annotations: { mechanism: "x".repeat(257) } },
+                { annotations: { mechanism: "m", expectedEffects: Array.from({ length: 17 }, () => "e") } },
+                { annotations: { mechanism: "m", citedEvidenceIds: ["not a valid id!"] } },
+                { annotations: "not-an-object" },
+            ];
+            for (const overrides of bad) {
+                expect(() => validateCandidateSubmission({
+                    ...validPayload("candidate-a"),
+                    ...overrides,
+                }, options)).toThrow(expect.objectContaining({
+                    code: RUNTIME_ERROR_CODES.WORKER_INVALID_CANDIDATE,
+                }));
+            }
+        });
+
+        it("binds prompt-context hash and annotations into worker identity", async () => {
+            const root = makeRoot("identity");
+            const contextHash = `sha256:crucible-runtime-prompt-context-v1:${"c".repeat(64)}`;
+            const client = driverClient(async (config) => {
+                const submitTool = config.tools[0];
+                await submitTool.handler({
+                    ...validPayload("candidate-a"),
+                    annotations: { mechanism: "cite ev-1", citedEvidenceIds: ["ev-1"] },
+                }, { sessionId: config.sessionId, toolName: submitTool.name });
+            });
+            const pool = createSdkWorkerPool({
+                client,
+                baseDirectory: path.join(root, "sdk"),
+                workingDirectory: path.join(root, "work"),
+            });
+            const proposal = await pool.propose({
+                ...request("candidate-a"),
+                visibleEvidenceIds: ["ev-1", "ev-2"],
+                promptContextHash: contextHash,
+            });
+            expect(proposal.identity.contextHash).toBe(contextHash);
+            expect(proposal.annotations.citedEvidenceIds).toEqual(["ev-1"]);
+            expect(assertWorkerSessionsAreNonTerminal(proposal)).toBe(true);
+            await pool.close();
+        });
+    });
+
+    describe("conditional parent-read tool set", () => {
+        it("adds the parent-read tool only when parent snapshots are assigned", async () => {
+            const root = makeRoot("cond");
+            const reader = makeReader({ [SNAPSHOT_A]: [{ path: "a.txt", bytes: Buffer.from("hi") }] });
+            const captured = { configs: [], disconnected: 0 };
+            const client = driverClient(async (config) => {
+                const submitTool = config.tools.find((tool) => tool.name === SUBMIT_CANDIDATE_TOOL_NAME);
+                const candidateId = config.sessionId === "session-b" ? "candidate-b" : "candidate-a";
+                await submitTool.handler(validPayload(candidateId), {
+                    sessionId: config.sessionId,
+                    toolName: submitTool.name,
+                });
+            }, captured);
+            const pool = createSdkWorkerPool({
+                client,
+                baseDirectory: path.join(root, "sdk"),
+                workingDirectory: path.join(root, "work"),
+                parentReader: reader,
+            });
+
+            await pool.propose({ ...request("candidate-a") });
+            const withoutParents = captured.configs[0];
+            expect(withoutParents.tools).toHaveLength(1);
+            expect(withoutParents.availableTools).toEqual([`custom:${SUBMIT_CANDIDATE_TOOL_NAME}`]);
+
+            await pool.propose({
+                ...request("candidate-b"),
+                sessionId: "session-b",
+                allowedCandidateIds: ["candidate-b"],
+                parents: [{ parentId: "ev-parent", snapshotId: SNAPSHOT_A }],
+            });
+            const withParents = captured.configs[1];
+            expect(withParents.tools.map((tool) => tool.name)).toEqual([
+                SUBMIT_CANDIDATE_TOOL_NAME,
+                READ_PARENT_ARTIFACT_TOOL_NAME,
+            ]);
+            expect(withParents.availableTools).toEqual([
+                `custom:${SUBMIT_CANDIDATE_TOOL_NAME}`,
+                `custom:${READ_PARENT_ARTIFACT_TOOL_NAME}`,
+            ]);
+            for (const tool of withParents.tools) {
+                expect(tool.defer).toBe("never");
+                expect(tool.skipPermission).toBe(true);
+            }
+            await pool.close();
+        });
+
+        it("refuses assigned parents when no reader is injected", async () => {
+            const { pool } = await makePool("valid");
+            await expect(pool.propose({
+                ...request("candidate-a"),
+                parents: [{ parentId: "ev-parent", snapshotId: SNAPSHOT_A }],
+            })).rejects.toMatchObject({ code: RUNTIME_ERROR_CODES.INVALID_CONFIG });
+            await pool.close();
+        });
+    });
+
+    describe("parent-read enforcement", () => {
+        const parents = [{ parentId: "ev-parent", snapshotId: SNAPSHOT_A }];
+
+        it("serves a bounded, nonce-framed UTF-8 chunk and lists the manifest", async () => {
+            const reader = makeReader({
+                [SNAPSHOT_A]: [{ path: "src/main.txt", bytes: Buffer.from("hello world\n") }],
+            });
+            const { results } = await runParentReads({
+                parents,
+                reader,
+                calls: [
+                    { args: { parentId: "ev-parent", op: "list" } },
+                    { args: { parentId: "ev-parent", op: "read", path: "src/main.txt", offset: 0, length: 5 } },
+                ],
+            });
+            expect(results[0].resultType).toBe("success");
+            expect(results[0].parsed).toMatchObject({
+                ok: true,
+                is_result: false,
+                entries: [{ path: "src/main.txt", size: 12 }],
+            });
+            expect(results[1].resultType).toBe("success");
+            expect(results[1].parsed).toMatchObject({ ok: true, is_result: false, bytes: 5, eof: false });
+            expect(results[1].parsed.content).toContain("hello");
+            expect(results[1].parsed.content).toMatch(/<<<CRUCIBLE_UNTRUSTED_DATA[^]*hello[^]*END_CRUCIBLE_UNTRUSTED_DATA/);
+        });
+
+        it("rejects unauthorized parents, unknown paths, offsets, and challenge/session", async () => {
+            const reader = makeReader({
+                [SNAPSHOT_A]: [{ path: "a.txt", bytes: Buffer.from("abcdef") }],
+            });
+            const { results } = await runParentReads({
+                parents,
+                reader,
+                calls: [
+                    { args: { parentId: "ev-other", op: "read", path: "a.txt", offset: 0, length: 3 } },
+                    { args: { parentId: "ev-parent", op: "read", path: "../a.txt", offset: 0, length: 3 } },
+                    { args: { parentId: "ev-parent", op: "read", path: "missing.txt", offset: 0, length: 3 } },
+                    { args: { parentId: "ev-parent", op: "read", path: "a.txt", offset: 99, length: 3 } },
+                    { args: { challenge: "nope", parentId: "ev-parent", op: "read", path: "a.txt", offset: 0, length: 3 } },
+                    {
+                        args: { parentId: "ev-parent", op: "read", path: "a.txt", offset: 0, length: 3 },
+                        invocation: { sessionId: "somebody-else" },
+                    },
+                ],
+            });
+            expect(results.map((result) => result.parsed.reason)).toEqual([
+                "parent",
+                "path",
+                "path",
+                "path",
+                "challenge",
+                "session",
+            ]);
+            expect(results.every((result) => result.resultType === "failure")).toBe(true);
+        });
+
+        it("refuses binary files", async () => {
+            const reader = makeReader({
+                [SNAPSHOT_A]: [{ path: "blob.bin", bytes: Buffer.from([0x41, 0x00, 0x42]) }],
+            });
+            const { results } = await runParentReads({
+                parents,
+                reader,
+                calls: [
+                    { args: { parentId: "ev-parent", op: "read", path: "blob.bin", offset: 0, length: 3 } },
+                ],
+            });
+            expect(results[0].resultType).toBe("failure");
+            expect(results[0].parsed.reason).toBe("binary");
+        });
+
+        it("enforces per-call, per-file, per-session, and call-count limits", async () => {
+            const bigFile = Buffer.from("0123456789abcdef");
+            const perCall = await runParentReads({
+                parents,
+                reader: makeReader({ [SNAPSHOT_A]: [{ path: "a.txt", bytes: bigFile }] }),
+                parentReadLimits: { maxChunkBytes: 4, maxSessionBytes: 64 },
+                calls: [
+                    { args: { parentId: "ev-parent", op: "read", path: "a.txt", offset: 0, length: 8 } },
+                ],
+            });
+            expect(perCall.results[0].parsed.reason).toBe("limit");
+
+            const perFile = await runParentReads({
+                parents,
+                reader: makeReader({ [SNAPSHOT_A]: [{ path: "a.txt", bytes: bigFile }] }),
+                parentReadLimits: { maxFileBytes: 4 },
+                calls: [
+                    { args: { parentId: "ev-parent", op: "read", path: "a.txt", offset: 0, length: 4 } },
+                ],
+            });
+            expect(perFile.results[0].parsed.reason).toBe("limit");
+
+            const perSession = await runParentReads({
+                parents,
+                reader: makeReader({ [SNAPSHOT_A]: [{ path: "a.txt", bytes: bigFile }] }),
+                parentReadLimits: { maxChunkBytes: 4, maxSessionBytes: 6 },
+                calls: [
+                    { args: { parentId: "ev-parent", op: "read", path: "a.txt", offset: 0, length: 4 } },
+                    { args: { parentId: "ev-parent", op: "read", path: "a.txt", offset: 4, length: 4 } },
+                ],
+            });
+            expect(perSession.results[0].resultType).toBe("success");
+            expect(perSession.results[1].parsed.reason).toBe("limit");
+
+            const callCap = await runParentReads({
+                parents,
+                reader: makeReader({ [SNAPSHOT_A]: [{ path: "a.txt", bytes: bigFile }] }),
+                parentReadLimits: { maxCalls: 1 },
+                calls: [
+                    { args: { parentId: "ev-parent", op: "read", path: "a.txt", offset: 0, length: 4 } },
+                    { args: { parentId: "ev-parent", op: "list" } },
+                ],
+            });
+            expect(callCap.results[0].resultType).toBe("success");
+            expect(callCap.results[1].parsed.reason).toBe("limit");
+        });
+
+        it("only reads assigned snapshots and never exposes a write surface", async () => {
+            const reader = makeReader({
+                [SNAPSHOT_A]: [{ path: "a.txt", bytes: Buffer.from("assigned") }],
+                [SNAPSHOT_B]: [{ path: "b.txt", bytes: Buffer.from("forbidden") }],
+            });
+            await runParentReads({
+                parents,
+                reader,
+                calls: [
+                    { args: { parentId: "ev-parent", op: "read", path: "a.txt", offset: 0, length: 8 } },
+                ],
+            });
+            // Only the assigned snapshot's object was ever read; the reader has no
+            // put/write/materialize methods at all.
+            expect(reader.reads).toHaveLength(1);
+            expect(Object.keys(reader)).toEqual(["reads", "loadManifest", "readObject"]);
+        });
+    });
+
+    describe("no terminal authority", () => {
+        it("exposes only prefixed custom tools and never emits a verdict", async () => {
+            const root = makeRoot("authority");
+            const reader = makeReader({ [SNAPSHOT_A]: [{ path: "a.txt", bytes: Buffer.from("ok") }] });
+            const captured = { configs: [], disconnected: 0 };
+            let submitResult;
+            const client = driverClient(async (config) => {
+                const submitTool = config.tools.find((tool) => tool.name === SUBMIT_CANDIDATE_TOOL_NAME);
+                submitResult = await submitTool.handler(validPayload("candidate-a"), {
+                    sessionId: config.sessionId,
+                    toolName: submitTool.name,
+                });
+            }, captured);
+            const pool = createSdkWorkerPool({
+                client,
+                baseDirectory: path.join(root, "sdk"),
+                workingDirectory: path.join(root, "work"),
+                parentReader: reader,
+            });
+            await pool.propose({
+                ...request("candidate-a"),
+                parents: [{ parentId: "ev-parent", snapshotId: SNAPSHOT_A }],
+            });
+            const config = captured.configs[0];
+            expect(config.availableTools).toEqual([
+                `custom:${SUBMIT_CANDIDATE_TOOL_NAME}`,
+                `custom:${READ_PARENT_ARTIFACT_TOOL_NAME}`,
+            ]);
+            // No built-in tools of any kind: every advertised tool is a custom:*.
+            expect(config.availableTools.every((name) => name.startsWith("custom:"))).toBe(true);
+            expect(submitResult.textResultForLlm).toContain("No verdict was produced");
+            await pool.close();
+        });
     });
 
     it("dynamically builds an empty-mode stdio SDK client", async () => {

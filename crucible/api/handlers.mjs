@@ -18,9 +18,15 @@ import fs from "node:fs";
 import path from "node:path";
 
 import {
+    DEFAULT_SEARCH_POLICY,
+    SEARCH_OPERATORS,
+    buildCandidateArchive,
     contractHash,
     createInvestigationContract,
     decideNext,
+    detectPlateau,
+    harnessCandidateEvidenceItems,
+    qualifyingCandidateEvidence,
     qualifyingCandidateEvidenceItems,
     searchProgress,
 } from "../domain/index.mjs";
@@ -383,6 +389,7 @@ export function startInvestigation(args, deps) {
         workerModels: args.worker_models,
         candidatesPerRound: args.candidates_per_round,
         maxRounds: args.max_rounds,
+        searchPolicy: args.search_policy ?? DEFAULT_SEARCH_POLICY,
         ...(args.bounded_candidate_ids === undefined
             ? {}
             : { boundedCandidateIds: args.bounded_candidate_ids }),
@@ -460,6 +467,23 @@ function summarizeRecommendation(recommendation) {
     };
 }
 
+// Adaptive-search progress projection. Exposes only aggregate, non-leaking
+// signals: counts, phase labels, and booleans. It deliberately NEVER surfaces a
+// decision, candidate identifiers, metric values, or evidence identifiers/hashes
+// — those belong only to crucible_result on a persisted terminal decision.
+function operatorMix(candidates) {
+    const mix = {};
+    for (const operator of SEARCH_OPERATORS) {
+        mix[operator] = 0;
+    }
+    for (const evidence of candidates) {
+        if (typeof evidence.operator === "string" && Object.hasOwn(mix, evidence.operator)) {
+            mix[evidence.operator] += 1;
+        }
+    }
+    return mix;
+}
+
 function buildProgress(aggregate) {
     if (aggregate.contract === null) {
         return {
@@ -469,18 +493,43 @@ function buildProgress(aggregate) {
         };
     }
     const progress = searchProgress(aggregate);
+    const plateau = detectPlateau(aggregate);
+    const archive = buildCandidateArchive(aggregate);
+    const candidates = harnessCandidateEvidenceItems(aggregate);
     const accepted = qualifyingCandidateEvidenceItems(aggregate);
+    const duplicateCount = candidates
+        .filter((evidence) => evidence.duplicateOf !== null).length;
     return {
         status: aggregate.status,
         event_seq: aggregate.lastSeq,
         open: true,
+        evaluations: progress.attemptedCandidates.length,
         candidates_observed: progress.candidates.length,
         accepted_candidates: accepted.length,
+        passing_incumbent_available: qualifyingCandidateEvidence(aggregate) !== null,
         next_round: progress.nextRound,
+        next_slot: progress.nextSlot,
+        partial_round: progress.partialRound,
+        slots_completed_in_round: progress.slotsCompletedInRound,
+        completed_rounds: progress.completedRounds,
         rounds_exhausted: progress.roundsExhausted,
         bounded_complete: progress.boundedComplete,
         max_rounds: aggregate.contract.maxRounds,
         candidates_per_round: aggregate.contract.candidatesPerRound,
+        plateau_phase: plateau.phase,
+        plateau_detected: plateau.plateauDetected,
+        escape_rounds_completed: plateau.escapeRoundsCompleted,
+        escape_rounds_required: plateau.escapeRoundsRequired,
+        operator_mix: operatorMix(candidates),
+        archive_counts: {
+            accepted: archive.accepted.length,
+            near_misses: archive.nearMisses.length,
+            rejected: archive.rejected.length,
+            invalid_metrics: archive.invalidMetrics.length,
+            mechanism_groups: archive.mechanismGroups.length,
+            lesson_groups: archive.lessonGroups.length,
+        },
+        duplicate_count: duplicateCount,
         stop_requests: aggregate.stopRequests.length,
         paused: aggregate.pause !== null,
         non_results: aggregate.nonResults.length,

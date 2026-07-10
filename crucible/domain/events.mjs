@@ -10,6 +10,8 @@ import {
     createInvestigationContract,
 } from "./contract.mjs";
 import {
+    ANNOTATION_LIMITS,
+    DOMAIN_VERSION,
     EVIDENCE_PURPOSES,
     EVENT_TYPES,
     EVENT_VOCABULARY,
@@ -49,7 +51,19 @@ function requireIdentifier(value, field) {
             { field, value },
         );
     }
+
     return identifier;
+}
+
+function requireNonNegativeInteger(value, field) {
+    if (!Number.isSafeInteger(value) || value < 0) {
+        throw new TransitionError(
+            ERROR_CODES.INVALID_EVENT,
+            `${field} must be a non-negative safe integer`,
+            { field, value },
+        );
+    }
+    return value;
 }
 
 function makeEnvelope(aggregate, type, payload) {
@@ -89,7 +103,85 @@ function normalizeCommandDispatched(payload) {
     };
 }
 
-function normalizeCommandObserved(payload) {
+function normalizeAnnotations(value, maximumCitations = ANNOTATION_LIMITS.citedEvidenceCount) {
+    if (value === undefined || value === null) {
+        return {
+            mechanism: null,
+            hypothesis: null,
+            expectedEffects: [],
+            citedEvidenceIds: [],
+            finding: null,
+        };
+    }
+    if (typeof value !== "object" || Array.isArray(value)) {
+        throw new TransitionError(
+            ERROR_CODES.INVALID_EVENT,
+            "annotations must be an object",
+        );
+    }
+    const allowed = new Set([
+        "mechanism",
+        "hypothesis",
+        "expectedEffects",
+        "citedEvidenceIds",
+        "finding",
+    ]);
+    for (const key of Object.keys(value)) {
+        if (!allowed.has(key)) {
+            throw new TransitionError(
+                ERROR_CODES.INVALID_EVENT,
+                `annotations.${key} is not supported`,
+            );
+        }
+    }
+    const optionalString = (field, maximum) => {
+        if (value[field] === undefined || value[field] === null) {
+            return null;
+        }
+        return requireString(value[field], `annotations.${field}`, maximum);
+    };
+    const expectedEffects = value.expectedEffects ?? [];
+    if (!Array.isArray(expectedEffects)
+        || expectedEffects.length > ANNOTATION_LIMITS.expectedEffectCount) {
+        throw new TransitionError(
+            ERROR_CODES.INVALID_EVENT,
+            `annotations.expectedEffects must contain at most ${ANNOTATION_LIMITS.expectedEffectCount} items`,
+        );
+    }
+    const citedEvidenceIds = value.citedEvidenceIds ?? [];
+    if (!Array.isArray(citedEvidenceIds)
+        || citedEvidenceIds.length > Math.min(
+            ANNOTATION_LIMITS.citedEvidenceCount,
+            maximumCitations,
+        )) {
+        throw new TransitionError(
+            ERROR_CODES.INVALID_EVENT,
+            "annotations.citedEvidenceIds exceeds the prompt citation bound",
+        );
+    }
+    const normalizedCitations = citedEvidenceIds.map((evidenceId, index) =>
+        requireIdentifier(evidenceId, `annotations.citedEvidenceIds[${index}]`));
+    if (new Set(normalizedCitations).size !== normalizedCitations.length) {
+        throw new TransitionError(
+            ERROR_CODES.INVALID_EVENT,
+            "annotations.citedEvidenceIds must be unique",
+        );
+    }
+    return {
+        mechanism: optionalString("mechanism", ANNOTATION_LIMITS.mechanismLength),
+        hypothesis: optionalString("hypothesis", ANNOTATION_LIMITS.hypothesisLength),
+        expectedEffects: expectedEffects.map((effect, index) =>
+            requireString(
+                effect,
+                `annotations.expectedEffects[${index}]`,
+                ANNOTATION_LIMITS.expectedEffectLength,
+            )),
+        citedEvidenceIds: normalizedCitations,
+        finding: optionalString("finding", ANNOTATION_LIMITS.findingLength),
+    };
+}
+
+function normalizeCommandObserved(payload, aggregate = null) {
     const sourceKind = payload?.sourceKind;
     const purpose = payload?.purpose;
     if (!SOURCE_KINDS.includes(sourceKind)) {
@@ -99,6 +191,8 @@ function normalizeCommandObserved(payload) {
         throw new TransitionError(ERROR_CODES.INVALID_EVENT, "purpose is not supported");
     }
     const harnessCandidate = sourceKind === "harness" && purpose === "candidate";
+    const commandId = requireString(payload.commandId, "commandId", 128);
+    const command = aggregate?.commands?.[commandId]?.command ?? null;
     const receipt = sourceKind === "harness"
         ? {
             attemptId: requireString(payload.receipt?.attemptId, "receipt.attemptId", 128),
@@ -117,7 +211,7 @@ function normalizeCommandObserved(payload) {
         );
     }
     return {
-        commandId: requireString(payload.commandId, "commandId", 128),
+        commandId,
         observationId: requireString(payload.observationId, "observationId", 128),
         sourceKind,
         purpose,
@@ -129,10 +223,20 @@ function normalizeCommandObserved(payload) {
             : null,
         receipt,
         round: harnessCandidate
-            ? requirePositiveInteger(payload.round, "round")
+            ? requirePositiveInteger(payload.round ?? command?.round, "round")
+            : null,
+        slotIndex: harnessCandidate
+            ? requireNonNegativeInteger(payload.slotIndex ?? command?.slotIndex, "slotIndex")
             : null,
         candidateId: harnessCandidate
-            ? requireIdentifier(payload.candidateId, "candidateId")
+            ? requireIdentifier(payload.candidateId ?? command?.candidateId, "candidateId")
+            : null,
+        annotations: purpose === "candidate"
+            ? normalizeAnnotations(
+                payload.annotations,
+                aggregate?.contract?.searchPolicy?.promptCaps?.promptContextRefs
+                    ?? ANNOTATION_LIMITS.citedEvidenceCount,
+            )
             : null,
         data: immutableCanonical(payload.data),
     };
@@ -206,6 +310,7 @@ export function createInvestigationOpenedEvent(contract) {
     const initial = createInitialAggregate();
     const normalizedContract = createInvestigationContract(contract);
     return makeEnvelope(initial, EVENT_TYPES.INVESTIGATION_OPENED, {
+        domainVersion: DOMAIN_VERSION,
         contract: normalizedContract,
         contractHash: contractHash(normalizedContract),
     });
@@ -261,7 +366,7 @@ export function constructHarnessObservedEvent(aggregate, payload) {
             sourceKind: "harness",
             harnessId: aggregate.contract.harnessId,
             parserVersion: aggregate.contract.parserVersion,
-        }),
+        }, aggregate),
     );
 }
 
@@ -281,7 +386,7 @@ export function constructModelObservedEvent(aggregate, payload) {
             harnessId: null,
             parserVersion: null,
             receipt: null,
-        }),
+        }, aggregate),
     );
 }
 
@@ -307,12 +412,26 @@ export function constructEvidenceCommittedEvent(aggregate, input) {
         const duplicate = aggregate.evidenceOrder.some((existingId) =>
             aggregate.evidence[existingId].sourceKind === "harness"
             && aggregate.evidence[existingId].purpose === "candidate"
+            && !aggregate.evidence[existingId].invalidated
             && aggregate.evidence[existingId].candidateId === observation.candidateId);
         if (duplicate) {
             throw new TransitionError(
                 ERROR_CODES.DUPLICATE_ID,
                 "Duplicate candidate identifier",
                 { id: observation.candidateId },
+            );
+        }
+        const duplicateSlot = aggregate.evidenceOrder.some((existingId) =>
+            aggregate.evidence[existingId].sourceKind === "harness"
+            && aggregate.evidence[existingId].purpose === "candidate"
+            && !aggregate.evidence[existingId].invalidated
+            && aggregate.evidence[existingId].round === observation.round
+            && aggregate.evidence[existingId].slotIndex === observation.slotIndex);
+        if (duplicateSlot) {
+            throw new TransitionError(
+                ERROR_CODES.DUPLICATE_ID,
+                "Duplicate candidate slot",
+                { id: `${observation.round}:${observation.slotIndex}` },
             );
         }
     }

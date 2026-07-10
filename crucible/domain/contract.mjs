@@ -4,12 +4,41 @@ import {
     hashCanonical,
     immutableCanonical,
 } from "./canonical.mjs";
-import { HYPOTHESIS_TOPOLOGIES } from "./constants.mjs";
+import {
+    DEFAULT_SEARCH_POLICY,
+    ESCAPE_SEARCH_OPERATORS,
+    HYPOTHESIS_TOPOLOGIES,
+    SEARCH_OPERATORS,
+} from "./constants.mjs";
 import { ContractError, ERROR_CODES } from "./errors.mjs";
 
 const COMPARISON_OPERATORS = Object.freeze(["<", "<=", "==", ">=", ">"]);
 const VALIDATION_EXPECTATIONS = Object.freeze(["accept", "reject"]);
 const METRIC_DIRECTIONS = Object.freeze(["min", "max"]);
+const SEARCH_POLICY_KEYS = Object.freeze([
+    "archiveCaps",
+    "dedupPolicy",
+    "mandatoryEscapeRounds",
+    "minRoundsBeforePlateau",
+    "operatorWeights",
+    "plateauMinImprovement",
+    "plateauWindow",
+    "promptCaps",
+    "stopOnFirstAccept",
+]);
+const ARCHIVE_CAP_KEYS = Object.freeze([
+    "accepted",
+    "duplicateIndex",
+    "invalidMetrics",
+    "lessonGroups",
+    "mechanismGroups",
+    "nearMisses",
+    "rejected",
+]);
+const PROMPT_CAP_KEYS = Object.freeze([
+    "parentEvidenceIds",
+    "promptContextRefs",
+]);
 
 function requireNonEmptyString(value, field, maximum = 4096) {
     if (typeof value !== "string" || value.trim().length === 0 || value.length > maximum) {
@@ -41,7 +70,46 @@ function requirePositiveSafeInteger(value, field, maximum = Number.MAX_SAFE_INTE
             value,
         });
     }
+
     return value;
+}
+
+function requireSafeIntegerInRange(value, field, minimum, maximum) {
+    if (!Number.isSafeInteger(value) || value < minimum || value > maximum) {
+        throw new ContractError(
+            `${field} must be a safe integer between ${minimum} and ${maximum}`,
+            { field, value, minimum, maximum },
+        );
+    }
+    return value;
+}
+
+function requireFiniteNumberInRange(value, field, minimum, maximum) {
+    if (typeof value !== "number"
+        || !Number.isFinite(value)
+        || value < minimum
+        || value > maximum) {
+        throw new ContractError(
+            `${field} must be a finite number between ${minimum} and ${maximum}`,
+            { field, value, minimum, maximum },
+        );
+    }
+    return value;
+}
+
+function requireExactObjectKeys(value, field, expectedKeys) {
+    if (value === null || typeof value !== "object" || Array.isArray(value)) {
+        throw new ContractError(`${field} must be an object`, { field });
+    }
+    const actual = Object.keys(value).sort();
+    const expected = [...expectedKeys].sort();
+    if (!canonicalEqual(actual, expected)) {
+        throw new ContractError(`${field} must contain exactly the canonical fields`, {
+            field,
+            expected,
+            actual,
+        });
+    }
 }
 
 function requireArtifactHash(value, field) {
@@ -198,6 +266,154 @@ function evaluatePredicate(predicate, result) {
     }
 }
 
+function numericFailureDistance(actual, operator, expected) {
+    if (typeof actual !== "number" || !Number.isFinite(actual)) {
+        return null;
+    }
+    let gap;
+    switch (operator) {
+        case "<":
+            gap = actual < expected ? 0 : actual - expected + Number.EPSILON;
+            break;
+        case "<=":
+            gap = actual <= expected ? 0 : actual - expected;
+            break;
+        case "==":
+            gap = Math.abs(actual - expected);
+            break;
+        case ">=":
+            gap = actual >= expected ? 0 : expected - actual;
+            break;
+        case ">":
+            gap = actual > expected ? 0 : expected - actual + Number.EPSILON;
+            break;
+        default:
+            return null;
+    }
+    return gap / Math.max(1, Math.abs(expected));
+}
+
+function assessPredicate(predicate, result) {
+    switch (predicate.kind) {
+        case "harness_pass":
+            return {
+                satisfied: result?.pass === true,
+                near: false,
+                distance: result?.pass === true ? 0 : null,
+                failedLeaves: result?.pass === true ? 0 : 1,
+                leafCount: 1,
+                booleanGateFailure: result?.pass !== true,
+            };
+        case "constant":
+            return {
+                satisfied: predicate.value,
+                near: false,
+                distance: predicate.value ? 0 : null,
+                failedLeaves: predicate.value ? 0 : 1,
+                leafCount: 1,
+                booleanGateFailure: false,
+            };
+        case "field_equals": {
+            const actual = valueAtPath(result, predicate.path);
+            const satisfied = actual.found && canonicalEqual(actual.value, predicate.value);
+            return {
+                satisfied,
+                near: false,
+                distance: satisfied ? 0 : null,
+                failedLeaves: satisfied ? 0 : 1,
+                leafCount: 1,
+                booleanGateFailure: false,
+            };
+        }
+        case "number_compare": {
+            const actual = valueAtPath(result, predicate.path);
+            const satisfied = actual.found
+                && compareNumbers(actual.value, predicate.operator, predicate.value);
+            const distance = actual.found
+                ? numericFailureDistance(actual.value, predicate.operator, predicate.value)
+                : null;
+            return {
+                satisfied,
+                near: !satisfied && distance !== null && distance <= 0.1,
+                distance,
+                failedLeaves: satisfied ? 0 : 1,
+                leafCount: 1,
+                booleanGateFailure: false,
+            };
+        }
+        case "metric_compare": {
+            const actual = result?.metrics?.[predicate.metric];
+            const satisfied = compareNumbers(actual, predicate.operator, predicate.value);
+            const distance = numericFailureDistance(actual, predicate.operator, predicate.value);
+            return {
+                satisfied,
+                near: !satisfied && distance !== null && distance <= 0.1,
+                distance,
+                failedLeaves: satisfied ? 0 : 1,
+                leafCount: 1,
+                booleanGateFailure: false,
+            };
+        }
+        case "all": {
+            const children = predicate.predicates.map((child) => assessPredicate(child, result));
+            const failed = children.filter((child) => !child.satisfied);
+            const booleanGateOnly = failed.length === 1
+                && failed[0].booleanGateFailure
+                && children.length > 1;
+            return {
+                satisfied: failed.length === 0,
+                near: failed.length === 1 && (failed[0].near || booleanGateOnly),
+                distance: failed.length === 0
+                    ? 0
+                    : failed.length === 1
+                        ? failed[0].distance
+                        : null,
+                failedLeaves: children.reduce((sum, child) => sum + child.failedLeaves, 0),
+                leafCount: children.reduce((sum, child) => sum + child.leafCount, 0),
+                booleanGateFailure: false,
+            };
+        }
+        case "any": {
+            const children = predicate.predicates.map((child) => assessPredicate(child, result));
+            const satisfied = children.some((child) => child.satisfied);
+            const nearChildren = children.filter((child) => child.near);
+            const distances = nearChildren
+                .map((child) => child.distance)
+                .filter((distance) => distance !== null);
+            return {
+                satisfied,
+                near: !satisfied && nearChildren.length > 0,
+                distance: distances.length > 0 ? Math.min(...distances) : null,
+                failedLeaves: satisfied
+                    ? 0
+                    : Math.min(...children.map((child) => child.failedLeaves)),
+                leafCount: children.reduce((sum, child) => sum + child.leafCount, 0),
+                booleanGateFailure: false,
+            };
+        }
+        case "not": {
+            const child = assessPredicate(predicate.predicate, result);
+            return {
+                satisfied: !child.satisfied,
+                near: false,
+                distance: !child.satisfied ? 0 : null,
+                failedLeaves: !child.satisfied ? 0 : 1,
+                leafCount: child.leafCount,
+                booleanGateFailure: false,
+            };
+        }
+        default:
+            return {
+                satisfied: false,
+                near: false,
+                distance: null,
+                failedLeaves: 1,
+                leafCount: 1,
+                booleanGateFailure: false,
+            };
+    }
+}
+
 function normalizeDeclaredLimits(limits) {
     if (limits === null || typeof limits !== "object" || Array.isArray(limits)) {
         throw new ContractError("declaredLimits must be an object");
@@ -294,6 +510,131 @@ function normalizeSearch(search, topology) {
     return normalized;
 }
 
+export function createSearchPolicy(input) {
+    requireExactObjectKeys(input, "searchPolicy", SEARCH_POLICY_KEYS);
+    if (typeof input.stopOnFirstAccept !== "boolean") {
+        throw new ContractError("searchPolicy.stopOnFirstAccept must be boolean");
+    }
+
+    const plateauWindow = requireSafeIntegerInRange(
+        input.plateauWindow,
+        "searchPolicy.plateauWindow",
+        1,
+        1000,
+    );
+    const minRoundsBeforePlateau = requireSafeIntegerInRange(
+        input.minRoundsBeforePlateau,
+        "searchPolicy.minRoundsBeforePlateau",
+        1,
+        100000,
+    );
+    if (minRoundsBeforePlateau < plateauWindow) {
+        throw new ContractError(
+            "searchPolicy.minRoundsBeforePlateau must be at least plateauWindow",
+        );
+    }
+    const plateauMinImprovement = requireFiniteNumberInRange(
+        input.plateauMinImprovement,
+        "searchPolicy.plateauMinImprovement",
+        0,
+        Number.MAX_SAFE_INTEGER,
+    );
+    const mandatoryEscapeRounds = requireSafeIntegerInRange(
+        input.mandatoryEscapeRounds,
+        "searchPolicy.mandatoryEscapeRounds",
+        1,
+        1000,
+    );
+
+    requireExactObjectKeys(
+        input.operatorWeights,
+        "searchPolicy.operatorWeights",
+        SEARCH_OPERATORS,
+    );
+    const operatorWeights = {};
+    for (const operator of SEARCH_OPERATORS) {
+        operatorWeights[operator] = requireSafeIntegerInRange(
+            input.operatorWeights[operator],
+            `searchPolicy.operatorWeights.${operator}`,
+            0,
+            1000000,
+        );
+    }
+    if (operatorWeights.fresh < 1) {
+        throw new ContractError("searchPolicy.operatorWeights.fresh must be at least 1");
+    }
+    if (ESCAPE_SEARCH_OPERATORS.reduce(
+        (sum, operator) => sum + operatorWeights[operator],
+        0,
+    ) < 1) {
+        throw new ContractError(
+            "searchPolicy.operatorWeights must enable at least one mandatory-escape operator",
+        );
+    }
+
+    requireExactObjectKeys(
+        input.archiveCaps,
+        "searchPolicy.archiveCaps",
+        ARCHIVE_CAP_KEYS,
+    );
+    const archiveCaps = {};
+    for (const key of ARCHIVE_CAP_KEYS) {
+        archiveCaps[key] = requireSafeIntegerInRange(
+            input.archiveCaps[key],
+            `searchPolicy.archiveCaps.${key}`,
+            1,
+            100000,
+        );
+    }
+
+    requireExactObjectKeys(
+        input.promptCaps,
+        "searchPolicy.promptCaps",
+        PROMPT_CAP_KEYS,
+    );
+    const promptCaps = {
+        parentEvidenceIds: requireSafeIntegerInRange(
+            input.promptCaps.parentEvidenceIds,
+            "searchPolicy.promptCaps.parentEvidenceIds",
+            1,
+            16,
+        ),
+        promptContextRefs: requireSafeIntegerInRange(
+            input.promptCaps.promptContextRefs,
+            "searchPolicy.promptCaps.promptContextRefs",
+            1,
+            256,
+        ),
+    };
+    if (promptCaps.parentEvidenceIds > promptCaps.promptContextRefs) {
+        throw new ContractError(
+            "searchPolicy.promptCaps.parentEvidenceIds cannot exceed promptContextRefs",
+        );
+    }
+
+    if (input.dedupPolicy !== "mark") {
+        throw new ContractError("searchPolicy.dedupPolicy must be mark");
+    }
+
+    return immutableCanonical({
+        stopOnFirstAccept: input.stopOnFirstAccept,
+        plateauWindow,
+        minRoundsBeforePlateau,
+        plateauMinImprovement,
+        mandatoryEscapeRounds,
+        operatorWeights,
+        archiveCaps,
+        promptCaps,
+        dedupPolicy: "mark",
+    });
+}
+
+export function defaultSearchPolicy() {
+    return createSearchPolicy(DEFAULT_SEARCH_POLICY);
+}
+
+export const normalizeSearchPolicy = createSearchPolicy;
+
 function normalizeMetrics(metrics) {
     if (metrics === undefined || metrics === null) {
         return [];
@@ -339,6 +680,16 @@ export function createInvestigationContract(input) {
         });
     }
 
+    if (!Object.hasOwn(input, "searchPolicy")) {
+        throw new ContractError(
+            "searchPolicy is required; callers must provide the canonical version-2 search policy",
+        );
+    }
+    const searchPolicy = createSearchPolicy(input.searchPolicy);
+    if (!canonicalEqual(searchPolicy, input.searchPolicy)) {
+        throw new ContractError("searchPolicy must already be in canonical kernel form");
+    }
+
     const search = normalizeSearch(input.search ?? input, input.hypothesisTopology);
     const contract = {
         objective,
@@ -356,6 +707,7 @@ export function createInvestigationContract(input) {
             ? {}
             : { boundedCandidateIds: search.boundedCandidateIds }),
         metrics: normalizeMetrics(input.metrics),
+        searchPolicy,
         declaredLimits: normalizeDeclaredLimits(input.declaredLimits),
     };
 
@@ -365,6 +717,13 @@ export function createInvestigationContract(input) {
 export function acceptanceSatisfied(acceptancePredicate, harnessResult) {
     const normalized = normalizePredicate(acceptancePredicate);
     return evaluatePredicate(normalized, harnessResult);
+}
+
+export function assessAcceptancePredicate(acceptancePredicate, harnessResult) {
+    return immutableCanonical(assessPredicate(
+        normalizePredicate(acceptancePredicate),
+        harnessResult,
+    ));
 }
 
 export function validationSatisfied(validationCases, harnessResult) {
@@ -395,13 +754,20 @@ export function candidateMetricValues(metrics, harnessResult) {
     const values = {};
     for (const metric of metrics) {
         const value = harnessResult?.metrics?.[metric.key];
-        if (typeof value !== "number" || !Number.isFinite(value)) {
-            return null;
+        if (typeof value === "number" && Number.isFinite(value)) {
+            values[metric.key] = value;
         }
-        values[metric.key] = value;
     }
     return immutableCanonical(values);
 }
+
+export function candidateMetricsRankable(metrics, metricValues) {
+    return metrics.every((metric) =>
+        typeof metricValues?.[metric.key] === "number"
+        && Number.isFinite(metricValues[metric.key]));
+}
+
+export const availableCandidateMetricValues = candidateMetricValues;
 
 export function contractHash(contract) {
     return hashCanonical(contract, CONTRACT_HASH_ALGORITHM);

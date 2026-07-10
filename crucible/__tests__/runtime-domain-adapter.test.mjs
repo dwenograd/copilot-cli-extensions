@@ -4,6 +4,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
+    DEFAULT_SEARCH_POLICY,
     EVENT_TYPES,
     constructEvidenceCommittedEvent,
     constructHarnessObservedEvent,
@@ -13,6 +14,7 @@ import {
     hashCanonical,
 } from "../domain/index.mjs";
 import {
+    ERROR_CODES as PERSISTENCE_ERROR_CODES,
     canonicalize,
     computeEventHash as computeRepositoryEventHash,
     openRepository,
@@ -27,6 +29,11 @@ import {
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const roots = [];
+// Track every repository we open so a test that throws mid-setup still releases
+// the SQLite file handle before afterEach removes its directory. On Windows an
+// open handle turns the recursive rmSync into an EPERM that masks the real
+// assertion failure, so cleanup closes first and then retries the removal.
+const openRepositories = new Set();
 
 function makeRoot(label) {
     const root = fs.mkdtempSync(path.join(HERE, `.runtime-adapter-${label}-`));
@@ -34,14 +41,71 @@ function makeRoot(label) {
     return root;
 }
 
+function trackRepository(repository) {
+    openRepositories.add(repository);
+    return repository;
+}
+
+function releaseRepository(repository) {
+    openRepositories.delete(repository);
+    try {
+        repository.close();
+    } catch {
+        // already closed — releasing twice is harmless
+    }
+}
+
+function removeRootWithRetry(root, attempts = 10) {
+    for (let attempt = 0; ; attempt += 1) {
+        try {
+            fs.rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 25 });
+            return;
+        } catch {
+            if (attempt >= attempts) {
+                return; // best-effort: never mask the real assertion failure
+            }
+        }
+    }
+}
+
 afterEach(() => {
+    for (const repository of openRepositories) {
+        try {
+            repository.close();
+        } catch {
+            // ignore — the directory removal below is the real cleanup
+        }
+    }
+    openRepositories.clear();
     for (const root of roots.splice(0)) {
-        fs.rmSync(root, { recursive: true, force: true });
+        removeRootWithRetry(root);
     }
 });
 
 function artifactHash(character) {
     return `sha256:${character.repeat(64)}`;
+}
+
+// Canonical version-2 search policy, optionally overridden. createInvestigationContract
+// requires searchPolicy to already be in canonical kernel form, so every override
+// is merged onto the frozen DEFAULT_SEARCH_POLICY rather than partially specified.
+function searchPolicy(overrides = {}) {
+    return {
+        ...DEFAULT_SEARCH_POLICY,
+        ...overrides,
+        operatorWeights: {
+            ...DEFAULT_SEARCH_POLICY.operatorWeights,
+            ...overrides.operatorWeights,
+        },
+        archiveCaps: {
+            ...DEFAULT_SEARCH_POLICY.archiveCaps,
+            ...overrides.archiveCaps,
+        },
+        promptCaps: {
+            ...DEFAULT_SEARCH_POLICY.promptCaps,
+            ...overrides.promptCaps,
+        },
+    };
 }
 
 function contractInput(overrides = {}) {
@@ -67,6 +131,7 @@ function contractInput(overrides = {}) {
         candidatesPerRound: 1,
         maxRounds: 2,
         metrics: [{ key: "score", direction: "max", epsilon: 0 }],
+        searchPolicy: searchPolicy(),
         declaredLimits: { maxCommands: 10 },
         ...overrides,
     };
@@ -74,7 +139,9 @@ function contractInput(overrides = {}) {
 
 function openAdapter(label = "db") {
     const root = makeRoot(label);
-    const repository = openRepository({ file: path.join(root, "events.sqlite") });
+    const repository = trackRepository(
+        openRepository({ file: path.join(root, "events.sqlite") }),
+    );
     const adapter = createDomainRepositoryAdapter({
         repository,
         investigationId: "inv-runtime",
@@ -96,7 +163,9 @@ function harnessReceipt(attemptId, candidate = false) {
 
 function appendFullVerifiedHistory(adapter) {
     let aggregate = adapter.openInvestigation(
-        createInvestigationContract(contractInput()),
+        createInvestigationContract(contractInput({
+            searchPolicy: searchPolicy({ stopOnFirstAccept: true }),
+        })),
     ).aggregate;
     aggregate = adapter.appendDomainEvent(
         constructKernelDecisionEvent(aggregate),
@@ -151,8 +220,8 @@ function appendFullVerifiedHistory(adapter) {
             commandId: "cmd-000002",
             observationId: "candidate-observation",
             purpose: "candidate",
-            round: 1,
-            candidateId: "candidate-a",
+            // round/slotIndex/candidateId default to the kernel-reserved
+            // search-candidate assignment; supplying our own would be rejected.
             receipt: harnessReceipt("candidate-attempt", true),
             data: { pass: true, metrics: { score: 95 } },
         }),
@@ -189,7 +258,7 @@ describe("Crucible domain/persistence adapter", () => {
             terminalKind: "verified_result",
         });
         expect(adapter.replay().aggregate).toEqual(aggregate);
-        repository.close();
+        releaseRepository(repository);
     });
 
     it("keeps non-domain evidence in the companion log without shifting domain sequence", () => {
@@ -208,21 +277,24 @@ describe("Crucible domain/persistence adapter", () => {
         expect(repository.listEvents("inv-runtime").map((row) => row.seq)).toEqual([1, 2]);
         expect(repository.listEvents(adapter.operationalInvestigationId)).toHaveLength(1);
         expect(aggregate.lastSeq).toBe(2);
-        repository.close();
+        releaseRepository(repository);
     });
 
     it("detects repository tampering before domain replay", () => {
         const { root, repository, adapter } = openAdapter("repo-tamper");
         adapter.openInvestigation(createInvestigationContract(contractInput()));
-        repository.close();
+        releaseRepository(repository);
 
         const raw = new DatabaseSync(path.join(root, "events.sqlite"));
-        raw.exec("PRAGMA journal_mode=WAL;");
-        raw.prepare("UPDATE events SET payload = ? WHERE investigation_id = ? AND seq = 1")
-            .run(JSON.stringify({ domainEvent: { forged: true } }), "inv-runtime");
-        raw.close();
+        try {
+            raw.exec("PRAGMA journal_mode=WAL;");
+            raw.prepare("UPDATE events SET payload = ? WHERE investigation_id = ? AND seq = 1")
+                .run(JSON.stringify({ domainEvent: { forged: true } }), "inv-runtime");
+        } finally {
+            raw.close();
+        }
 
-        const reopened = openRepository({ file: path.join(root, "events.sqlite") });
+        const reopened = trackRepository(openRepository({ file: path.join(root, "events.sqlite") }));
         const replayAdapter = createDomainRepositoryAdapter({
             repository: reopened,
             investigationId: "inv-runtime",
@@ -230,14 +302,14 @@ describe("Crucible domain/persistence adapter", () => {
         expect(() => replayAdapter.replay()).toThrow(expect.objectContaining({
             code: RUNTIME_ERROR_CODES.INTEGRITY_FAILURE,
         }));
-        reopened.close();
+        releaseRepository(reopened);
     });
 
     it("detects a forged domain event even when the repository hash is recomputed", () => {
         const { root, repository, adapter } = openAdapter("domain-tamper");
         adapter.openInvestigation(createInvestigationContract(contractInput()));
         const row = repository.getEvent("inv-runtime", 1);
-        repository.close();
+        releaseRepository(repository);
 
         const forgedPayload = JSON.parse(JSON.stringify(row.payload));
         forgedPayload.domainEvent.payload.contract.objective = "forged objective";
@@ -255,12 +327,15 @@ describe("Crucible domain/persistence adapter", () => {
             createdAt: row.createdAt,
         });
         const raw = new DatabaseSync(path.join(root, "events.sqlite"));
-        raw.exec("PRAGMA journal_mode=WAL;");
-        raw.prepare("UPDATE events SET payload = ?, event_hash = ? WHERE investigation_id = ? AND seq = 1")
-            .run(payloadCanonical, repositoryHash, "inv-runtime");
-        raw.close();
+        try {
+            raw.exec("PRAGMA journal_mode=WAL;");
+            raw.prepare("UPDATE events SET payload = ?, event_hash = ? WHERE investigation_id = ? AND seq = 1")
+                .run(payloadCanonical, repositoryHash, "inv-runtime");
+        } finally {
+            raw.close();
+        }
 
-        const reopened = openRepository({ file: path.join(root, "events.sqlite") });
+        const reopened = trackRepository(openRepository({ file: path.join(root, "events.sqlite") }));
         const replayAdapter = createDomainRepositoryAdapter({
             repository: reopened,
             investigationId: "inv-runtime",
@@ -269,7 +344,7 @@ describe("Crucible domain/persistence adapter", () => {
         expect(() => replayAdapter.replay()).toThrow(expect.objectContaining({
             code: RUNTIME_ERROR_CODES.INTEGRITY_FAILURE,
         }));
-        reopened.close();
+        releaseRepository(reopened);
     });
 
     it("abandons stale reserved/dispatched attempts before replacement work", () => {
@@ -302,6 +377,100 @@ describe("Crucible domain/persistence adapter", () => {
             lease: second.lease,
         });
         expect(replacement.state).toBe("reserved");
-        repository.close();
+        releaseRepository(repository);
+    });
+
+    it("atomically fences stale runners before a domain observation can land", () => {
+        const { repository, adapter } = openAdapter("fenced-observation");
+        adapter.openInvestigation(createInvestigationContract(contractInput()));
+        const reserved = adapter.appendKernelDecision().domainEvent.payload;
+        adapter.appendExternal(EVENT_TYPES.COMMAND_DISPATCHED, {
+            commandId: reserved.commandId,
+        });
+        const first = adapter.acquireRunnerLease({ leaseId: "lease-one", owner: "runner-one" });
+        adapter.reserveAttempt({
+            attemptId: "attempt-one",
+            command: formatAttemptCommand("domain-command", {
+                commandId: reserved.commandId,
+                command: reserved.command,
+            }),
+            lease: first.lease,
+        });
+        adapter.dispatchAttempt("attempt-one", first.lease);
+        adapter.acquireRunnerLease({ leaseId: "lease-two", owner: "runner-two" });
+        const before = adapter.replay().aggregate;
+
+        expect(() => adapter.appendHarnessObservationFenced({
+            commandId: reserved.commandId,
+            observationId: "stale-validation-observation",
+            purpose: "validation",
+            receipt: harnessReceipt("attempt-one"),
+            data: {
+                caseResults: [
+                    { id: "good", artifactHash: artifactHash("a"), outcome: "accept" },
+                    { id: "bad", artifactHash: artifactHash("b"), outcome: "reject" },
+                ],
+            },
+        }, {
+            attemptId: "attempt-one",
+            lease: first.lease,
+        })).toThrow(expect.objectContaining({
+            code: PERSISTENCE_ERROR_CODES.FENCE_REJECTED,
+        }));
+        const after = adapter.replay().aggregate;
+        expect(after.lastSeq).toBe(before.lastSeq);
+        expect(after.observationOrder).toEqual([]);
+        releaseRepository(repository);
+    });
+
+    it("atomically fences stale runners before domain evidence can land", () => {
+        const { repository, adapter } = openAdapter("fenced-evidence");
+        adapter.openInvestigation(createInvestigationContract(contractInput()));
+        const reserved = adapter.appendKernelDecision().domainEvent.payload;
+        adapter.appendExternal(EVENT_TYPES.COMMAND_DISPATCHED, {
+            commandId: reserved.commandId,
+        });
+        const first = adapter.acquireRunnerLease({ leaseId: "lease-one", owner: "runner-one" });
+        adapter.reserveAttempt({
+            attemptId: "attempt-one",
+            command: formatAttemptCommand("domain-command", {
+                commandId: reserved.commandId,
+                command: reserved.command,
+            }),
+            lease: first.lease,
+        });
+        adapter.dispatchAttempt("attempt-one", first.lease);
+        adapter.appendHarnessObservationFenced({
+            commandId: reserved.commandId,
+            observationId: "validation-observation",
+            purpose: "validation",
+            receipt: harnessReceipt("attempt-one"),
+            data: {
+                caseResults: [
+                    { id: "good", artifactHash: artifactHash("a"), outcome: "accept" },
+                    { id: "bad", artifactHash: artifactHash("b"), outcome: "reject" },
+                ],
+            },
+        }, {
+            attemptId: "attempt-one",
+            lease: first.lease,
+        });
+        adapter.acquireRunnerLease({ leaseId: "lease-two", owner: "runner-two" });
+        const before = adapter.replay().aggregate;
+
+        expect(() => adapter.appendEvidenceCommitFenced({
+            evidenceId: "evidence-000001",
+            observationId: "validation-observation",
+        }, {
+            attemptId: "attempt-one",
+            lease: first.lease,
+        })).toThrow(expect.objectContaining({
+            code: PERSISTENCE_ERROR_CODES.FENCE_REJECTED,
+        }));
+        const after = adapter.replay().aggregate;
+        expect(after.lastSeq).toBe(before.lastSeq);
+        expect(after.evidenceOrder).toEqual([]);
+        expect(after.observations["validation-observation"].evidenceId).toBeNull();
+        releaseRepository(repository);
     });
 });

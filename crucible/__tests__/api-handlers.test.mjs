@@ -12,9 +12,12 @@
 import { afterEach, describe, expect, it } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
+import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 
 import {
+    DEFAULT_SEARCH_POLICY,
+    DOMAIN_VERSION,
     EVENT_TYPES,
     createInvestigationContract,
     decideNext,
@@ -151,6 +154,28 @@ function startArgs(projectDir, overrides = {}) {
 
 const seedArtifactHash = (character) => `sha256:${character.repeat(64)}`;
 
+// Canonical version-2 search policy, optionally overridden. The domain requires
+// searchPolicy to already be in canonical kernel form, so overrides are merged
+// onto the frozen DEFAULT_SEARCH_POLICY rather than partially specified.
+function searchPolicy(overrides = {}) {
+    return {
+        ...DEFAULT_SEARCH_POLICY,
+        ...overrides,
+        operatorWeights: {
+            ...DEFAULT_SEARCH_POLICY.operatorWeights,
+            ...overrides.operatorWeights,
+        },
+        archiveCaps: {
+            ...DEFAULT_SEARCH_POLICY.archiveCaps,
+            ...overrides.archiveCaps,
+        },
+        promptCaps: {
+            ...DEFAULT_SEARCH_POLICY.promptCaps,
+            ...overrides.promptCaps,
+        },
+    };
+}
+
 function seedReceipt(observationId, isCandidate) {
     return {
         attemptId: `attempt-${observationId}`,
@@ -180,6 +205,7 @@ function baseSeedContract(overrides = {}) {
         policyVersion: "policy-v1",
         parserVersion: "parser-v1",
         metrics: [{ key: "score", direction: "max", epsilon: 0 }],
+        searchPolicy: searchPolicy(),
         declaredLimits: {},
         ...overrides,
     };
@@ -187,7 +213,11 @@ function baseSeedContract(overrides = {}) {
 
 // Generic domain driver: consumes decideNext recommendations, supplying
 // external inputs (dispatch/observe/commit/stop) and recording kernel decisions,
-// until a terminal / pause / non-result aggregate is reached.
+// until a terminal / pause / non-result aggregate is reached. Under domain-v2 the
+// kernel reserves one deterministic per-candidate `search_candidate` command per
+// slot; each queue entry supplies only the harness `data` (and optional
+// annotations) for the next candidate slot, while round/slot/candidateId are
+// inherited from the reserved assignment.
 function driveToTerminal(adapter, candidateQueue) {
     let observations = 0;
     let stops = 0;
@@ -240,7 +270,7 @@ function driveToTerminal(adapter, candidateQueue) {
                         receipt: seedReceipt(observationId, false),
                         data: { caseResults },
                     });
-                } else if (reserved.kind === "search") {
+                } else if (reserved.kind === "search_candidate") {
                     const spec = candidateQueue.shift();
                     if (spec === undefined) {
                         throw new Error("candidate queue exhausted");
@@ -249,10 +279,11 @@ function driveToTerminal(adapter, candidateQueue) {
                         commandId: recommendation.commandId,
                         observationId,
                         purpose: "candidate",
-                        round: reserved.round,
-                        candidateId: spec.candidateId,
+                        // round/slotIndex/candidateId are inherited from the
+                        // reserved search-candidate assignment.
                         receipt: seedReceipt(observationId, true),
                         data: spec.data,
+                        ...(spec.annotations === undefined ? {} : { annotations: spec.annotations }),
                     });
                 } else {
                     throw new Error(`unexpected reserved command ${reserved.kind}`);
@@ -288,12 +319,18 @@ function seedVerifiedResult(stateRoot, investigationId) {
             workerModels: ["model-a"],
             candidatesPerRound: 1,
             maxRounds: 3,
+            // Immediate terminal: the first accepted candidate verifies.
+            searchPolicy: searchPolicy({ stopOnFirstAccept: true }),
         }),
         (adapter) => driveToTerminal(adapter, [
-            { candidateId: "cand-a", data: { pass: true, metrics: { score: 95 } } },
+            { data: { pass: true, metrics: { score: 95 } } },
         ]),
     );
 }
+
+// The deterministic candidateId the kernel assigns to round 1, slot 0 for an
+// unbounded (generated) search space. Result assertions compare against this.
+const FIRST_GENERATED_CANDIDATE_ID = "candidate-r000001-s000";
 
 function seedTargetUnreachable(stateRoot, investigationId) {
     return seedInvestigation(
@@ -307,8 +344,8 @@ function seedTargetUnreachable(stateRoot, investigationId) {
             boundedCandidateIds: ["cand-a", "cand-b"],
         }),
         (adapter) => driveToTerminal(adapter, [
-            { candidateId: "cand-a", data: { pass: false, metrics: { score: 10 } } },
-            { candidateId: "cand-b", data: { pass: false, metrics: { score: 20 } } },
+            { data: { pass: false, metrics: { score: 10 } } },
+            { data: { pass: false, metrics: { score: 20 } } },
         ]),
     );
 }
@@ -410,6 +447,23 @@ function recordOperationalNonResult(stateRoot, investigationId, input) {
     }
 }
 
+// Reserve and dispatch the first kernel command (validation) without observing
+// it, leaving an in-flight command. A crucible_stop against this state records
+// the stop request but the kernel cannot persist the pause until the active
+// command resolves, so resumability must not yet be claimed.
+function seedDispatchedCommand(stateRoot, investigationId) {
+    const paths = resolveInvestigationPaths(stateRoot, investigationId);
+    const repository = openRepository({ file: paths.eventsDbPath });
+    try {
+        const adapter = createDomainRepositoryAdapter({ repository, investigationId });
+        const reserve = adapter.appendKernelDecision();
+        const commandId = reserve.domainEvent.payload.commandId;
+        adapter.appendExternal(EVENT_TYPES.COMMAND_DISPATCHED, { commandId });
+    } finally {
+        repository.close();
+    }
+}
+
 // --- environment / path + state resolution ---------------------------------
 
 describe("environment: path + state resolution", () => {
@@ -440,6 +494,28 @@ describe("environment: path + state resolution", () => {
         });
         expect(differentObjective).not.toBe(id1);
         expect(differentHarness).not.toBe(id1);
+    });
+
+    it("namespaces investigation identity by DOMAIN_VERSION instead of reopening v1", () => {
+        const objective = "find a candidate";
+        const projectDir = "C:\\proj";
+        const harnessId = "h1";
+        const legacyMaterial = [
+            "crucible-investigation-v1",
+            harnessId,
+            objective,
+            path.resolve(projectDir).replace(/\//gu, "\\").toLowerCase(),
+        ].join("\u0000");
+        const legacySuffix = createHash("sha256")
+            .update(legacyMaterial, "utf8")
+            .digest("hex")
+            .slice(0, 16);
+        const legacyId = `find-a-candidate-${legacySuffix}`;
+        const currentId = deriveInvestigationId({ objective, projectDir, harnessId });
+
+        expect(DOMAIN_VERSION).toBe(2);
+        expect(currentId).not.toBe(legacyId);
+        expect(currentId).toBe(deriveInvestigationId({ objective, projectDir, harnessId }));
     });
 
     it("resolves investigation paths under the state root", () => {
@@ -504,6 +580,37 @@ describe("crucible_start", () => {
         }
     });
 
+    it("starts domain v2 beside a legacy v1 identity instead of reopening it", () => {
+        const workspace = makeWorkspace("versioned-start");
+        const objective = "find a candidate scoring at least 90";
+        const canonicalProjectDir = fs.realpathSync.native(workspace.projectDir);
+        const legacyMaterial = [
+            "crucible-investigation-v1",
+            "primary-harness",
+            objective,
+            path.resolve(canonicalProjectDir).replace(/\//gu, "\\").toLowerCase(),
+        ].join("\u0000");
+        const legacyId = `find-a-candidate-scoring-at-least-90-${createHash("sha256")
+            .update(legacyMaterial, "utf8")
+            .digest("hex")
+            .slice(0, 16)}`;
+        const stateRoot = resolveStateRoot(workspace.env);
+        const legacyPaths = resolveInvestigationPaths(stateRoot, legacyId);
+        fs.mkdirSync(legacyPaths.stateDir, { recursive: true });
+        const legacyMarker = path.join(legacyPaths.stateDir, "legacy-v1.marker");
+        fs.writeFileSync(legacyMarker, "do-not-reopen");
+
+        const { deps } = makeDeps(workspace.env);
+        const started = startInvestigation(startArgs(workspace.projectDir), deps);
+
+        expect(started.investigation_id).not.toBe(legacyId);
+        expect(fs.readFileSync(legacyMarker, "utf8")).toBe("do-not-reopen");
+        expect(fs.existsSync(resolveInvestigationPaths(
+            stateRoot,
+            started.investigation_id,
+        ).eventsDbPath)).toBe(true);
+    });
+
     it("is idempotent for an identical contract and returns the existing investigation", () => {
         const workspace = makeWorkspace("idem");
         const { deps, calls } = makeDeps(workspace.env);
@@ -545,7 +652,9 @@ describe("crucible_start", () => {
     it("does not resume terminal investigations without a new identity", () => {
         const workspace = makeWorkspace("terminal-reattach");
         const { deps } = makeDeps(workspace.env);
-        const args = startArgs(workspace.projectDir);
+        const args = startArgs(workspace.projectDir, {
+            search_policy: searchPolicy({ stopOnFirstAccept: true }),
+        });
         const started = startInvestigation(args, deps);
         const paths = resolveInvestigationPaths(workspace.stateRoot, started.investigation_id);
         const repository = openRepository({ file: paths.eventsDbPath });
@@ -555,7 +664,7 @@ describe("crucible_start", () => {
                 investigationId: started.investigation_id,
             });
             driveToTerminal(adapter, [
-                { candidateId: "candidate-a", data: { pass: true, metrics: { score: 95 } } },
+                { data: { pass: true, metrics: { score: 95 } } },
             ]);
         } finally {
             repository.close();
@@ -805,6 +914,9 @@ describe("crucible_stop", () => {
         const workspace = makeWorkspace("stop");
         const { deps } = makeDeps(workspace.env);
         const started = startInvestigation(startArgs(workspace.projectDir), deps);
+        // Leave a dispatched (in-flight) command so the kernel cannot persist the
+        // pause yet; the stop request is recorded but not resumable.
+        seedDispatchedCommand(workspace.stateRoot, started.investigation_id);
 
         const stop = stopInvestigation({ investigation_id: started.investigation_id, reason: "operator pause" }, deps);
         expect(stop.is_result).toBe(false);
@@ -873,7 +985,7 @@ describe("crucible_result", () => {
         expect(result.is_result).toBe(true);
         expect(result.banner).toBe(TERMINAL_BANNER);
         expect(result.decision).toBe("VERIFIED_RESULT");
-        expect(result.candidate_id).toBe("cand-a");
+        expect(result.candidate_id).toBe(FIRST_GENERATED_CANDIDATE_ID);
         expect(result.evidence_hash).toMatch(/^sha256:/u);
         expect(result.contract_hash).toMatch(/^sha256:crucible-contract-v1:/u);
         expect(typeof result.terminal_event_hash).toBe("string");

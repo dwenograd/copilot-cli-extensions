@@ -3,13 +3,16 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 
 import {
+    ANNOTATION_LIMITS,
     EVENT_TYPES,
     NON_RESULT_CODES,
-    acceptanceSatisfied,
-    candidateMetricValues,
+    buildCandidateArchive,
+    canonicalEqual,
     canonicalJson,
     createExternalEvent,
     decideNext,
+    detectPlateau,
+    duplicateEvidenceId,
     hashCanonical,
     harnessCandidateEvidenceItems,
 } from "../domain/index.mjs";
@@ -32,9 +35,11 @@ import {
     RuntimeIntegrityError,
 } from "./errors.mjs";
 import {
+    DEFAULT_PARENT_READ_LIMITS,
     buildProposalPrompt,
     createSdkWorkerPool,
 } from "./worker-pool.mjs";
+import { buildPromptContext } from "./prompt-context.mjs";
 import {
     assertPathInside,
     atomicWriteJson,
@@ -48,6 +53,7 @@ import {
 
 const VALIDATION_RECEIPT_HASH_ALGORITHM = "sha256:crucible-runtime-validation-receipts-v1";
 const OBSERVATION_STREAM_HASH_ALGORITHM = "sha256:crucible-runtime-observation-streams-v1";
+const LOGICAL_EFFECT_KEY_ALGORITHM = "sha256:crucible-runtime-logical-effect-v1";
 
 function defaultClock() {
     return {
@@ -118,36 +124,6 @@ function pauseResult(aggregate) {
     };
 }
 
-function compareMetricCandidates(metrics, left, right) {
-    for (const metric of metrics) {
-        const epsilon = metric.epsilon > 0 ? metric.epsilon : 0;
-        let leftValue = left.metricValues[metric.key];
-        let rightValue = right.metricValues[metric.key];
-        if (epsilon > 0) {
-            leftValue = Math.round(leftValue / epsilon);
-            rightValue = Math.round(rightValue / epsilon);
-        }
-        if (leftValue === rightValue) {
-            continue;
-        }
-        return metric.direction === "min"
-            ? leftValue - rightValue
-            : rightValue - leftValue;
-    }
-    return left.proposal.candidateId.localeCompare(right.proposal.candidateId);
-}
-
-function selectCandidate(contract, candidates) {
-    const accepted = candidates
-        .filter((candidate) => candidate.accepted)
-        .sort((left, right) => compareMetricCandidates(contract.metrics, left, right));
-    if (accepted.length > 0) {
-        return accepted[0];
-    }
-    return [...candidates].sort((left, right) =>
-        left.proposal.candidateId.localeCompare(right.proposal.candidateId))[0] ?? null;
-}
-
 function ensureReceiptObservationHash(receiptHash) {
     if (typeof receiptHash !== "string"
         || !/^sha256:[a-z0-9][a-z0-9._-]*:[a-f0-9]{64}$/u.test(receiptHash)) {
@@ -156,6 +132,66 @@ function ensureReceiptObservationHash(receiptHash) {
         });
     }
     return receiptHash;
+}
+
+function boundedOptionalText(value, maximum) {
+    if (typeof value !== "string" || value.length === 0) {
+        return null;
+    }
+    return value.slice(0, maximum);
+}
+
+function normalizeCandidateAnnotations(proposal, command) {
+    const supplied = proposal?.annotations !== null
+        && typeof proposal?.annotations === "object"
+        && !Array.isArray(proposal.annotations)
+        ? proposal.annotations
+        : {};
+    const expectedEffects = Array.isArray(supplied.expectedEffects)
+        ? supplied.expectedEffects
+        : Array.isArray(proposal?.expectedEffects)
+            ? proposal.expectedEffects
+            : [];
+    const promptRefs = new Set(command.promptContextRefs);
+    const requestedCitations = Array.isArray(supplied.citedEvidenceIds)
+        ? supplied.citedEvidenceIds
+        : Array.isArray(proposal?.citedEvidenceIds)
+            ? proposal.citedEvidenceIds
+            : command.parentEvidenceIds;
+    const citedEvidenceIds = [...new Set(requestedCitations)]
+        .filter((evidenceId) => typeof evidenceId === "string" && promptRefs.has(evidenceId))
+        .slice(0, ANNOTATION_LIMITS.citedEvidenceCount);
+
+    return {
+        mechanism: boundedOptionalText(
+            supplied.mechanism ?? proposal?.mechanism,
+            ANNOTATION_LIMITS.mechanismLength,
+        ),
+        hypothesis: boundedOptionalText(
+            supplied.hypothesis ?? proposal?.hypothesis,
+            ANNOTATION_LIMITS.hypothesisLength,
+        ),
+        expectedEffects: expectedEffects
+            .filter((effect) => typeof effect === "string" && effect.length > 0)
+            .slice(0, ANNOTATION_LIMITS.expectedEffectCount)
+            .map((effect) => effect.slice(0, ANNOTATION_LIMITS.expectedEffectLength)),
+        citedEvidenceIds,
+        finding: boundedOptionalText(
+            supplied.finding ?? proposal?.finding,
+            ANNOTATION_LIMITS.findingLength,
+        ),
+    };
+}
+
+function trustedHarnessFinding(parsed) {
+    const outcome = parsed?.pass === true ? "pass" : "reject";
+    const metrics = parsed?.metrics !== null && typeof parsed?.metrics === "object"
+        ? parsed.metrics
+        : {};
+    return `Trusted harness outcome=${outcome}; metrics=${canonicalJson(metrics)}`.slice(
+        0,
+        ANNOTATION_LIMITS.findingLength,
+    );
 }
 
 export class AutonomousRunner {
@@ -171,6 +207,7 @@ export class AutonomousRunner {
     #recovery = null;
     #runTempRoot = null;
     #attemptCounter = 0;
+    #workerAssignments = new Map();
     #clock;
 
     constructor(config, dependencies = {}) {
@@ -389,10 +426,42 @@ export class AutonomousRunner {
         return `${prefix}-${this.#lease?.fencingToken ?? 0}-${this.#attemptCounter}-${hex}`.toLowerCase();
     }
 
+    #stableAttemptId(scope, basis = {}) {
+        const safeScope = String(scope).replace(/[^A-Za-z0-9._-]/gu, "-").slice(0, 32);
+        const hex = stableHex({
+            investigationId: this.#config.investigationId,
+            runnerEpochId: this.#config.runnerEpochId,
+            fencingToken: this.#lease?.fencingToken ?? 0,
+            scope,
+            basis,
+        }).slice(0, 40);
+        return `attempt-${this.#lease?.fencingToken ?? 0}-${safeScope}-${hex}`.toLowerCase();
+    }
+
+    #stableObservationId(commandId, basis = {}) {
+        return `observation-${stableHex({
+            investigationId: this.#config.investigationId,
+            commandId,
+            basis,
+        }).slice(0, 48)}`;
+    }
+
     async #fault(point, details = {}) {
         if (typeof this.#dependencies.faultInjector === "function") {
             await this.#dependencies.faultInjector(point, details);
         }
+    }
+
+    #logicalEffectKey(command) {
+        return hashCanonical({
+            investigationId: this.#config.investigationId,
+            domainCommandId: command.commandId ?? null,
+            phase: command.kind ?? null,
+            round: command.round ?? null,
+            slotIndex: command.slotIndex ?? null,
+            candidateId: command.candidateId ?? command.caseId ?? null,
+            snapshotId: command.snapshot ?? null,
+        }, LOGICAL_EFFECT_KEY_ALGORITHM);
     }
 
     #deadlineReached() {
@@ -405,12 +474,6 @@ export class AutonomousRunner {
             if (aggregate.terminal !== null) {
                 return terminalResult(aggregate);
             }
-            if (aggregate.pause !== null) {
-                return pauseResult(aggregate);
-            }
-            if (aggregate.nonResults.length > 0) {
-                return nonResult(aggregate);
-            }
             const operationalNonResult = this.#adapter.latestOperationalNonResult();
             if (operationalNonResult !== null) {
                 return {
@@ -420,6 +483,12 @@ export class AutonomousRunner {
                     persisted: true,
                     operationalSeq: operationalNonResult.seq,
                 };
+            }
+            if (aggregate.pause !== null) {
+                return pauseResult(aggregate);
+            }
+            if (aggregate.nonResults.length > 0) {
+                return nonResult(aggregate);
             }
             if (this.#deadlineReached()) {
                 return this.#recordDeadlineNonResult(aggregate);
@@ -448,26 +517,7 @@ export class AutonomousRunner {
                     await this.#executeDomainCommand(aggregate, recommendation);
                     break;
                 case "commit_evidence":
-                    this.#adapter.appendEvidenceCommit({
-                        evidenceId: recommendation.command.evidenceId,
-                        observationId: recommendation.command.observationId,
-                    });
-                    await this.#fault("after_evidence_commit", {
-                        commandId: recommendation.commandId,
-                        observationId: recommendation.command.observationId,
-                    });
-                    break;
-                case "await_stop_request":
-                    if (this.#deadlineReached()) {
-                        return this.#recordDeadlineNonResult(aggregate);
-                    }
-                    this.#adapter.requestStop({
-                        requestId: this.#nextStableId("stop", {
-                            reason: "bounded-search-exhausted",
-                        }),
-                        reason: "Autonomous runner confirmed the frozen bounded search space is exhausted.",
-                        pauseRequested: false,
-                    });
+                    await this.#commitPendingEvidence(recommendation);
                     break;
                 default:
                     throw new RuntimeIntegrityError(
@@ -491,8 +541,7 @@ export class AutonomousRunner {
                 commandId,
             });
         }
-        const mainAttemptId = this.#nextStableId("attempt", {
-            scope: "domain-command",
+        const mainAttemptId = this.#stableAttemptId("domain-command", {
             commandId,
             command: commandRecord.command,
         });
@@ -523,8 +572,8 @@ export class AutonomousRunner {
                 commandId,
                 mainAttemptId,
             );
-        } else if (commandRecord.command.kind === "search") {
-            observation = await this.#runSearchCommand(
+        } else if (commandRecord.command.kind === "search_candidate") {
+            observation = await this.#runSearchCandidateCommand(
                 currentAggregate,
                 commandId,
                 mainAttemptId,
@@ -536,14 +585,15 @@ export class AutonomousRunner {
             });
         }
 
-        this.#adapter.appendHarnessObservation(observation);
+        this.#adapter.appendHarnessObservationFenced(observation, {
+            attemptId: mainAttemptId,
+            lease: this.#lease,
+        });
         await this.#fault("after_domain_observation", {
             attemptId: mainAttemptId,
             commandId,
             observationId: observation.observationId,
         });
-        this.#adapter.observeAttempt(mainAttemptId, this.#lease);
-
         const afterObservation = this.#adapter.replay().aggregate;
         const commitRecommendation = decideNext(afterObservation);
         if (commitRecommendation.command?.kind !== "commit_evidence") {
@@ -552,28 +602,89 @@ export class AutonomousRunner {
                 { recommendation: commitRecommendation },
             );
         }
-        this.#adapter.appendEvidenceCommit({
+        this.#adapter.appendEvidenceCommitFenced({
             evidenceId: commitRecommendation.command.evidenceId,
             observationId: commitRecommendation.command.observationId,
+        }, {
+            attemptId: mainAttemptId,
+            lease: this.#lease,
         });
         await this.#fault("after_evidence_commit", {
             attemptId: mainAttemptId,
             commandId,
             evidenceId: commitRecommendation.command.evidenceId,
         });
-        this.#adapter.commitAttempt(mainAttemptId, this.#lease);
     }
 
-    async #executeEffect(command, operation, persist = null) {
-        const attemptId = this.#nextStableId("attempt", command);
+    async #commitPendingEvidence(recommendation) {
+        const attemptId = this.#stableAttemptId("domain-evidence-commit", {
+            commandId: recommendation.commandId,
+            observationId: recommendation.command.observationId,
+            evidenceId: recommendation.command.evidenceId,
+        });
         this.#adapter.reserveAttempt({
             attemptId,
-            command: formatAttemptCommand("external-effect", command),
+            command: formatAttemptCommand("domain-evidence-commit", {
+                commandId: recommendation.commandId,
+                observationId: recommendation.command.observationId,
+                evidenceId: recommendation.command.evidenceId,
+            }),
             lease: this.#lease,
         });
-        await this.#fault("after_effect_reservation", { attemptId, command });
         this.#adapter.dispatchAttempt(attemptId, this.#lease);
-        await this.#fault("after_effect_dispatch", { attemptId, command });
+        this.#adapter.observeAttempt(attemptId, this.#lease);
+        this.#adapter.appendEvidenceCommitFenced({
+            evidenceId: recommendation.command.evidenceId,
+            observationId: recommendation.command.observationId,
+        }, {
+            attemptId,
+            lease: this.#lease,
+        });
+        await this.#fault("after_evidence_commit", {
+            commandId: recommendation.commandId,
+            observationId: recommendation.command.observationId,
+            evidenceId: recommendation.command.evidenceId,
+        });
+    }
+
+    async #executeEffect(command, operation, persist = null, recover = null) {
+        const logicalEffectKey = this.#logicalEffectKey(command);
+        const committed = this.#findCommittedEffect(logicalEffectKey, command);
+        if (committed !== null) {
+            if (recover === null) {
+                throw new RuntimeIntegrityError(
+                    "A committed logical effect exists but no recovery decoder was provided",
+                    { logicalEffectKey, command },
+                );
+            }
+            const result = await recover(committed, logicalEffectKey);
+            return {
+                attemptId: committed.attempt.attemptId,
+                result,
+                logicalEffectKey,
+                recovered: true,
+            };
+        }
+        const attemptId = this.#stableAttemptId("external-effect", command);
+        this.#adapter.reserveAttempt({
+            attemptId,
+            command: formatAttemptCommand("external-effect", {
+                logicalEffectKey,
+                effect: command,
+            }),
+            lease: this.#lease,
+        });
+        await this.#fault("after_effect_reservation", {
+            attemptId,
+            command,
+            logicalEffectKey,
+        });
+        this.#adapter.dispatchAttempt(attemptId, this.#lease);
+        await this.#fault("after_effect_dispatch", {
+            attemptId,
+            command,
+            logicalEffectKey,
+        });
 
         let result;
         try {
@@ -589,6 +700,7 @@ export class AutonomousRunner {
                 kind: "runtime:effect_failure",
                 payload: {
                     command,
+                    logicalEffectKey,
                     error: {
                         name: error?.name ?? "Error",
                         code: error?.code ?? null,
@@ -602,11 +714,309 @@ export class AutonomousRunner {
 
         this.#adapter.observeAttempt(attemptId, this.#lease);
         if (persist !== null) {
-            await persist(result, attemptId);
+            await persist(result, attemptId, logicalEffectKey);
         }
+        await this.#fault("after_effect_artifact_persistence", {
+            attemptId,
+            command,
+            logicalEffectKey,
+        });
         this.#adapter.commitAttempt(attemptId, this.#lease);
-        await this.#fault("after_effect_commit", { attemptId, command });
-        return { attemptId, result };
+        await this.#fault("after_effect_commit", {
+            attemptId,
+            command,
+            logicalEffectKey,
+        });
+        return { attemptId, result, logicalEffectKey, recovered: false };
+    }
+
+    #findCommittedEffect(logicalEffectKey, command) {
+        const committed = [];
+        for (const attempt of this.#adapter.listAttempts()) {
+            let metadata;
+            try {
+                metadata = JSON.parse(attempt.command);
+            } catch (error) {
+                throw new RuntimeIntegrityError(
+                    "Command-attempt metadata is not valid canonical JSON",
+                    { attemptId: attempt.attemptId },
+                    { cause: error },
+                );
+            }
+            if (metadata?.scope !== "external-effect"
+                || metadata.logicalEffectKey !== logicalEffectKey) {
+                continue;
+            }
+            if (!canonicalEqual(metadata.effect, command)) {
+                throw new RuntimeIntegrityError(
+                    "Logical effect key is bound to different attempt metadata",
+                    {
+                        logicalEffectKey,
+                        attemptId: attempt.attemptId,
+                        expected: command,
+                        actual: metadata.effect ?? null,
+                    },
+                );
+            }
+            if (attempt.state === "committed") {
+                committed.push(attempt);
+            }
+        }
+        if (committed.length > 1) {
+            throw new RuntimeIntegrityError(
+                "More than one committed attempt exists for one logical effect",
+                {
+                    logicalEffectKey,
+                    attemptIds: committed.map((attempt) => attempt.attemptId),
+                },
+            );
+        }
+        if (committed.length === 0) {
+            return null;
+        }
+        const attempt = committed[0];
+        const events = this.#adapter.listOperationalEvidence()
+            .filter((event) =>
+                event.attemptId === attempt.attemptId
+                && event.payload?.logicalEffectKey === logicalEffectKey);
+        const failure = events.find((event) => event.kind === "runtime:effect_failure");
+        if (failure !== undefined) {
+            throw new CrucibleRuntimeError(
+                RUNTIME_ERROR_CODES.CHILD_CRASH,
+                "A previously committed logical effect recorded a failure",
+                {
+                    logicalEffectKey,
+                    attemptId: attempt.attemptId,
+                    persistedError: failure.payload?.error ?? null,
+                },
+            );
+        }
+        return { attempt, events };
+    }
+
+    #requireRecoveredEffectEvent(committed, kind, logicalEffectKey) {
+        const matches = committed.events.filter((event) => event.kind === kind);
+        if (matches.length !== 1) {
+            throw new RuntimeIntegrityError(
+                "Committed logical effect does not have exactly one recoverable evidence record",
+                {
+                    logicalEffectKey,
+                    attemptId: committed.attempt.attemptId,
+                    kind,
+                    count: matches.length,
+                },
+            );
+        }
+        return matches[0];
+    }
+
+    #readRegisteredJsonArtifact(artifactId, label) {
+        const artifact = this.#repository.getArtifact(artifactId);
+        if (artifact === null
+            || artifact.investigationId !== this.#config.investigationId
+            || artifact.storage !== "external"
+            || artifact.durable !== true
+            || artifact.hashAlgo !== "sha256"
+            || typeof artifact.hashValue !== "string") {
+            throw new RuntimeIntegrityError(
+                `${label} artifact metadata is missing or not durable`,
+                { artifactId },
+            );
+        }
+        const objectId = `sha256:${artifact.hashValue}`;
+        let bytes;
+        try {
+            bytes = this.#artifactStore.readObject(objectId, { verify: true });
+        } catch (error) {
+            throw new RuntimeIntegrityError(
+                `${label} artifact failed ArtifactStore verification`,
+                { artifactId, objectId },
+                { cause: error },
+            );
+        }
+        if (artifact.sizeBytes !== bytes.length) {
+            throw new RuntimeIntegrityError(
+                `${label} artifact size disagrees with repository metadata`,
+                {
+                    artifactId,
+                    expectedSize: artifact.sizeBytes,
+                    actualSize: bytes.length,
+                },
+            );
+        }
+        let value;
+        try {
+            value = JSON.parse(bytes.toString("utf8"));
+        } catch (error) {
+            throw new RuntimeIntegrityError(
+                `${label} artifact is not valid JSON`,
+                { artifactId },
+                { cause: error },
+            );
+        }
+        if (!Buffer.from(canonicalJson(value), "utf8").equals(bytes)) {
+            throw new RuntimeIntegrityError(
+                `${label} artifact is not in canonical persisted form`,
+                { artifactId },
+            );
+        }
+        return value;
+    }
+
+    #recoverProposalEffect({
+        committed,
+        logicalEffectKey,
+        request,
+        commandId,
+        assignment,
+    }) {
+        const event = this.#requireRecoveredEffectEvent(
+            committed,
+            "runtime:model_proposal",
+            logicalEffectKey,
+        );
+        const payload = event.payload;
+        if (payload.commandId !== commandId
+            || payload.round !== assignment.round
+            || payload.slotIndex !== assignment.slotIndex
+            || payload.candidateId !== assignment.candidateId
+            || payload.model !== assignment.model
+            || payload.operator !== assignment.operator
+            || payload.seed !== assignment.seed
+            || payload.promptContextHash !== request.promptContextHash
+            || !canonicalEqual(payload.parentEvidenceIds, assignment.parentEvidenceIds)
+            || !canonicalEqual(payload.promptContextRefs, assignment.promptContextRefs)) {
+            throw new RuntimeIntegrityError(
+                "Committed proposal evidence does not match the reserved search assignment",
+                { logicalEffectKey, attemptId: committed.attempt.attemptId },
+            );
+        }
+        const value = this.#readRegisteredJsonArtifact(
+            payload.artifactId,
+            "Committed proposal",
+        );
+        if (!canonicalEqual(value.assignment, request.promptContext.assignment)
+            || !canonicalEqual(value.promptContext, request.promptContext)
+            || value.promptContextHash !== request.promptContextHash) {
+            throw new RuntimeIntegrityError(
+                "Committed proposal artifact does not match the trusted prompt context",
+                { logicalEffectKey, artifactId: payload.artifactId },
+            );
+        }
+        const proposal = value.proposal;
+        if (proposal === null
+            || typeof proposal !== "object"
+            || Array.isArray(proposal)
+            || proposal.candidateId !== assignment.candidateId
+            || !Array.isArray(proposal.files)
+            || proposal.files.length === 0
+            || proposal.files.some((file) =>
+                file === null
+                || typeof file !== "object"
+                || typeof file.path !== "string"
+                || typeof file.content !== "string")
+            || !canonicalEqual(payload.identity, proposal.identity ?? null)) {
+            throw new RuntimeIntegrityError(
+                "Committed proposal artifact contains an invalid candidate",
+                { logicalEffectKey, artifactId: payload.artifactId },
+            );
+        }
+        if (proposal.identity !== null && typeof proposal.identity === "object") {
+            if (proposal.identity.invocationSessionId !== request.sessionId
+                || proposal.identity.configuredModel !== request.model
+                || proposal.identity.challengeNonce !== request.challengeNonce
+                || (proposal.identity.contextHash !== undefined
+                    && proposal.identity.contextHash !== request.promptContextHash)) {
+                throw new RuntimeIntegrityError(
+                    "Committed proposal identity is not bound to this deterministic session",
+                    { logicalEffectKey, artifactId: payload.artifactId },
+                );
+            }
+        }
+        return proposal;
+    }
+
+    #recoverMeasurementEffect({
+        committed,
+        logicalEffectKey,
+        aggregate,
+        purpose,
+        commandId,
+        round = null,
+        slotIndex = null,
+        candidateId,
+        snapshotId,
+    }) {
+        const event = this.#requireRecoveredEffectEvent(
+            committed,
+            "runtime:measurement",
+            logicalEffectKey,
+        );
+        const payload = event.payload;
+        const candidateArtifactHash = measurementSnapshotHash(snapshotId);
+        if (payload.purpose !== purpose
+            || payload.commandId !== commandId
+            || payload.round !== round
+            || payload.slotIndex !== slotIndex
+            || payload.candidateId !== candidateId
+            || payload.snapshotId !== snapshotId
+            || payload.candidateArtifactHash !== candidateArtifactHash
+            || payload.receipt?.attemptId !== committed.attempt.attemptId
+            || payload.receipt?.candidateSnapshotHash !== candidateArtifactHash
+            || payload.receipt?.parserVersion !== aggregate.contract.parserVersion
+            || payload.stdoutHash !== payload.receipt?.stdoutHash
+            || payload.stderrHash !== payload.receipt?.stderrHash
+            || hashReceipt(payload.receipt) !== payload.receiptHash) {
+            throw new RuntimeIntegrityError(
+                "Committed measurement evidence does not match its logical effect",
+                { logicalEffectKey, attemptId: committed.attempt.attemptId },
+            );
+        }
+        const snapshotStatus = this.#artifactStore.verifySnapshot(snapshotId);
+        if (!snapshotStatus.ok) {
+            throw new RuntimeIntegrityError(
+                "Committed measurement snapshot failed ArtifactStore verification",
+                { logicalEffectKey, snapshotId, snapshotStatus },
+            );
+        }
+        const verifiedEntry = this.#allowlist.verifyEntry(aggregate.contract.harnessId);
+        const expectedDependencies = verifiedEntry.dependencies
+            .map((dependency) => ({
+                path: dependency.path,
+                role: dependency.role,
+                sha256: dependency.sha256,
+            }))
+            .sort((left, right) => left.path.localeCompare(right.path));
+        if (payload.receipt.allowlistFileHash !== verifiedEntry.allowlistFileHash
+            || payload.receipt.harnessEntryHash !== verifiedEntry.entryHash
+            || payload.receipt.executableHash !== verifiedEntry.executableHash
+            || !canonicalEqual(payload.receipt.dependencyHashes, expectedDependencies)) {
+            throw new RuntimeIntegrityError(
+                "Committed measurement receipt no longer matches the verified harness",
+                { logicalEffectKey, attemptId: committed.attempt.attemptId },
+            );
+        }
+        const persistedReceipt = this.#readRegisteredJsonArtifact(
+            payload.receiptArtifactId,
+            "Committed measurement receipt",
+        );
+        if (!canonicalEqual(persistedReceipt, payload.receipt)
+            || !canonicalEqual(payload.parsed, payload.receipt.parsed)) {
+            throw new RuntimeIntegrityError(
+                "Committed measurement receipt artifact disagrees with operational evidence",
+                {
+                    logicalEffectKey,
+                    attemptId: committed.attempt.attemptId,
+                    artifactId: payload.receiptArtifactId,
+                },
+            );
+        }
+        return {
+            parsed: payload.parsed,
+            receipt: payload.receipt,
+            stdoutHash: payload.stdoutHash,
+            stderrHash: payload.stderrHash,
+        };
     }
 
     async #runValidationCommand(aggregate, commandId, mainAttemptId) {
@@ -637,15 +1047,27 @@ export class AutonomousRunner {
                             runnerEpochId: this.#config.runnerEpochId,
                         });
                     },
-                    async (measurement, attemptId) => {
+                    async (measurement, attemptId, logicalEffectKey) => {
                         this.#persistMeasurement({
                             measurement,
                             attemptId,
+                            logicalEffectKey,
                             purpose: "validation",
+                            commandId,
                             candidateId: validationCase.id,
                             snapshotId: validationCase.artifactHash,
                         });
                     },
+                    async (committed, logicalEffectKey) =>
+                        this.#recoverMeasurementEffect({
+                            committed,
+                            logicalEffectKey,
+                            aggregate,
+                            purpose: "validation",
+                            commandId,
+                            candidateId: validationCase.id,
+                            snapshotId: validationCase.artifactHash,
+                        }),
                 );
                 const outcome = effect.result.parsed.pass ? "accept" : "reject";
                 return {
@@ -734,8 +1156,7 @@ export class AutonomousRunner {
 
         return {
             commandId,
-            observationId: this.#nextStableId("observation", {
-                commandId,
+            observationId: this.#stableObservationId(commandId, {
                 purpose: "validation",
             }),
             purpose: "validation",
@@ -764,24 +1185,57 @@ export class AutonomousRunner {
         };
     }
 
-    async #runSearchCommand(aggregate, commandId, mainAttemptId, command) {
-        const requests = this.#buildSearchRequests(aggregate, commandId, mainAttemptId, command);
-        const proposalSettled = await Promise.allSettled(requests.map((request) =>
-            this.#executeEffect(
+    async #runSearchCandidateCommand(aggregate, commandId, mainAttemptId, command) {
+        const workerPool = this.#getWorkerPool(aggregate);
+        const request = this.#buildSearchRequest(
+            aggregate,
+            commandId,
+            command,
+            workerPool,
+        );
+        this.#workerAssignments.set(request.sessionId, Object.freeze({
+            candidateId: command.candidateId,
+            parentEvidenceIds: new Set(command.parentEvidenceIds),
+        }));
+
+        let proposalEffect;
+        try {
+            proposalEffect = await this.#executeEffect(
                 {
                     kind: "sdk-proposal",
                     commandId,
                     round: command.round,
-                    model: request.model,
+                    slotIndex: command.slotIndex,
+                    model: command.model,
+                    operator: command.operator,
                     sessionId: request.sessionId,
-                    candidateId: request.allowedCandidateIds[0],
+                    candidateId: command.candidateId,
+                    seed: command.seed,
                 },
-                () => this.#getWorkerPool(aggregate).propose(request),
-                async (proposal, attemptId) => {
+                async () => {
+                    const proposal = await workerPool.propose(request);
+                    if (proposal?.candidateId !== command.candidateId) {
+                        throw new CrucibleRuntimeError(
+                            RUNTIME_ERROR_CODES.WORKER_INVALID_CANDIDATE,
+                            "Worker proposal did not preserve the kernel-assigned candidate id",
+                            {
+                                assignedCandidateId: command.candidateId,
+                                proposedCandidateId: proposal?.candidateId ?? null,
+                            },
+                        );
+                    }
+                    return proposal;
+                },
+                async (proposal, attemptId, logicalEffectKey) => {
                     const artifact = this.#persistJsonArtifact({
                         attemptId,
                         kind: `proposal-${proposal.candidateId}`,
-                        value: proposal,
+                        value: {
+                            assignment: request.promptContext.assignment,
+                            promptContext: request.promptContext,
+                            promptContextHash: request.promptContextHash,
+                            proposal,
+                        },
                         contentType: "application/vnd.crucible.candidate-proposal+json",
                     });
                     this.#adapter.ingestOperationalEvidence({
@@ -790,43 +1244,81 @@ export class AutonomousRunner {
                         kind: "runtime:model_proposal",
                         payload: {
                             commandId,
+                            logicalEffectKey,
                             round: command.round,
+                            slotIndex: command.slotIndex,
                             candidateId: proposal.candidateId,
-                            identity: proposal.identity,
+                            model: command.model,
+                            operator: command.operator,
+                            parentEvidenceIds: command.parentEvidenceIds,
+                            promptContextRefs: command.promptContextRefs,
+                            seed: command.seed,
+                            identity: proposal.identity ?? null,
+                            promptContextHash: request.promptContextHash,
                             artifactId: artifact.artifactId,
                         },
                     });
                 },
-            )));
-        const proposalCrash = proposalSettled.find(
-            (item) => item.status === "rejected" && item.reason?.leaveAttemptActive === true,
-        );
-        if (proposalCrash !== undefined) {
-            throw proposalCrash.reason;
-        }
-        const proposals = proposalSettled
-            .filter((item) => item.status === "fulfilled")
-            .map((item) => item.value.result);
-        if (proposals.length === 0) {
-            const error = new CrucibleRuntimeError(
-                RUNTIME_ERROR_CODES.NO_ELIGIBLE_CANDIDATE,
-                "Every configured proposal session failed to submit a valid candidate",
-                {
-                    commandId,
-                    failures: proposalSettled
-                        .filter((item) => item.status === "rejected")
-                        .map((item) => item.reason?.code ?? item.reason?.message ?? String(item.reason)),
-                },
+                async (committed, logicalEffectKey) =>
+                    this.#recoverProposalEffect({
+                        committed,
+                        logicalEffectKey,
+                        request,
+                        commandId,
+                        assignment: command,
+                    }),
             );
-            error.recoverable = true;
-            throw error;
+        } finally {
+            this.#workerAssignments.delete(request.sessionId);
         }
 
-        const measuredSettled = await Promise.allSettled(proposals.map(async (proposal) => {
-            const snapshot = this.#ingestCandidate(proposal);
+        const proposal = proposalEffect.result;
+        const annotations = normalizeCandidateAnnotations(proposal, command);
+        const snapshot = this.#ingestCandidate(proposal);
+        const candidateArtifactHash = measurementSnapshotHash(snapshot.snapshot);
+        this.#persistCandidateSnapshot({
+            attemptId: mainAttemptId,
+            commandId,
+            command,
+            snapshotId: snapshot.snapshot,
+            candidateArtifactHash,
+        });
+        await this.#fault("after_candidate_snapshot", {
+            attemptId: mainAttemptId,
+            commandId,
+            candidateId: command.candidateId,
+            candidateArtifactHash,
+        });
+
+        const priorCandidates = harnessCandidateEvidenceItems(aggregate);
+        const duplicateOf = duplicateEvidenceId(priorCandidates, candidateArtifactHash);
+        const reusable = duplicateOf === null
+            || aggregate.contract.searchPolicy.dedupPolicy !== "mark"
+            ? null
+            : this.#findReusableMeasurement(aggregate, duplicateOf, candidateArtifactHash);
+
+        let measurement;
+        let measurementAttemptId;
+        if (reusable !== null) {
+            measurement = {
+                parsed: reusable.observation.data,
+                stdoutHash: reusable.observation.receipt.rawStdoutHash,
+                stderrHash: reusable.observation.receipt.rawStderrHash,
+            };
+            measurementAttemptId = reusable.observation.receipt.attemptId;
+            this.#persistDuplicateMeasurementReuse({
+                attemptId: mainAttemptId,
+                commandId,
+                command,
+                snapshotId: snapshot.snapshot,
+                candidateArtifactHash,
+                duplicateOf,
+                reusable,
+            });
+        } else {
             const materialized = this.#materializeSnapshot(
                 snapshot.snapshot,
-                `candidate-${proposal.candidateId}`,
+                `candidate-${command.candidateId}`,
             );
             try {
                 const effect = await this.#executeEffect(
@@ -834,197 +1326,454 @@ export class AutonomousRunner {
                         kind: "candidate-measurement",
                         commandId,
                         round: command.round,
-                        candidateId: proposal.candidateId,
+                        slotIndex: command.slotIndex,
+                        candidateId: command.candidateId,
                         snapshot: snapshot.snapshot,
                     },
                     async (attemptId) => {
-                        const verifiedEntry = this.#allowlist.verifyEntry(aggregate.contract.harnessId);
+                        const verifiedEntry = this.#allowlist.verifyEntry(
+                            aggregate.contract.harnessId,
+                        );
                         return this.#executor.run({
                             verifiedEntry,
                             candidateSnapshot: Object.freeze({
                                 path: materialized.dest,
-                                hash: measurementSnapshotHash(snapshot.snapshot),
+                                hash: candidateArtifactHash,
                             }),
                             attemptId,
                             runnerEpochId: this.#config.runnerEpochId,
                         });
                     },
-                    async (measurement, attemptId) => {
+                    async (result, attemptId, logicalEffectKey) => {
                         this.#persistMeasurement({
-                            measurement,
+                            measurement: result,
                             attemptId,
+                            logicalEffectKey,
                             purpose: "candidate",
-                            candidateId: proposal.candidateId,
+                            commandId,
+                            round: command.round,
+                            slotIndex: command.slotIndex,
+                            candidateId: command.candidateId,
                             snapshotId: snapshot.snapshot,
                         });
                     },
+                    async (committed, logicalEffectKey) =>
+                        this.#recoverMeasurementEffect({
+                            committed,
+                            logicalEffectKey,
+                            aggregate,
+                            purpose: "candidate",
+                            commandId,
+                            round: command.round,
+                            slotIndex: command.slotIndex,
+                            candidateId: command.candidateId,
+                            snapshotId: snapshot.snapshot,
+                        }),
                 );
-                const metricValues = candidateMetricValues(
-                    aggregate.contract.metrics,
-                    effect.result.parsed,
-                );
-                if (metricValues === null) {
-                    throw new CrucibleRuntimeError(
-                        RUNTIME_ERROR_CODES.NO_ELIGIBLE_CANDIDATE,
-                        "Measured candidate omitted one or more frozen ranking metrics",
-                        { candidateId: proposal.candidateId },
-                    );
-                }
-                return {
-                    proposal,
-                    snapshot,
-                    measurement: effect.result,
-                    measurementAttemptId: effect.attemptId,
-                    metricValues,
-                    accepted: acceptanceSatisfied(
-                        aggregate.contract.acceptancePredicate,
-                        effect.result.parsed,
-                    ),
-                };
+                measurement = effect.result;
+                measurementAttemptId = effect.attemptId;
             } finally {
                 removeTreeInside(materialized.dest, this.#runTempRoot);
             }
-        }));
-        const measurementCrash = measuredSettled.find(
-            (item) => item.status === "rejected" && item.reason?.leaveAttemptActive === true,
-        );
-        if (measurementCrash !== undefined) {
-            throw measurementCrash.reason;
         }
-
-        const measured = measuredSettled
-            .filter((item) => item.status === "fulfilled")
-            .map((item) => item.value);
-        if (measured.length === 0) {
-            for (const proposal of proposals) {
-                this.#workerPool?.releaseCandidateId?.(proposal.candidateId);
-            }
-            const error = new CrucibleRuntimeError(
-                RUNTIME_ERROR_CODES.NO_ELIGIBLE_CANDIDATE,
-                "No submitted candidate produced domain-eligible harness evidence",
-                {
-                    commandId,
-                    failures: measuredSettled
-                        .filter((item) => item.status === "rejected")
-                        .map((item) => item.reason?.code ?? item.reason?.message ?? String(item.reason)),
-                },
-            );
-            error.recoverable = true;
-            throw error;
-        }
-
-        const selected = selectCandidate(aggregate.contract, measured);
-        for (const proposal of proposals) {
-            if (proposal.candidateId !== selected.proposal.candidateId) {
-                this.#workerPool?.releaseCandidateId?.(proposal.candidateId);
-            }
-        }
-        this.#adapter.ingestOperationalEvidence({
-            attemptId: mainAttemptId,
-            evidenceKind: `selection:round-${command.round}`,
-            kind: "runtime:candidate_selection",
-            payload: {
-                commandId,
-                round: command.round,
-                selectedCandidateId: selected.proposal.candidateId,
-                measuredCandidates: measured.map((candidate) => ({
-                    candidateId: candidate.proposal.candidateId,
-                    accepted: candidate.accepted,
-                    metrics: candidate.metricValues,
-                    measurementAttemptId: candidate.measurementAttemptId,
-                })),
-            },
-        });
 
         return {
             commandId,
-            observationId: this.#nextStableId("observation", {
-                commandId,
-                candidateId: selected.proposal.candidateId,
+            observationId: this.#stableObservationId(commandId, {
+                purpose: "candidate",
+                round: command.round,
+                slotIndex: command.slotIndex,
+                candidateId: command.candidateId,
             }),
             purpose: "candidate",
             round: command.round,
-            candidateId: selected.proposal.candidateId,
-            receipt: {
-                attemptId: selected.measurementAttemptId,
-                runnerEpochId: this.#config.runnerEpochId,
-                rawStdoutHash: selected.measurement.stdoutHash,
-                rawStderrHash: selected.measurement.stderrHash,
-                candidateArtifactHash: measurementSnapshotHash(selected.snapshot.snapshot),
+            slotIndex: command.slotIndex,
+            candidateId: command.candidateId,
+            annotations: {
+                ...annotations,
+                finding: annotations.finding ?? trustedHarnessFinding(measurement.parsed),
             },
-            data: selected.measurement.parsed,
+            receipt: {
+                attemptId: measurementAttemptId,
+                runnerEpochId: reusable?.observation.receipt.runnerEpochId
+                    ?? this.#config.runnerEpochId,
+                rawStdoutHash: measurement.stdoutHash,
+                rawStderrHash: measurement.stderrHash,
+                candidateArtifactHash,
+            },
+            data: measurement.parsed,
         };
     }
 
-    #buildSearchRequests(aggregate, commandId, mainAttemptId, command) {
+    #buildSearchRequest(aggregate, commandId, command, workerPool) {
         const contract = aggregate.contract;
-        const evidenced = new Set(
-            harnessCandidateEvidenceItems(aggregate).map((item) => item.candidateId),
-        );
-        const slots = [];
-        if (contract.boundedCandidateIds !== undefined) {
-            const remaining = contract.boundedCandidateIds.filter((candidateId) => !evidenced.has(candidateId));
-            for (const candidateId of remaining.slice(0, contract.candidatesPerRound)) {
-                slots.push(candidateId);
-            }
-        } else {
-            for (let slot = 0; slot < contract.candidatesPerRound; slot += 1) {
-                slots.push(null);
+        const archive = buildCandidateArchive(aggregate);
+        const promptRefSet = new Set(command.promptContextRefs);
+        if (command.parentEvidenceIds.some((evidenceId) => !promptRefSet.has(evidenceId))) {
+            throw new RuntimeIntegrityError(
+                "Kernel-authored parent evidence must be included in promptContextRefs",
+                {
+                    commandId,
+                    parentEvidenceIds: command.parentEvidenceIds,
+                    promptContextRefs: command.promptContextRefs,
+                },
+            );
+        }
+
+        for (const evidenceId of command.promptContextRefs) {
+            const evidence = aggregate.evidence[evidenceId];
+            if (evidence?.sourceKind !== "harness"
+                || evidence?.purpose !== "candidate"
+                || evidence.invalidated) {
+                throw new RuntimeIntegrityError(
+                    "Prompt context references must identify active committed candidate evidence",
+                    { commandId, evidenceId },
+                );
             }
         }
-        if (slots.length === 0) {
-            throw new RuntimeIntegrityError("Search command has no remaining candidate slots", {
-                commandId,
-                round: command.round,
-            });
-        }
-        return slots.map((boundedCandidateId, slot) => {
-            const model = contract.workerModels[slot % contract.workerModels.length];
-            const sessionHex = stableHex({
-                investigationId: this.#config.investigationId,
-                commandId,
-                mainAttemptId,
-                round: command.round,
-                slot,
-                model,
-                runnerEpochId: this.#config.runnerEpochId,
-            }).slice(0, 32);
-            const sessionId = uuidFromHex(sessionHex);
-            const candidateSessionHex = stableHex({
-                round: command.round,
-                model,
-                sessionId,
-            });
-            const candidateId = boundedCandidateId
-                ?? `r${command.round}-${model.replace(/[^A-Za-z0-9_-]/gu, "-").slice(0, 40)}-${candidateSessionHex.slice(0, 16)}`;
-            const challengeNonce = stableHex({
-                sessionId,
-                nonce: this.#idFactory()(),
-                commandId,
-            });
-            const searchContext = [
-                `Frozen strategy revision: ${command.strategyRevision}`,
-                `Frozen acceptance predicate: ${canonicalJson(contract.acceptancePredicate)}`,
-                `Frozen ranking metrics: ${canonicalJson(contract.metrics)}`,
-                this.#config.options.workerAdditionalContext,
-            ].filter((item) => item !== null).join("\n");
-            const prompt = buildProposalPrompt({
-                objective: contract.objective,
-                candidateId,
-                challengeNonce,
-                round: command.round,
-                model,
-                additionalContext: searchContext,
-            });
+        const { context: promptContext, hash: promptContextHash } = buildPromptContext({
+            contract,
+            archive,
+            plateau: detectPlateau(aggregate),
+            slot: command,
+        });
+        const parents = command.parentEvidenceIds.map((evidenceId) => {
+            const assigned = this.#resolveParentSnapshot(aggregate, evidenceId);
             return {
-                model,
-                reasoningEffort: this.#config.options.reasoningEffort,
-                sessionId,
-                challengeNonce,
-                allowedCandidateIds: [candidateId],
-                prompt,
+                parentId: evidenceId,
+                snapshotId: assigned.snapshotId,
             };
         });
+        const parentReadLimits = workerPool?.parentReadLimits ?? DEFAULT_PARENT_READ_LIMITS;
+        const sessionId = uuidFromHex(stableHex({
+            investigationId: this.#config.investigationId,
+            contractHash: aggregate.contractHash,
+            commandId,
+            assignment: promptContext.assignment,
+            promptContextHash,
+        }));
+        const challengeNonce = stableHex({
+            investigationId: this.#config.investigationId,
+            contractHash: aggregate.contractHash,
+            commandId,
+            candidateId: command.candidateId,
+            seed: command.seed,
+            sessionId,
+        });
+        const prompt = buildProposalPrompt({
+            objective: contract.objective,
+            candidateId: command.candidateId,
+            challengeNonce,
+            round: command.round,
+            model: command.model,
+            operator: command.operator,
+            promptContext,
+            contextHash: promptContextHash,
+            parentReadToolAvailable: parents.length > 0,
+            parentReadLimits,
+            trustedOperatorContext: this.#config.options.workerAdditionalContext,
+        });
+        return {
+            candidateId: command.candidateId,
+            round: command.round,
+            slotIndex: command.slotIndex,
+            model: command.model,
+            operator: command.operator,
+            parentEvidenceIds: command.parentEvidenceIds,
+            promptContextRefs: command.promptContextRefs,
+            visibleEvidenceIds: command.promptContextRefs,
+            seed: command.seed,
+            boundedCandidateId: command.boundedCandidateId ?? null,
+            promptContext,
+            promptContextHash,
+            parents,
+            parentReadLimits,
+            reasoningEffort: this.#config.options.reasoningEffort,
+            sessionId,
+            challengeNonce,
+            allowedCandidateIds: [command.candidateId],
+            prompt,
+        };
+    }
+
+    #persistCandidateSnapshot({
+        attemptId,
+        commandId,
+        command,
+        snapshotId,
+        candidateArtifactHash,
+    }) {
+        const snapshotArtifact = this.#registerCasObject({
+            attemptId,
+            kind: `candidate-snapshot-${command.candidateId}`,
+            objectId: snapshotId,
+            size: this.#artifactStore.readObject(snapshotId, { verify: true }).length,
+            contentType: "application/vnd.crucible.snapshot+json",
+        });
+        this.#adapter.ingestOperationalEvidence({
+            attemptId,
+            evidenceKind: `candidate-snapshot:${command.candidateId}`,
+            kind: "runtime:candidate_snapshot",
+            payload: {
+                commandId,
+                round: command.round,
+                slotIndex: command.slotIndex,
+                candidateId: command.candidateId,
+                snapshotId,
+                candidateArtifactHash,
+                artifactId: snapshotArtifact.artifactId,
+            },
+        });
+    }
+
+    #findReusableMeasurement(aggregate, duplicateOf, candidateArtifactHash) {
+        const seen = new Set();
+        let evidence = aggregate.evidence[duplicateOf] ?? null;
+        while (evidence !== null && evidence.duplicateOf !== null) {
+            if (seen.has(evidence.evidenceId)) {
+                return null;
+            }
+            seen.add(evidence.evidenceId);
+            evidence = aggregate.evidence[evidence.duplicateOf] ?? null;
+        }
+        if (evidence === null
+            || evidence.receipt?.candidateArtifactHash !== candidateArtifactHash) {
+            return null;
+        }
+        const observation = aggregate.observations[evidence.observationId] ?? null;
+        if (observation === null
+            || observation.receipt?.candidateArtifactHash !== candidateArtifactHash) {
+            return null;
+        }
+
+        const verifiedEntry = this.#allowlist.verifyEntry(aggregate.contract.harnessId);
+        const expectedDependencies = verifiedEntry.dependencies
+            .map((dependency) => ({
+                path: dependency.path,
+                role: dependency.role,
+                sha256: dependency.sha256,
+            }))
+            .sort((left, right) => left.path.localeCompare(right.path));
+        const operational = this.#adapter.listOperationalEvidence();
+        for (let index = operational.length - 1; index >= 0; index -= 1) {
+            const row = operational[index];
+            const payload = row.payload;
+            if (row.kind !== "runtime:measurement"
+                || payload?.purpose !== "candidate"
+                || payload.candidateId !== evidence.candidateId
+                || payload.snapshotId === undefined
+                || measurementSnapshotHash(payload.snapshotId) !== candidateArtifactHash
+                || !canonicalEqual(payload.parsed, observation.data)
+                || payload.stdoutHash !== observation.receipt.rawStdoutHash
+                || payload.stderrHash !== observation.receipt.rawStderrHash
+                || hashReceipt(payload.receipt) !== payload.receiptHash
+                || payload.receipt.allowlistFileHash !== verifiedEntry.allowlistFileHash
+                || payload.receipt.harnessEntryHash !== verifiedEntry.entryHash
+                || payload.receipt.executableHash !== verifiedEntry.executableHash
+                || payload.receipt.parserVersion !== aggregate.contract.parserVersion
+                || payload.receipt.candidateSnapshotHash !== candidateArtifactHash
+                || !canonicalEqual(payload.receipt.dependencyHashes, expectedDependencies)) {
+                continue;
+            }
+            const snapshotStatus = this.#artifactStore.verifySnapshot(payload.snapshotId);
+            if (!snapshotStatus.ok) {
+                continue;
+            }
+            const receiptArtifact = this.#repository.getArtifact(payload.receiptArtifactId);
+            if (receiptArtifact === null
+                || receiptArtifact.durable !== true
+                || receiptArtifact.hashAlgo !== "sha256"
+                || typeof receiptArtifact.hashValue !== "string") {
+                continue;
+            }
+            const receiptObjectId = `sha256:${receiptArtifact.hashValue}`;
+            let receiptBytes;
+            try {
+                receiptBytes = this.#artifactStore.readObject(receiptObjectId, { verify: true });
+            } catch {
+                continue;
+            }
+            if (receiptArtifact.sizeBytes !== receiptBytes.length) {
+                continue;
+            }
+            let persistedReceipt;
+            try {
+                persistedReceipt = JSON.parse(receiptBytes.toString("utf8"));
+            } catch {
+                continue;
+            }
+            if (!canonicalEqual(persistedReceipt, payload.receipt)) {
+                continue;
+            }
+            return {
+                evidence,
+                observation,
+                measurementRecord: row,
+                snapshotId: payload.snapshotId,
+            };
+        }
+        return null;
+    }
+
+    #persistDuplicateMeasurementReuse({
+        attemptId,
+        commandId,
+        command,
+        snapshotId,
+        candidateArtifactHash,
+        duplicateOf,
+        reusable,
+    }) {
+        const value = {
+            version: 1,
+            policy: "mark",
+            commandId,
+            candidateId: command.candidateId,
+            candidateArtifactHash,
+            snapshotId,
+            duplicateOf,
+            sourceEvidenceId: reusable.evidence.evidenceId,
+            sourceObservationId: reusable.observation.observationId,
+            sourceMeasurementAttemptId: reusable.observation.receipt.attemptId,
+            sourceReceiptHash: reusable.measurementRecord.payload.receiptHash,
+        };
+        const artifact = this.#persistJsonArtifact({
+            attemptId,
+            kind: `measurement-reuse-${command.candidateId}`,
+            value,
+            contentType: "application/vnd.crucible.measurement-reuse+json",
+        });
+        this.#adapter.ingestOperationalEvidence({
+            attemptId,
+            evidenceKind: `measurement-reuse:candidate:${command.candidateId}`,
+            kind: "runtime:measurement_reuse",
+            payload: {
+                ...value,
+                round: command.round,
+                slotIndex: command.slotIndex,
+                purpose: "candidate",
+                parsed: reusable.observation.data,
+                receipt: reusable.measurementRecord.payload.receipt,
+                receiptArtifactId: reusable.measurementRecord.payload.receiptArtifactId,
+                artifactId: artifact.artifactId,
+            },
+        });
+    }
+
+    #parseParentAccessRequest(input, evidenceId, objectId = null) {
+        if (input !== null && typeof input === "object" && !Array.isArray(input)) {
+            return {
+                sessionId: input.sessionId,
+                evidenceId: input.evidenceId,
+                objectId: input.objectId ?? null,
+            };
+        }
+        return { sessionId: input, evidenceId, objectId };
+    }
+
+    #assignedParentSnapshot(input, evidenceId) {
+        const request = this.#parseParentAccessRequest(input, evidenceId);
+        const assignment = this.#workerAssignments.get(request.sessionId);
+        if (assignment === undefined
+            || !assignment.parentEvidenceIds.has(request.evidenceId)) {
+            throw new CrucibleRuntimeError(
+                RUNTIME_ERROR_CODES.WORKER_PROTOCOL,
+                "Worker requested an unassigned parent snapshot",
+                {
+                    sessionId: request.sessionId ?? null,
+                    evidenceId: request.evidenceId ?? null,
+                },
+            );
+        }
+        const aggregate = this.#adapter.replay().aggregate;
+        return this.#resolveParentSnapshot(aggregate, request.evidenceId);
+    }
+
+    #resolveParentSnapshot(aggregate, evidenceId) {
+        const evidence = aggregate.evidence[evidenceId];
+        if (evidence?.sourceKind !== "harness"
+            || evidence?.purpose !== "candidate"
+            || evidence.invalidated) {
+            throw new RuntimeIntegrityError(
+                "Assigned parent evidence is not committed candidate evidence",
+                { evidenceId },
+            );
+        }
+        const operational = this.#adapter.listOperationalEvidence();
+        for (let index = operational.length - 1; index >= 0; index -= 1) {
+            const row = operational[index];
+            const payload = row.payload;
+            if (row.kind !== "runtime:candidate_snapshot"
+                || payload?.candidateId !== evidence.candidateId
+                || payload.candidateArtifactHash !== evidence.receipt.candidateArtifactHash) {
+                continue;
+            }
+            const status = this.#artifactStore.verifySnapshot(payload.snapshotId);
+            if (status.ok) {
+                return {
+                    evidence,
+                    snapshotId: payload.snapshotId,
+                    status,
+                };
+            }
+        }
+        throw new RuntimeIntegrityError(
+            "Assigned parent snapshot is missing or failed integrity verification",
+            { evidenceId, candidateId: evidence.candidateId },
+        );
+    }
+
+    #verifyAssignedParentSnapshot(input, evidenceId) {
+        const assigned = this.#assignedParentSnapshot(input, evidenceId);
+        return {
+            evidenceId: assigned.evidence.evidenceId,
+            candidateId: assigned.evidence.candidateId,
+            snapshotId: assigned.snapshotId,
+            status: assigned.status,
+        };
+    }
+
+    #readAssignedParentSnapshot(input, evidenceId) {
+        const assigned = this.#assignedParentSnapshot(input, evidenceId);
+        const manifest = this.#artifactStore.loadManifest(assigned.snapshotId);
+        return {
+            evidenceId: assigned.evidence.evidenceId,
+            candidateId: assigned.evidence.candidateId,
+            snapshotId: assigned.snapshotId,
+            manifest,
+            files: manifest.entries.map((entry) => {
+                const bytes = this.#artifactStore.readObject(entry.object, { verify: true });
+                return {
+                    path: entry.path,
+                    objectId: entry.object,
+                    size: entry.size,
+                    bytes,
+                    content: bytes.toString("utf8"),
+                };
+            }),
+        };
+    }
+
+    #readAssignedParentObject(input, evidenceId, objectId) {
+        const request = this.#parseParentAccessRequest(input, evidenceId, objectId);
+        const assigned = this.#assignedParentSnapshot(request, request.evidenceId);
+        const manifest = this.#artifactStore.loadManifest(assigned.snapshotId);
+        const allowedObjectIds = new Set([
+            assigned.snapshotId,
+            ...manifest.entries.map((entry) => entry.object),
+        ]);
+        if (!allowedObjectIds.has(request.objectId)) {
+            throw new CrucibleRuntimeError(
+                RUNTIME_ERROR_CODES.WORKER_PROTOCOL,
+                "Worker requested an object outside its assigned parent snapshot",
+                {
+                    sessionId: request.sessionId ?? null,
+                    evidenceId: request.evidenceId ?? null,
+                    objectId: request.objectId ?? null,
+                },
+            );
+        }
+        return this.#artifactStore.readObject(request.objectId, { verify: true });
     }
 
     #getWorkerPool(aggregate) {
@@ -1038,6 +1787,28 @@ export class AutonomousRunner {
         const existingCandidateIds = harnessCandidateEvidenceItems(aggregate)
             .map((item) => item.candidateId);
         const factory = this.#dependencies.workerPoolFactory ?? createSdkWorkerPool;
+        const parentReader = Object.freeze({
+            loadManifest: (snapshotId) => {
+                const status = this.#artifactStore.verifySnapshot(snapshotId);
+                if (!status.ok) {
+                    throw new RuntimeIntegrityError(
+                        "Parent snapshot closure failed ArtifactStore verification",
+                        { snapshotId, status },
+                    );
+                }
+                return this.#artifactStore.loadManifest(snapshotId);
+            },
+            readObject: (objectId) =>
+                this.#artifactStore.readObject(objectId, { verify: true }),
+        });
+        const parentSnapshotAccess = Object.freeze({
+            verifySnapshot: (input, evidenceId) =>
+                this.#verifyAssignedParentSnapshot(input, evidenceId),
+            readSnapshot: (input, evidenceId) =>
+                this.#readAssignedParentSnapshot(input, evidenceId),
+            readObject: (input, evidenceId, objectId) =>
+                this.#readAssignedParentObject(input, evidenceId, objectId),
+        });
         this.#workerPool = factory({
             sdkPath: this.#config.sdkPath,
             cliPath: this.#config.cliPath,
@@ -1046,6 +1817,15 @@ export class AutonomousRunner {
             candidateLimits: this.#config.options.candidateLimits,
             sessionTimeoutMs: this.#config.options.sessionTimeoutMs,
             existingCandidateIds,
+            parentReader,
+            parentReadLimits: this.#dependencies.parentReadLimits,
+            parentSnapshotAccess,
+            verifyParentSnapshot: parentSnapshotAccess.verifySnapshot,
+            readParentSnapshot: parentSnapshotAccess.readSnapshot,
+            readParentSnapshotObject: parentSnapshotAccess.readObject,
+            client: this.#dependencies.sdkClient,
+            sdkLoader: this.#dependencies.sdkLoader,
+            clientFactory: this.#dependencies.sdkClientFactory,
         });
         return this.#workerPool;
     }
@@ -1089,10 +1869,27 @@ export class AutonomousRunner {
     #persistMeasurement({
         measurement,
         attemptId,
+        logicalEffectKey,
         purpose,
+        commandId = null,
+        round = null,
+        slotIndex = null,
         candidateId,
         snapshotId,
     }) {
+        const candidateArtifactHash = measurementSnapshotHash(snapshotId);
+        if (measurement.receipt?.candidateSnapshotHash !== candidateArtifactHash) {
+            throw new RuntimeIntegrityError(
+                "Measurement receipt does not bind the ingested candidate snapshot",
+                {
+                    candidateId,
+                    snapshotId,
+                    candidateArtifactHash,
+                    receiptCandidateSnapshotHash:
+                        measurement.receipt?.candidateSnapshotHash ?? null,
+                },
+            );
+        }
         const receiptArtifact = this.#persistJsonArtifact({
             attemptId,
             kind: `measurement-receipt-${candidateId}`,
@@ -1103,7 +1900,7 @@ export class AutonomousRunner {
             attemptId,
             kind: `snapshot-${candidateId}`,
             objectId: snapshotId,
-            size: this.#artifactStore.readObject(snapshotId).length,
+            size: this.#artifactStore.readObject(snapshotId, { verify: true }).length,
             contentType: "application/vnd.crucible.snapshot+json",
         });
         this.#adapter.ingestOperationalEvidence({
@@ -1111,8 +1908,13 @@ export class AutonomousRunner {
             evidenceKind: `measurement:${purpose}:${candidateId}`,
             kind: "runtime:measurement",
             payload: {
+                logicalEffectKey,
                 purpose,
+                commandId,
+                round,
+                slotIndex,
                 candidateId,
+                candidateArtifactHash,
                 parsed: measurement.parsed,
                 receipt: measurement.receipt,
                 receiptHash: hashReceipt(measurement.receipt),
@@ -1170,33 +1972,34 @@ export class AutonomousRunner {
     }
 
     #recordDeadlineNonResult(aggregate) {
+        const currentRecommendation = decideNext(aggregate);
+        if (currentRecommendation.kind === "TERMINAL"
+            && currentRecommendation.event !== null) {
+            this.#adapter.appendKernelDecision();
+            return terminalResult(this.#adapter.replay().aggregate);
+        }
         const attemptId = this.#nextStableId("deadline", {
             seq: aggregate.lastSeq,
             deadlineMs: this.#config.deadlineMs,
         });
         let domainPausePersisted = false;
-        const currentRecommendation = decideNext(aggregate);
-        const boundedExhaustionWouldBecomeTerminal =
-            currentRecommendation.command?.kind === "await_stop_request";
-        if (!boundedExhaustionWouldBecomeTerminal) {
-            try {
-                const requested = this.#adapter.requestStop({
-                    requestId: this.#nextStableId("stop", { reason: "deadline" }),
-                    reason: "Autonomous runner deadline reached.",
-                    pauseRequested: true,
-                });
-                if (requested.domainEvent !== null) {
-                    const afterStop = requested.aggregate;
-                    const recommendation = decideNext(afterStop);
-                    if (recommendation.event?.type === EVENT_TYPES.INVESTIGATION_PAUSED) {
-                        this.#adapter.appendKernelDecision();
-                        domainPausePersisted = true;
-                    }
+        try {
+            const requested = this.#adapter.requestStop({
+                requestId: this.#nextStableId("stop", { reason: "deadline" }),
+                reason: "Autonomous runner deadline reached.",
+                pauseRequested: true,
+            });
+            if (requested.domainEvent !== null) {
+                const afterStop = requested.aggregate;
+                const recommendation = decideNext(afterStop);
+                if (recommendation.event?.type === EVENT_TYPES.INVESTIGATION_PAUSED) {
+                    this.#adapter.appendKernelDecision();
+                    domainPausePersisted = true;
                 }
-            } catch (error) {
-                if (error?.code !== RUNTIME_ERROR_CODES.DOMAIN_EVENT_INVALID) {
-                    throw error;
-                }
+            }
+        } catch (error) {
+            if (error?.code !== RUNTIME_ERROR_CODES.DOMAIN_EVENT_INVALID) {
+                throw error;
             }
         }
         this.#adapter.recordOperationalNonResult({

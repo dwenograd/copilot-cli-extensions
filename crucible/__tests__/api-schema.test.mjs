@@ -10,6 +10,9 @@ import { describe, expect, it } from "vitest";
 
 import { SchemaValidationError } from "../api/schema.mjs";
 import {
+    DEFAULT_SEARCH_POLICY,
+} from "../domain/index.mjs";
+import {
     PUBLIC_TOOL_NAMES,
     TOOL_SPECS,
     crucibleResultSpec,
@@ -112,6 +115,58 @@ describe("crucible API schema (single source)", () => {
         // Default is cloned, not shared.
         parsed.metrics.push({ key: "x", direction: "max" });
         expect(crucibleStartSpec.parse(validStartArgs()).metrics).toEqual([]);
+    });
+
+    it("fills a canonical version-2 search policy by default", () => {
+        const parsed = crucibleStartSpec.parse(validStartArgs());
+        expect(parsed.search_policy).toEqual(DEFAULT_SEARCH_POLICY);
+        expect(parsed.search_policy.stopOnFirstAccept).toBe(false);
+        expect(parsed.search_policy.dedupPolicy).toBe("mark");
+
+        parsed.search_policy.operatorWeights.fresh = 999;
+        expect(crucibleStartSpec.parse(validStartArgs()).search_policy)
+            .toEqual(DEFAULT_SEARCH_POLICY);
+    });
+
+    it("normalizes partial search-policy overrides and enforces strict ranges", () => {
+        const parsed = crucibleStartSpec.parse(validStartArgs({
+            search_policy: {
+                stopOnFirstAccept: true,
+                plateauWindow: 2,
+                minRoundsBeforePlateau: 2,
+                operatorWeights: { fresh: 5 },
+            },
+        }));
+        expect(parsed.search_policy).toEqual({
+            ...DEFAULT_SEARCH_POLICY,
+            stopOnFirstAccept: true,
+            plateauWindow: 2,
+            minRoundsBeforePlateau: 2,
+            operatorWeights: {
+                ...DEFAULT_SEARCH_POLICY.operatorWeights,
+                fresh: 5,
+            },
+        });
+
+        for (const search_policy of [
+            { plateauWindow: 0 },
+            { plateauWindow: 3, minRoundsBeforePlateau: 2 },
+            { mandatoryEscapeRounds: 0 },
+            { operatorWeights: { fresh: 0 } },
+            {
+                operatorWeights: {
+                    diversification: 0,
+                    adversarial: 0,
+                    restart: 0,
+                },
+            },
+            { promptCaps: { parentEvidenceIds: 3, promptContextRefs: 2 } },
+            { dedupPolicy: "drop" },
+            { extra: true },
+        ]) {
+            expect(() => crucibleStartSpec.parse(validStartArgs({ search_policy })))
+                .toThrow(SchemaValidationError);
+        }
     });
 
     it("normalizes nested metric objects and rejects bad enums/ranges", () => {
