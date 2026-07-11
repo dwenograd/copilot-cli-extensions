@@ -70,7 +70,7 @@ function catchErr(fn) {
 }
 
 describe("CAS durable installation lifecycle", () => {
-    it("persists monotonic installed and referenced state under private metadata", () => {
+    it("persists monotonic installed and referenced state", () => {
         const store = openArtifactStore({ root });
         const bytes = Buffer.from("journal-lifecycle");
         const meta = store.putBytes(bytes);
@@ -126,7 +126,7 @@ describe("CAS durable installation lifecycle", () => {
         expect(journalFiles()).toEqual([]);
     });
 
-    it("reports and removes an aged durable unreferenced orphan with its marker", () => {
+    it("reports and removes an aged durable unreferenced orphan", () => {
         const store = openArtifactStore({ root });
         const meta = store.putBytes(Buffer.from("durable-orphan"));
         const old = new Date(Date.now() - 2 * 60 * 60 * 1000);
@@ -227,24 +227,6 @@ describe("fsync failure propagation", () => {
             "object prefix parent directory",
             "before-directory-fsync",
             (event) => event.purpose === "object prefix parent",
-            true,
-        ],
-        [
-            "installed marker file",
-            "before-file-fsync",
-            (event) => event.purpose === "installed installation marker temporary file",
-            true,
-        ],
-        [
-            "installed marker directory",
-            "before-directory-fsync",
-            (event) => event.purpose === "installed installation marker parent",
-            true,
-        ],
-        [
-            "installed marker ancestor directory",
-            "before-directory-fsync",
-            (event) => event.purpose === "installed installation marker parent ancestor",
             true,
         ],
     ])("propagates an unexpected %s fsync failure and never returns durable", (
@@ -449,7 +431,6 @@ describe("crash-window reconciliation", () => {
         "object-entry-installed",
         "object-file-durable",
         "object-directory-durable",
-        "installed-marker-durable",
         "transaction-cleaned",
     ])("recovers deterministically after a crash at %s", (point) => {
         const bytes = Buffer.from(`recover-${point}`);

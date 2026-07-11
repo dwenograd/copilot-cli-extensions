@@ -9,7 +9,7 @@
 //     version (see schema.mjs).
 //   * Append-only, hash-chained event log with per-investigation unique seq and
 //     event hash, at-most-one terminal event, compare-and-swap batch append.
-//   * Idempotent commutative evidence ingestion.
+//   * Idempotent evidence ingestion with conflict detection.
 //   * Durable command lifecycle with fencing tokens / lease ownership.
 //   * Inline + external artifact metadata with a durability gate on external
 //     references (the filesystem CAS itself lives elsewhere).
@@ -645,9 +645,9 @@ export class EventRepository {
         return err;
     }
 
-    // Idempotent, commutative evidence ingestion keyed by
-    // (investigation, attempt_id, evidence_kind). A duplicate returns the
-    // already-stored event instead of appending a second one.
+    // Idempotent evidence ingestion keyed by
+    // (investigation, attempt_id, evidence_kind). An exact duplicate returns the
+    // already-stored event; conflicting facts under the same key fail closed.
     ingestEvidence({ investigationId, attemptId, evidenceKind, kind, payload, createdAt } = {}) {
         requireNonEmptyString(investigationId, "investigationId");
         requireNonEmptyString(attemptId, "attemptId");
@@ -668,7 +668,20 @@ export class EventRepository {
                 .prepare("SELECT * FROM events WHERE investigation_id = ? AND attempt_id = ? AND evidence_kind = ?")
                 .get(investigationId, attemptId, evidenceKind);
             if (existing) {
-                return { deduplicated: true, event: this.#rowToEvent(existing) };
+                if (existing.kind === eventKind && existing.payload === payloadCanonical) {
+                    return { deduplicated: true, event: this.#rowToEvent(existing) };
+                }
+                throw new CruciblePersistenceError(
+                    ERROR_CODES.EVIDENCE_CONFLICT,
+                    "evidence idempotency key conflicts with already-persisted facts",
+                    {
+                        investigationId,
+                        attemptId,
+                        evidenceKind,
+                        existingKind: existing.kind,
+                        incomingKind: eventKind,
+                    },
+                );
             }
 
             const head = this.getHead(investigationId);

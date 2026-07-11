@@ -19,6 +19,7 @@ import {
 
 import {
     NODE_EXE,
+    canCreateFileSymlink,
     makeTempRoot,
     nodeExeSha256Hex,
     rmTempRoot,
@@ -143,13 +144,24 @@ describe("loadHarnessAllowlist", () => {
         expect(err.code).toBe(MEASUREMENT_ERROR_CODES.ALLOWLIST_INVALID);
     });
 
-    it("rejects the allowlist file itself if it is a symlink or missing", () => {
-        const err = catchIt(() => loadHarnessAllowlist("C:\\this\\path\\does\\not\\exist.json"));
-        expect([
-            MEASUREMENT_ERROR_CODES.FILE_NOT_FOUND,
-            MEASUREMENT_ERROR_CODES.FILE_NOT_LOCAL,
-            MEASUREMENT_ERROR_CODES.INVALID_ARGUMENT,
-        ]).toContain(err.code);
+    it("rejects a missing allowlist with FILE_NOT_FOUND", () => {
+        const root = tmp("missing");
+        const err = catchIt(() =>
+            loadHarnessAllowlist(path.join(root, "does-not-exist.json")));
+        expect(err.code).toBe(MEASUREMENT_ERROR_CODES.FILE_NOT_FOUND);
+    });
+
+    it("rejects an allowlist symlink with FILE_SYMLINK", () => {
+        if (!canCreateFileSymlink()) return;
+        const root = tmp("symlink");
+        const target = writeAllowlist(root, "e1", {}, {
+            fileName: "target.json",
+        });
+        const link = path.join(root, "allowlist-link.json");
+        fs.symlinkSync(target, link, "file");
+
+        const err = catchIt(() => loadHarnessAllowlist(link));
+        expect(err.code).toBe(MEASUREMENT_ERROR_CODES.FILE_SYMLINK);
     });
 
     it("produces byte-equal entry hashes for byte-equal entries and different hashes when a field changes", () => {

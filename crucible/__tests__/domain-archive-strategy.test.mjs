@@ -640,27 +640,10 @@ describe("Crucible deterministic archive and strategy", () => {
         expect(first.parentEvidenceIds).toEqual([]);
     });
 
-    it("fails deterministically rather than returning a zero-weight operator", () => {
-        const emptyArchive = {
-            accepted: [],
-            nearMisses: [],
-            rejected: [],
-            invalidMetrics: [],
-            mechanismGroups: [],
-            lessonGroups: [],
-            duplicateIndex: {},
-            incumbent: null,
-        };
-        const errorMessage = (input) => {
-            try {
-                selectAdaptiveOperator(input);
-                return null;
-            } catch (error) {
-                return `${error.name}: ${error.message}`;
-            }
-        };
-        const noOperatorsPolicy = policy({
-            operatorWeights: {
+    it.each([
+        [
+            "normal",
+            {
                 fresh: 0,
                 refinement: 0,
                 crossover: 0,
@@ -668,22 +651,10 @@ describe("Crucible deterministic archive and strategy", () => {
                 adversarial: 0,
                 restart: 0,
             },
-        });
-        const normalInput = {
-            searchPolicy: noOperatorsPolicy,
-            archive: emptyArchive,
-            contractHash: hashCanonical({ contract: "no-operators" }),
-            round: 1,
-            slotIndex: 0,
-        };
-        const firstNormalError = errorMessage(normalInput);
-        expect(firstNormalError).toBe(errorMessage(normalInput));
-        expect(firstNormalError).toContain(
-            "Deterministic strategy error: no positive-weight eligible operators",
-        );
-
-        const incumbentOnlyEscapePolicy = policy({
-            operatorWeights: {
+        ],
+        [
+            "mandatory_escape",
+            {
                 fresh: 1,
                 refinement: 0,
                 crossover: 0,
@@ -691,16 +662,43 @@ describe("Crucible deterministic archive and strategy", () => {
                 adversarial: 1,
                 restart: 0,
             },
-        });
-        const escapeInput = {
-            ...normalInput,
-            searchPolicy: incumbentOnlyEscapePolicy,
-            phase: "mandatory_escape",
+        ],
+    ])("fails closed deterministically with no positive eligible operator in %s", (
+        phase,
+        operatorWeights,
+    ) => {
+        const input = {
+            searchPolicy: policy({ operatorWeights }),
+            archive: {
+                accepted: [],
+                nearMisses: [],
+                rejected: [],
+                invalidMetrics: [],
+                mechanismGroups: [],
+                lessonGroups: [],
+                duplicateIndex: {},
+                incumbent: null,
+            },
+            contractHash: hashCanonical({ contract: `no-eligible-${phase}` }),
+            round: 1,
+            slotIndex: 0,
+            phase,
         };
-        const firstEscapeError = errorMessage(escapeInput);
-        expect(firstEscapeError).toBe(errorMessage(escapeInput));
-        expect(firstEscapeError).toContain(
-            "Deterministic strategy error: no positive-weight eligible operators",
-        );
+        const capture = () => {
+            try {
+                selectAdaptiveOperator(input);
+                return null;
+            } catch (error) {
+                return { name: error.name, message: error.message };
+            }
+        };
+
+        const first = capture();
+        expect(first).toEqual(capture());
+        expect(first).toMatchObject({
+            name: "DeterministicStrategyError",
+            message: expect.stringContaining("no positive-weight eligible operators"),
+        });
     });
+
 });

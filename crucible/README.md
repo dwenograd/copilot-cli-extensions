@@ -33,7 +33,10 @@ four tools, and only `crucible_result` may ever report a terminal decision:
   only once the kernel-owned pause transition is actually persisted; a bare
   in-flight stop request is honest that the pause is not yet durable. Its
   `stop_state` distinguishes terminal, operational/domain non-result, persisted
-  pause, and requested/in-flight pause outcomes.
+  pause, and requested/in-flight pause outcomes. A persisted pause is not
+  reported as a successful quiescent stop when worker, SDK, runner-child, or
+  process-owner cleanup cannot be proven; the supervisor retains fenced
+  `pause_pending`/`failed_non_quiescent` authority for retry or intervention.
 - `crucible_result` is the only tool that may return `VERIFIED_RESULT` or
   `TARGET_UNREACHABLE`, always with its terminal evidence closure. It reads the
   persisted terminal decision and never recomputes policy.
@@ -51,7 +54,8 @@ New contracts are bounded before any investigation state is created: objective
 text is limited to 2 KiB/2048 characters; the normalized acceptance predicate
 to 4 KiB, depth 16, 128 nodes, and 32 children per boolean node; ranking metrics
 to 12; validation cases to 64; rounds to 64; and candidates to 8 per round
-(512 evaluations total). Bounded candidate-id sets are likewise capped at 512.
+(512 evaluations total). `finite_enumerable` and `bounded_parameterized`
+contracts must declare their exhaustive bounded candidate-id set, capped at 512.
 Archive cohorts are capped at 32 entries (duplicate index: 256), with at most
 12 prompt references and four parents.
 
@@ -194,12 +198,12 @@ record for every observed candidate slot and classifies it as one of
 dropped. Duplicate candidate artifacts are committed and *linked* to the first
 occurrence (`dedupPolicy: "mark"`), never refused.
 
-**Partial or missing metrics do not fail the run.** A candidate whose declared
-ranking metrics are absent or non-numeric is classified `invalid_metrics`
-(non-rankable) and archived as a lesson rather than rejected outright — so a
-harness that can only partially score a candidate should still emit whatever it
-has. Only the frozen acceptance predicate decides `accepted`; the metrics decide
-*ranking* among rankable candidates.
+**Partial or missing metrics do not fail the run.** A candidate that satisfies
+the frozen acceptance predicate remains `accepted` even when a declared ranking
+metric is absent; it is marked non-rankable and sorts behind rankable accepted
+candidates. A non-accepted candidate with incomplete metrics is classified
+`invalid_metrics` and retained as a lesson. Metrics rank candidates; they never
+override acceptance.
 
 Every executable and declared dependency is reverified, copied into a private
 per-attempt staging directory, rehashed, and executed only from staged bytes.
@@ -225,6 +229,19 @@ untrusted PE path; startup exceptions are acknowledged over redirected pipes,
 bounded, and returned as typed failures. The helper sets process/thread error
 mode plus WER no-UI flags before creating any child, so unattended failures
 cannot display loader, crash, or Windows Error Reporting dialogs.
+
+Native Windows containment tests are not part of the default developer run.
+`npm run test:crucible` is fast, credential-free, and host-independent.
+`npm run test:crucible:release-safe` retains the hard-kill, multiprocess, and
+long real-process matrices. `npm run test:crucible:integration` is a mandatory
+explicit real SDK/CLI smoke: it fails clearly unless `COPILOT_SDK_PATH` and
+`COPILOT_CLI_PATH` are absolute installed paths and the CLI is authenticated.
+`npm run test:crucible:windows-conformance` is an explicit serial job using
+only test-owned files, registry keys, profiles, loopback listeners, pipes, and
+bounded processes. Typed sandbox unavailability fails that job. Production
+release validation uses `npm run test:crucible:release`, which runs the safe
+release matrix, real SDK integration, and Windows conformance. The workspace
+`npm run test:release` includes that gate.
 
 ## Configuring a harness (operator CLI)
 
@@ -352,7 +369,9 @@ ranking metrics, operator assignment, plateau/escape state, and omission counts
 are trusted kernel/operator lines; prior model-authored findings are isolated in
 nonce-delimited untrusted-data framing. Assigned parents are exposed only
 through a per-session, read-only bounded tool backed by verified ArtifactStore
-manifests and objects.
+manifests and objects. Alternate worker-pool factories receive only that bounded
+invocation authority, never raw manifest/object readers, and the runner
+revalidates every returned proposal and its complete code-stamped identity.
 
 Invalidated candidate evidence remains in history but does not complete a slot,
 round, plateau window, escape round, or bounded search space. Its slot is

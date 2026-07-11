@@ -134,9 +134,7 @@ export function qualifyingCandidateEvidence(aggregate) {
 
 export function qualifyingCandidateEvidenceItems(aggregate) {
     return harnessCandidateEvidenceItems(aggregate)
-        .filter((evidence) =>
-            evidence.rankable === true
-            && evidence.outcomeClass === "accepted")
+        .filter((evidence) => evidence.outcomeClass === "accepted")
         .sort((left, right) => compareCandidateEvidence(aggregate.contract.metrics, left, right));
 }
 

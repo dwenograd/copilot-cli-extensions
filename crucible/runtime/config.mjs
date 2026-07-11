@@ -292,7 +292,7 @@ export function normalizeRunnerConfig(input, { env = process.env } = {}) {
             shutdownTimeoutMs: optionalPositiveInteger(
                 options.shutdownTimeoutMs,
                 "options.shutdownTimeoutMs",
-                10_000,
+                30_000,
                 60 * 1000,
             ),
             maxLoopIterations: optionalPositiveInteger(

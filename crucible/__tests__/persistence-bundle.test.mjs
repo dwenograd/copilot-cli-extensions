@@ -246,7 +246,7 @@ describe("canonical export", () => {
     });
 });
 
-describe("authenticated import and round trip", () => {
+describe("bundle import and round trip", () => {
     it("authenticates the expected digest and materializes an identical bundle", () => {
         const { destDir, res } = doExport();
         const dest = path.join(base, "imported");
@@ -258,6 +258,8 @@ describe("authenticated import and round trip", () => {
 
         expect(imported).toMatchObject({
             verified: true,
+            selfConsistent: true,
+            authenticated: true,
             trustLevel: "authenticated",
             digest: res.digest,
             investigationId: "inv-1",
@@ -307,7 +309,11 @@ describe("authenticated import and round trip", () => {
             allowUnauthenticated: true,
         });
         expect(imported.trustLevel).toBe("self-consistent");
-        expect(imported.verified).toBe(true);
+        expect(imported).toMatchObject({
+            selfConsistent: true,
+            authenticated: false,
+            verified: false,
+        });
     });
 
     it("refuses a non-empty import destination before publication", () => {
@@ -335,7 +341,12 @@ describe("authenticated import and round trip", () => {
                 return digest === res.digest && signature.equals(Buffer.from("signed"));
             },
         });
-        expect(imported.trustLevel).toBe("authenticated");
+        expect(imported).toMatchObject({
+            trustLevel: "authenticated",
+            selfConsistent: true,
+            authenticated: true,
+            verified: true,
+        });
     });
 
     it("re-verifies staged bytes after caller-owned authentication", () => {

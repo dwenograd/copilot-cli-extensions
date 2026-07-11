@@ -14,9 +14,9 @@ import {
     loadHarnessAllowlist,
 } from "../measurement/index.mjs";
 import {
-    fixedClock,
     fixedIds,
     makeTempRoot,
+    manualClock,
     materializeCandidateSnapshot,
     rmTempRoot,
     sha256HexOfFile,
@@ -157,7 +157,7 @@ function createExecutor(fixture, sandboxProvider, processAdapter, extra = {}) {
         sandboxProvider,
         processAdapter,
         scratchRoot: fixture.root,
-        clock: fixedClock(),
+        clock: manualClock(),
         ...extra,
     });
 }
@@ -184,6 +184,46 @@ function manualAdmissionRequest(fixture, stageRoot, attemptId = "att-manual") {
 }
 
 describe("opaque SandboxLaunchCapability", () => {
+    it("requires a sandbox provider for candidate-code harnesses", async () => {
+        const fixture = makeFixture("required");
+        const calls = emptyCalls();
+        const executor = createMeasurementExecutor({
+            allowlist: fixture.allowlist,
+            sandboxProvider: null,
+            processAdapter: makeHostAdapter(calls),
+            scratchRoot: fixture.root,
+            clock: manualClock(),
+        });
+
+        await expect(runFixture(executor, fixture)).rejects.toMatchObject({
+            code: MEASUREMENT_ERROR_CODES.SANDBOX_REQUIRED,
+        });
+        expect(calls.hostLaunches).toHaveLength(0);
+    });
+
+    it("surfaces an explicit provider refusal without host fallback", async () => {
+        const fixture = makeFixture("refused");
+        const calls = emptyCalls();
+        const provider = createSandboxProvider({
+            providerId: "refusing-provider",
+            providerVersion: "v1",
+            admitAndPrepare: () => ({
+                admitted: false,
+                reason: "synthetic refusal",
+            }),
+        });
+        const executor = createExecutor(
+            fixture,
+            provider,
+            makeHostAdapter(calls),
+        );
+
+        await expect(runFixture(executor, fixture)).rejects.toMatchObject({
+            code: MEASUREMENT_ERROR_CODES.SANDBOX_REFUSED,
+        });
+        expect(calls.hostLaunches).toHaveLength(0);
+    });
+
     it("rejects forged providers and advisory {admitted:true} results", async () => {
         const fixture = makeFixture("forged");
         expect(() => createMeasurementExecutor({

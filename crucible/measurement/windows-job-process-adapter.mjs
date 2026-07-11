@@ -985,6 +985,9 @@ export function createWindowsJobProcessAdapter(options = {}) {
         owns(pid) {
             return active.has(pid);
         },
+        activePids() {
+            return Object.freeze([...active.keys()].sort((left, right) => left - right));
+        },
         spawn(executable, argv, launchOptions) {
             if (closed) {
                 throw new MeasurementError(

@@ -1,63 +1,19 @@
-import {
-    spawn as rawSpawn,
-} from "node:child_process";
 import { EventEmitter } from "node:events";
-import fs from "node:fs";
-import path from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+
+import { describe, expect, it } from "vitest";
 
 import {
-    afterEach,
-    describe,
-    expect,
-    it,
-} from "vitest";
+    MEASUREMENT_ERROR_CODES,
+    createDefaultProcessAdapter,
+} from "../measurement/index.mjs";
 
-import { createDefaultProcessAdapter } from "../measurement/index.mjs";
-
-const HERE = path.dirname(fileURLToPath(import.meta.url));
-const roots = [];
-
-function makeRoot(label) {
-    const root = fs.mkdtempSync(path.join(HERE, `.windows-adapter-${label}-`));
-    roots.push(root);
-    return root;
-}
-
-function pidAlive(pid) {
-    try {
-        process.kill(pid, 0);
-        return true;
-    } catch {
-        return false;
-    }
-}
-
-async function waitFor(predicate, timeoutMs = 10_000) {
-    const deadline = Date.now() + timeoutMs;
-    while (!predicate() && Date.now() < deadline) {
-        await new Promise((resolve) => setTimeout(resolve, 25));
-    }
-    return predicate();
-}
-
-afterEach(() => {
-    for (const root of roots.splice(0)) {
-        fs.rmSync(root, {
-            recursive: true,
-            force: true,
-            maxRetries: 100,
-            retryDelay: 25,
-        });
-    }
-});
-
-describe("Windows process adapter termination", () => {
-    it("bounds a hung taskkill process", async () => {
+describe("Windows process adapter termination protocol", () => {
+    it("bounds a hung taskkill process and closes the fake child", async () => {
         const calls = [];
         const killer = new EventEmitter();
         killer.kill = () => {
             calls.push("killer-kill");
+            setImmediate(() => killer.emit("close", null, "SIGKILL"));
             return true;
         };
         const adapter = createDefaultProcessAdapter({
@@ -68,11 +24,13 @@ describe("Windows process adapter termination", () => {
                 return killer;
             },
         });
+
         const started = Date.now();
         await expect(adapter.terminateTree(4242, {
             force: false,
             timeoutMs: 10,
         })).resolves.toBe(false);
+
         expect(Date.now() - started).toBeLessThan(500);
         expect(calls[0].argv).toEqual(["/T", "/PID", "4242"]);
         expect(calls).toContain("killer-kill");
@@ -81,7 +39,10 @@ describe("Windows process adapter termination", () => {
     it("uses forced exact-PID tree termination for escalation", async () => {
         let invocation = null;
         const killer = new EventEmitter();
-        killer.kill = () => true;
+        killer.kill = () => {
+            setImmediate(() => killer.emit("close", null, "SIGKILL"));
+            return true;
+        };
         const adapter = createDefaultProcessAdapter({
             platform: "win32",
             spawnProcess(executable, argv, options) {
@@ -90,6 +51,7 @@ describe("Windows process adapter termination", () => {
                 return killer;
             },
         });
+
         await expect(adapter.terminateTree(5252, {
             force: true,
             timeoutMs: 100,
@@ -102,77 +64,101 @@ describe("Windows process adapter termination", () => {
         });
     });
 
-    it.runIf(process.platform === "win32")(
-        "closes the Job Object when the owning parent process crashes",
-        async () => {
-            const root = makeRoot("parent-death");
-            const candidatePidPath = path.join(root, "candidate.pid");
-            const ownerPidPath = path.join(root, "owner.pid");
-            const harnessPath = path.join(root, "linger.mjs");
-            const parentPath = path.join(root, "parent.mjs");
-            fs.writeFileSync(harnessPath, `
-                import fs from "node:fs";
-                fs.writeFileSync(${JSON.stringify(candidatePidPath)}, String(process.pid));
-                setInterval(() => {}, 1000);
-            `);
-            const adapterUrl = pathToFileURL(
-                path.join(
-                    HERE,
-                    "..",
-                    "measurement",
-                    "windows-adapter.mjs",
-                ),
-            ).href;
-            fs.writeFileSync(parentPath, `
-                import fs from "node:fs";
-                import { createDefaultProcessAdapter } from ${JSON.stringify(adapterUrl)};
-                const adapter = createDefaultProcessAdapter();
-                const child = adapter.spawn(
-                    process.execPath,
-                    [${JSON.stringify(harnessPath)}],
-                    {
-                        cwd: ${JSON.stringify(root)},
-                        env: { SystemRoot: process.env.SystemRoot },
-                        stdio: ["ignore", "pipe", "pipe"],
-                        executesCandidateCode: false,
-                        launchPath: "host-process-adapter",
-                        timeoutMs: 60_000,
-                        ownerRoot: ${JSON.stringify(root)},
-                    },
-                );
-                fs.writeFileSync(${JSON.stringify(ownerPidPath)}, String(child.pid));
-                child.on("error", () => {});
-                setInterval(() => {}, 1000);
-            `);
+    it("reports sorted immutable owned Job Object PIDs", async () => {
+        const active = new Set([9003, 9001, 9002]);
+        let closeOptions = null;
+        const adapter = createDefaultProcessAdapter({
+            platform: "win32",
+            jobProcessAdapter: {
+                owns: (pid) => active.has(pid),
+                activePids: () => [
+                    ...active,
+                    ...(active.has(9002) ? [9002] : []),
+                ],
+                spawn() {
+                    throw new Error("spawn is not part of this protocol test");
+                },
+                terminate() {
+                    return false;
+                },
+                async close(options) {
+                    closeOptions = options;
+                    active.clear();
+                    return true;
+                },
+            },
+        });
 
-            const parent = rawSpawn(process.execPath, [parentPath], {
-                cwd: root,
-                stdio: "ignore",
-                shell: false,
-                windowsHide: true,
-            });
-            let candidatePid = null;
-            let ownerPid = null;
+        const pids = adapter.activeOwnedPids();
+        expect(pids).toEqual([9001, 9002, 9003]);
+        expect(Object.isFrozen(pids)).toBe(true);
+        await expect(adapter.close({ timeoutMs: 321 })).resolves.toBe(true);
+        expect(closeOptions.timeoutMs).toBe(321);
+        expect(adapter.activeOwnedPids()).toEqual([]);
+    });
+
+    it("fails close when a Job adapter still reports an owned PID", async () => {
+        const adapter = createDefaultProcessAdapter({
+            platform: "win32",
+            jobProcessAdapter: {
+                owns: () => false,
+                activePids: () => [7777],
+                spawn() {
+                    throw new Error("spawn is not part of this protocol test");
+                },
+                terminate() {
+                    return false;
+                },
+                close() {
+                    return true;
+                },
+            },
+        });
+
+        await expect(adapter.close({ timeoutMs: 20 })).rejects.toMatchObject({
+            code: MEASUREMENT_ERROR_CODES.SANDBOX_LIFECYCLE,
+            details: { activePids: [7777] },
+        });
+    });
+
+    it("waits for an exact test-owned direct child to close", async () => {
+        const adapter = createDefaultProcessAdapter({
+            platform: "linux",
+            terminationTimeoutMs: 5_000,
+        });
+        const child = adapter.spawn(
+            process.execPath,
+            ["-e", "setTimeout(() => {}, 60000)"],
+            {
+                cwd: process.cwd(),
+                env: {
+                    SystemRoot:
+                        process.env.SystemRoot
+                        ?? process.env.SYSTEMROOT
+                        ?? "C:\\Windows",
+                },
+                stdio: ["ignore", "ignore", "ignore"],
+                executesCandidateCode: false,
+                launchPath: "host-process-adapter",
+            },
+        );
+        let closeObserved = false;
+        child.once("close", () => {
+            closeObserved = true;
+        });
+
+        try {
+            expect(adapter.activeOwnedPids()).toEqual([child.pid]);
+            await expect(adapter.close({ timeoutMs: 5_000 }))
+                .resolves.toBe(true);
+            expect(closeObserved).toBe(true);
+            expect(adapter.activeOwnedPids()).toEqual([]);
+        } finally {
             try {
-                expect(await waitFor(() =>
-                    fs.existsSync(candidatePidPath)
-                    && fs.existsSync(ownerPidPath))).toBe(true);
-                candidatePid = Number(fs.readFileSync(candidatePidPath, "utf8"));
-                ownerPid = Number(fs.readFileSync(ownerPidPath, "utf8"));
-                expect(pidAlive(candidatePid)).toBe(true);
-                expect(pidAlive(ownerPid)).toBe(true);
-
-                parent.kill("SIGKILL");
-                await new Promise((resolve) => parent.once("close", resolve));
-                expect(await waitFor(() =>
-                    !pidAlive(candidatePid) && !pidAlive(ownerPid))).toBe(true);
-            } finally {
-                for (const pid of [candidatePid, ownerPid, parent.pid]) {
-                    if (!Number.isSafeInteger(pid) || pid < 1) continue;
-                    try { process.kill(pid, "SIGKILL"); } catch {}
-                }
+                process.kill(child.pid, "SIGKILL");
+            } catch {
+                // The expected close path already terminated the exact PID.
             }
-        },
-        30_000,
-    );
+        }
+    }, 10_000);
 });

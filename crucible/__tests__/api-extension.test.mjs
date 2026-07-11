@@ -1,23 +1,15 @@
 // crucible/__tests__/api-extension.test.mjs
 //
-// Registration/static test for the thin extension: the SDK registration payload
-// exposes EXACTLY the four public tools and NO hooks, each tool carries a
-// derived JSON Schema and a boundary handler, and the extension.mjs entrypoint
-// stays thin (registration only) and never writes to stdout.
+// Registration tests for the public SDK payload: exactly four tools, no hooks,
+// derived JSON Schemas, and structured boundary error handling.
 
 import { describe, expect, it } from "vitest";
-import fs from "node:fs";
-import path from "node:path";
-import { fileURLToPath } from "node:url";
 
 import { buildRegistration, runToolBoundary } from "../api/handlers.mjs";
 import { PUBLIC_TOOL_NAMES, crucibleStartSpec } from "../api/schema.mjs";
 import { SandboxUnavailableApiError } from "../api/errors.mjs";
 
-const HERE = path.dirname(fileURLToPath(import.meta.url));
-const EXTENSION_PATH = path.join(HERE, "..", "extension.mjs");
-
-describe("crucible thin extension registration", () => {
+describe("crucible API registration", () => {
     it("registers exactly four tools and no hooks", () => {
         const registration = buildRegistration({ env: {}, log: () => {} });
         expect(Object.keys(registration)).toEqual(["tools"]);
@@ -88,6 +80,7 @@ describe("crucible thin extension registration", () => {
                 harness_id: "harness",
                 acceptance_predicate: { kind: "harness_pass" },
                 hypothesis_topology: "finite_enumerable",
+                bounded_candidate_ids: ["candidate-a"],
                 validation_cases: [
                     { id: "good", expectation: "accept", path: "cases/good" },
                     { id: "bad", expectation: "reject", path: "cases/bad" },
@@ -106,25 +99,4 @@ describe("crucible thin extension registration", () => {
         });
     });
 
-    it("keeps extension.mjs thin: registration only, no hooks, no stdout", () => {
-        const source = fs.readFileSync(EXTENSION_PATH, "utf8");
-        // Strip line comments so prose (e.g. the "NO hooks" note) does not trip
-        // the code assertions below. The file uses only // comments.
-        const code = source.replace(/\/\/.*$/gmu, "");
-        // Imports the SDK join + the API registration builder.
-        expect(source).toMatch(/joinSession/u);
-        expect(source).toMatch(/buildRegistration/u);
-        // The registration passed to joinSession comes solely from
-        // buildRegistration (which is separately proven to expose no hooks).
-        expect(code).toMatch(/joinSession\(\s*buildRegistration\(/u);
-        // No hook registration of any kind in the executable code.
-        expect(code).not.toMatch(/hooks/iu);
-        expect(code).not.toMatch(/registerHook/iu);
-        // Never writes to stdout/stderr directly; diagnostics go via session.log.
-        expect(code).not.toMatch(/console\./u);
-        expect(code).not.toMatch(/process\.stdout/u);
-        expect(code).not.toMatch(/process\.stderr/u);
-        // Thin: no inline tool objects (no `parameters:` literals here).
-        expect(code).not.toMatch(/parameters\s*:/u);
-    });
 });

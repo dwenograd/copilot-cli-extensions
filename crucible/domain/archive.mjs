@@ -83,6 +83,12 @@ function compareMetricValues(left, right, epsilon) {
 }
 
 export function compareCandidateEvidence(metrics, left, right) {
+    if (left.rankable === true && right.rankable === false) {
+        return -1;
+    }
+    if (left.rankable === false && right.rankable === true) {
+        return 1;
+    }
     for (const metric of metrics) {
         const epsilon = metric.epsilon > 0 ? metric.epsilon : 0;
         const leftValue = left.metrics?.[metric.key];
@@ -146,11 +152,11 @@ export function classifyCandidateOutcome(
         priorCandidates = [],
     } = {},
 ) {
-    if (!rankable) {
-        return "invalid_metrics";
-    }
     if (accepted) {
         return "accepted";
+    }
+    if (!rankable) {
+        return "invalid_metrics";
     }
 
     const predicateAssessment = assessAcceptancePredicate(
@@ -209,9 +215,7 @@ export function duplicateEvidenceId(candidateEvidence, candidateArtifactHash) {
 
 export function selectIncumbent(contract, candidateEvidence) {
     return selectPrimaryEvidence(candidateEvidence)
-        .filter((evidence) =>
-            evidence.rankable === true
-            && evidence.outcomeClass === "accepted")
+        .filter((evidence) => evidence.outcomeClass === "accepted")
         .sort((left, right) => compareCandidateEvidence(contract.metrics, left, right))[0] ?? null;
 }
 
@@ -285,7 +289,7 @@ export function buildCandidateArchive(aggregate) {
     const comparator = (left, right) =>
         compareCandidateEvidence(contract.metrics, left, right);
     const accepted = boundedSelect(
-        primary.filter((item) => item.outcomeClass === "accepted" && item.rankable),
+        primary.filter((item) => item.outcomeClass === "accepted"),
         caps.accepted,
         comparator,
     );

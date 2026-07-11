@@ -9,7 +9,7 @@
 //   * NON_RESULT_BANNER marks everything else, and its exact text is a contract
 //     the calling agent is instructed to honor: do NOT report as complete.
 
-export const TERMINAL_BANNER = "===== ORACLE V3 TERMINAL RESULT =====";
+export const TERMINAL_BANNER = "===== CRUCIBLE TERMINAL RESULT =====";
 export const NON_RESULT_BANNER = "NOT A RESULT — DO NOT REPORT AS COMPLETE";
 export const INTEGRITY_NON_RESULT_BANNER =
     "===== CRUCIBLE INTEGRITY BLOCKED — NOT A RESULT =====";

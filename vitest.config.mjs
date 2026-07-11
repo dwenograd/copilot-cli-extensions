@@ -21,6 +21,9 @@ export default defineConfig({
             "**/dist/**",
             "**/.{idea,git,cache,output,temp}/**",
             "zerotrust-sourcecheck/**",
+            "crucible/__tests__/windows-conformance/**",
+            "crucible/__tests__/**/*.integration.test.mjs",
+            "crucible/__tests__/**/*.release.test.mjs",
         ],
     },
 });

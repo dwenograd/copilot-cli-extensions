@@ -794,6 +794,24 @@ describe("Crucible domain version 3 kernel", () => {
         }))).toThrow(expect.objectContaining({ code: ERROR_CODES.INVALID_ACCEPTANCE_PREDICATE }));
     });
 
+    it("requires bounded ids exactly for finite and bounded topologies", () => {
+        for (const hypothesisTopology of ["finite_enumerable", "bounded_parameterized"]) {
+            expect(() => createInvestigationContract(contractInput({
+                hypothesisTopology,
+            }))).toThrow(expect.objectContaining({ code: ERROR_CODES.INVALID_CONTRACT }));
+            expect(() => createInvestigationContract(contractInput({
+                hypothesisTopology,
+                boundedCandidateIds: ["candidate-a"],
+            }))).not.toThrow();
+        }
+        for (const hypothesisTopology of ["open_generative", "certified_impossibility"]) {
+            expect(() => createInvestigationContract(contractInput({
+                hypothesisTopology,
+                boundedCandidateIds: ["candidate-a"],
+            }))).toThrow(expect.objectContaining({ code: ERROR_CODES.INVALID_CONTRACT }));
+        }
+    });
+
     it("commits accepted, near-miss, rejected, and invalid-metrics candidate evidence", () => {
         const context = validateInvestigation(openInvestigation({
             acceptancePredicate: {
@@ -1250,7 +1268,7 @@ describe("Crucible domain version 3 kernel", () => {
         expect(replayEvents(context.history)).toEqual(context.aggregate);
     });
 
-    it("does not run an impossibility verifier after any candidate satisfies acceptance", () => {
+    it("retains and verifies an accepted candidate without optional ranking metrics", () => {
         const context = validateInvestigation(openInvestigation({
             hypothesisTopology: "certified_impossibility",
             workerModels: ["model-alpha"],
@@ -1263,11 +1281,13 @@ describe("Crucible domain version 3 kernel", () => {
             data: { pass: true, metrics: {} },
         });
         expect(candidate.evidence.acceptanceSatisfied).toBe(true);
-        expect(candidate.evidence.outcomeClass).toBe("invalid_metrics");
+        expect(candidate.evidence.rankable).toBe(false);
+        expect(candidate.evidence.outcomeClass).toBe("accepted");
         const recommendation = decideNext(context.aggregate);
         expect(recommendation).toMatchObject({
-            kind: "NON_RESULT",
-            code: NON_RESULT_CODES.BUDGET_EXHAUSTED_INCONCLUSIVE,
+            kind: "TERMINAL",
+            decision: "VERIFIED_RESULT",
+            candidateId: candidate.evidence.candidateId,
         });
         expect(recommendation.command?.kind).not.toBe("verify_impossibility");
     });

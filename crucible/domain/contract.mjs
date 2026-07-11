@@ -1098,12 +1098,21 @@ function normalizeSearch(search, topology) {
             `search capacity cannot exceed ${CONTRACT_LIMITS.maxEvaluations} candidate evaluations`,
         );
     }
-    if (search.boundedCandidateIds !== undefined && search.boundedCandidateIds !== null) {
-        if (topology !== "finite_enumerable" && topology !== "bounded_parameterized") {
-            throw new ContractError(
-                "search.boundedCandidateIds is only valid for finite or bounded topologies",
-            );
-        }
+    const requiresBoundedCandidateIds =
+        topology === "finite_enumerable" || topology === "bounded_parameterized";
+    const hasBoundedCandidateIds =
+        search.boundedCandidateIds !== undefined && search.boundedCandidateIds !== null;
+    if (requiresBoundedCandidateIds && !hasBoundedCandidateIds) {
+        throw new ContractError(
+            "search.boundedCandidateIds is required for finite_enumerable and bounded_parameterized topologies",
+        );
+    }
+    if (!requiresBoundedCandidateIds && hasBoundedCandidateIds) {
+        throw new ContractError(
+            "search.boundedCandidateIds is only valid for finite or bounded topologies",
+        );
+    }
+    if (hasBoundedCandidateIds) {
         normalized.boundedCandidateIds = normalizeIdentifierArray(
             search.boundedCandidateIds,
             "search.boundedCandidateIds",

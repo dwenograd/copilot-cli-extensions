@@ -24,12 +24,14 @@ import {
 } from "../api/schema.mjs";
 
 function validStartArgs(overrides = {}) {
-    return {
+    const hypothesisTopology =
+        overrides.hypothesis_topology ?? "finite_enumerable";
+    const args = {
         objective: "find a candidate scoring at least 90",
         project_dir: "C:\\proj",
         harness_id: "primary-harness",
         acceptance_predicate: { kind: "harness_pass" },
-        hypothesis_topology: "finite_enumerable",
+        hypothesis_topology: hypothesisTopology,
         validation_cases: [
             { id: "good", expectation: "accept", path: "cases/good" },
             { id: "bad", expectation: "reject", path: "cases/bad" },
@@ -37,8 +39,12 @@ function validStartArgs(overrides = {}) {
         worker_models: ["model-a", "model-b"],
         candidates_per_round: 2,
         max_rounds: 3,
-        ...overrides,
     };
+    if (["finite_enumerable", "bounded_parameterized"].includes(hypothesisTopology)
+        && !Object.hasOwn(overrides, "bounded_candidate_ids")) {
+        args.bounded_candidate_ids = ["cand-a"];
+    }
+    return { ...args, ...overrides };
 }
 
 const VALID_ARGS = {
@@ -118,6 +124,18 @@ describe("crucible API schema (single source)", () => {
             "candidates_per_round",
             "max_rounds",
         ]));
+        expect(newBranch.allOf).toContainEqual({
+            if: {
+                properties: {
+                    hypothesis_topology: {
+                        enum: ["finite_enumerable", "bounded_parameterized"],
+                    },
+                },
+                required: ["hypothesis_topology"],
+            },
+            then: { required: ["bounded_candidate_ids"] },
+            else: { not: { required: ["bounded_candidate_ids"] } },
+        });
         expect(reattachBranch.required).toEqual(["investigation_id"]);
         expect(() => crucibleStartSpec.parse(validStartArgs())).not.toThrow();
         expect(() => crucibleStartSpec.parse({
@@ -344,7 +362,7 @@ describe("crucible API schema (single source)", () => {
         }))).toThrow(SchemaValidationError);
     });
 
-    it("accepts optional bounded_candidate_ids/deadline for new starts and reset on reattach", () => {
+    it("requires bounded_candidate_ids for finite/bounded starts and accepts reattach reset", () => {
         const parsed = crucibleStartSpec.parse(validStartArgs({
             bounded_candidate_ids: ["cand-a", "cand-b"],
             deadline_iso: "2026-07-10T09:00:00.000Z",
@@ -361,6 +379,19 @@ describe("crucible API schema (single source)", () => {
             reset_policy: "anything",
         }))
             .toThrow(SchemaValidationError);
+
+        for (const hypothesis_topology of ["finite_enumerable", "bounded_parameterized"]) {
+            expect(() => crucibleStartSpec.parse(validStartArgs({
+                hypothesis_topology,
+                bounded_candidate_ids: undefined,
+            }))).toThrow(SchemaValidationError);
+        }
+        for (const hypothesis_topology of ["open_generative", "certified_impossibility"]) {
+            expect(() => crucibleStartSpec.parse(validStartArgs({
+                hypothesis_topology,
+                bounded_candidate_ids: ["cand-a"],
+            }))).toThrow(SchemaValidationError);
+        }
     });
 
     it("documents and accepts the certified-impossibility verifier prerequisite", () => {

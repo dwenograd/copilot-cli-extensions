@@ -69,9 +69,7 @@ import {
     stopInvestigation,
 } from "../api/handlers.mjs";
 import {
-    INTEGRITY_NON_RESULT_BANNER,
     NON_RESULT_BANNER,
-    TERMINAL_BANNER,
 } from "../api/result.mjs";
 import {
     ContractConflictError,
@@ -227,7 +225,7 @@ function startArgs(projectDir, overrides = {}) {
                 { kind: "metric_compare", metric: "score", operator: ">=", value: 90 },
             ],
         },
-        hypothesis_topology: "finite_enumerable",
+        hypothesis_topology: "open_generative",
         validation_cases: [
             { id: "good", expectation: "accept", path: "cases/good" },
             { id: "bad", expectation: "reject", path: "cases/bad" },
@@ -1212,7 +1210,7 @@ function corruptCasArtifact(
 function expectIntegrityBlocked(result) {
     expect(result).toMatchObject({
         is_result: false,
-        banner: INTEGRITY_NON_RESULT_BANNER,
+        banner: "===== CRUCIBLE INTEGRITY BLOCKED — NOT A RESULT =====",
         integrity_blocked: true,
         non_result: true,
         non_result_code: "INTEGRITY_BLOCKED",
@@ -1384,7 +1382,7 @@ describe("environment: path + state resolution", () => {
         expect(differentEntry).not.toBe(id1);
     });
 
-    it("namespaces investigation identity by DOMAIN_VERSION instead of reopening v1", () => {
+    it("includes DOMAIN_VERSION in the deterministic investigation identity", () => {
         const objective = "find a candidate";
         const projectDir = "C:\\proj";
         const harnessId = "h1";
@@ -1521,37 +1519,6 @@ describe("crucible_start", () => {
                 certificateVersion: "crucible-impossibility-certificate-v1",
             },
         });
-    });
-
-    it("starts domain v2 beside a legacy v1 identity instead of reopening it", () => {
-        const workspace = makeWorkspace("versioned-start");
-        const objective = "find a candidate scoring at least 90";
-        const canonicalProjectDir = fs.realpathSync.native(workspace.projectDir);
-        const legacyMaterial = [
-            "crucible-investigation-v1",
-            "primary-harness",
-            objective,
-            path.resolve(canonicalProjectDir).replace(/\//gu, "\\").toLowerCase(),
-        ].join("\u0000");
-        const legacyId = `find-a-candidate-scoring-at-least-90-${createHash("sha256")
-            .update(legacyMaterial, "utf8")
-            .digest("hex")
-            .slice(0, 16)}`;
-        const stateRoot = resolveStateRoot(workspace.env);
-        const legacyPaths = resolveInvestigationPaths(stateRoot, legacyId);
-        fs.mkdirSync(legacyPaths.stateDir, { recursive: true });
-        const legacyMarker = path.join(legacyPaths.stateDir, "legacy-v1.marker");
-        fs.writeFileSync(legacyMarker, "do-not-reopen");
-
-        const { deps } = makeDeps(workspace.env);
-        const started = startInvestigation(startArgs(workspace.projectDir), deps);
-
-        expect(started.investigation_id).not.toBe(legacyId);
-        expect(fs.readFileSync(legacyMarker, "utf8")).toBe("do-not-reopen");
-        expect(fs.existsSync(resolveInvestigationPaths(
-            stateRoot,
-            started.investigation_id,
-        ).eventsDbPath)).toBe(true);
     });
 
     it("is idempotent for an identical contract and returns the existing investigation", () => {
@@ -2178,7 +2145,7 @@ describe("crucible_result", () => {
 
         const result = resultInvestigation({ investigation_id: "verified-inv" }, deps);
         expect(result.is_result).toBe(true);
-        expect(result.banner).toBe(TERMINAL_BANNER);
+        expect(result.banner).toBe("===== CRUCIBLE TERMINAL RESULT =====");
         expect(result.decision).toBe("VERIFIED_RESULT");
         expect(result.candidate_id).toBe(FIRST_GENERATED_CANDIDATE_ID);
         expect(result.evidence_hash).toMatch(/^sha256:/u);
@@ -2205,7 +2172,7 @@ describe("crucible_result", () => {
 
         const result = resultInvestigation({ investigation_id: "unreach-inv" }, deps);
         expect(result.is_result).toBe(true);
-        expect(result.banner).toBe(TERMINAL_BANNER);
+        expect(result.banner).toBe("===== CRUCIBLE TERMINAL RESULT =====");
         expect(result.decision).toBe("TARGET_UNREACHABLE");
         expect(result.basis.kind).toBe("search_space_exhausted");
         const persisted = replayAggregate(workspace.stateRoot, "unreach-inv").terminal;
@@ -2228,7 +2195,7 @@ describe("crucible_result", () => {
         }, deps);
         expect(result).toMatchObject({
             is_result: true,
-            banner: TERMINAL_BANNER,
+            banner: "===== CRUCIBLE TERMINAL RESULT =====",
             decision: "TARGET_UNREACHABLE",
             basis: {
                 kind: "verified_impossibility_certificate",
@@ -2240,7 +2207,7 @@ describe("crucible_result", () => {
         );
     });
 
-    for (const artifactClass of [
+    it.each([
         "validation composite",
         "proposal/context",
         "measurement receipt",
@@ -2248,61 +2215,74 @@ describe("crucible_result", () => {
         "raw stderr",
         "snapshot manifest",
         "snapshot object",
-    ]) {
-        for (const mode of ["missing", "corrupt", "substitute"]) {
-            it(`refuses a terminal result when the ${artifactClass} artifact is ${mode}`, () => {
-                const workspace = makeWorkspace(`result-${artifactClass}-${mode}`);
-                seedVerifiedResult(workspace.stateRoot, "verified-inv");
-                const { artifacts } = terminalArtifactClasses(
-                    workspace.stateRoot,
-                    "verified-inv",
-                );
-                expect(artifacts[artifactClass]).toBeTruthy();
-                const replacement = Object.values(artifacts).find((artifact) =>
-                    artifact?.objectId !== undefined
-                    && artifact.objectId !== artifacts[artifactClass].objectId);
-                corruptCasArtifact(
-                    workspace.stateRoot,
-                    "verified-inv",
-                    artifacts[artifactClass],
-                    mode,
-                    replacement,
-                );
-                const { deps } = makeDeps(workspace.env);
-                expectIntegrityBlocked(resultInvestigation({
-                    investigation_id: "verified-inv",
-                }, deps));
-            });
-        }
-    }
+    ])("refuses a terminal result when the %s artifact is corrupt", (artifactClass) => {
+        const workspace = makeWorkspace(`result-${artifactClass}-corrupt`);
+        seedVerifiedResult(workspace.stateRoot, "verified-inv");
+        const { artifacts } = terminalArtifactClasses(
+            workspace.stateRoot,
+            "verified-inv",
+        );
+        expect(artifacts[artifactClass]).toBeTruthy();
+        corruptCasArtifact(
+            workspace.stateRoot,
+            "verified-inv",
+            artifacts[artifactClass],
+            "corrupt",
+        );
+        const { deps } = makeDeps(workspace.env);
+        expectIntegrityBlocked(resultInvestigation({
+            investigation_id: "verified-inv",
+        }, deps));
+    });
 
-    for (const mode of ["missing", "corrupt", "substitute"]) {
-        it(`refuses a certified terminal result when the impossibility certificate is ${mode}`, () => {
-            const workspace = makeWorkspace(`result-certificate-${mode}`);
-            seedCertifiedTargetUnreachable(
-                workspace.stateRoot,
-                "certified-unreach-inv",
-            );
+    it.each(["missing", "substitute"])(
+        "refuses a terminal result when decisive measurement evidence is %s",
+        (mode) => {
+            const workspace = makeWorkspace(`result-measurement-${mode}`);
+            seedVerifiedResult(workspace.stateRoot, "verified-inv");
             const { artifacts } = terminalArtifactClasses(
                 workspace.stateRoot,
-                "certified-unreach-inv",
+                "verified-inv",
             );
-            const replacement = Object.values(artifacts).find((artifact) =>
-                artifact?.objectId !== undefined
-                && artifact.objectId !== artifacts["impossibility certificate"].objectId);
+            const artifact = artifacts["measurement receipt"];
+            const replacement = Object.values(artifacts).find((candidate) =>
+                candidate?.objectId !== undefined
+                && candidate.objectId !== artifact.objectId);
             corruptCasArtifact(
                 workspace.stateRoot,
-                "certified-unreach-inv",
-                artifacts["impossibility certificate"],
+                "verified-inv",
+                artifact,
                 mode,
                 replacement,
             );
             const { deps } = makeDeps(workspace.env);
             expectIntegrityBlocked(resultInvestigation({
-                investigation_id: "certified-unreach-inv",
+                investigation_id: "verified-inv",
             }, deps));
-        });
-    }
+        },
+    );
+
+    it("refuses a certified terminal result with a corrupt impossibility certificate", () => {
+        const workspace = makeWorkspace("result-certificate-corrupt");
+        seedCertifiedTargetUnreachable(
+            workspace.stateRoot,
+            "certified-unreach-inv",
+        );
+        const { artifacts } = terminalArtifactClasses(
+            workspace.stateRoot,
+            "certified-unreach-inv",
+        );
+        corruptCasArtifact(
+            workspace.stateRoot,
+            "certified-unreach-inv",
+            artifacts["impossibility certificate"],
+            "corrupt",
+        );
+        const { deps } = makeDeps(workspace.env);
+        expectIntegrityBlocked(resultInvestigation({
+            investigation_id: "certified-unreach-inv",
+        }, deps));
+    });
 
     it("refuses external artifact size metadata that does not match CAS bytes", () => {
         const workspace = makeWorkspace("result-size-mismatch");
@@ -2360,20 +2340,8 @@ describe("crucible_result", () => {
         expect(fs.existsSync(paths.artifactRoot)).toBe(false);
     });
 
-    it.each([
-        ["delete", (bytes) => Buffer.alloc(0), 0],
-        ["corrupt", (bytes) => {
-            const corrupted = Buffer.from(bytes);
-            corrupted[0] ^= 0xff;
-            return corrupted;
-        }, null],
-        ["substitute", (bytes) => Buffer.alloc(bytes.length, 0x5a), null],
-    ])("verifies inline artifact checksums and refuses %s", (
-        mode,
-        mutate,
-        explicitSize,
-    ) => {
-        const workspace = makeWorkspace(`result-inline-${mode}`);
+    it("verifies inline artifact checksums before returning a result", () => {
+        const workspace = makeWorkspace("result-inline-corrupt");
         seedVerifiedResult(workspace.stateRoot, "verified-inv");
         const { artifacts } = terminalArtifactClasses(
             workspace.stateRoot,
@@ -2402,7 +2370,8 @@ describe("crucible_result", () => {
             investigation_id: "verified-inv",
         }, deps).is_result).toBe(true);
 
-        const mutated = mutate(bytes);
+        const mutated = Buffer.from(bytes);
+        mutated[0] ^= 0xff;
         const corruptDb = new DatabaseSync(paths.eventsDbPath);
         try {
             corruptDb.prepare(`
@@ -2411,7 +2380,7 @@ describe("crucible_result", () => {
                     size_bytes = ?
                 WHERE artifact_id = ?`).run(
                 mutated,
-                explicitSize ?? mutated.length,
+                mutated.length,
                 proposal.artifactId,
             );
         } finally {

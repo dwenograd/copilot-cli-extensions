@@ -63,6 +63,7 @@ import {
     PARSER_VERSION,
     parseHarnessResult,
 } from "./parser.mjs";
+import { MEASUREMENT_LIFECYCLE_ADAPTER } from "./private-adapters.mjs";
 import {
     buildMeasurementReceipt,
     hashArgv,
@@ -82,6 +83,24 @@ const SAFE_ID = /^[a-z0-9][a-z0-9._-]{0,127}$/u;
 const HASH_TAG = /^sha256:[a-z0-9][a-z0-9._-]*:[a-f0-9]{64}$/u;
 const DEFAULT_TERMINATION_DRAIN_TIMEOUT_MS = 5_000;
 const DEFAULT_CAPABILITY_CLEANUP_TIMEOUT_MS = 10_000;
+const EXECUTOR_OPTION_KEYS = new Set([
+    "allowlist",
+    "sandboxProvider",
+    "processAdapter",
+    "clock",
+    "scratchRoot",
+    "onCapturedOutput",
+    "terminationDrainMs",
+    "capabilityCleanupTimeoutMs",
+    "byteBudgets",
+    "initialByteUsage",
+]);
+const LIFECYCLE_ADAPTER_METHODS = Object.freeze([
+    "afterHarnessStaging",
+    "beforeHarnessLaunch",
+    "afterHarnessLaunch",
+    "afterHarnessExit",
+]);
 export const DEFAULT_MEASUREMENT_BYTE_BUDGETS = Object.freeze({
     perAttemptOutputBytes: 16 * 1024 * 1024,
     perInvestigationOutputBytes: 256 * 1024 * 1024,
@@ -510,10 +529,31 @@ function byteBudgetError(result, attemptId, stage) {
 //   clock              : { now(): number, isoNow(): string } for tests
 //   scratchRoot        : operator-owned root for private per-attempt staging
 //   onCapturedOutput   : trusted raw-output observer used by the runtime runner
-//   faultInjector      : optional async boundary injector used by failure tests
 //   terminationDrainMs : final child-output drain bound after termination
 //   capabilityCleanupTimeoutMs : final sandbox cleanup / Job Object close bound
 export function createMeasurementExecutor(options = {}) {
+    if (options === null
+        || typeof options !== "object"
+        || Array.isArray(options)) {
+        throw new MeasurementError(
+            MEASUREMENT_ERROR_CODES.INVALID_ARGUMENT,
+            "MeasurementExecutor options must be an object",
+        );
+    }
+    const unknownOptions = Object.keys(options)
+        .filter((key) => !EXECUTOR_OPTION_KEYS.has(key));
+    const unknownSymbols = Object.getOwnPropertySymbols(options)
+        .filter((key) => key !== MEASUREMENT_LIFECYCLE_ADAPTER);
+    if (unknownOptions.length > 0 || unknownSymbols.length > 0) {
+        throw new MeasurementError(
+            MEASUREMENT_ERROR_CODES.INVALID_ARGUMENT,
+            "MeasurementExecutor received unknown options",
+            {
+                unknownOptions,
+                unknownSymbolCount: unknownSymbols.length,
+            },
+        );
+    }
     const allowlist = options.allowlist;
     if (!isLoadedHarnessAllowlist(allowlist)) {
         throw new MeasurementError(
@@ -552,13 +592,9 @@ export function createMeasurementExecutor(options = {}) {
             "onCapturedOutput must be a function or null",
         );
     }
-    const faultInjector = options.faultInjector ?? null;
-    if (faultInjector !== null && typeof faultInjector !== "function") {
-        throw new MeasurementError(
-            MEASUREMENT_ERROR_CODES.INVALID_ARGUMENT,
-            "faultInjector must be a function or null",
-        );
-    }
+    const lifecycleAdapter = normalizeLifecycleAdapter(
+        options[MEASUREMENT_LIFECYCLE_ADAPTER],
+    );
     const scratchRoot = normalizeScratchRoot(options.scratchRoot);
     const terminationDrainMs = normalizeLifecycleTimeout(
         options.terminationDrainMs,
@@ -596,7 +632,7 @@ export function createMeasurementExecutor(options = {}) {
                 scratchRoot,
                 allowlist,
                 onCapturedOutput,
-                faultInjector,
+                lifecycleAdapter,
                 terminationDrainMs,
                 capabilityCleanupTimeoutMs,
                 byteLedger,
@@ -607,6 +643,32 @@ export function createMeasurementExecutor(options = {}) {
             return adapter.close(closeOptions);
         },
     });
+}
+
+function normalizeLifecycleAdapter(value) {
+    if (value === undefined || value === null) return null;
+    if (typeof value !== "object" || Array.isArray(value)) {
+        throw new MeasurementError(
+            MEASUREMENT_ERROR_CODES.INVALID_ARGUMENT,
+            "measurement lifecycle adapter must be an object",
+        );
+    }
+    const unknown = Object.keys(value)
+        .filter((key) => !LIFECYCLE_ADAPTER_METHODS.includes(key));
+    if (unknown.length > 0
+        || LIFECYCLE_ADAPTER_METHODS.some((key) =>
+            value[key] !== undefined && typeof value[key] !== "function")) {
+        throw new MeasurementError(
+            MEASUREMENT_ERROR_CODES.INVALID_ARGUMENT,
+            "measurement lifecycle adapter is malformed",
+            { unknown },
+        );
+    }
+    return Object.freeze(Object.fromEntries(
+        LIFECYCLE_ADAPTER_METHODS
+            .filter((key) => value[key] !== undefined)
+            .map((key) => [key, value[key]]),
+    ));
 }
 
 function normalizeScratchRoot(value) {
@@ -718,7 +780,7 @@ async function runOnce({
     scratchRoot,
     allowlist,
     onCapturedOutput,
-    faultInjector,
+    lifecycleAdapter,
     terminationDrainMs,
     capabilityCleanupTimeoutMs,
     byteLedger,
@@ -842,7 +904,7 @@ async function runOnce({
             ...snapshot,
             path: stagedSnapshot.path,
         });
-        await faultInjector?.("after_harness_staging", Object.freeze({
+        await lifecycleAdapter?.afterHarnessStaging?.(Object.freeze({
             attemptId,
             runnerEpochId,
             harnessId: entry.id,
@@ -928,7 +990,7 @@ async function runOnce({
         );
         const startedAt = clock.isoNow();
         const startTimeMs = clock.now();
-        await faultInjector?.("before_harness_launch", Object.freeze({
+        await lifecycleAdapter?.beforeHarnessLaunch?.(Object.freeze({
             attemptId,
             runnerEpochId,
             harnessId: entry.id,
@@ -1023,7 +1085,7 @@ async function runOnce({
             byteLedger,
         });
         try {
-            await faultInjector?.("after_harness_launch", Object.freeze({
+            await lifecycleAdapter?.afterHarnessLaunch?.(Object.freeze({
                 attemptId,
                 runnerEpochId,
                 harnessId: entry.id,
@@ -1049,7 +1111,7 @@ async function runOnce({
             throw error;
         }
         const outcome = await capture.outcome;
-        await faultInjector?.("after_harness_exit", Object.freeze({
+        await lifecycleAdapter?.afterHarnessExit?.(Object.freeze({
             attemptId,
             runnerEpochId,
             harnessId: entry.id,

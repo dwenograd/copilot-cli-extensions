@@ -2250,10 +2250,13 @@ export function importBundle(options = {}) {
             };
         }
         assertSameVerifiedBundle(publication.prepared.verification, verification);
+        const authenticated = publication.prepared.trustLevel === "authenticated";
         return {
             fileCount: verification.inventory.length,
             objectCount: verification.manifest.objects.length,
-            verified: true,
+            selfConsistent: true,
+            authenticated,
+            verified: authenticated,
             digest: verification.digest,
             trustLevel: publication.prepared.trustLevel,
             investigationId: verification.binding.investigationId,

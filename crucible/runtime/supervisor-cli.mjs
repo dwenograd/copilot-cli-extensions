@@ -39,7 +39,10 @@ export async function mainSupervisorCli(argv = process.argv.slice(2), dependenci
             non_result_code: error?.code ?? RUNTIME_ERROR_CODES.RUNTIME_FAILURE,
         };
         dependencies.stderr?.write?.(`${JSON.stringify(envelope)}\n`);
-        return { exitCode: 1, envelope };
+        return {
+            exitCode: error?.code === RUNTIME_ERROR_CODES.INVALID_CONFIG ? 64 : 1,
+            envelope,
+        };
     }
 }
 

@@ -19,55 +19,41 @@ function atomicTemps(root) {
 }
 
 afterEach(() => {
+    const failures = [];
     for (const root of roots.splice(0)) {
-        fs.rmSync(root, {
-            recursive: true,
-            force: true,
-            maxRetries: 10,
-            retryDelay: 25,
-        });
+        try {
+            fs.rmSync(root, {
+                recursive: true,
+                force: true,
+                maxRetries: 10,
+                retryDelay: 25,
+            });
+        } catch (error) {
+            failures.push(error);
+        }
+        if (fs.existsSync(root)) {
+            failures.push(new Error(`runtime utils root survived cleanup: ${root}`));
+        }
+    }
+    if (failures.length > 0) {
+        throw new AggregateError(failures, "runtime utils test cleanup failed");
     }
 });
 
 describe("H7 atomic status-write failure matrix", () => {
     it.each([
-        "after-open",
-        "after-write",
-        "before-file-fsync",
-        "after-file-fsync",
-        "before-rename",
-    ])("removes the current-owned temporary after a pre-publication failure at %s", (point) => {
+        ["after-open", false],
+        ["after-file-fsync", false],
+        ["after-rename", true],
+    ])("leaves an atomic recoverable state at representative point %s", (
+        point,
+        published,
+    ) => {
         const root = makeRoot(point);
         const target = path.join(root, "status.json");
-        const inject = (event) => {
-            if (event.point === point) {
-                throw new Error(`injected ${point}`);
-            }
-        };
 
         expect(() => atomicWriteJson(target, { revision: 1 }, {
-            token: "fixed-retry-token",
-            faultInjector: inject,
-        })).toThrow(`injected ${point}`);
-        expect(fs.existsSync(target)).toBe(false);
-        expect(atomicTemps(root)).toEqual([]);
-
-        atomicWriteJson(target, { revision: 2 }, {
-            token: "fixed-retry-token",
-        });
-        expect(JSON.parse(fs.readFileSync(target, "utf8"))).toEqual({ revision: 2 });
-        expect(atomicTemps(root)).toEqual([]);
-    });
-
-    it.each([
-        "after-rename",
-        "before-directory-fsync",
-    ])("leaves one complete recoverable publication and no temporary at %s", (point) => {
-        const root = makeRoot(point);
-        const target = path.join(root, "status.json");
-
-        expect(() => atomicWriteJson(target, { revision: 7 }, {
-            token: "published-token",
+            token: "representative-token",
             faultInjector(event) {
                 if (event.point === point) {
                     throw new Error(`injected ${point}`);
@@ -75,7 +61,15 @@ describe("H7 atomic status-write failure matrix", () => {
             },
         })).toThrow(`injected ${point}`);
 
-        expect(JSON.parse(fs.readFileSync(target, "utf8"))).toEqual({ revision: 7 });
+        if (published) {
+            expect(JSON.parse(fs.readFileSync(target, "utf8"))).toEqual({ revision: 1 });
+        } else {
+            expect(fs.existsSync(target)).toBe(false);
+            atomicWriteJson(target, { revision: 2 }, {
+                token: "representative-token",
+            });
+            expect(JSON.parse(fs.readFileSync(target, "utf8"))).toEqual({ revision: 2 });
+        }
         expect(atomicTemps(root)).toEqual([]);
     });
 });

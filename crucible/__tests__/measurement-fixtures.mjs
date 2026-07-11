@@ -12,7 +12,6 @@
 //     small helpers to write fixture scripts + allowlists.
 
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
@@ -51,6 +50,14 @@ export function sha256HexOfFile(p) {
     return hash.digest("hex");
 }
 
+export function pinnedDependency(filePath, role = "script") {
+    return {
+        path: filePath,
+        sha256: sha256HexOfFile(filePath),
+        role,
+    };
+}
+
 export function makeTempRoot(label) {
     const root = fs.mkdtempSync(path.join(HERE, `.measure-tmp-${label}-`));
     return root;
@@ -60,7 +67,7 @@ export function rmTempRoot(root) {
     if (root) fs.rmSync(root, { recursive: true, force: true });
 }
 
-// Write a tiny .mjs script that behaves as an crucible harness. `body` is a
+// Write a tiny .mjs script that behaves as a Crucible harness. `body` is a
 // snippet of JS that runs inside the script (after node imports fs). It
 // must eventually call process.exit or print to stdout and let the script
 // finish. Returns the absolute path of the created script.
@@ -71,27 +78,14 @@ export function writeHarnessScript(root, name, body) {
 }
 
 // Write a valid allowlist JSON referencing a single entry. `overrides` is
-// a partial entry that is merged over sensible defaults. Returns the
-// absolute path of the created allowlist file.
+// a partial entry that is merged over sensible defaults. Dependencies are
+// always explicit; this helper never infers them from argvTemplate.
 export function writeAllowlist(root, entryId, entryOverrides = {}, { fileName = "harness.allowlist.json" } = {}) {
-    const inferredDependencies = Array.isArray(entryOverrides.argvTemplate)
-        ? entryOverrides.argvTemplate
-            .filter((item) => typeof item === "string"
-                && !item.includes("{{")
-                && path.isAbsolute(item)
-                && fs.existsSync(item)
-                && path.resolve(item).toLowerCase() !== path.resolve(entryOverrides.executable ?? NODE_EXE).toLowerCase())
-            .map((dependencyPath) => ({
-                path: dependencyPath,
-                sha256: sha256HexOfFile(dependencyPath),
-                role: "script",
-            }))
-        : [];
     const entries = { [entryId]: {
         executable: NODE_EXE,
         executableSha256: nodeExeSha256Hex(),
         argvTemplate: [],
-        dependencies: inferredDependencies,
+        dependencies: [],
         timeoutMs: 15000,
         maxStdoutBytes: 1024 * 1024,
         maxStderrBytes: 256 * 1024,
@@ -147,14 +141,27 @@ export function fixedIds() {
     };
 }
 
-// A frozen-clock helper: repeated calls to now()/isoNow() advance by a
-// fixed delta each time so durationMs is predictable in tests.
-export function fixedClock(startIso = "2026-07-09T12:00:00.000Z", stepMs = 100) {
-    const start = Date.parse(startIso);
-    let n = 0;
+export function manualClock(startIso = "2026-07-09T12:00:00.000Z") {
+    let current = typeof startIso === "number"
+        ? startIso
+        : Date.parse(startIso);
+    if (!Number.isFinite(current)) throw new TypeError("invalid manual clock start");
     return {
-        now() { const v = start + n * stepMs; n += 1; return v; },
-        isoNow() { const v = new Date(start + n * stepMs).toISOString(); n += 1; return v; },
+        now() { return current; },
+        isoNow() { return new Date(current).toISOString(); },
+        advance(milliseconds) {
+            if (!Number.isFinite(milliseconds)) {
+                throw new TypeError("manual clock advance must be finite");
+            }
+            current += milliseconds;
+        },
+        set(value) {
+            const next = typeof value === "string" ? Date.parse(value) : value;
+            if (!Number.isFinite(next)) {
+                throw new TypeError("manual clock value must be finite");
+            }
+            current = next;
+        },
     };
 }
 
@@ -198,19 +205,3 @@ export function canCreateDirJunction() {
         fs.rmSync(dir, { recursive: true, force: true });
     }
 }
-
-// Ensure our temp roots go under __tests__/ and never under system /tmp.
-export function assertUnderTests(p) {
-    const abs = path.resolve(p);
-    if (!abs.startsWith(HERE + path.sep)) {
-        throw new Error(`temp path ${abs} escaped __tests__ (${HERE})`);
-    }
-    return abs;
-}
-
-// A tiny convenience so tests can build a full run input in one line.
-export function runInputFor({ verifiedEntry, snapshot, attemptId, runnerEpochId }) {
-    return { verifiedEntry, candidateSnapshot: snapshot, attemptId, runnerEpochId };
-}
-
-export { os };

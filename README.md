@@ -134,7 +134,20 @@ npm install   # one-time
 npm test
 ```
 
-`npm test` runs both test runners in sequence: `vitest` for the orchestrators, Crucible, and `_shared/`, then `node --test` for `zerotrust-sourcecheck/`.
+`npm test` runs the safe developer suites: `vitest` for the orchestrators,
+Crucible, and `_shared/`, then `node --test` for `zerotrust-sourcecheck/`.
+Native Windows containment, real SDK/CLI smoke, hard-kill, multiprocess, and
+long real-process matrices are deliberately excluded.
+
+Use `npm run test:crucible` for Crucible's fast credential-free suite and
+`npm run test:crucible:release-safe` for its long safe matrices. The mandatory
+real integration gate is `npm run test:crucible:integration`; it requires
+absolute `COPILOT_SDK_PATH` and `COPILOT_CLI_PATH` values plus an authenticated
+Copilot CLI, and fails rather than skipping when they are unavailable. Run the
+native boundary serially with
+`npm run test:crucible:windows-conformance`. The explicit
+`npm run test:crucible:release` gate runs all three. `npm run test:release`
+adds the rest of the workspace suites.
 
 If you change a packet wording deliberately in any orchestrator extension, regenerate vitest snapshots once with `npm run test:update`. The zerotrust suite has no snapshots — its tests are explicit assertions.
 

@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
+import { spawnSync } from "node:child_process";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 import {
     MAX_TRUSTED_OPERATOR_CONTEXT_BYTES,
@@ -8,6 +10,8 @@ import {
 } from "../runtime/index.mjs";
 import { mainRunnerCli } from "../runtime/runner-cli.mjs";
 import { mainSupervisorCli } from "../runtime/supervisor-cli.mjs";
+
+const HERE = path.dirname(fileURLToPath(import.meta.url));
 
 describe("Crucible strict runtime CLIs", () => {
     it("rejects anything other than --config with an absolute JSON path", async () => {
@@ -20,8 +24,30 @@ describe("Crucible strict runtime CLIs", () => {
         const supervisor = await mainSupervisorCli(["relative.json"], {
             stderr: { write() {} },
         });
-        expect(supervisor.exitCode).toBe(1);
+        expect(supervisor.exitCode).toBe(64);
         expect(supervisor.envelope.non_result_code).toBe(RUNTIME_ERROR_CODES.INVALID_CONFIG);
+    });
+
+    it.each([
+        ["runner", path.join(HERE, "..", "runtime", "runner-cli.mjs")],
+        ["supervisor", path.join(HERE, "..", "runtime", "supervisor-cli.mjs")],
+    ])("uses exit 64 for invalid %s config in a spawned CLI", (_name, cliPath) => {
+        const result = spawnSync(
+            process.execPath,
+            [cliPath, "--config", "relative.json"],
+            {
+                encoding: "utf8",
+                shell: false,
+                windowsHide: true,
+            },
+        );
+        expect(result.status).toBe(64);
+        expect(result.stdout).toBe("");
+        expect(JSON.parse(result.stderr.trim())).toMatchObject({
+            ok: false,
+            state: "failed",
+            non_result_code: RUNTIME_ERROR_CODES.INVALID_CONFIG,
+        });
     });
 
     it("rejects unknown config fields and result paths outside stateDir", () => {
@@ -35,6 +61,7 @@ describe("Crucible strict runtime CLIs", () => {
             copilotCliPath: path.join(root, "copilot.exe"),
             runnerEpochId: "runner",
         };
+        expect(normalizeRunnerConfig(base).options.shutdownTimeoutMs).toBe(30_000);
         expect(() => normalizeRunnerConfig({
             ...base,
             shellCommand: "node evil.js",

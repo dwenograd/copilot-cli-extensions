@@ -36,10 +36,12 @@ export {
     DEFAULT_CANDIDATE_LIMITS,
     DEFAULT_PARENT_READ_LIMITS,
     SdkWorkerPool,
+    createBoundedParentReadAuthority,
     createSdkWorkerPool,
+    normalizeParentReadLimits,
     validateCandidateSubmission,
+    validateWorkerProposal,
     buildProposalPrompt,
-    assertWorkerSessionsAreNonTerminal,
 } from "./worker-pool.mjs";
 
 export {

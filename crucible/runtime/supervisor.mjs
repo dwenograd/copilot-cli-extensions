@@ -548,6 +548,17 @@ function hasFreshMatchingHeartbeat(lock, status, now, staleLockMs, isPidAlive) {
         && isPidAlive(lock.pid);
 }
 
+function retainedNonQuiescentAuthority(lock, status, isPidAlive) {
+    if (!statusMatchesOwner(status, lock)
+        || !["failed_non_quiescent", "pause_pending"].includes(status.state)) {
+        return false;
+    }
+    if (Number.isSafeInteger(status.childPid) && status.childPid > 0) {
+        return isPidAlive(status.childPid);
+    }
+    return status.state === "failed_non_quiescent";
+}
+
 function ownershipLostError(lock, action, current = null) {
     const error = new SupervisorLockError(
         RUNTIME_ERROR_CODES.LOCK_HELD,
@@ -866,6 +877,8 @@ export function acquireSupervisorLock(config, dependencies = {}) {
                     : null
             );
             const status = readStatusForOwnership(normalized.paths.statusPath, looseOwner);
+            const retainedAuthority = looseOwner !== null
+                && retainedNonQuiescentAuthority(looseOwner, status, isPidAlive);
             const freshOwner = looseOwner !== null
                 && hasFreshMatchingHeartbeat(
                     looseOwner,
@@ -874,7 +887,10 @@ export function acquireSupervisorLock(config, dependencies = {}) {
                     normalized.staleLockMs,
                     isPidAlive,
                 );
-            if (freshOwner || !Number.isFinite(ageMs) || ageMs < normalized.staleLockMs) {
+            if (retainedAuthority
+                || freshOwner
+                || !Number.isFinite(ageMs)
+                || ageMs < normalized.staleLockMs) {
                 throw new SupervisorLockError(
                     RUNTIME_ERROR_CODES.LOCK_HELD,
                     "Another supervisor owns this investigation",
@@ -884,6 +900,8 @@ export function acquireSupervisorLock(config, dependencies = {}) {
                         nonce: inspected.valid?.nonce ?? null,
                         ageMs,
                         freshHeartbeat: freshOwner,
+                        retainedNonQuiescentAuthority: retainedAuthority,
+                        interventionRequired: retainedAuthority,
                         malformed: inspected.valid === null,
                     },
                 );
@@ -900,6 +918,24 @@ export function acquireSupervisorLock(config, dependencies = {}) {
                 normalized.paths.statusPath,
                 looseOwner,
             );
+            if (looseOwner !== null && retainedNonQuiescentAuthority(
+                looseOwner,
+                confirmedStatus,
+                isPidAlive,
+            )) {
+                throw new SupervisorLockError(
+                    RUNTIME_ERROR_CODES.LOCK_HELD,
+                    "Supervisor retained fenced authority for a non-quiescent child",
+                    {
+                        lockPath,
+                        pid: looseOwner.pid,
+                        nonce: looseOwner.nonce,
+                        supervisorGeneration: looseOwner.supervisorGeneration ?? null,
+                        childPid: confirmedStatus?.childPid ?? null,
+                        interventionRequired: true,
+                    },
+                );
+            }
             if (looseOwner !== null && hasFreshMatchingHeartbeat(
                 looseOwner,
                 confirmedStatus,
@@ -1280,6 +1316,7 @@ export async function runSupervisor(input, dependencies = {}) {
     const crashes = [];
     const signalHandlers = new Map();
     let scavenging = null;
+    let retainAuthority = false;
 
     const assertOwnership = (action) => assertSupervisorOwnership(lock, action);
     const scavengeRuntime = dependencies.scavengeRuntime
@@ -1559,7 +1596,7 @@ export async function runSupervisor(input, dependencies = {}) {
                 diagnostics,
             },
         };
-        if (currentChild === child) {
+        if (currentChild === child && exit.cleanupTimedOut !== true) {
             currentChild = null;
             currentChildWait = null;
             currentChildPid = null;
@@ -1711,11 +1748,25 @@ export async function runSupervisor(input, dependencies = {}) {
                     const exitedRunnerIncarnation = currentRunnerIncarnation;
                     const exit = await terminateCurrentChild();
                     stopHeartbeat();
+                    if (exit?.cleanupTimedOut === true) {
+                        retainAuthority = true;
+                        writeStatus("pause_pending", {
+                            non_result_code: RUNTIME_ERROR_CODES.NON_QUIESCENT,
+                        });
+                        return {
+                            kind: "PAUSE_PENDING",
+                            status,
+                            terminalAvailable: false,
+                            nonResultCode: RUNTIME_ERROR_CODES.NON_QUIESCENT,
+                            exit,
+                        };
+                    }
                     await reapRunnerOwnedPaths(
                         exitedRunnerIncarnation,
                         exitedRunnerPid,
                     );
                     if (completed.request.kind === "ownership_lost") {
+                        retainAuthority = true;
                         return {
                             kind: "STOPPED",
                             status,
@@ -1735,7 +1786,7 @@ export async function runSupervisor(input, dependencies = {}) {
                 currentChildPid = null;
                 stopHeartbeat();
                 assertOwnership("runner result processing");
-                await reapRunnerOwnedPaths(
+                const reapExitedRunner = () => reapRunnerOwnedPaths(
                     exitedRunnerIncarnation,
                     exitedRunnerPid,
                 );
@@ -1757,6 +1808,7 @@ export async function runSupervisor(input, dependencies = {}) {
                 if (envelope?.ok === true) {
                     const finalState = classifySuccessfulResult(envelope);
                     if (finalState === null) {
+                        await reapExitedRunner();
                         const reason = "Runner returned an unsupported result kind";
                         recordSupervisorNonResult({
                             code: RUNTIME_ERROR_CODES.RESULT_MISSING,
@@ -1774,6 +1826,7 @@ export async function runSupervisor(input, dependencies = {}) {
                             nonResultCode: RUNTIME_ERROR_CODES.RESULT_MISSING,
                         };
                     }
+                    await reapExitedRunner();
                     writeStatus(finalState, {
                         terminal_available: envelope.terminal_available,
                         non_result_code: envelope.non_result_code,
@@ -1806,7 +1859,21 @@ export async function runSupervisor(input, dependencies = {}) {
                             ?? "Runner exited without an outcome envelope",
                     recoverable,
                 };
+                if (lastError.code === RUNTIME_ERROR_CODES.NON_QUIESCENT) {
+                    retainAuthority = true;
+                    writeStatus("failed_non_quiescent", {
+                        non_result_code: RUNTIME_ERROR_CODES.NON_QUIESCENT,
+                    });
+                    return {
+                        kind: "FAILED_NON_QUIESCENT",
+                        status,
+                        terminalAvailable: false,
+                        nonResultCode: RUNTIME_ERROR_CODES.NON_QUIESCENT,
+                        error: lastError,
+                    };
+                }
                 if (!recoverable) {
+                    await reapExitedRunner();
                     recordSupervisorNonResult({
                         code: lastError.code ?? RUNTIME_ERROR_CODES.RUNTIME_FAILURE,
                         reason: lastError.message ?? "Runner failed without a recoverable outcome.",
@@ -1816,6 +1883,7 @@ export async function runSupervisor(input, dependencies = {}) {
                     writeStatus("failed", { non_result_code: lastError.code });
                     return { kind: "FAILED", status, error: lastError };
                 }
+                await reapExitedRunner();
                 crashes.push(clock.now());
                 writeStatus("crashed");
             }
@@ -1886,13 +1954,16 @@ export async function runSupervisor(input, dependencies = {}) {
             throw error;
         }
         requestOwnershipLoss(error?.details?.action ?? "supervisor action", error);
+        retainAuthority = true;
         const exitedRunnerPid = currentChildPid;
         const exitedRunnerIncarnation = currentRunnerIncarnation;
         const exit = await terminateCurrentChild();
-        await reapRunnerOwnedPaths(
-            exitedRunnerIncarnation,
-            exitedRunnerPid,
-        );
+        if (exit?.cleanupTimedOut !== true) {
+            await reapRunnerOwnedPaths(
+                exitedRunnerIncarnation,
+                exitedRunnerPid,
+            );
+        }
         return {
             kind: "STOPPED",
             status,
@@ -1915,23 +1986,79 @@ export async function runSupervisor(input, dependencies = {}) {
         }
         const exitedRunnerPid = currentChildPid;
         const exitedRunnerIncarnation = currentRunnerIncarnation;
+        let cleanupFailure = null;
         try {
-            await terminateCurrentChild();
-            await reapRunnerOwnedPaths(
-                exitedRunnerIncarnation,
-                exitedRunnerPid,
-            );
+            if (!retainAuthority) {
+                const exit = await terminateCurrentChild();
+                if (exit?.cleanupTimedOut === true) {
+                    retainAuthority = true;
+                    cleanupFailure = new CrucibleRuntimeError(
+                        RUNTIME_ERROR_CODES.NON_QUIESCENT,
+                        "Supervisor could not prove that the runner child process tree exited",
+                        {
+                            childPid: exitedRunnerPid,
+                            runnerIncarnation: exitedRunnerIncarnation,
+                            shutdown: exit.shutdown ?? null,
+                            interventionRequired: true,
+                        },
+                    );
+                } else {
+                    await reapRunnerOwnedPaths(
+                        exitedRunnerIncarnation,
+                        exitedRunnerPid,
+                    );
+                }
+            }
             if (typeof processTreeAdapter.close === "function") {
-                await processTreeAdapter.close({
-                    timeoutMs: shutdownPolicy.finalMs,
-                });
+                const closed = await settleWithin(
+                    () => processTreeAdapter.close({
+                        timeoutMs: shutdownPolicy.finalMs,
+                    }),
+                    shutdownPolicy.finalMs,
+                    { timers: shutdownTimers },
+                );
+                if (closed.status !== "fulfilled") {
+                    retainAuthority = true;
+                    cleanupFailure ??= new CrucibleRuntimeError(
+                        RUNTIME_ERROR_CODES.NON_QUIESCENT,
+                        "Supervisor process-owner cleanup did not complete within its bound",
+                        {
+                            status: closed.status,
+                            error: closed.error?.message ?? null,
+                            interventionRequired: true,
+                        },
+                        closed.error === undefined
+                            ? undefined
+                            : { cause: closed.error },
+                    );
+                }
+            }
+            if (cleanupFailure !== null) {
+                try {
+                    writeStatus("failed_non_quiescent", {
+                        non_result_code: RUNTIME_ERROR_CODES.NON_QUIESCENT,
+                    });
+                } catch (error) {
+                    cleanupFailure.details = {
+                        ...(cleanupFailure.details ?? {}),
+                        statusWriteFailure: {
+                            code: error?.code ?? null,
+                            message: error?.message ?? String(error),
+                        },
+                    };
+                }
             }
         } finally {
             try {
                 closeSupervisorAuthorityRepository(authorityHandle);
             } finally {
-                releaseSupervisorLock(lock);
+                if (!retainAuthority) {
+                    releaseSupervisorLock(lock);
+                }
             }
+        }
+        if (cleanupFailure !== null) {
+            throw cleanupFailure;
         }
     }
 }

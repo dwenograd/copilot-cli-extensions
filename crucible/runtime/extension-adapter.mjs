@@ -37,6 +37,8 @@ const ACKNOWLEDGED_ACTIVE_STATES = new Set(["running"]);
 const ACKNOWLEDGED_FINAL_STATES = new Set(["terminal", "non_result", "pause"]);
 const FAILED_ACKNOWLEDGEMENT_STATES = new Set([
     "failed",
+    "failed_non_quiescent",
+    "pause_pending",
     "circuit_open",
     "stopped",
 ]);
@@ -397,6 +399,14 @@ export function ensureSupervisor(input, dependencies = {}) {
     if (status !== null) {
         if (status.state === "terminal") {
             return finish({ action: "not-restarted", reason: status.state, status });
+        }
+        if (["failed_non_quiescent", "pause_pending"].includes(status.state)) {
+            return finish({
+                action: "not-restarted",
+                reason: status.state,
+                interventionRequired: true,
+                status,
+            });
         }
         if (["non_result", "pause", "circuit_open", "failed"].includes(status.state)
             && !resetOperationalState) {

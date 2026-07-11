@@ -36,6 +36,18 @@ const RESULT_ALLOWED_KEYS = new Set([
 // downstream JSON serialisation). Same policy as safe entry ids elsewhere.
 const METRIC_NAME = /^[A-Za-z_][A-Za-z0-9_.-]{0,127}$/u;
 const VALIDATION_CASE_NAME = /^[a-z0-9][a-z0-9._-]{0,127}$/u;
+const FORBIDDEN_RECORD_KEYS = new Set([
+    "__proto__",
+    "constructor",
+    "prototype",
+]);
+
+class DuplicateJsonKeyError extends Error {
+    constructor(key) {
+        super(`duplicate JSON object key ${JSON.stringify(key)}`);
+        this.key = key;
+    }
+}
 
 function fail(code, message, details) {
     throw new ResultParseError(code, message, details);
@@ -65,7 +77,7 @@ function normalizeMetrics(metrics) {
     }
     const out = {};
     for (const key of keys.sort()) {
-        if (!METRIC_NAME.test(key)) {
+        if (!METRIC_NAME.test(key) || FORBIDDEN_RECORD_KEYS.has(key)) {
             fail(MEASUREMENT_ERROR_CODES.PARSE_SCHEMA, `metrics key ${JSON.stringify(key)} is not a safe identifier`);
         }
         const value = metrics[key];
@@ -77,7 +89,7 @@ function normalizeMetrics(metrics) {
         }
         out[key] = value;
     }
-    return out;
+    return Object.freeze(out);
 }
 
 function normalizeValidationCases(validationCases) {
@@ -94,7 +106,8 @@ function normalizeValidationCases(validationCases) {
     }
     const out = {};
     for (const key of keys.sort()) {
-        if (!VALIDATION_CASE_NAME.test(key)) {
+        if (!VALIDATION_CASE_NAME.test(key)
+            || FORBIDDEN_RECORD_KEYS.has(key)) {
             fail(MEASUREMENT_ERROR_CODES.PARSE_SCHEMA, `validationCases key ${JSON.stringify(key)} is not a safe id`);
         }
         const value = validationCases[key];
@@ -103,7 +116,7 @@ function normalizeValidationCases(validationCases) {
         }
         out[key] = value;
     }
-    return out;
+    return Object.freeze(out);
 }
 
 // Parse `raw` (a UTF-8 string) as the harness's result document. Returns
@@ -183,6 +196,22 @@ export function parseHarnessResult(raw) {
         }
     }
 
+    try {
+        findJsonValueBoundary(raw, { rejectDuplicateKeys: true });
+    } catch (error) {
+        if (error instanceof DuplicateJsonKeyError) {
+            fail(
+                MEASUREMENT_ERROR_CODES.PARSE_SCHEMA,
+                error.message,
+                { key: error.key },
+            );
+        }
+        fail(
+            MEASUREMENT_ERROR_CODES.PARSE_MALFORMED,
+            `harness result failed strict JSON scanning: ${error?.message ?? String(error)}`,
+        );
+    }
+
     // Even on successful JSON.parse, verify there was no trailing content
     // (JSON.parse rejects trailing tokens but accepts trailing whitespace).
     // We enforce whitespace-only tails as our contract.
@@ -244,15 +273,16 @@ export function parseHarnessResult(raw) {
 // linear-time scanner limited to the value grammar we care about; it is
 // used only to distinguish PARSE_TRAILING from PARSE_MALFORMED for a
 // better error message.
-function findJsonValueBoundary(raw) {
+function findJsonValueBoundary(raw, options = {}) {
     // Skip leading whitespace.
     let i = 0;
     while (i < raw.length && isWs(raw.charCodeAt(i))) i += 1;
     if (i >= raw.length) return 0;
     const start = i;
     try {
-        i = scanValue(raw, i);
-    } catch {
+        i = scanValue(raw, i, options);
+    } catch (error) {
+        if (error instanceof DuplicateJsonKeyError) throw error;
         return 0;
     }
     // Return exclusive end offset of the scanned value.
@@ -263,10 +293,10 @@ function isWs(cc) {
     return cc === 0x20 || cc === 0x09 || cc === 0x0a || cc === 0x0d;
 }
 
-function scanValue(raw, i) {
+function scanValue(raw, i, options) {
     const cc = raw.charCodeAt(i);
-    if (cc === 0x7b /* { */) return scanObject(raw, i);
-    if (cc === 0x5b /* [ */) return scanArray(raw, i);
+    if (cc === 0x7b /* { */) return scanObject(raw, i, options);
+    if (cc === 0x5b /* [ */) return scanArray(raw, i, options);
     if (cc === 0x22 /* " */) return scanString(raw, i);
     if (cc === 0x74 /* t */) return scanLiteral(raw, i, "true");
     if (cc === 0x66 /* f */) return scanLiteral(raw, i, "false");
@@ -296,15 +326,30 @@ function scanString(raw, i) {
 }
 
 function scanNumber(raw, i) {
-    // Grammar approx: -?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?
     if (raw.charCodeAt(i) === 0x2d) i += 1;
-    while (i < raw.length) {
-        const cc = raw.charCodeAt(i);
-        if (cc >= 0x30 && cc <= 0x39) { i += 1; continue; }
-        break;
+    const first = raw.charCodeAt(i);
+    if (first === 0x30) {
+        i += 1;
+        const next = raw.charCodeAt(i);
+        if (next >= 0x30 && next <= 0x39) {
+            throw new Error("leading zero in number");
+        }
+    } else if (first >= 0x31 && first <= 0x39) {
+        i += 1;
+        while (i < raw.length) {
+            const cc = raw.charCodeAt(i);
+            if (cc >= 0x30 && cc <= 0x39) { i += 1; continue; }
+            break;
+        }
+    } else {
+        throw new Error("number requires an integer component");
     }
     if (raw.charCodeAt(i) === 0x2e /* . */) {
         i += 1;
+        const firstFraction = raw.charCodeAt(i);
+        if (firstFraction < 0x30 || firstFraction > 0x39) {
+            throw new Error("number fraction requires a digit");
+        }
         while (i < raw.length) {
             const cc = raw.charCodeAt(i);
             if (cc >= 0x30 && cc <= 0x39) { i += 1; continue; }
@@ -314,6 +359,10 @@ function scanNumber(raw, i) {
     if (raw.charCodeAt(i) === 0x65 || raw.charCodeAt(i) === 0x45) {
         i += 1;
         if (raw.charCodeAt(i) === 0x2b || raw.charCodeAt(i) === 0x2d) i += 1;
+        const firstExponent = raw.charCodeAt(i);
+        if (firstExponent < 0x30 || firstExponent > 0x39) {
+            throw new Error("number exponent requires a digit");
+        }
         while (i < raw.length) {
             const cc = raw.charCodeAt(i);
             if (cc >= 0x30 && cc <= 0x39) { i += 1; continue; }
@@ -323,14 +372,14 @@ function scanNumber(raw, i) {
     return i;
 }
 
-function scanArray(raw, i) {
+function scanArray(raw, i, options) {
     i += 1;
     while (i < raw.length && isWs(raw.charCodeAt(i))) i += 1;
     if (raw.charCodeAt(i) === 0x5d) return i + 1;
     // eslint-disable-next-line no-constant-condition
     while (true) {
         while (i < raw.length && isWs(raw.charCodeAt(i))) i += 1;
-        i = scanValue(raw, i);
+        i = scanValue(raw, i, options);
         while (i < raw.length && isWs(raw.charCodeAt(i))) i += 1;
         const cc = raw.charCodeAt(i);
         if (cc === 0x5d) return i + 1;
@@ -339,19 +388,26 @@ function scanArray(raw, i) {
     }
 }
 
-function scanObject(raw, i) {
+function scanObject(raw, i, options) {
     i += 1;
+    const keys = options.rejectDuplicateKeys ? new Set() : null;
     while (i < raw.length && isWs(raw.charCodeAt(i))) i += 1;
     if (raw.charCodeAt(i) === 0x7d) return i + 1;
     // eslint-disable-next-line no-constant-condition
     while (true) {
         while (i < raw.length && isWs(raw.charCodeAt(i))) i += 1;
+        const keyStart = i;
         i = scanString(raw, i);
+        if (keys !== null) {
+            const key = JSON.parse(raw.slice(keyStart, i));
+            if (keys.has(key)) throw new DuplicateJsonKeyError(key);
+            keys.add(key);
+        }
         while (i < raw.length && isWs(raw.charCodeAt(i))) i += 1;
         if (raw.charCodeAt(i) !== 0x3a) throw new Error("bad object");
         i += 1;
         while (i < raw.length && isWs(raw.charCodeAt(i))) i += 1;
-        i = scanValue(raw, i);
+        i = scanValue(raw, i, options);
         while (i < raw.length && isWs(raw.charCodeAt(i))) i += 1;
         const cc = raw.charCodeAt(i);
         if (cc === 0x7d) return i + 1;

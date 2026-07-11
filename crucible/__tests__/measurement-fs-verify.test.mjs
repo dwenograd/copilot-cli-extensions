@@ -10,7 +10,9 @@ import path from "node:path";
 import {
     FILE_HASH_ALGORITHM,
     MEASUREMENT_ERROR_CODES,
+    STREAM_HASH_ALGORITHM,
     normalizeExpectedHash,
+    sha256Bytes,
     sha256File,
     verifyAndHashFile,
     verifyLocalRegularFile,
@@ -56,7 +58,7 @@ describe("verifyLocalRegularFile", () => {
             "\\\\server\\share\\thing.exe",
             "//fileserver/share/thing.exe",
             "\\\\?\\GLOBALROOT\\Device\\HarddiskVolume1\\thing.exe",
-            "\\\\.\\PhysicalDrive0",
+            "\\\\.\\CrucibleSyntheticDevice",
         ]) {
             const err = expectThrow(() => verifyLocalRegularFile(p, { label: "x" }));
             expect(err.code).toBe(MEASUREMENT_ERROR_CODES.FILE_NOT_LOCAL);
@@ -125,11 +127,23 @@ describe("verifyLocalRegularFile", () => {
 });
 
 describe("sha256File / verifyAndHashFile", () => {
-    it("produces an algorithm-tagged digest that matches manual sha256", () => {
+    it("matches independent SHA-256 golden vectors for files and bytes", () => {
         const root = tmp("hash");
-        const p = writeSample(root, "x.bin", "content-abc");
-        const tagged = sha256File(p);
-        expect(tagged).toMatch(new RegExp(`^${FILE_HASH_ALGORITHM}:[a-f0-9]{64}$`));
+        const empty = writeSample(root, "empty.bin", "");
+        const abc = writeSample(root, "abc.bin", "abc");
+        const emptyHex =
+            "e3b0c44298fc1c149afbf4c8996fb924"
+            + "27ae41e4649b934ca495991b7852b855";
+        const abcHex =
+            "ba7816bf8f01cfea414140de5dae2223"
+            + "b00361a396177a9cb410ff61f20015ad";
+
+        expect(sha256File(empty)).toBe(`${FILE_HASH_ALGORITHM}:${emptyHex}`);
+        expect(sha256File(abc)).toBe(`${FILE_HASH_ALGORITHM}:${abcHex}`);
+        expect(sha256Bytes(Buffer.alloc(0)))
+            .toBe(`${STREAM_HASH_ALGORITHM}:${emptyHex}`);
+        expect(sha256Bytes(Buffer.from("abc", "utf8")))
+            .toBe(`${STREAM_HASH_ALGORITHM}:${abcHex}`);
     });
 
     it("verifyAndHashFile accepts a bare-hex expected value", () => {

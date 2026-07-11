@@ -95,7 +95,7 @@ function roundSignalSummaries(aggregate) {
                     }
                 }
             }
-            if (evidence.outcomeClass === "accepted" && evidence.rankable && !acceptedSeen) {
+            if (evidence.outcomeClass === "accepted" && !acceptedSeen) {
                 acceptanceNovelty = true;
                 acceptedSeen = true;
             }

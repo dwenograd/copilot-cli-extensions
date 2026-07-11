@@ -64,6 +64,26 @@ export function createDefaultProcessAdapter(options = {}) {
         : null;
     const directChildren = new Map();
 
+    const waitForDirectChildClose = (pid, child, timeoutMs) => {
+        if (!directChildren.has(pid)
+            || child?.exitCode !== null
+            || child?.signalCode !== null) {
+            return Promise.resolve(true);
+        }
+        return new Promise((resolve) => {
+            let settled = false;
+            const finish = (value) => {
+                if (settled) return;
+                settled = true;
+                timers.clearTimeout?.(timer);
+                resolve(value);
+            };
+            child.once("close", () => finish(true));
+            const timer = timers.setTimeout(() => finish(!directChildren.has(pid)), timeoutMs);
+            timer?.unref?.();
+        });
+    };
+
     const terminateTree = async (pid, termination = {}) => {
         if (!Number.isInteger(pid) || pid <= 0) return false;
         const force = termination?.force !== false;
@@ -184,28 +204,49 @@ export function createDefaultProcessAdapter(options = {}) {
             return child;
         },
         terminateTree,
+        activeOwnedPids() {
+            const jobPids = typeof jobAdapter?.activePids === "function"
+                ? jobAdapter.activePids()
+                : [];
+            return Object.freeze(
+                [...new Set([...jobPids, ...directChildren.keys()])]
+                    .sort((left, right) => left - right),
+            );
+        },
         async close(termination = {}) {
             let firstError = null;
+            const timeoutMs = Number.isSafeInteger(termination?.timeoutMs)
+                && termination.timeoutMs > 0
+                ? Math.min(termination.timeoutMs, 60_000)
+                : defaultTerminationTimeoutMs;
             if (jobAdapter !== null) {
                 try {
-                    await jobAdapter.close(termination);
+                    await jobAdapter.close({ ...termination, timeoutMs });
                 } catch (error) {
                     firstError = error;
                 }
             }
-            const directPids = [...directChildren.keys()];
-            const results = await Promise.all(
-                directPids.map((pid) => terminateTree(pid, {
+            const directRecords = [...directChildren.entries()];
+            const terminationResults = await Promise.all(
+                directRecords.map(([pid]) => terminateTree(pid, {
                     force: true,
+                    timeoutMs,
                     ...termination,
                 })),
             );
+            const closeResults = await Promise.all(
+                directRecords.map(([pid, child]) =>
+                    waitForDirectChildClose(pid, child, timeoutMs)),
+            );
             if (firstError !== null) throw firstError;
-            if (results.some((result) => result !== true)) {
+            const activePids = adapter.activeOwnedPids();
+            if (terminationResults.some((result) => result !== true)
+                || closeResults.some((result) => result !== true)
+                || activePids.length > 0) {
                 throw new MeasurementError(
                     MEASUREMENT_ERROR_CODES.SANDBOX_LIFECYCLE,
                     "Process adapter did not terminate every owned child tree",
-                    { activePids: [...directChildren.keys()] },
+                    { activePids },
                 );
             }
             return true;

@@ -33,8 +33,24 @@ function makeRoot(label) {
 }
 
 afterEach(() => {
+    const failures = [];
     for (const root of roots.splice(0)) {
-        fs.rmSync(root, { recursive: true, force: true });
+        try {
+            fs.rmSync(root, {
+                recursive: true,
+                force: true,
+                maxRetries: 20,
+                retryDelay: 25,
+            });
+        } catch (error) {
+            failures.push(error);
+        }
+        if (fs.existsSync(root)) {
+            failures.push(new Error(`supervisor test root survived cleanup: ${root}`));
+        }
+    }
+    if (failures.length > 0) {
+        throw new AggregateError(failures, "supervisor test cleanup failed");
     }
 });
 
@@ -42,7 +58,7 @@ describe("H7 supervisor status-write failure matrix", () => {
     it.each([
         "after_owner_status_write",
         "after_status_write",
-    ])("recovers after a crash at %s without a stale write or atomic temporary", async (point) => {
+    ])("recovers after an injected write failure at %s without stale output", async (point) => {
         const root = makeRoot(`status-fault-${point}`);
         const config = normalizeSupervisorConfig(rawConfig(root));
         let injected = false;
@@ -761,6 +777,58 @@ describe("Crucible supervisor", () => {
         ]);
     });
 
+    it("retains intervention-required authority after runner non-quiescence", async () => {
+        const root = makeRoot("runner-non-quiescent");
+        const config = normalizeSupervisorConfig(rawConfig(root));
+        const scavenges = [];
+        const result = await runSupervisor(config, {
+            pid: 4051,
+            idFactory: () => "runner-non-quiescent-owner",
+            isPidAlive: () => false,
+            scavengeRuntime(input) {
+                scavenges.push(input);
+                return { removed: [], preserved: [] };
+            },
+            spawnRunner: childResultSpawner([{
+                code: 1,
+                envelope: failedOutcome(RUNTIME_ERROR_CODES.NON_QUIESCENT, false),
+            }]),
+        });
+        expect(result).toMatchObject({
+            kind: "FAILED_NON_QUIESCENT",
+            nonResultCode: RUNTIME_ERROR_CODES.NON_QUIESCENT,
+            status: {
+                state: "failed_non_quiescent",
+                childPid: null,
+            },
+        });
+        expect(fs.existsSync(config.paths.lockPath)).toBe(true);
+        expect(scavenges).toHaveLength(1);
+        expect(scavenges[0].abandonedRunners).toEqual([]);
+        expect(() => acquireSupervisorLock(config, {
+            pid: 4052,
+            idFactory: () => "replacement-denied",
+            isPidAlive: () => false,
+        })).toThrow(expect.objectContaining({
+            code: RUNTIME_ERROR_CODES.LOCK_HELD,
+            details: expect.objectContaining({
+                retainedNonQuiescentAuthority: true,
+                interventionRequired: true,
+            }),
+        }));
+        expect(ensureSupervisor(config, {
+            isPidAlive: () => false,
+            resetOperationalState: true,
+            spawnProcess() {
+                throw new Error("non-quiescent authority must not auto-restart");
+            },
+        })).toMatchObject({
+            action: "not-restarted",
+            reason: "failed_non_quiescent",
+            interventionRequired: true,
+        });
+    });
+
     it("persists supervisor non-results through current generation/incarnation/lease authority", async () => {
         const root = makeRoot("fenced-supervisor-non-result");
         const config = normalizeSupervisorConfig(rawConfig(root));
@@ -1466,7 +1534,7 @@ describe("Crucible supervisor", () => {
             expect(fs.existsSync(config.paths.lockPath)).toBe(false);
     });
 
-    it("releases supervisor ownership within the final shutdown bound", async () => {
+    it("retains fenced authority when child shutdown cannot be proven", async () => {
         const root = makeRoot("bounded-child-cleanup");
         const config = normalizeSupervisorConfig(rawConfig(root));
         const signals = new EventEmitter();
@@ -1502,13 +1570,61 @@ describe("Crucible supervisor", () => {
         const result = await resultPromise;
         expect(Date.now() - started).toBeLessThan(500);
         expect(result).toMatchObject({
-            kind: "STOPPED",
+            kind: "PAUSE_PENDING",
+            nonResultCode: RUNTIME_ERROR_CODES.NON_QUIESCENT,
             status: {
-                state: "stopped",
+                state: "pause_pending",
+                childPid: 7654,
             },
         });
         expect(phases).toEqual(["drain", "escalation", "job_object_close"]);
-        expect(fs.existsSync(config.paths.lockPath)).toBe(false);
+        expect(fs.existsSync(config.paths.lockPath)).toBe(true);
+        expect(() => acquireSupervisorLock(config, {
+            pid: 507,
+            idFactory: () => "blocked-replacement",
+            isPidAlive: (pid) => pid === 7654,
+        })).toThrow(expect.objectContaining({
+            code: RUNTIME_ERROR_CODES.LOCK_HELD,
+            details: expect.objectContaining({
+                retainedNonQuiescentAuthority: true,
+                interventionRequired: true,
+            }),
+        }));
+    });
+
+    it("retains fenced authority when process-owner cleanup times out", async () => {
+        const root = makeRoot("process-owner-cleanup-timeout");
+        const config = normalizeSupervisorConfig(rawConfig(root));
+        await expect(runSupervisor(config, {
+            pid: 508,
+            idFactory: () => "process-owner-timeout",
+            isPidAlive: () => false,
+            shutdownPolicy: {
+                drainMs: 10,
+                escalationMs: 10,
+                finalMs: 25,
+            },
+            spawnRunner: childResultSpawner([{
+                envelope: successfulOutcome("terminal"),
+            }]),
+            processTreeAdapter: {
+                close() {
+                    return new Promise(() => {});
+                },
+            },
+        })).rejects.toMatchObject({
+            code: RUNTIME_ERROR_CODES.NON_QUIESCENT,
+            details: expect.objectContaining({
+                interventionRequired: true,
+                status: "timed_out",
+            }),
+        });
+        expect(fs.existsSync(config.paths.lockPath)).toBe(true);
+        expect(JSON.parse(fs.readFileSync(config.paths.statusPath, "utf8")))
+            .toMatchObject({
+                state: "failed_non_quiescent",
+                non_result_code: RUNTIME_ERROR_CODES.NON_QUIESCENT,
+            });
     });
 
     it("scavenges only dead older-generation runtime debris", async () => {

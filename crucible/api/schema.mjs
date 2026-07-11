@@ -454,7 +454,7 @@ function discriminatedObjectUnion({
 
 const searchPolicyShape = object({
     stopOnFirstAccept: boolean({
-        description: "If true, the first accepted rankable candidate terminates immediately.",
+        description: "If true, the first accepted candidate terminates immediately.",
         default: DEFAULT_SEARCH_POLICY.stopOnFirstAccept,
     }),
     plateauWindow: integer({
@@ -603,7 +603,7 @@ const validationCasesField = makeField({
     },
 });
 
-const newInvestigationStartArgs = object({
+const newInvestigationStartShape = object({
         objective: string({
             description: "The falsifiable objective under investigation. Part of the deterministic investigationId.",
             maxLength: MAX_OBJECTIVE_CHARACTERS,
@@ -622,7 +622,7 @@ const newInvestigationStartArgs = object({
         }),
         hypothesis_topology: enumField(HYPOTHESIS_TOPOLOGIES, {
             description:
-                "Search topology. finite_enumerable/bounded_parameterized require bounded_candidate_ids for exhaustive TARGET_UNREACHABLE. open_generative can never emit TARGET_UNREACHABLE. certified_impossibility runs the same allowlisted harness in verifier mode only after validation and every frozen search slot complete without an accepted candidate; the harness must recognize crucible-impossibility-request.json and return a certificate verdict.",
+                "Search topology. finite_enumerable/bounded_parameterized require bounded_candidate_ids. open_generative can never emit TARGET_UNREACHABLE. certified_impossibility runs the same allowlisted harness in verifier mode only after validation and every frozen search slot complete without an accepted candidate; the harness must recognize crucible-impossibility-request.json and return a certificate verdict.",
         }),
         validation_cases: validationCasesField,
         metrics: array(
@@ -668,7 +668,7 @@ const newInvestigationStartArgs = object({
         bounded_candidate_ids: array(
             identifier({ description: "A declared candidate id for a finite/bounded search space." }),
             {
-                description: "Optional exhaustive candidate id set for finite_enumerable / bounded_parameterized topologies.",
+                description: "Required exhaustive candidate id set for finite_enumerable / bounded_parameterized topologies.",
                 minItems: 1,
                 maxItems: CONTRACT_LIMITS.boundedCandidateIds,
                 uniqueItems: true,
@@ -683,6 +683,49 @@ const newInvestigationStartArgs = object({
             optional: true,
         }),
     });
+
+const BOUNDED_HYPOTHESIS_TOPOLOGIES = Object.freeze([
+    "finite_enumerable",
+    "bounded_parameterized",
+]);
+const boundedTopologySchemaRule = Object.freeze({
+    if: {
+        properties: {
+            hypothesis_topology: { enum: BOUNDED_HYPOTHESIS_TOPOLOGIES },
+        },
+        required: ["hypothesis_topology"],
+    },
+    then: { required: ["bounded_candidate_ids"] },
+    else: { not: { required: ["bounded_candidate_ids"] } },
+});
+const newInvestigationStartSchema = Object.freeze({
+    ...newInvestigationStartShape.jsonSchema,
+    allOf: [boundedTopologySchemaRule],
+});
+const newInvestigationStartArgs = Object.freeze({
+    ...newInvestigationStartShape,
+    jsonSchema: newInvestigationStartSchema,
+    toJsonSchema: () => structuredClone(newInvestigationStartSchema),
+    parse(rawArgs, pathLabel = "args") {
+        const parsed = newInvestigationStartShape.parse(rawArgs, pathLabel);
+        const requiresBoundedIds = BOUNDED_HYPOTHESIS_TOPOLOGIES.includes(
+            parsed.hypothesis_topology,
+        );
+        if (requiresBoundedIds && parsed.bounded_candidate_ids === undefined) {
+            fail(
+                `${pathLabel}.bounded_candidate_ids`,
+                "is required for finite_enumerable and bounded_parameterized topologies",
+            );
+        }
+        if (!requiresBoundedIds && parsed.bounded_candidate_ids !== undefined) {
+            fail(
+                `${pathLabel}.bounded_candidate_ids`,
+                "is only valid for finite_enumerable and bounded_parameterized topologies",
+            );
+        }
+        return parsed;
+    },
+});
 
 const reattachStartArgs = object({
     investigation_id: investigationIdField,
@@ -719,7 +762,7 @@ export const crucibleStartSpec = defineTool({
 export const crucibleStatusSpec = defineTool({
     name: "crucible_status",
     description:
-        "Read-only progress for an Crucible investigation. Replays and integrity-checks domain plus operational evidence, exposes only terminal_available for terminal state (never the decision/winner/evidence), and restarts a missing supervisor only when no terminal or non-result blocks recovery. Never a result.",
+        "Read-only progress for a Crucible investigation. Replays and integrity-checks domain plus operational evidence, exposes only terminal_available for terminal state (never the decision/winner/evidence), and restarts a missing supervisor only when no terminal or non-result blocks recovery. Never a result.",
     args: object({ investigation_id: investigationIdField }),
 });
 

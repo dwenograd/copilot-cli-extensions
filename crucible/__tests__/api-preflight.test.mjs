@@ -33,6 +33,7 @@ import {
     SandboxUnavailableApiError,
     StartPreflightError,
 } from "../api/errors.mjs";
+import { SchemaValidationError } from "../api/schema.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const roots = [];
@@ -128,7 +129,7 @@ function startArgs(projectDir, overrides = {}) {
                 { kind: "metric_compare", metric: "score", operator: ">=", value: 90 },
             ],
         },
-        hypothesis_topology: "finite_enumerable",
+        hypothesis_topology: "open_generative",
         validation_cases: [
             { id: "good", expectation: "accept", path: "cases/good" },
             { id: "bad", expectation: "reject", path: "cases/bad" },
@@ -270,11 +271,25 @@ describe("crucible_start lifecycle preflight", () => {
         await expectRejectedWithoutState(
             workspace,
             startArgs(workspace.projectDir, {
+                hypothesis_topology: "finite_enumerable",
                 bounded_candidate_ids: ["candidate-a", "candidate-b", "candidate-c"],
             }),
             deps,
             StartPreflightError,
         );
+    });
+
+    it("rejects finite and bounded topologies without bounded ids before state", async () => {
+        for (const hypothesis_topology of ["finite_enumerable", "bounded_parameterized"]) {
+            const workspace = makeWorkspace(`missing-bounded-${hypothesis_topology}`);
+            const { deps } = makeDeps(workspace);
+            await expectRejectedWithoutState(
+                workspace,
+                startArgs(workspace.projectDir, { hypothesis_topology }),
+                deps,
+                SchemaValidationError,
+            );
+        }
     });
 
     it("rejects oversized prompt inputs before state", async () => {

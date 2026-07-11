@@ -44,6 +44,7 @@ import {
     sha256Bytes,
     verifyFrozenHarnessIdentity,
 } from "../measurement/index.mjs";
+import { MEASUREMENT_LIFECYCLE_ADAPTER } from "../measurement/private-adapters.mjs";
 import { normalizeRunnerConfig } from "./config.mjs";
 import { deriveRunnerExecutionLimits } from "./config-validation.mjs";
 import { createDomainRepositoryAdapter, formatAttemptCommand } from "./domain-adapter.mjs";
@@ -57,7 +58,10 @@ import {
 import {
     DEFAULT_PARENT_READ_LIMITS,
     buildProposalPrompt,
+    createBoundedParentReadAuthority,
     createSdkWorkerPool,
+    normalizeParentReadLimits,
+    validateWorkerProposal,
 } from "./worker-pool.mjs";
 import { buildPromptContext } from "./prompt-context.mjs";
 import {
@@ -318,64 +322,6 @@ function truncateUtf8(value, maximumCharacters, maximumBytes) {
     return output;
 }
 
-function boundedOptionalText(value, maximumCharacters, maximumBytes) {
-    if (typeof value !== "string" || value.length === 0) {
-        return null;
-    }
-    const output = truncateUtf8(value, maximumCharacters, maximumBytes);
-    return output.length === 0 ? null : output;
-}
-
-function normalizeCandidateAnnotations(proposal, command) {
-    const supplied = proposal?.annotations !== null
-        && typeof proposal?.annotations === "object"
-        && !Array.isArray(proposal.annotations)
-        ? proposal.annotations
-        : {};
-    const expectedEffects = Array.isArray(supplied.expectedEffects)
-        ? supplied.expectedEffects
-        : Array.isArray(proposal?.expectedEffects)
-            ? proposal.expectedEffects
-            : [];
-    const promptRefs = new Set(command.promptContextRefs);
-    const requestedCitations = Array.isArray(supplied.citedEvidenceIds)
-        ? supplied.citedEvidenceIds
-        : Array.isArray(proposal?.citedEvidenceIds)
-            ? proposal.citedEvidenceIds
-            : command.parentEvidenceIds;
-    const citedEvidenceIds = [...new Set(requestedCitations)]
-        .filter((evidenceId) => typeof evidenceId === "string" && promptRefs.has(evidenceId))
-        .slice(0, ANNOTATION_LIMITS.citedEvidenceCount);
-
-    return {
-        mechanism: boundedOptionalText(
-            supplied.mechanism ?? proposal?.mechanism,
-            ANNOTATION_LIMITS.mechanismLength,
-            ANNOTATION_LIMITS.mechanismBytes,
-        ),
-        hypothesis: boundedOptionalText(
-            supplied.hypothesis ?? proposal?.hypothesis,
-            ANNOTATION_LIMITS.hypothesisLength,
-            ANNOTATION_LIMITS.hypothesisBytes,
-        ),
-        expectedEffects: expectedEffects
-            .filter((effect) => typeof effect === "string" && effect.length > 0)
-            .slice(0, ANNOTATION_LIMITS.expectedEffectCount)
-            .map((effect) => truncateUtf8(
-                effect,
-                ANNOTATION_LIMITS.expectedEffectLength,
-                ANNOTATION_LIMITS.expectedEffectBytes,
-            ))
-            .filter((effect) => effect.length > 0),
-        citedEvidenceIds,
-        finding: boundedOptionalText(
-            supplied.finding ?? proposal?.finding,
-            ANNOTATION_LIMITS.findingLength,
-            ANNOTATION_LIMITS.findingBytes,
-        ),
-    };
-}
-
 function trustedHarnessFinding(parsed) {
     const outcome = parsed?.pass === true ? "pass" : "reject";
     const metrics = parsed?.metrics !== null && typeof parsed?.metrics === "object"
@@ -400,6 +346,8 @@ export class AutonomousRunner {
     #sandboxIdentity = Object.freeze({ required: false });
     #executor = null;
     #workerPool = null;
+    #parentReadController = null;
+    #parentReadLimits;
     #lease = null;
     #recovery = null;
     #runTempRoot = null;
@@ -408,7 +356,6 @@ export class AutonomousRunner {
     #executionLimits = null;
     #attemptCommands = new Map();
     #effectEvidenceBuffers = new Map();
-    #workerAssignments = new Map();
     #capturedOutputs = new Map();
     #recoveredDeadlineStopRequestSeqs = new Set();
     #byteBudgets;
@@ -428,6 +375,9 @@ export class AutonomousRunner {
         this.#dependencies = dependencies;
         this.#byteBudgets = normalizeRuntimeByteBudgets(
             dependencies.byteBudgets,
+        );
+        this.#parentReadLimits = normalizeParentReadLimits(
+            dependencies.parentReadLimits ?? {},
         );
         this.#clock = dependencies.clock ?? defaultClock();
         if (typeof this.#clock.now !== "function" || typeof this.#clock.isoNow !== "function") {
@@ -469,58 +419,21 @@ export class AutonomousRunner {
             }
         } finally {
             const cleanupError = await this.#cleanup();
-            if (cleanupError !== null && result?.kind === "PAUSE") {
-                result = {
-                    ...result,
-                    cleanupWarning: {
-                        code: cleanupError?.code ?? null,
-                        message: cleanupError?.message ?? String(cleanupError),
-                    },
-                };
-                this.#dependencies.log?.(
-                    `[crucible] paused runner cleanup warning: ${
-                        cleanupError?.message ?? String(cleanupError)
-                    }`,
-                );
-            } else if (cleanupError !== null) {
-                if (thrown === null) {
-                    thrown = cleanupError;
-                } else {
-                    try {
-                        thrown.details = {
-                            ...(thrown.details ?? {}),
-                            cleanupFailure: {
-                                name: cleanupError?.name ?? "Error",
-                                code: cleanupError?.code ?? null,
-                                message:
-                                    cleanupError?.message ?? String(cleanupError),
-                            },
-                        };
-                    } catch {
-                        // Preserve the original crash even if it is immutable.
-                    }
-                    this.#dependencies.log?.(
-                        `[crucible] runner cleanup failed while preserving ${
-                            thrown.code ?? thrown.name ?? "original failure"
-                        }: ${cleanupError?.message ?? String(cleanupError)}`,
-                    );
+            if (cleanupError !== null) {
+                if (thrown !== null) {
+                    cleanupError.details = {
+                        ...(cleanupError.details ?? {}),
+                        originalFailure: {
+                            name: thrown?.name ?? "Error",
+                            code: thrown?.code ?? null,
+                            message: thrown?.message ?? String(thrown),
+                        },
+                    };
                 }
+                thrown = cleanupError;
             }
         }
         if (thrown !== null) {
-            if (result !== undefined) {
-                const cleanupFailure = new CrucibleRuntimeError(
-                    RUNTIME_ERROR_CODES.RUNTIME_FAILURE,
-                    `Autonomous runner cleanup failed: ${thrown?.message ?? String(thrown)}`,
-                    {
-                        name: thrown?.name ?? "Error",
-                        code: thrown?.code ?? null,
-                    },
-                    { cause: thrown },
-                );
-                cleanupFailure.recoverable = true;
-                throw cleanupFailure;
-            }
             if (typeof thrown?.code !== "string") {
                 const wrapped = new CrucibleRuntimeError(
                     RUNTIME_ERROR_CODES.RUNTIME_FAILURE,
@@ -780,20 +693,35 @@ export class AutonomousRunner {
                         stderr: [stderr],
                     });
                 },
-                faultInjector: async (point, details = {}) => {
-                    let command = null;
-                    const attemptCommand = this.#attemptCommands.get(details.attemptId);
-                    if (attemptCommand !== undefined) {
-                        try {
-                            command = JSON.parse(attemptCommand)?.effect ?? null;
-                        } catch {
-                            command = null;
-                        }
-                    }
-                    await this.#fault(point, { ...details, command });
-                },
+                [MEASUREMENT_LIFECYCLE_ADAPTER]:
+                    this.#measurementLifecycleAdapter(),
             });
 
+    }
+
+    #measurementLifecycleAdapter() {
+        const invoke = async (point, details = {}) => {
+            let command = null;
+            const attemptCommand = this.#attemptCommands.get(details.attemptId);
+            if (attemptCommand !== undefined) {
+                try {
+                    command = JSON.parse(attemptCommand)?.effect ?? null;
+                } catch {
+                    command = null;
+                }
+            }
+            await this.#fault(point, { ...details, command });
+        };
+        return Object.freeze({
+            afterHarnessStaging: (details) =>
+                invoke("after_harness_staging", details),
+            beforeHarnessLaunch: (details) =>
+                invoke("before_harness_launch", details),
+            afterHarnessLaunch: (details) =>
+                invoke("after_harness_launch", details),
+            afterHarnessExit: (details) =>
+                invoke("after_harness_exit", details),
+        });
     }
 
     #recordCapabilityEpoch(aggregate) {
@@ -2317,41 +2245,34 @@ export class AutonomousRunner {
             );
         }
         const proposal = value.proposal;
-        if (proposal === null
-            || typeof proposal !== "object"
-            || Array.isArray(proposal)
-            || proposal.candidateId !== assignment.candidateId
-            || !Array.isArray(proposal.files)
-            || proposal.files.length === 0
-            || proposal.files.some((file) =>
-                file === null
-                || typeof file !== "object"
-                || typeof file.path !== "string"
-                || typeof file.content !== "string")
-            || !canonicalEqual(payload.identity, proposal.identity ?? null)) {
+        if (!canonicalEqual(payload.identity, proposal?.identity ?? null)) {
             throw new RuntimeIntegrityError(
                 "Committed proposal artifact contains an invalid candidate",
                 { logicalEffectKey, artifactId: payload.artifactId },
             );
         }
-        if (proposal.identity !== null && typeof proposal.identity === "object") {
-            if (proposal.identity.invocationSessionId !== request.sessionId
-                || proposal.identity.configuredModel !== request.model
-                || proposal.identity.challengeNonce !== request.challengeNonce
-                || (proposal.identity.contextHash !== undefined
-                    && proposal.identity.contextHash !== request.promptContextHash)) {
-                throw new RuntimeIntegrityError(
-                    "Committed proposal identity is not bound to this deterministic session",
-                    { logicalEffectKey, artifactId: payload.artifactId },
-                );
-            }
+        let validatedProposal;
+        try {
+            validatedProposal = validateWorkerProposal(proposal, request, {
+                limits: this.#config.options.candidateLimits,
+            });
+        } catch (error) {
+            throw new RuntimeIntegrityError(
+                "Committed proposal failed the runner trust-boundary protocol",
+                {
+                    logicalEffectKey,
+                    artifactId: payload.artifactId,
+                    cause: error?.code ?? null,
+                },
+                { cause: error },
+            );
         }
         const proposalArtifact = this.#registeredArtifactRef(
             payload.artifactId,
             "Committed proposal",
         ).artifact;
         return {
-            result: proposal,
+            result: validatedProposal,
             persisted: {
                 proposalArtifact,
                 promptContextHash: request.promptContextHash,
@@ -3158,12 +3079,8 @@ export class AutonomousRunner {
             aggregate,
             commandId,
             command,
-            workerPool,
         );
-        this.#workerAssignments.set(request.sessionId, Object.freeze({
-            candidateId: command.candidateId,
-            parentEvidenceIds: new Set(command.parentEvidenceIds),
-        }));
+        this.#parentReadController.register(request);
 
         let proposalEffect;
         try {
@@ -3180,14 +3097,18 @@ export class AutonomousRunner {
                     seed: command.seed,
                 },
                 async (attemptId) => {
-                    const proposal = await workerPool.propose(request);
-                    if (proposal?.candidateId !== command.candidateId) {
+                    const proposal = validateWorkerProposal(
+                        await workerPool.propose(request),
+                        request,
+                        { limits: this.#config.options.candidateLimits },
+                    );
+                    if (proposal.candidateId !== command.candidateId) {
                         throw new CrucibleRuntimeError(
                             RUNTIME_ERROR_CODES.WORKER_INVALID_CANDIDATE,
                             "Worker proposal did not preserve the kernel-assigned candidate id",
                             {
                                 assignedCandidateId: command.candidateId,
-                                proposedCandidateId: proposal?.candidateId ?? null,
+                                proposedCandidateId: proposal.candidateId,
                             },
                         );
                     }
@@ -3251,7 +3172,7 @@ export class AutonomousRunner {
                     }),
             );
         } finally {
-            this.#workerAssignments.delete(request.sessionId);
+            this.#parentReadController.unregister(request.sessionId);
         }
 
         const proposal = proposalEffect.result;
@@ -3264,7 +3185,7 @@ export class AutonomousRunner {
                 { commandId, candidateId: command.candidateId },
             );
         }
-        const annotations = normalizeCandidateAnnotations(proposal, command);
+        const annotations = proposal.annotations;
         const persistedSnapshot = this.#loadPersistedCandidateSnapshot({
             commandId,
             command,
@@ -3424,7 +3345,7 @@ export class AutonomousRunner {
         };
     }
 
-    #buildSearchRequest(aggregate, commandId, command, workerPool) {
+    #buildSearchRequest(aggregate, commandId, command) {
         const contract = aggregate.contract;
         const archive = buildCandidateArchive(aggregate);
         const promptRefSet = new Set(command.promptContextRefs);
@@ -3463,7 +3384,7 @@ export class AutonomousRunner {
                 snapshotId: assigned.snapshotId,
             };
         });
-        const parentReadLimits = workerPool?.parentReadLimits ?? DEFAULT_PARENT_READ_LIMITS;
+        const parentReadLimits = this.#parentReadLimits ?? DEFAULT_PARENT_READ_LIMITS;
         const sessionId = uuidFromHex(stableHex({
             investigationId: this.#config.investigationId,
             contractHash: aggregate.contractHash,
@@ -3492,29 +3413,32 @@ export class AutonomousRunner {
             parentReadLimits,
             trustedOperatorContext: this.#config.options.workerAdditionalContext,
         });
-        return {
+        return Object.freeze({
             candidateId: command.candidateId,
             round: command.round,
             slotIndex: command.slotIndex,
             model: command.model,
             operator: command.operator,
-            parentEvidenceIds: command.parentEvidenceIds,
-            promptContextRefs: command.promptContextRefs,
-            visibleEvidenceIds: command.promptContextRefs,
+            parentEvidenceIds: Object.freeze([...command.parentEvidenceIds]),
+            promptContextRefs: Object.freeze([...command.promptContextRefs]),
+            visibleEvidenceIds: Object.freeze([...command.promptContextRefs]),
             seed: command.seed,
             boundedCandidateId: command.boundedCandidateId ?? null,
             promptContext,
             promptContextHash,
-            parents,
+            parents: Object.freeze(
+                parents.map((parent) => Object.freeze({ ...parent })),
+            ),
             parentReadLimits,
             reasoningEffort: this.#config.options.reasoningEffort,
             deadlineMs: this.#config.deadlineMs,
             remainingBudgetMs: this.#remainingDeadlineMs(),
             sessionId,
             challengeNonce,
-            allowedCandidateIds: [command.candidateId],
+            allowedCandidateIds: Object.freeze([command.candidateId]),
             prompt,
-        };
+            parentReadAuthority: this.#parentReadController.authority,
+        });
     }
 
     #persistCandidateSnapshot({
@@ -3804,35 +3728,6 @@ export class AutonomousRunner {
         return { artifact };
     }
 
-    #parseParentAccessRequest(input, evidenceId, objectId = null) {
-        if (input !== null && typeof input === "object" && !Array.isArray(input)) {
-            return {
-                sessionId: input.sessionId,
-                evidenceId: input.evidenceId,
-                objectId: input.objectId ?? null,
-            };
-        }
-        return { sessionId: input, evidenceId, objectId };
-    }
-
-    #assignedParentSnapshot(input, evidenceId) {
-        const request = this.#parseParentAccessRequest(input, evidenceId);
-        const assignment = this.#workerAssignments.get(request.sessionId);
-        if (assignment === undefined
-            || !assignment.parentEvidenceIds.has(request.evidenceId)) {
-            throw new CrucibleRuntimeError(
-                RUNTIME_ERROR_CODES.WORKER_PROTOCOL,
-                "Worker requested an unassigned parent snapshot",
-                {
-                    sessionId: request.sessionId ?? null,
-                    evidenceId: request.evidenceId ?? null,
-                },
-            );
-        }
-        const aggregate = this.#adapter.replay().aggregate;
-        return this.#resolveParentSnapshot(aggregate, request.evidenceId);
-    }
-
     #resolveParentSnapshot(aggregate, evidenceId) {
         const evidence = aggregate.evidence[evidenceId];
         if (evidence?.sourceKind !== "harness"
@@ -3867,62 +3762,30 @@ export class AutonomousRunner {
         );
     }
 
-    #verifyAssignedParentSnapshot(input, evidenceId) {
-        const assigned = this.#assignedParentSnapshot(input, evidenceId);
-        return {
-            evidenceId: assigned.evidence.evidenceId,
-            candidateId: assigned.evidence.candidateId,
-            snapshotId: assigned.snapshotId,
-            status: assigned.status,
-        };
-    }
-
-    #readAssignedParentSnapshot(input, evidenceId) {
-        const assigned = this.#assignedParentSnapshot(input, evidenceId);
-        const manifest = this.#artifactStore.loadManifest(assigned.snapshotId);
-        return {
-            evidenceId: assigned.evidence.evidenceId,
-            candidateId: assigned.evidence.candidateId,
-            snapshotId: assigned.snapshotId,
-            manifest,
-            files: manifest.entries.map((entry) => {
-                const bytes = this.#artifactStore.readObject(entry.object, { verify: true });
-                return {
-                    path: entry.path,
-                    objectId: entry.object,
-                    size: entry.size,
-                    bytes,
-                    content: bytes.toString("utf8"),
-                };
-            }),
-        };
-    }
-
-    #readAssignedParentObject(input, evidenceId, objectId) {
-        const request = this.#parseParentAccessRequest(input, evidenceId, objectId);
-        const assigned = this.#assignedParentSnapshot(request, request.evidenceId);
-        const manifest = this.#artifactStore.loadManifest(assigned.snapshotId);
-        const allowedObjectIds = new Set([
-            assigned.snapshotId,
-            ...manifest.entries.map((entry) => entry.object),
-        ]);
-        if (!allowedObjectIds.has(request.objectId)) {
-            throw new CrucibleRuntimeError(
-                RUNTIME_ERROR_CODES.WORKER_PROTOCOL,
-                "Worker requested an object outside its assigned parent snapshot",
-                {
-                    sessionId: request.sessionId ?? null,
-                    evidenceId: request.evidenceId ?? null,
-                    objectId: request.objectId ?? null,
-                },
-            );
-        }
-        return this.#artifactStore.readObject(request.objectId, { verify: true });
-    }
-
     #getWorkerPool(aggregate) {
         if (this.#workerPool !== null) {
             return this.#workerPool;
+        }
+        if (this.#parentReadController === null) {
+            const parentReader = Object.freeze({
+                loadManifest: (snapshotId) => {
+                    const status = this.#artifactStore.verifySnapshot(snapshotId);
+                    if (!status.ok) {
+                        throw new RuntimeIntegrityError(
+                            "Parent snapshot closure failed ArtifactStore verification",
+                            { snapshotId, status },
+                        );
+                    }
+                    return this.#artifactStore.loadManifest(snapshotId);
+                },
+                readObject: (objectId) =>
+                    this.#artifactStore.readObject(objectId, { verify: true }),
+            });
+            this.#parentReadController = createBoundedParentReadAuthority({
+                parentReader,
+                parentReadLimits: this.#parentReadLimits,
+                clock: this.#clock,
+            });
         }
         if (this.#dependencies.workerPool !== undefined) {
             this.#workerPool = this.#dependencies.workerPool;
@@ -3931,28 +3794,6 @@ export class AutonomousRunner {
         const existingCandidateIds = harnessCandidateEvidenceItems(aggregate)
             .map((item) => item.candidateId);
         const factory = this.#dependencies.workerPoolFactory ?? createSdkWorkerPool;
-        const parentReader = Object.freeze({
-            loadManifest: (snapshotId) => {
-                const status = this.#artifactStore.verifySnapshot(snapshotId);
-                if (!status.ok) {
-                    throw new RuntimeIntegrityError(
-                        "Parent snapshot closure failed ArtifactStore verification",
-                        { snapshotId, status },
-                    );
-                }
-                return this.#artifactStore.loadManifest(snapshotId);
-            },
-            readObject: (objectId) =>
-                this.#artifactStore.readObject(objectId, { verify: true }),
-        });
-        const parentSnapshotAccess = Object.freeze({
-            verifySnapshot: (input, evidenceId) =>
-                this.#verifyAssignedParentSnapshot(input, evidenceId),
-            readSnapshot: (input, evidenceId) =>
-                this.#readAssignedParentSnapshot(input, evidenceId),
-            readObject: (input, evidenceId, objectId) =>
-                this.#readAssignedParentObject(input, evidenceId, objectId),
-        });
         this.#workerPool = factory({
             sdkPath: this.#config.sdkPath,
             cliPath: this.#config.cliPath,
@@ -3965,12 +3806,8 @@ export class AutonomousRunner {
             clock: this.#clock,
             timers: this.#dependencies.timers ?? globalThis,
             existingCandidateIds,
-            parentReader,
-            parentReadLimits: this.#dependencies.parentReadLimits,
-            parentSnapshotAccess,
-            verifyParentSnapshot: parentSnapshotAccess.verifySnapshot,
-            readParentSnapshot: parentSnapshotAccess.readSnapshot,
-            readParentSnapshotObject: parentSnapshotAccess.readObject,
+            parentReadAuthority: this.#parentReadController.authority,
+            parentReadLimits: this.#parentReadLimits,
             client: this.#dependencies.sdkClient,
             sdkLoader: this.#dependencies.sdkLoader,
             clientFactory: this.#dependencies.sdkClientFactory,
@@ -4626,6 +4463,7 @@ export class AutonomousRunner {
 
     async #cleanup() {
         let firstError = null;
+        const nonQuiescentFailures = [];
         this.#capturedOutputs.clear();
         this.#effectEvidenceBuffers.clear();
         this.#attemptCommands.clear();
@@ -4639,12 +4477,23 @@ export class AutonomousRunner {
             );
             if (outcome.status === "rejected") {
                 firstError ??= outcome.error;
+                nonQuiescentFailures.push({
+                    component: "executor.close",
+                    status: outcome.status,
+                    error: outcome.error?.message ?? null,
+                });
             } else if (outcome.status === "timed_out") {
-                firstError ??= new CrucibleRuntimeError(
+                const error = new CrucibleRuntimeError(
                     RUNTIME_ERROR_CODES.RUNTIME_FAILURE,
                     "Runner external-effect process cleanup exceeded its final shutdown bound",
                     { timeoutMs: this.#config.options.shutdownTimeoutMs },
                 );
+                firstError ??= error;
+                nonQuiescentFailures.push({
+                    component: "executor.close",
+                    status: outcome.status,
+                    error: error.message,
+                });
             }
         }
         if (this.#workerPool !== null && typeof this.#workerPool.close === "function") {
@@ -4655,14 +4504,26 @@ export class AutonomousRunner {
             );
             if (outcome.status === "rejected") {
                 firstError ??= outcome.error;
+                nonQuiescentFailures.push({
+                    component: "workerPool.close",
+                    status: outcome.status,
+                    error: outcome.error?.message ?? null,
+                });
             } else if (outcome.status === "timed_out") {
-                firstError ??= new CrucibleRuntimeError(
+                const error = new CrucibleRuntimeError(
                     RUNTIME_ERROR_CODES.RUNTIME_FAILURE,
                     "Runner worker-pool cleanup exceeded its final shutdown bound",
                     { timeoutMs: this.#config.options.shutdownTimeoutMs },
                 );
+                firstError ??= error;
+                nonQuiescentFailures.push({
+                    component: "workerPool.close",
+                    status: outcome.status,
+                    error: error.message,
+                });
             }
         }
+        this.#parentReadController?.close();
         if (this.#repository !== null) {
             try {
                 this.#repository.close();
@@ -4670,14 +4531,43 @@ export class AutonomousRunner {
                 firstError ??= error;
             }
         }
-        if (this.#runTempRoot !== null) {
+        if (this.#runTempRoot !== null && nonQuiescentFailures.length === 0) {
             try {
                 removeTreeInside(this.#runTempRoot, this.#config.options.tempRoot);
             } catch (error) {
                 firstError ??= error;
             }
         }
-        return firstError;
+        if (nonQuiescentFailures.length > 0) {
+            return new CrucibleRuntimeError(
+                RUNTIME_ERROR_CODES.NON_QUIESCENT,
+                "Runner cleanup could not prove that every worker and child process stopped",
+                {
+                    failures: nonQuiescentFailures,
+                    retainedTempRoot: this.#runTempRoot,
+                    firstError: firstError === null
+                        ? null
+                        : {
+                            name: firstError?.name ?? "Error",
+                            code: firstError?.code ?? null,
+                            message: firstError?.message ?? String(firstError),
+                        },
+                    pausePending: true,
+                },
+                firstError === null ? undefined : { cause: firstError },
+            );
+        }
+        if (firstError === null || typeof firstError?.code === "string") {
+            return firstError;
+        }
+        return new CrucibleRuntimeError(
+            RUNTIME_ERROR_CODES.RUNTIME_FAILURE,
+            `Runner cleanup failed: ${firstError?.message ?? String(firstError)}`,
+            {
+                name: firstError?.name ?? "Error",
+            },
+            { cause: firstError },
+        );
     }
 }
 

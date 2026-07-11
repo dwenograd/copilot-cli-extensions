@@ -8,9 +8,9 @@ import {
     READ_PARENT_ARTIFACT_TOOL_NAME,
     RUNTIME_ERROR_CODES,
     SUBMIT_CANDIDATE_TOOL_NAME,
-    assertWorkerSessionsAreNonTerminal,
     createSdkWorkerPool,
     validateCandidateSubmission,
+    validateWorkerProposal,
 } from "../runtime/index.mjs";
 import { hashCanonical } from "../domain/index.mjs";
 
@@ -24,8 +24,24 @@ function makeRoot(label) {
 }
 
 afterEach(() => {
+    const failures = [];
     for (const root of roots.splice(0)) {
-        fs.rmSync(root, { recursive: true, force: true });
+        try {
+            fs.rmSync(root, {
+                recursive: true,
+                force: true,
+                maxRetries: 20,
+                retryDelay: 25,
+            });
+        } catch (error) {
+            failures.push(error);
+        }
+        if (fs.existsSync(root)) {
+            failures.push(new Error(`worker-pool test root survived cleanup: ${root}`));
+        }
+    }
+    if (failures.length > 0) {
+        throw new AggregateError(failures, "worker-pool test cleanup failed");
     }
 });
 
@@ -362,6 +378,130 @@ describe("Crucible SDK worker pool", () => {
         expect(Date.now() - started).toBeLessThan(500);
     });
 
+    it("bounds a never-resolving createSession by the absolute deadline and reports it on close", async () => {
+        const root = makeRoot("create-session-deadline");
+        let stopCalls = 0;
+        const client = {
+            async start() {},
+            async stop() {
+                stopCalls += 1;
+            },
+            createSession() {
+                return new Promise(() => {});
+            },
+        };
+        const deadlineMs = Date.now() + 50;
+        const pool = createSdkWorkerPool({
+            client,
+            baseDirectory: path.join(root, "sdk"),
+            workingDirectory: path.join(root, "work"),
+            sessionTimeoutMs: 5_000,
+            shutdownTimeoutMs: 25,
+            deadlineMs,
+        });
+
+        const proposalStartedAt = Date.now();
+        await expect(pool.propose(request())).rejects.toMatchObject({
+            code: RUNTIME_ERROR_CODES.DEADLINE_EXCEEDED,
+            details: {
+                deadlineMs,
+                stage: "proposal session creation",
+            },
+        });
+        expect(Date.now() - proposalStartedAt).toBeLessThan(1_000);
+
+        const closeStartedAt = Date.now();
+        await expect(pool.close()).rejects.toMatchObject({
+            code: RUNTIME_ERROR_CODES.RUNTIME_FAILURE,
+            details: {
+                failures: [
+                    expect.objectContaining({
+                        component: "session.create",
+                        sessionId: "session-a",
+                        model: "gpt-test",
+                        status: "timed_out",
+                    }),
+                ],
+            },
+        });
+        expect(Date.now() - closeStartedAt).toBeLessThan(1_000);
+        expect(stopCalls).toBe(1);
+    });
+
+    it("retains a failed session disconnect so close can retry it", async () => {
+        const root = makeRoot("disconnect-retry");
+        let disconnectCalls = 0;
+        let abortCalls = 0;
+        let stopCalls = 0;
+        const client = {
+            async start() {},
+            async stop() {
+                stopCalls += 1;
+            },
+            async createSession(config) {
+                return {
+                    async sendAndWait() {
+                        await config.tools[0].handler(validPayload("candidate-a"), {
+                            sessionId: config.sessionId,
+                            toolName: config.tools[0].name,
+                        });
+                    },
+                    async abort() {
+                        abortCalls += 1;
+                    },
+                    async disconnect() {
+                        disconnectCalls += 1;
+                        if (disconnectCalls === 1) {
+                            throw new Error("first disconnect failed");
+                        }
+                    },
+                };
+            },
+        };
+        const pool = createSdkWorkerPool({
+            client,
+            baseDirectory: path.join(root, "sdk"),
+            workingDirectory: path.join(root, "work"),
+        });
+        await expect(pool.propose(request())).rejects.toThrow("first disconnect failed");
+        await expect(pool.close()).resolves.toBeUndefined();
+        expect(disconnectCalls).toBe(2);
+        expect(abortCalls).toBe(1);
+        expect(stopCalls).toBe(1);
+    });
+
+    it("retains a partially started SDK client when startup cleanup needs a retry", async () => {
+        const root = makeRoot("startup-cleanup-retry");
+        let stopCalls = 0;
+        const client = {
+            async start() {
+                throw new Error("startup failed");
+            },
+            stop() {
+                stopCalls += 1;
+                return stopCalls === 1 ? new Promise(() => {}) : Promise.resolve();
+            },
+            async createSession() {
+                throw new Error("must not create a session");
+            },
+        };
+        const pool = createSdkWorkerPool({
+            client,
+            baseDirectory: path.join(root, "sdk"),
+            workingDirectory: path.join(root, "work"),
+            shutdownTimeoutMs: 10,
+        });
+        await expect(pool.start()).rejects.toMatchObject({
+            code: RUNTIME_ERROR_CODES.WORKER_STARTUP,
+            recoverable: true,
+            details: {
+                cleanupStatus: "timed_out",
+            },
+        });
+        await expect(pool.close()).resolves.toBeUndefined();
+        expect(stopCalls).toBe(2);
+    });
+
     it.each([
         ["no-submit", RUNTIME_ERROR_CODES.WORKER_NO_SUBMISSION],
         ["wrong-nonce", RUNTIME_ERROR_CODES.WORKER_WRONG_NONCE],
@@ -495,8 +635,40 @@ describe("Crucible SDK worker pool", () => {
             });
             expect(proposal.identity.contextHash).toBe(contextHash);
             expect(proposal.annotations.citedEvidenceIds).toEqual(["ev-1"]);
-            expect(assertWorkerSessionsAreNonTerminal(proposal)).toBe(true);
+            expect(validateWorkerProposal(proposal, {
+                ...request("candidate-a"),
+                visibleEvidenceIds: ["ev-1", "ev-2"],
+                promptContextHash: contextHash,
+            })).toEqual(proposal);
             await pool.close();
+        });
+
+        it.each([
+            ["invocationSessionId", "different-session"],
+            ["configuredModel", "different-model"],
+            ["challengeNonce", "different-challenge"],
+            ["promptHash", "sha256:wrong-prompt"],
+            ["contextHash", "sha256:wrong-context"],
+            ["annotationsHash", "sha256:wrong-annotations"],
+            ["payloadHash", "sha256:wrong-payload"],
+        ])("rejects an independent identity.%s mismatch", async (field, mismatch) => {
+            const { pool } = await makePool("valid");
+            let proposal;
+            try {
+                proposal = await pool.propose(request());
+                expect(() => validateWorkerProposal({
+                    ...proposal,
+                    identity: {
+                        ...proposal.identity,
+                        [field]: mismatch,
+                    },
+                }, request())).toThrow(expect.objectContaining({
+                    code: RUNTIME_ERROR_CODES.WORKER_PROTOCOL,
+                    details: expect.objectContaining({ field }),
+                }));
+            } finally {
+                await pool.close();
+            }
         });
     });
 

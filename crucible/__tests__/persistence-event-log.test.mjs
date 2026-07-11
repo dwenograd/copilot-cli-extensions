@@ -1,6 +1,6 @@
 // crucible/__tests__/persistence-event-log.test.mjs
 //
-// Event-log behaviour: CAS conflict under concurrency, idempotent commutative
+// Event-log behaviour: CAS conflict under concurrency, idempotent/conflict-safe
 // evidence, single-terminal enforcement, transactional rollback, and structural
 // integrity / tamper detection.
 
@@ -152,8 +152,8 @@ describe("append-only hash-chained event log", () => {
     });
 });
 
-describe("idempotent commutative evidence ingestion", () => {
-    it("returns the existing event on a duplicate (investigation, attempt, evidence_kind) key", () => {
+describe("idempotent evidence ingestion", () => {
+    it("deduplicates exact facts and rejects conflicting facts under the same key", () => {
         const first = repo.ingestEvidence({
             investigationId: "inv-1",
             attemptId: "attempt-9",
@@ -163,23 +163,31 @@ describe("idempotent commutative evidence ingestion", () => {
         });
         expect(first.deduplicated).toBe(false);
 
-        // A second ingestion with a *different* payload must NOT append again and
-        // must return the originally stored event unchanged (commutative + idempotent).
-        const second = repo.ingestEvidence({
+        const duplicate = repo.ingestEvidence({
             investigationId: "inv-1",
             attemptId: "attempt-9",
             evidenceKind: "stdout",
             kind: "evidence-observed",
-            payload: { bytes: 999999 },
+            payload: { bytes: 10 },
         });
-        expect(second.deduplicated).toBe(true);
-        expect(second.event.seq).toBe(first.event.seq);
-        expect(second.event.eventHash).toBe(first.event.eventHash);
-        expect(second.event.payload).toEqual({ bytes: 10 });
+        expect(duplicate.deduplicated).toBe(true);
+        expect(duplicate.event.seq).toBe(first.event.seq);
+        expect(duplicate.event.eventHash).toBe(first.event.eventHash);
+
+        for (const conflict of [
+            { kind: "evidence-observed", payload: { bytes: 999999 } },
+            { kind: "different-kind", payload: { bytes: 10 } },
+        ]) {
+            const err = catchCode(() => repo.ingestEvidence({
+                investigationId: "inv-1",
+                attemptId: "attempt-9",
+                evidenceKind: "stdout",
+                ...conflict,
+            }));
+            expect(err.code).toBe(ERROR_CODES.EVIDENCE_CONFLICT);
+        }
 
         expect(repo.countEvents("inv-1")).toBe(1);
-
-        // A different evidence_kind for the same attempt is a distinct event.
         const other = repo.ingestEvidence({
             investigationId: "inv-1",
             attemptId: "attempt-9",
@@ -245,32 +253,24 @@ describe("terminal-event uniqueness", () => {
 });
 
 describe("transactional rollback", () => {
-    it("discards every event in a batch when one fails mid-batch", () => {
-        const head0 = repo.getHead("inv-1");
-        repo.appendEvents({
-            investigationId: "inv-1",
-            expectedHead: head0.eventHash,
-            events: [{ kind: "verified", terminal: { kind: "verified_result" }, payload: {} }],
-        });
-        expect(repo.countEvents("inv-1")).toBe(1);
-
-        const head1 = repo.getHead("inv-1");
-        // First event of the batch is a legal non-terminal note (it *will* be
-        // inserted), the second is a forbidden second terminal (fails). The whole
-        // batch must roll back, leaving only the original terminal.
+    it("rolls back a first insert when the second event fails", () => {
+        const head = repo.getHead("inv-1");
         const err = catchCode(() => repo.appendEvents({
             investigationId: "inv-1",
-            expectedHead: head1.eventHash,
+            expectedHead: head.eventHash,
             events: [
-                { kind: "note", payload: { n: 1 } },
-                { kind: "second-terminal", terminal: { kind: "target_unreachable" }, payload: {} },
+                { kind: "first-write", payload: { n: 1 } },
+                {
+                    kind: "second-write",
+                    payload: { n: 2 },
+                    expectedEventHash: "0".repeat(64),
+                },
             ],
         }));
-        expect(err.code).toBe(ERROR_CODES.TERMINAL_EXISTS);
+        expect(err.code).toBe(ERROR_CODES.EVENT_HASH_MISMATCH);
 
-        // The "note" write was rolled back with the failing terminal.
-        expect(repo.countEvents("inv-1")).toBe(1);
-        expect(repo.getHead("inv-1")).toEqual(head1);
+        expect(repo.countEvents("inv-1")).toBe(0);
+        expect(repo.getHead("inv-1")).toEqual(head);
         expect(repo.verifyInvestigation("inv-1").ok).toBe(true);
     });
 });

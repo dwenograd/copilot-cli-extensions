@@ -40,7 +40,7 @@ const HELPER_LAUNCHER_SCRIPT_HASH_TAG =
 const HELPER_LAUNCHER_ID = "powershell-loadfrom-no-ui-v1";
 const MANAGED_HELPER_READY = "CRUCIBLE_MANAGED_HELPER_READY";
 const HELPER_SOURCE_SHA256 =
-    "7fa036e9e89941900796e966255df58c45b01cd748d0df3391cfc036c5e7d63f";
+    "1c18004e1deb3f4b0321937bd8331e19a597fc6110742e05ae0574840f1c8ef9";
 const HELPER_BUILD_DIR = "windows-appcontainer-helper-v3";
 const HELPER_SOURCE_NAME = "CrucibleWindowsSandbox.cs";
 const HELPER_EXE_NAME = "CrucibleWindowsSandbox.exe";
@@ -836,7 +836,6 @@ function prepareManagedHelperLaunch(
     helper,
     invocation,
     argv,
-    { helperPath = invocation.path } = {},
 ) {
     const bytes = Buffer.from(JSON.stringify(argv), "utf8");
     const argumentsPath = path.join(invocation.root, "managed-arguments.json");
@@ -853,7 +852,7 @@ function prepareManagedHelperLaunch(
     try { fs.chmodSync(argumentsPath, 0o400); } catch { /* ACLs govern Windows */ }
     const env = {
         ...helperEnvironment(),
-        CRUCIBLE_MANAGED_HELPER_PATH: helperPath,
+        CRUCIBLE_MANAGED_HELPER_PATH: invocation.path,
         CRUCIBLE_MANAGED_HELPER_ARGUMENTS_PATH:
             fs.realpathSync.native(argumentsPath),
         CRUCIBLE_MANAGED_HELPER_ARGUMENTS_HASH: sha256Hex(bytes),
@@ -1195,6 +1194,12 @@ async function probeWithHelper(helper, controlRoot, limits) {
         || result.lowIntegrity !== true
         || result.zeroCapabilities !== true
         || result.networkDenied !== true
+        || result.loopbackExempt !== false
+        || result.networkConnectionSucceeded !== false
+        || typeof result.networkProbeDenied !== "boolean"
+        || typeof result.networkProbeCompleted !== "boolean"
+        || typeof result.networkProbeTimedOut !== "boolean"
+        || !Number.isInteger(result.networkErrorCode)
         || result.secretDenied !== true
         || result.registryDenied !== true
         || result.outputWriteAllowed !== true
@@ -1301,6 +1306,7 @@ function requireAvailability(availability) {
                 primitive: WINDOWS_SANDBOX_PRIMITIVE,
                 code: availability.code,
                 limitations: WINDOWS_SANDBOX_LIMITATIONS,
+                probeDetails: availability.details,
             },
         );
     }
@@ -1673,29 +1679,19 @@ function buildPolicy({
 }
 
 export function createWindowsSandboxProvider(options = {}) {
-    const limits = normalizeLimits(options.limits);
-    const clock = normalizeClock(options.clock);
-    const testHooks = options.testHooks ?? {};
-    if (testHooks === null
-        || typeof testHooks !== "object"
-        || Array.isArray(testHooks)
-        || Object.keys(testHooks).some((key) =>
-            ![
-                "beforeHelperSpawn",
-                "failAssignProcessToJobObject",
-                "invalidManagedHelperStartup",
-            ].includes(key))
-        || (testHooks.beforeHelperSpawn !== undefined
-            && typeof testHooks.beforeHelperSpawn !== "function")
-        || (testHooks.failAssignProcessToJobObject !== undefined
-            && typeof testHooks.failAssignProcessToJobObject !== "boolean")
-        || (testHooks.invalidManagedHelperStartup !== undefined
-            && typeof testHooks.invalidManagedHelperStartup !== "boolean")) {
+    if (options === null
+        || typeof options !== "object"
+        || Array.isArray(options)
+        || Object.keys(options).some((key) =>
+            !["controlRoot", "limits", "clock"].includes(key))
+        || Object.getOwnPropertySymbols(options).length > 0) {
         throw new MeasurementError(
             MEASUREMENT_ERROR_CODES.INVALID_ARGUMENT,
-            "Windows sandbox testHooks are malformed",
+            "Windows sandbox provider options are malformed",
         );
     }
+    const limits = normalizeLimits(options.limits);
+    const clock = normalizeClock(options.clock);
     const requestedControlRoot = options.controlRoot;
     let availabilityPromise = null;
     const availability = () => {
@@ -1777,7 +1773,6 @@ export function createWindowsSandboxProvider(options = {}) {
                             clock,
                         ),
                         invocationRoot: attemptRoot,
-                        beforeSpawn: testHooks.beforeHelperSpawn,
                         afterSpawn() {
                             prepareHelperLaunched = true;
                         },
@@ -1870,30 +1865,8 @@ export function createWindowsSandboxProvider(options = {}) {
                                 ),
                             );
                             let helperTimeoutMs = resolveHelperTimeoutMs();
-                            await testHooks.beforeHelperSpawn?.(Object.freeze({
-                                operation: "launch",
-                                helperPath: launchHelperInvocation.path,
-                                helperRoot: launchHelperInvocation.root,
-                                launchManifestPath: launchManifest.path,
-                                statePath,
-                                launchRequest,
-                                timeoutMs: helperTimeoutMs,
-                            }));
                             verifyHelperInvocation(launchHelperInvocation);
                             verifyHelper(helper);
-                            let managedHelperPath =
-                                launchHelperInvocation.path;
-                            if (testHooks.invalidManagedHelperStartup === true) {
-                                managedHelperPath = path.join(
-                                    launchHelperInvocation.root,
-                                    "invalid-managed-helper.exe",
-                                );
-                                fs.writeFileSync(
-                                    managedHelperPath,
-                                    Buffer.from("not-a-managed-assembly", "utf8"),
-                                    { flag: "wx", mode: 0o400 },
-                                );
-                            }
                             helperTimeoutMs = resolveHelperTimeoutMs();
                             const helperArgv = [
                                     "launch",
@@ -1909,9 +1882,6 @@ export function createWindowsSandboxProvider(options = {}) {
                                     String(effectiveLimits.cpuRatePercent),
                                     String(effectiveLimits.cpuTimeMs),
                                     String(helperTimeoutMs),
-                                    testHooks.failAssignProcessToJobObject === true
-                                        ? "1"
-                                        : "0",
                                     "--",
                                     ...launchRequest.argv,
                             ];
@@ -1919,7 +1889,6 @@ export function createWindowsSandboxProvider(options = {}) {
                                 helper,
                                 launchHelperInvocation,
                                 helperArgv,
-                                { helperPath: managedHelperPath },
                             );
                             child = spawn(
                                 managed.executable,
@@ -1934,9 +1903,7 @@ export function createWindowsSandboxProvider(options = {}) {
                                 },
                             );
                             verifyHelper(helper);
-                            if (testHooks.invalidManagedHelperStartup !== true) {
-                                verifyHelperInvocation(launchHelperInvocation);
-                            }
+                            verifyHelperInvocation(launchHelperInvocation);
                             child = await waitForManagedHelperReady(
                                 child,
                                 Math.min(5_000, helperTimeoutMs),
@@ -1989,7 +1956,6 @@ export function createWindowsSandboxProvider(options = {}) {
                             {
                                 timeoutMs: 120_000,
                                 invocationRoot: attemptRoot,
-                                beforeSpawn: testHooks.beforeHelperSpawn,
                             },
                         );
                         if (result.cleaned !== true
@@ -2326,10 +2292,17 @@ internal static class CrucibleWindowsSandbox
     private sealed class ProbeResult
     {
         public bool available { get; set; }
+        public int childExitCode { get; set; }
         public bool appContainer { get; set; }
         public bool lowIntegrity { get; set; }
         public bool zeroCapabilities { get; set; }
         public bool networkDenied { get; set; }
+        public bool loopbackExempt { get; set; }
+        public bool networkProbeDenied { get; set; }
+        public bool networkConnectionSucceeded { get; set; }
+        public bool networkProbeCompleted { get; set; }
+        public bool networkProbeTimedOut { get; set; }
+        public int networkErrorCode { get; set; }
         public bool secretDenied { get; set; }
         public bool registryDenied { get; set; }
         public bool outputWriteAllowed { get; set; }
@@ -2342,6 +2315,10 @@ internal static class CrucibleWindowsSandbox
         public bool LowIntegrity { get; set; }
         public bool ZeroCapabilities { get; set; }
         public bool NetworkDenied { get; set; }
+        public bool NetworkConnectionSucceeded { get; set; }
+        public bool NetworkProbeCompleted { get; set; }
+        public bool NetworkProbeTimedOut { get; set; }
+        public int NetworkErrorCode { get; set; }
         public bool SecretDenied { get; set; }
         public bool RegistryDenied { get; set; }
         public bool OutputWriteAllowed { get; set; }
@@ -3026,6 +3003,19 @@ internal static class CrucibleWindowsSandbox
             if (!Directory.Exists(profileRoot)) return;
             try
             {
+                foreach (string file in Directory.GetFiles(
+                    profileRoot,
+                    "*",
+                    SearchOption.AllDirectories))
+                {
+                    FileAttributes attributes = File.GetAttributes(file);
+                    File.SetAttributes(
+                        file,
+                        attributes
+                            & ~FileAttributes.ReadOnly
+                            & ~FileAttributes.Hidden
+                            & ~FileAttributes.System);
+                }
                 Directory.Delete(profileRoot, true);
                 if (!Directory.Exists(profileRoot)) return;
             }
@@ -3787,8 +3777,7 @@ internal static class CrucibleWindowsSandbox
         int cpuRatePercent,
         int cpuTimeMs,
         int wallTimeMs,
-        bool monitorControlInput,
-        bool failAssignProcessToJobObject)
+        bool monitorControlInput)
     {
         executable = FullPath(executable, "executable");
         currentDirectory = FullPath(currentDirectory, "current directory");
@@ -3860,13 +3849,6 @@ internal static class CrucibleWindowsSandbox
                 arguments,
                 currentDirectory,
                 environment);
-            if (failAssignProcessToJobObject)
-            {
-                Console.Error.WriteLine(
-                    "CRUCIBLE_TEST_ASSIGN_FAILURE_PID " + process.ProcessId);
-                throw new InvalidOperationException(
-                    "injected AssignProcessToJobObject failure");
-            }
             if (!AssignProcessToJobObject(job, process.Process))
                 throw new Win32Exception(Marshal.GetLastWin32Error());
             assignedToJob = true;
@@ -4072,7 +4054,7 @@ internal static class CrucibleWindowsSandbox
 
     private static int Launch(string[] args)
     {
-        if (args.Length < 15 || args[14] != "--")
+        if (args.Length < 14 || args[13] != "--")
             throw new InvalidOperationException("launch arguments are malformed");
         string statePath = FullPath(args[1], "state path");
         SandboxState state = ReadState(statePath, args[2]);
@@ -4087,8 +4069,7 @@ internal static class CrucibleWindowsSandbox
         int cpuRatePercent = Int32.Parse(args[10]);
         int cpuTimeMs = Int32.Parse(args[11]);
         int wallTimeMs = Int32.Parse(args[12]);
-        bool failAssignProcessToJobObject = args[13] == "1";
-        List<string> candidateArgs = args.Skip(15).ToList();
+        List<string> candidateArgs = args.Skip(14).ToList();
         uint exitCode = RunContained(
             state,
             parentPid,
@@ -4102,8 +4083,7 @@ internal static class CrucibleWindowsSandbox
             cpuRatePercent,
             cpuTimeMs,
             wallTimeMs,
-            true,
-            failAssignProcessToJobObject);
+            true);
         return unchecked((int)exitCode);
     }
 
@@ -4255,23 +4235,55 @@ internal static class CrucibleWindowsSandbox
                     null,
                     null);
                 bool completed = connect.AsyncWaitHandle.WaitOne(1000);
+                result.NetworkProbeCompleted = completed;
+                result.NetworkProbeTimedOut = !completed;
                 if (completed)
                 {
-                    client.EndConnect(connect);
-                    result.NetworkDenied = !client.Connected;
+                    try
+                    {
+                        client.EndConnect(connect);
+                        result.NetworkDenied = false;
+                        result.NetworkConnectionSucceeded = client.Connected;
+                        result.NetworkErrorCode = 0;
+                    }
+                    catch (SocketException error)
+                    {
+                        result.NetworkDenied = true;
+                        result.NetworkConnectionSucceeded = false;
+                        result.NetworkErrorCode = error.ErrorCode;
+                    }
                 }
-                else result.NetworkDenied = true;
+                else
+                {
+                    result.NetworkDenied = false;
+                    result.NetworkConnectionSucceeded = false;
+                    result.NetworkErrorCode = 0;
+                }
             }
         }
-        catch (SocketException) { result.NetworkDenied = true; }
-        catch (UnauthorizedAccessException) { result.NetworkDenied = true; }
+        catch (SocketException error)
+        {
+            result.NetworkProbeCompleted = true;
+            result.NetworkProbeTimedOut = false;
+            result.NetworkDenied = true;
+            result.NetworkConnectionSucceeded = false;
+            result.NetworkErrorCode = error.ErrorCode;
+        }
+        catch (UnauthorizedAccessException error)
+        {
+            result.NetworkProbeCompleted = true;
+            result.NetworkProbeTimedOut = false;
+            result.NetworkDenied = true;
+            result.NetworkConnectionSucceeded = false;
+            result.NetworkErrorCode = error.HResult;
+        }
         File.WriteAllText(
             Path.Combine(Path.GetDirectoryName(output), "probe-result.json"),
             Serializer().Serialize(result));
         return result.AppContainer
             && result.LowIntegrity
             && result.ZeroCapabilities
-            && result.NetworkDenied
+            && !result.NetworkConnectionSucceeded
             && result.SecretDenied
             && result.RegistryDenied
             && result.OutputWriteAllowed
@@ -4381,22 +4393,33 @@ internal static class CrucibleWindowsSandbox
                 cpuRatePercent,
                 cpuTimeMs,
                 wallTimeMs,
-                false,
                 false);
             string resultPath = Path.Combine(outputRoot, "probe-result.json");
-            if (exit != 0 || !File.Exists(resultPath))
+            if (!File.Exists(resultPath))
                 throw new InvalidOperationException(
-                    "AppContainer child probe failed with exit " + exit);
+                    "AppContainer child probe produced no telemetry; exit "
+                    + exit);
             ChildProbeResult child = Serializer()
                 .Deserialize<ChildProbeResult>(
                     File.ReadAllText(resultPath, Encoding.UTF8));
             ProbeResult result = new ProbeResult
             {
-                available = true,
+                available = exit == 0,
+                childExitCode = unchecked((int)exit),
                 appContainer = child.AppContainer,
                 lowIntegrity = child.LowIntegrity,
                 zeroCapabilities = child.ZeroCapabilities,
-                networkDenied = child.NetworkDenied,
+                // A filtered connect can time out, which is telemetry only.
+                // Denial is proved structurally by the zero-capability token
+                // plus CreateProfile's explicit no-loopback-exemption check.
+                networkDenied = child.ZeroCapabilities,
+                loopbackExempt = false,
+                networkProbeDenied = child.NetworkDenied,
+                networkConnectionSucceeded =
+                    child.NetworkConnectionSucceeded,
+                networkProbeCompleted = child.NetworkProbeCompleted,
+                networkProbeTimedOut = child.NetworkProbeTimedOut,
+                networkErrorCode = child.NetworkErrorCode,
                 secretDenied = child.SecretDenied,
                 registryDenied = child.RegistryDenied,
                 outputWriteAllowed = child.OutputWriteAllowed,
@@ -4408,27 +4431,46 @@ internal static class CrucibleWindowsSandbox
         }
         finally
         {
-            listener.Stop();
+            Exception cleanupFailure = null;
+            try { listener.Stop(); }
+            catch (Exception error) { cleanupFailure = error; }
             if (File.Exists(statePath))
             {
                 try { CleanupState(statePath, true); }
-                catch { }
+                catch (Exception error) {
+                    if (cleanupFailure == null) cleanupFailure = error;
+                }
             }
             else if (profileCreated)
             {
                 try { DeleteProfile(profileName, profileRoot); }
-                catch { }
+                catch (Exception error) {
+                    if (cleanupFailure == null) cleanupFailure = error;
+                }
             }
-            try { Directory.Delete(root, true); }
-            catch { }
-            try { Registry.CurrentUser.DeleteSubKeyTree(registrySubKey, false); }
-            catch { }
-            try {
-                Registry.CurrentUser.DeleteSubKey(
-                    "Software\\CrucibleSandboxProbe",
-                    false);
+            try { DeleteProfileDirectory(root); }
+            catch (Exception error) {
+                if (cleanupFailure == null) cleanupFailure = error;
             }
-            catch { }
+            try
+            {
+                Registry.CurrentUser.DeleteSubKeyTree(registrySubKey, false);
+                using (RegistryKey residual =
+                    Registry.CurrentUser.OpenSubKey(registrySubKey))
+                {
+                    if (residual != null)
+                        throw new InvalidOperationException(
+                            "probe registry leaf survived cleanup");
+                }
+            }
+            catch (Exception error) {
+                if (cleanupFailure == null) cleanupFailure = error;
+            }
+            if (cleanupFailure != null)
+                throw new InvalidOperationException(
+                    "Windows sandbox probe cleanup failed: "
+                    + cleanupFailure.Message,
+                    cleanupFailure);
         }
     }
 
