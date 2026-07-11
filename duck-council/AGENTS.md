@@ -23,8 +23,8 @@ This file mirrors `triple-review/AGENTS.md`. Same root cause, same fix.
 - `view` with `view_range` for targeted reads of large files.
 - Report a request for git context as a Finding instead of running it yourself (e.g., "I'd want to see the diff of `src/auth/cookies.ts` against main — please share that").
 
-## Why duck-council does not have a Step 0.6 diff-materialization step
+## Why duck-council does not materialize a diff
 
-Unlike `triple-review`, which operates on a git repo and needs to materialize a diff for reviewers, `duck-council` operates on a topic + free-text context + free-text focus. There is no implicit git scope to materialize. Reviewers `view` whatever file paths the user pastes into `context`, and that's it.
+Unlike `triple-review`, `duck-council` has no git/no-git scope parameter. It operates on a topic plus optional context/focus. There is no implicit baseline: reviewers may `view` paths explicitly supplied in context, but they must not derive a diff themselves.
 
 If a future use case needs to council-review actual code changes, the right move is to add a `paths:` parameter (mirroring `triple-review`'s pass-14 addition) — not to lift the no-`git diff` rule.

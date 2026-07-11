@@ -1,6 +1,6 @@
 // Extension: triple-duck
-// Multi-model rubber-duck critique: launches 3 rubber-duck agents in parallel
-// and merges findings by consensus.
+// Multi-model rubber-duck critique: returns a packet for 3 parallel reviewers
+// plus a separate judge synthesis.
 //
 // This file is a thin shell — handler.mjs holds the orchestration logic
 // (validation, scrub, injection policy, budget check, model resolution).
@@ -14,7 +14,7 @@ const session = await joinSession({
         {
             name: "triple-duck",
             description:
-                "Launch three rubber-duck critique agents in parallel using different models, then have a dedicated judge agent (highest-quality model) cluster findings by consensus (3/3, 2/3, 1/3 agreement) and produce the final unified critique. Use BEFORE implementing non-trivial changes to get high-confidence design feedback. Returns an instruction packet — the calling agent then executes the pattern using the built-in `task` tool.",
+                "Launch three rubber-duck critique agents in parallel using different models, then have a configured judge cluster findings by consensus (3/3, 2/3, 1/3 agreement) and produce the final unified critique. Use BEFORE implementing non-trivial changes to get multi-model design feedback. Returns an instruction packet — the calling agent executes the pattern using the built-in `task` tool.",
             parameters: {
                 type: "object",
                 properties: {
@@ -34,12 +34,12 @@ const session = await joinSession({
                         minItems: 3,
                         maxItems: 3,
                         description:
-                            "Optional. Exactly 3 model IDs to override the default reviewer trio. Defaults to claude-opus-4.8, gpt-5.6-sol, claude-opus-4.7-1m-internal: senior review, operator/tool reasoning, and generational diversity. (Aliases are translated at spawn time; every spawned reviewer runs with context_tier:\"long_context\".)",
+                            "Optional. Exactly 3 model preset IDs. Defaults to claude-opus-4.8, gpt-5.6-sol, and the capability alias claude-opus-4.7-1m-internal (spawned as base claude-opus-4.7). Every reviewer gets context_tier:\"long_context\"; full-quality mode adds elevated effort only for supported base models.",
                     },
                     judge: {
                         type: "string",
                         description:
-                            "Optional. Model ID for the judge that synthesizes the 3 reviewer critiques into the final unified output. Defaults to `gpt-5.6-sol` with context_tier:\"long_context\" and elevated reasoning. Compatible with `cheap: true` (cheap reviewer trio + premium judge is a sensible config).",
+                            "Optional. Judge model preset. Defaults to gpt-5.6-sol. Every judge gets context_tier:\"long_context\"; full-quality mode requests elevated effort when supported. Compatible with cheap:true, but a plain base-model override still inherits cheap effort suppression.",
                     },
                     focus: {
                         type: "string",
@@ -50,7 +50,7 @@ const session = await joinSession({
                         type: "boolean",
                         default: false,
                         description:
-                            "Optional. When true, use the cheap reviewer trio (claude-opus-4.7, claude-opus-4.6, gpt-5.5) instead of the default heavy trio. ~23% reviewer-cost savings; every spawned reviewer still runs with context_tier:\"long_context\". Judge defaults to `claude-opus-4.7` in cheap mode unless overridden via `judge`. MUTUALLY EXCLUSIVE with `models` (but compatible with explicit `judge`).",
+                            "Optional. Use the cheap reviewer trio (claude-opus-4.7, claude-opus-4.6, gpt-5.5). Long context remains enabled, but automatic elevated reasoning is suppressed; an explicit effort alias still pins its effort. Judge defaults to claude-opus-4.7 unless overridden. Mutually exclusive with models, compatible with judge.",
                     },
                     max_premium_calls: {
                         type: "integer",

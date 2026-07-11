@@ -2,10 +2,9 @@
 //
 // Single source of truth for model presets across the five orchestrator
 // extensions (triple-duck, triple-review, triple-plan, debate,
-// duck-council). The sixth extension (zerotrust-sourcecheck) maintains
-// its own ALLOWED_MODEL_IDS in council/roster.mjs and does NOT currently
-// route through resolveModels — see zerotrust-sourcecheck/README.md
-// "Model availability" for the implications.
+// duck-council). Zero Trust maintains its own ALLOWED_MODEL_IDS in
+// council/roster.mjs and does not route through resolveModels. Crucible and
+// mcp-autoreload do not use these orchestration presets.
 //
 // ---------------------------------------------------------------------------
 // FALLBACK TABLE DRIFT POLICY (read this if you touch MODEL_FALLBACK_MAP):
@@ -32,31 +31,27 @@
 // IMPORTANT — the model strings in this file are CAPABILITY ALIASES, not raw
 // spawn IDs. The CLI no longer encodes reasoning effort or context window in
 // the model ID; those are separate task() parameters (reasoning_effort,
-// context_tier). A suffix like `-xhigh` or `-1m-internal` is REJECTED as an
-// unknown model (verified empirically). `_shared/spawnSpec.mjs` translates
-// these aliases into the concrete (base model + params) at the ONE boundary
-// where a sub-agent is actually spawned (the packets + zerotrust spawn code):
+// context_tier). Literal alias IDs such as `-xhigh` or `-1m-internal` are not
+// passed to task(). `_shared/spawnSpec.mjs` translates these aliases into the
+// concrete base model + params where orchestrator/Zero Trust packets render
+// task arguments:
 //   - `-xhigh` / `-high`       -> base model + reasoning_effort
-//   - `-1m-internal` / `-1m`   -> base model (context is GLOBAL: every spawn
-//                                 runs with context_tier:"long_context", which
-//                                 all models accept at no cost)
+//   - `-1m-internal` / `-1m`   -> base model (context is global:
+//                                 every packet-rendered spawn uses
+//                                 context_tier:"long_context")
 // Keeping the readable aliases here keeps logs, notes, and the fallback map
 // legible; spawnSpec is the only place that needs the real IDs.
 //
-// Opus 4.8 anchors critique and senior-review judgment; GPT-5.6 Sol supplies
-// the stronger operator/tool-orchestration perspective; Opus 4.7 preserves
-// generational diversity. This balance is shared by critique, planning, and
-// review trios so each run includes judgment, execution, and an independent
-// second Claude generation.
+// The default trio spans two model families and two Claude generations. The
+// same preset is shared by critique, planning, and review.
 export const DEFAULT_MODELS = [
     "claude-opus-4.8",
     "gpt-5.6-sol",
     "claude-opus-4.7-1m-internal",
 ];
 
-// Cheap-mode trio: same model families, cheaper model variants, no
-// reasoning-tier upgrade. ~23% reviewer-cost savings vs default. (Context is
-// global — every spawn still runs with long context regardless of tier.)
+// Cheap-mode trio: lower-tier model variants with no automatic reasoning-tier
+// upgrade. Context remains global long-context.
 export const CHEAP_MODELS = [
     "claude-opus-4.7",
     "claude-opus-4.6",
@@ -79,13 +74,13 @@ export const CHEAP_DEBATERS = [
 export const CHEAP_JUDGE = "claude-opus-4.6";
 
 // duck-council: 6 role-specialized reviewers + 1 judge synthesis pass.
-// Tiered model assignment (NOT all-4.8) per pass-15 triple-plan synthesis:
-// - reasoning-heavy roles (security, stability) get the top reasoning model (4.8)
+// Tiered model assignment:
+// - reasoning-heavy roles (security, stability) get the higher-tier model
 // - operational/dataflow roles (performance) get cross-family Sol
 // - cross-generation diversity (maintainer) gets a distinct Opus 4.7 alias
 // - prior-diverse roles (skeptic) get a different GPT variant
 // - intuition-heavy roles (user/UX) get a cheaper tier
-// Family balance: 4 Claude + 2 GPT reviewers + Claude judge.
+// Family balance: 4 Claude + 2 GPT reviewers, with a GPT judge.
 export const COUNCIL_ROLE_NAMES = ["security", "stability", "performance", "maintainer", "skeptic", "user"];
 export const DEFAULT_COUNCIL_ROLES = Object.freeze({
     security: "claude-opus-4.8",
@@ -111,17 +106,13 @@ export const CHEAP_COUNCIL_JUDGE = "claude-opus-4.7";
 // Triple-review's synthesis model performs the implementation-heavy merge.
 export const SYNTHESIS_MODEL = "gpt-5.6-sol";
 
-// Triple-duck judge: synthesizes 3 reviewer critiques into a unified, consensus-
-// ranked output. The win is the generational + honesty improvement for nuanced
-// cluster-and-conflict-resolution work.
+// Triple-duck judge: synthesizes reviewer critiques into a consensus-ranked
+// output.
 export const DEFAULT_TRIPLE_DUCK_JUDGE = "gpt-5.6-sol";
-// Cheap variant: standard reasoning. Cheap mode targets ~23% reviewer-cost
-// savings; the judge stays on the highest model the cheap-mode theme allows
-// (no reasoning-tier upgrade).
+// Cheap variant: lower-tier base model with no automatic reasoning upgrade.
 export const CHEAP_TRIPLE_DUCK_JUDGE = "claude-opus-4.7";
 
-// Triple-plan judgment is architectural review, so the strongest available
-// model merges the planner outputs.
+// Triple-plan judge preset.
 export const DEFAULT_TRIPLE_PLAN_JUDGE = "gpt-5.6-sol";
 export const CHEAP_TRIPLE_PLAN_JUDGE = "claude-opus-4.7";
 

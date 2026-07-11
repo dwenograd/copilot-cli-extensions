@@ -1,11 +1,8 @@
 // safeWrappers/defaults.mjs — single source of truth for DEFAULT_BUILD_ROOT.
 //
-// Before this module existed, the default was a hardcoded Windows 
-// zerotrust-sourcecheck` literal was hardcoded in 9 source files —
-// a developer-specific path that made the extension
-// unusable on Linux/macOS without passing `build_root` on every
-// invocation. This module centralises the default + adds env-var
-// override + a portable fallback under the user's home directory.
+// Before this module existed, a developer-specific Windows path was duplicated
+// across several files, making other hosts require `build_root` on every call.
+// This module centralizes the env override and portable home-directory fallback.
 //
 // Override order (first non-empty wins):
 //   1. `ZEROTRUST_BUILD_ROOT` env var

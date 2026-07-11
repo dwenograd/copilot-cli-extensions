@@ -26,10 +26,10 @@
 // "opt-in" (deterministic-only is default; council requires ZEROTRUST_DEFAULT_COUNCIL=1)
 // "opt-out" (council is default for repo-class URLs; ZEROTRUST_DETERMINISTIC_ONLY=1 downgrades back)
 //
-// Operator flipped to "opt-out" in v3 once the substitutional-safety architecture
-// (safeWrappers/) made the council overlay safe to enable by default — the broken
-// hook layer is no longer a precondition because the wrappers enforce containment
-// directly. ZEROTRUST_DETERMINISTIC_ONLY=1 remains the escape hatch.
+// The configured strategy is currently "opt-out": council mode is the default
+// for repo-class URLs, with ZEROTRUST_DETERMINISTIC_ONLY=1 as the escape hatch.
+// This is a mode-selection fact, not a claim that wrappers intercept raw
+// built-in tool calls; they do not.
 export const DEFAULT_STRATEGY = "opt-out";
 
 export function defaultStrategy() {
@@ -126,8 +126,9 @@ export function modeIsAudit(mode) {
 export function modeNeedsClone(mode) {
     // v4: only build modes need a local clone. Pure audit modes
     // (`audit_source`, `audit_source_council`, `verify_release`,
-    // `metadata_only`) operate on GitHub-API-fetched content in memory
-    // — no source bytes ever land on disk.
+    // `metadata_only`) return GitHub-API content through tool results and do
+    // not intentionally create source files. Runtime/session logging is out
+    // of scope for this taxonomy helper.
     return modeIsBuild(mode);
 }
 

@@ -49,8 +49,9 @@ site, mirror the wording.
      cwd-relative write lands inside the swept sandbox, not at the
      workspace root.
   3. **Post-hoc sweep** via `zerotrust_sweep_audit_scratch` — the
-     orchestrator MUST call this at end-of-audit. The packet's Section
-     9 instructs it to.
+     orchestrator calls a non-dry-run sweep last to close audit state.
+     Parent sweeping defaults on, so use dry-run and normally disable it
+     unless the parent is dedicated scratch.
 
 ## `Set-Location $build_root` must be the first line of every `powershell` call
 
@@ -61,9 +62,10 @@ at the orchestrator's cwd — often the operator's workspace root — and
 sweep can't safely clean that (it would risk deleting real personal
 files).
 
-If you add a new sub-agent launch path, the preamble MUST include
-`Set-Location '${buildRoot}';` (or equivalent shell-portable form for
-non-Windows). Pin it with a snapshot test in
+If a mode/tier permits a sub-agent `powershell` call, the preamble MUST
+include `Set-Location '${buildRoot}';` (or equivalent) first. API-direct
+source roles and local-source roles do not permit `powershell` at all.
+Pin new prompt paths with a snapshot test in
 `__tests__/v4r2r2Hardening.test.mjs` (see the `round-17:` tests for
 the existing pattern).
 
@@ -71,9 +73,9 @@ the existing pattern).
 
 This mirrors the `triple-review/AGENTS.md` and `duck-council/AGENTS.md`
 rule. Same root cause (hung-shell deadlocks when sub-agent PowerShell
-tools fail to drain `git diff` stdout buffers), same fix (the role
-prompt template forbids it, and the orchestrator pre-materialises any
-git context the role needs).
+tools fail to drain `git diff` stdout buffers): role prompts forbid
+reviewer-owned diff commands and use the already-available source/tree
+context instead.
 
 **The rule:** sub-agents spawned by this extension MUST NOT run
 `git diff`, `git show`, `git log -p`, `git status`, or any other `git`
@@ -83,6 +85,18 @@ already constrain the tool whitelist to `view/grep/glob` (no
 `powershell`) for the `source-inspection` tier — the `provenance` tier
 gets `gh` for commit/tag metadata but is similarly forbidden from
 piping git output through `Select-Object -First`.
+
+## Mode-specific role tool whitelists
+
+Keep `council/promptTemplate.mjs` and user documentation aligned:
+
+| Mode | Source-inspection | Provenance |
+|---|---|---|
+| API-direct | safe fetch/list wrappers + `web_fetch` for external context | same + `gh api` metadata |
+| Build clone | `view`/`grep`/`glob`/`web_fetch` | same + git verification/GitHub CLI |
+| Local source | `view`/`grep`/`glob` under `localPath` only | same + `web_fetch` for external advisories only |
+
+These are prompt rules. No registered hook enforces built-in tool use.
 
 ## `build_root` resolution (centralised)
 
@@ -147,6 +161,9 @@ When working on `enforcement.mjs`:
   `getActiveAudit` / `deactivateAudit` / `recordResolvedClonePath` /
   `recordResolvedSha` / `getTrustedAuditContext`) is the load-bearing
   half of this file — the `safeWrappers/*` tools call into it.
+- Full binding assumes an SDK-provided `sessionId`. Some no-session
+  compatibility/test paths fall back to default/argument-root checks; do not
+  describe wrappers as a universal authorization boundary.
 - The README's "Honest disclosure" section spells this out for users;
   preserve that wording when editing.
 
@@ -169,6 +186,11 @@ Worst case: a session that ends without reaching sweep AND without
 further audit access leaves a few hundred bytes of stale Map state
 until the extension process exits — bounded and trivial.
 
+`zerotrust_cleanup_audit` is build-clone cleanup and runs **before** sweep.
+API-direct `verify_release` has no clone path, so its quarantine directory
+must be removed manually. A successful non-dry-run sweep is the final
+deactivation point.
+
 ## Test seam: `__internals` exports
 
 Several modules export an `__internals` object for test access (e.g.
@@ -190,18 +212,20 @@ node --test "__tests__/*.test.mjs"
 ```
 
 The glob must be explicit — `node --test __tests__/` errors with
-"cannot find module". If you migrate this extension to vitest in the
-future, you'll need to port all the `import { test } from "node:test"`
-+ `import assert from "node:assert/strict"` patterns; budget for it.
+"cannot find module". The suite is in-process coverage; it does not prove
+live GitHub API behavior, Copilot hook delivery, host AV behavior, or OS-level
+build containment.
 
 ## Grains, owner-repo-sha basenames, and other invariants
 
 If you touch wrapper code, preserve these invariants — they have tests
 guarding them but the rationale is non-obvious:
 
-- **Clone basename format:** `<owner>-<repo>-<short-sha>` where
-  short-sha is 7 hex chars. Refused by `cleanupWrapper` and
-  `cloneWrapper` if violated.
+- **Clone basename construction:** literal
+  `<owner>-<repo>-<sha.slice(0,7)>`. Because owner/repo may contain hyphens,
+  the basename is not reversibly parsed into components. Cleanup validates
+  immediate-child placement, the broad canonical regex, and (during an active
+  audit) exact equality with the recorded resolved clone path.
 - **`_reports/` and `_quarantine/` are immediate children of
   `build_root`.** Anything starting with `_` is refused as a clone
   basename (defends meta-dirs from being mistaken for clones).

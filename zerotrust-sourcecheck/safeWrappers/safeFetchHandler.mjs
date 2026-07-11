@@ -1,8 +1,8 @@
 // safeWrappers/safeFetchHandler.mjs — zerotrust_safe_fetch_file tool.
 //
-// API-direct fetch of a single file's contents. Returns the bytes (text or
-// base64) IN MEMORY — never writes to disk. Refuses oversized files
-// (returns sha256 + size + preview instead).
+// API-direct fetch of one file. Returns bounded text or binary metadata through
+// the tool result and performs no source-file write. Runtime logging/spill is
+// outside this module. Oversized files return metadata and sometimes a preview.
 //
 // Trust model:
 // - Owner/repo/sha/path validated against pure regexes (no traversal).

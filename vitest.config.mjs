@@ -1,16 +1,17 @@
 // vitest.config.mjs — workspace test config.
 //
-// Five of the six extensions (the orchestrators: triple-*, debate,
-// duck-council) and the _shared/ module use vitest.
+// Six extensions use vitest: the five orchestrators (triple-*, debate,
+// duck-council) plus Crucible. The _shared/ module also uses vitest.
 // `zerotrust-sourcecheck/` uses Node's built-in `node:test` runner
 // instead (its suite predates the workspace vitest adoption).
-// Excluding it from vitest's file walk keeps the "Tests" counts honest
-// and avoids confusing "0 tests" entries for files that ARE running
-// tests — just through a different runner.
+// Excluding it avoids duplicate/incorrect discovery under a different runner.
+// mcp-autoreload currently has no automated test files.
 //
 // `npm test` (in package.json) runs vitest first, then explicitly
 // invokes `node --test "zerotrust-sourcecheck/__tests__/*.test.mjs"`
-// so both suites are exercised end-to-end.
+// so both test runners are invoked by the workspace command.
+// This config does not enable passWithNoTests. Only the snapshot-maintenance
+// script `npm run test:update` passes `--passWithNoTests`.
 
 import { defineConfig } from "vitest/config";
 

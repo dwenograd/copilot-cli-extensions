@@ -1,21 +1,55 @@
 # Regression corpus harness
 
-This directory contains a local-only regression corpus for comparing the deterministic audit mode with the council audit mode. It ships with clean-control GitHub URLs only. Operators may add local-only fixtures for private validation, but those additions must not be committed.
+Experimental local harness for comparing `audit_source` with
+`audit_source_council`. The committed registry currently contains only two
+clean-control public repositories; it is not a malicious-sample corpus and is
+not a release gate by itself.
 
-## Run
+## Dry run
 
-From the extension directory:
+From `zerotrust-sourcecheck/`:
 
 ```powershell
 node __corpus__\runner\runCorpus.mjs --dry-run
 ```
 
-`--dry-run` validates `urls.txt` and matching expectation files, prints the planned audit pairs, and does not start audits. Non-dry runs write summaries under `__corpus__\results\`, which is ignored by git.
+Dry-run validates `urls.txt` and matching expectation files, prints the two
+planned modes, and performs no network/audit dispatch.
 
 Options:
 
-- `--fixture <slug>` runs one fixture derived from the expectation filename.
-- `--promote-gate` exits nonzero for any failure or inconclusive fixture.
+- `--fixture <slug>` selects one expectation filename stem.
+- `--promote-gate` returns nonzero for failed or inconclusive fixtures.
+
+## Live mode is experimental
+
+Without `--dry-run`, `dispatchAudit.mjs` currently shells out to:
+
+```text
+gh copilot exec -- <prompt>
+```
+
+That command path is marked TODO in source and has not been validated as a
+reliable promotion gate. It requires the relevant `gh`/Copilot command,
+authentication, network access, model availability, and parseable report-path
+output. The path extractor recognizes Windows drive-letter paths only.
+
+The runner does not copy reports into the corpus results directory. It reads
+the absolute `REPORT.md` path printed by the child. If no path is parsed, the
+fallback `<fixture>/<mode>-REPORT.md` name is only a guessed path and is not
+created by `dispatchAudit`, so the comparison will fail when it tries to read
+it. Live fixtures run sequentially with a 30-second delay.
+
+## Results paths
+
+Successful live comparisons create:
+
+```text
+__corpus__\results\<ISO-timestamp>\<fixture>\comparison.json
+```
+
+The actual audit reports remain in the Zero Trust canonical `_reports`
+location returned by each child audit. `results/` is git-ignored.
 
 ## TSV format
 
@@ -25,18 +59,19 @@ Options:
 URL<TAB>kind<TAB>expected_min_verdict<TAB>required_tags<TAB>forbidden_tags
 ```
 
-Tags are comma-separated generic tags such as `remote-fetch`, `obfuscation`, `credential-store-read`, `persistence`, `supply-chain`, or `ci-workflow`.
+Tags are comma-separated generic labels such as `remote-fetch`,
+`obfuscation`, `credential-store-read`, `persistence`, `supply-chain`, or
+`ci-workflow`.
 
 ## AV-safety contract
 
-Defender alerts occurred twice during earlier development: once from an inert fixture shaped like a script payload, and once from dense prompt prose listing offensive PowerShell command names. The lesson is that byte shape and density matter, even when content is meant as documentation or a test fixture.
+1. Do not store literal attack patterns, command inventories, encoded payload
+   fragments, or invisible-character bytes in committed corpus files.
+2. Expectations use category letters (`A` through `G`) and generic tags only.
+3. Synthetic reports use category-letter prose and generic paths.
+4. Risky URLs/expectations remain local under ignored paths or outside the
+   repository.
+5. Stop immediately if host AV alerts during corpus work.
 
-Rules for this corpus:
-
-1. Do not store literal attack patterns, command-name inventories, encoded payload fragments, or invisible-character bytes in any corpus file.
-2. Expectation files must use category letters (`A` through `G`) and generic tags only.
-3. Synthetic reports in tests must use category-letter prose and generic file paths.
-4. Operator-curated risky URLs and their expectations stay local under ignored paths or outside this repository.
-5. If an AV alert appears during corpus work, stop immediately and treat it as a blocker.
-
-The terse expectation files are intentional: they preserve regression semantics without writing risky byte patterns to disk.
+These constraints reduce alert-prone byte shapes; they do not make live corpus
+runs a sandbox or an AV test.

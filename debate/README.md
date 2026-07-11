@@ -10,9 +10,21 @@ This is the **opposite** pattern from `triple-duck`. Triple-duck seeks consensus
 2. **Optional rebuttal rounds (parallel):** Each debater sees the other's prior round and rebuts.
 3. **Judge:** A third model reads the full transcript and renders a verdict including: strongest/weakest arguments per side, cruxes, verdict, confidence, and what would change its mind.
 
-## Tool
+## Tool signature
 
-- `debate(question, position_a?, position_b?, context?, rounds?, debaters?, judge?, cheap?, max_premium_calls?)`
+```text
+debate({
+  question: string,
+  position_a?: string,
+  position_b?: string,
+  context?: string,
+  rounds?: 1 | 2 | 3 | 4,
+  debaters?: [string, string],
+  judge?: string,
+  cheap?: boolean,
+  max_premium_calls?: number,
+})
+```
 
 `position_a` and `position_b` must be supplied **together** or **neither** (otherwise the debate is unbalanced). If neither is supplied, the orchestrator infers both opposing positions from the question.
 
@@ -33,15 +45,15 @@ Don't use for questions with a clear right answer — debate forces both sides t
 
 **Worst case** (with retries): `4N + 1` calls — the handler reserves one retry per debater call. If you set `max_premium_calls`, it MUST satisfy the worst-case formula or the handler rejects the request.
 
-`cheap: true` swaps in cheaper model presets; context remains global long-context for every spawned sub-agent.
+`cheap: true` swaps in lower-tier presets. It is mutually exclusive with explicit `debaters` or `judge`.
 
 ## Defaults
 
 - Debaters: `claude-opus-4.8` vs `gemini-3.1-pro-preview` (different model families maximize divergence)
-- Judge: `gpt-5.6-sol` (strongest available model, independent from both debaters)
+- Judge: `gpt-5.6-sol` (independent from both default debaters)
 - Cheap debaters: `claude-opus-4.7` vs `gpt-5.5`; cheap judge: `claude-opus-4.6`
 
-**Context:** every spawned debater and judge runs with `context_tier:"long_context"`; override `debaters` only when you want different model families or reasoning presets.
+**Spawn parameters:** every debater and judge gets `context_tier:"long_context"`. Full-quality mode requests elevated (`xhigh`) effort only for supported resolved base models. Cheap mode suppresses automatic elevation. Explicit effort aliases can pin effort in a custom non-cheap configuration.
 
 ---
 

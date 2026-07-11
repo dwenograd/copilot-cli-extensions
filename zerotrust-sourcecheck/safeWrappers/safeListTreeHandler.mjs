@@ -2,7 +2,7 @@
 //
 // API-direct alternative to safe_clone for the tree-enumeration step of an
 // audit. Calls `gh api repos/X/Y/git/trees/SHA?recursive=1` and returns the
-// tree in memory. NO files are written to disk.
+// tree through the tool result without intentionally creating a tree file.
 //
 // Trust model:
 // - Validates owner/repo against the same regexes urlParser uses.

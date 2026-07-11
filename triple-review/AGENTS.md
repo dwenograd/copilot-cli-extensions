@@ -1,28 +1,33 @@
-# When orchestrating triple-review on a non-git directory
+# triple-review — diff and no-git notes
 
-The extensions dir (the workspace where these tools live, e.g. `~/.copilot/extensions/`) is not itself a git repo. When you want to run `triple-review` on its contents, **use the `paths:` scope** introduced as the pass-14 hung-shell fix:
+## Git scopes
 
-```
-triple-review({
-    scope: "paths:_shared/budget.mjs,_shared/scrub.mjs,triple-review/handler.mjs,triple-review/packet.mjs"
-})
-```
+For `staged`, `unstaged`, `all-uncommitted`, `branch:`, `commit:`, and
+`files:` scopes, the **orchestrator** runs the resolved git command once and
+fully materializes its output into a snapshot file. Reviewers read that file
+with `view`; they must not run `git diff`, `git show`, `git log -p`,
+`git status`, or truncating PowerShell pipelines themselves.
 
-This hands reviewers the absolute file paths and tells them to use the `view` tool. **No staging dir. No git init. No `git diff`. No hung shells.**
+This rule applies whether the target directory is this extensions repository
+or any other git repository. It avoids hung native processes caused by
+sub-agent shell output not being fully drained.
 
-For backwards compatibility, the old workflow (create staging dir + git init + give reviewers a `staged` scope) still works — but the reviewer prompt now forbids them from running `git diff` or piping anything through `Select-Object -First`, so the failure mode is much smaller. Even if you forget and use the staging-dir pattern, reviewers will materialize the diff into a file via `Out-File` (Step 0.6 of the protocol) instead of letting sub-agent shells hang on git output buffers.
+## `paths:` no-git/current-state scope
 
-## Why the structural fix lives in `packet.mjs`
+`paths:<comma-list>` does not require git and has no baseline. Relative paths
+are resolved by the handler; reviewers inspect the current files directly.
+Use it for a genuinely non-git directory or when current-state review is the
+goal.
 
-The hung-shell pattern recurred 5+ times in one session because:
-1. The protocol packet told reviewers `Diff command: <diffCommand> (run this to see the exact changes under review)`.
-2. Reviewers (sub-agents) ran the command via their PowerShell tool.
-3. Their PowerShell tool didn't always drain git's stdout, OR they piped through `Select-Object -First N` which doesn't propagate stop-upstream.
-4. Git blocked on full stdout buffer, sub-agent reported back anyway, shell stayed "running" forever holding a real OS process.
+`paths:` skips diff sizing and backup creation. Auto-applied edits therefore
+have no protocol-provided restore path; prefer manual acceptance unless the
+operator already has another backup/VCS layer.
 
-The pass-14 fix changed the protocol so reviewers receive a **pre-materialized diff snapshot path** instead of a command to run. The orchestrator (you or me) runs git ONCE, drains stdout fully into a file, and passes the path. Reviewers `view` the file. Subprocess output is owned by exactly one party (the orchestrator) instead of being fanned out to N stateless sub-agents.
+## Backup caveats
 
-## When to NOT use `paths:`
-
-- When you ARE in a real git repo and want a real diff (use `staged`/`unstaged`/`branch:`/`commit:`/`files:` as before; the protocol now safely materializes the diff for reviewers either way).
-- When the review baseline matters (e.g., "what changed since main") — `paths:` has no baseline.
+Git scopes use `git stash create`, which snapshots tracked staged/unstaged
+content without changing the worktree. It does **not** include untracked files.
+The packet currently shows both a timestamped backup ref (POSIX example) and
+the fixed `refs/triple-review/backup` ref (PowerShell/final-report examples).
+Record the exact ref and stash SHA actually written; do not assume the fixed
+cleanup command applies to a timestamped ref.

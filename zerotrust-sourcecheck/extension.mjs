@@ -1,15 +1,14 @@
 // Extension: zerotrust-sourcecheck
 //
-// Audits a GitHub URL for source-level malware indicators. v3:
-// substitutional-safety hybrid — deterministic baseline checks +
-// an optional 32-role multi-model security council, with the dangerous
-// commands (clone/install/build) executed by the extension itself via
-// safe-wrapper tools rather than by the agent's raw shell.
+// Audits a GitHub URL or local directory for source-level malware indicators.
+// Current architecture: API-direct URL reads, deterministic checks, an optional
+// 32-role council, and substitutional wrappers for clone/install/build.
 //
 // IMPORTANT — no `hooks: {}` registration (operator-elevated-permissions
 // minimization, v4-r3): earlier versions registered an onPreToolUse hook
-// (forward-compat against a known Copilot CLI 1.0.x bug where the runtime
-// doesn't fire it for built-in tools) and an onSessionEnd hook (per-session
+// (forward-compat against observed Copilot CLI 1.0.x behavior where the runtime
+// did not fire it for built-in tools; no public issue URL is recorded here)
+// and an onSessionEnd hook (per-session
 // Map cleanup). Registering hooks at all triggers an "extension wants
 // elevated permissions: register hooks" prompt at every CLI launch, which
 // exposes capabilities (see-every-tool-input, modify-tool-input, run
@@ -44,7 +43,7 @@
 //   - enforcement.mjs          : audit-in-progress state machine (activate/getActive/deactivate) used by the wrappers; also exports the unregistered preToolUseHook for tests and future re-wiring
 //   - packet.mjs               : the natural-language playbook the agent executes
 //   - council/                 : 32-role roster + universal prompt template + extra-roles validator
-//   - safeWrappers/            : the substitutional-safety tools (v3 core architecture)
+//   - safeWrappers/            : substitutional-safety tools
 
 import { joinSession } from "@github/copilot-sdk/extension";
 import { runHandler } from "./handler.mjs";
@@ -65,7 +64,7 @@ const session = await joinSession({
         {
             name: "zerotrust_sourcecheck",
             description:
-                "Audits a GitHub URL OR an already-on-disk directory for source-level malware indicators. **URL mode (v4): API-direct by default — source files NEVER touch your disk for audit modes.** Pure URL audit modes (`audit_source`, `audit_source_council`, `metadata_only`) fetch GitHub content via the GitHub API into memory and produce a REPORT.md. `verify_release` is the same API-direct flow for source context, but ALSO downloads release artifacts to `_quarantine/` for hash + magic-byte verification. **Local-path mode:** pass `local_path` (an absolute path to an on-disk directory) + `i_understand_local_path_reads_my_disk: true` to audit bytes already on the operator's disk — use this when you've already downloaded a repo and want to audit that exact tree. Local mode uses `audit_local_source[_council]` only; no clone, no API fetches, no SHA pinning. Council modes (URL or local) run a 32-role multi-model security council across many independent angles. **All audit modes that produce on-disk content (build modes + local modes) include a Section 9b remediation flow** that walks the user through defang / delete-project / keep-as-is per HIGH/CRITICAL finding, with backup-before-edit and no-batch safety rules. Build modes (`audit_and_safe_build`, `audit_and_full_build`, `audit_and_*_build_council`) DO write source to a sandbox and execute the build — these are NOT offered up-front; operator must explicitly request as a follow-up after a clean audit. The hardened wrapper tools (`zerotrust_safe_list_tree`, `zerotrust_safe_fetch_file`, plus the on-disk `zerotrust_safe_clone`/`_install`/`_build` for build modes) all enforce trusted-context binding, path containment, and (for builds) the council-outcome gate. Wrappers refuse with explicit local-mode messages when the active audit is local-source.",
+                "Audit a GitHub URL or already-on-disk directory for source-level malware indicators. URL wrappers do not intentionally create source files, although Copilot CLI/session logging may retain returned text; verify_release downloads assets to _quarantine, which must be removed manually when no clone exists. Local modes read the supplied directory without SHA pinning. Council modes run 32 specialized roles. Build modes require explicit acknowledgements, but no separate prior-audit report is enforced. Safe/full build modes currently use the same install/build wrappers: install lifecycle scripts remain suppressed, while build scripts may execute in either mode. Wrapper protections apply only to calls routed through the registered wrappers; no pre-tool hook intercepts raw built-in shell calls.",
             parameters: {
                 type: "object",
                 properties: {
@@ -96,7 +95,7 @@ const session = await joinSession({
                             "audit_and_full_build_council",
                         ],
                         description:
-                            "Audit depth. metadata_only: GH API recon only, no clone. audit_source: deterministic checklist audit (default for repo/commit/tree URLs). audit_source_council: deterministic baseline plus a 32-role multi-model security council. audit_local_source: deterministic checklist audit against an on-disk directory (use with local_path). audit_local_source_council: 32-role council audit against an on-disk directory (use with local_path; default when local_path is set and mode omitted). verify_release: provenance verification of release artifacts (default for /releases/* URLs). audit_and_safe_build: audit_source + safe build (mandates safe install flags); requires i_understand_build_executes_code. audit_and_full_build: audit_source + lifecycle-script build; requires i_understand_build_executes_code AND unsafe. audit_and_safe_build_council: council audit + safe build; build waits for a recorded passing council outcome unless explicitly overridden. audit_and_full_build_council: council audit + lifecycle-script build; requires both build acknowledgements and the same recorded-outcome gate.",
+                            "Audit depth. Repo/tree/commit/pull URLs default to audit_source_council unless ZEROTRUST_DETERMINISTIC_ONLY=1; release URLs default to verify_release; local paths default to audit_local_source_council. Build modes require i_understand_build_executes_code. Full variants also require unsafe, but currently use the same wrapper commands as safe variants. Council-build modes additionally require a recorded outcome unless the orthogonal incompleteness/severity overrides are supplied.",
                     },
                     ref: {
                         type: "string",
@@ -132,7 +131,7 @@ const session = await joinSession({
                         type: "boolean",
                         default: false,
                         description:
-                            "Required ack flag for full-build modes (audit_and_full_build and audit_and_full_build_council), in addition to i_understand_build_executes_code. These modes run lifecycle scripts on your host with no sandbox.",
+                            "Required acknowledgement for full-build modes, in addition to i_understand_build_executes_code. It changes admission/warning posture; current full modes still use the same wrappers as safe modes and do not enable an alternate lifecycle-script installer.",
                     },
                     i_understand_private_repo_risk: {
                         type: "boolean",
@@ -161,7 +160,7 @@ const session = await joinSession({
                         type: "integer",
                         minimum: 1,
                         description:
-                            "Optional (council modes only). Circuit breaker against runaway recursion. Default 200 (well above worst-case ~95). Not a cost cap.",
+                            "Optional (council modes only). Launch-count circuit breaker. Default 200. This is not a billing/cost estimate.",
                     },
                 },
                 required: [],
@@ -174,8 +173,9 @@ const session = await joinSession({
         },
 
         // ----- v4 API-direct audit tools (default for non-build modes) -----
-        // These tools fetch GitHub content via `gh api` and return it
-        // in-memory only. NO source bytes ever land on disk. The audit
+        // These tools fetch GitHub content via `gh api` and return it through
+        // tool results. They do not intentionally create source files, but CLI
+        // logging/output spill behavior is outside this extension. The audit
         // packet for non-build modes directs the agent to call these
         // instead of safe_clone — keeping Defender out of the picture
         // for source files entirely.
@@ -183,7 +183,7 @@ const session = await joinSession({
         {
             name: "zerotrust_safe_list_tree",
             description:
-                "List a repo's full file tree at a specific SHA via the GitHub API. Returns { sha, truncated, entriesTruncated, totalEntryCount, entries: [{path, type, size, sha}, ...], entryCount, coverageComplete } in-memory. NO files written to disk. Pass either { url } (full GitHub URL) or { owner, repo, ref? }. Resolves the ref to a SHA before listing. Cross-checks active audit's pinned owner/repo/ref. **Coverage gate (mandatory):** if `coverageComplete !== true`, the tree was truncated (either by GitHub or by our 5000-entry anti-spill cap); the audit must drill into subtrees individually OR explicitly surface the coverage gap as a finding — do NOT issue a clean verdict on incomplete coverage. Use this as the FIRST step of an API-direct audit to discover what files exist; then use zerotrust_safe_fetch_file to fetch the interesting ones.",
+                "List a repo tree at a resolved SHA through the GitHub API and return metadata in the tool result. The wrapper does not create a tree file. It cross-checks the active audit's owner/repo/ref/SHA. If coverageComplete is not true, drill into subtrees or report incomplete coverage; do not issue a no-red-flags verdict.",
             parameters: {
                 type: "object",
                 properties: {
@@ -200,7 +200,7 @@ const session = await joinSession({
         {
             name: "zerotrust_safe_fetch_file",
             description:
-                "Fetch a single file's contents from a repo at a specific SHA via the GitHub API. Returns text (utf-8) or metadata-only (binary) IN MEMORY — file is NEVER written to disk. **v4.1 hardening: BINARY content is NEVER returned in full** — for binary files, response is `{sizeBytes, sha256, encoding: 'binary', previewBase64: <first 256 bytes for magic-byte inspection>}`. Text files over 256KB are truncated to that size with `textTruncated: true`. Files larger than 5MB return metadata + 4KB preview only. Validates path against traversal. Cross-checks active audit's pinned owner/repo. Use after zerotrust_safe_list_tree to fetch the manifests / lockfiles / scripts / suspicious files for inspection — but for binaries, the size + sha256 from the tree listing is sufficient for an audit finding; do not call fetch on binaries unless you specifically need the magic-byte preview.",
+                "Fetch one file at the audit's pinned SHA through the GitHub API and return bounded data in the tool result. The wrapper does not create a source file, but Copilot CLI/session logging may retain returned text. Binary content is never returned in full; within the fetch cap it returns size, SHA-256, and a 256-byte preview, while over-ceiling files may be metadata-only. Text defaults to 256KB inline.",
             parameters: {
                 type: "object",
                 properties: {
@@ -208,7 +208,7 @@ const session = await joinSession({
                     repo: { type: "string" },
                     sha: { type: "string", description: "40-char hex SHA (commit). Use the value returned by zerotrust_safe_list_tree." },
                     path: { type: "string", description: "Forward-slash repo-relative path. No '..' / no leading slash." },
-                    max_bytes: { type: "integer", minimum: 1, description: "Optional hard ceiling per-call (default 5MB, max 50MB). Files over the ceiling return metadata + 4KB preview only." },
+                    max_bytes: { type: "integer", minimum: 1, description: "Optional hard ceiling per call (default 5MB, max 50MB). Over-ceiling files return metadata-only or a bounded preview depending on the GitHub API response path." },
                     max_text_bytes: { type: "integer", minimum: 1, description: "Optional inline-text cap (default 256KB, max 1MB). Text files over the cap are truncated with `textTruncated: true`. Has no effect on binaries (which never return content)." },
                 },
                 required: ["owner", "repo", "sha", "path"],
@@ -216,7 +216,7 @@ const session = await joinSession({
             handler: (args, invocation) => safeFetchFileHandler(args, { sessionId: invocation?.sessionId }),
         },
 
-        // ----- Substitutional-safety wrapper tools (v3) -----
+        // ----- Substitutional-safety wrapper tools -----
         // These wrappers run the dangerous operations themselves with
         // hardened flags hardcoded. They remain available for build modes
         // (audit_and_*_build*), but for default audit modes the v4
@@ -226,7 +226,7 @@ const session = await joinSession({
         {
             name: "zerotrust_safe_clone",
             description:
-                "Hardened git clone, executed by the extension itself. Validates the URL against parseGithubUrl, resolves the ref to a SHA via `git ls-remote`, computes the canonical clone path under build_root, then runs `git clone` with the hardened security flags hardcoded (protocol.file.allow=never, no submodules, no LFS, no checkout, no symlinks, no hooks, longpaths). Returns { ok, clonePath, sha, canonicalUrl } on success or { ok: false, error } on failure.",
+                "Hardened build-mode clone. Resolves a trusted git executable and commit SHA, binds owner/repo/ref/SHA, and hardcodes protocol.file/ext=never, protocol.allow=never, protocol.https=always, symlinks/fsmonitor off, null hooks path, longpaths, no submodules/tags/checkout, blob filtering, and no LFS smudge. No minimum Git version is enforced; unsupported flags fail the call.",
             parameters: {
                 type: "object",
                 properties: {
@@ -251,7 +251,7 @@ const session = await joinSession({
         {
             name: "zerotrust_safe_install",
             description:
-                "Run a package-manager install with safe-mode flags hardcoded. Refuses if clone_path is outside build_root or ecosystem isn't allowlisted. For npm/yarn/pnpm the wrapper enforces --ignore-scripts; for pip it enforces --only-binary=:all: --no-deps; for cargo --locked; for dotnet --locked-mode. Returns structured stdout/stderr/exitCode.",
+                "Run one allowlisted dependency operation against the active clone: npm ci, npm install, yarn install, pnpm install, pip install, cargo fetch, or dotnet restore with hardcoded safety flags. extra_args are flag tokens only; positional packages/URLs/paths, redirects, traversal, and safety-negating options are refused. Option values must use a single --flag=value token rather than a split positional value.",
             parameters: {
                 type: "object",
                 properties: {
@@ -267,7 +267,7 @@ const session = await joinSession({
                     extra_args: {
                         type: "array",
                         items: { type: "string" },
-                        description: "Optional additional args appended to the command. Validated against [A-Za-z0-9._=:@/\\\\-]+ to prevent injection.",
+                        description: "Optional flag-only args. Max 32 × 256 chars; positional packages/URLs/paths, redirects, traversal, absolute paths, and safety-negating options are refused.",
                     },
                     build_root: {
                         type: "string",
@@ -282,7 +282,7 @@ const session = await joinSession({
         {
             name: "zerotrust_safe_build",
             description:
-                "Run a build command with safe-mode flags. In council-build modes (audit_and_*_build_council), this wrapper checks the recorded council outcome and refuses to build if the council didn't pass — this is where Feature 3's 'council aborts the build' guarantee actually lives. Returns structured stdout/stderr/exitCode.",
+                "Run an allowlisted build command against the active clone. Safe and full modes use the same build implementation. Council-build modes require a recorded outcome; proceed_on_council_failure bypasses only incompleteness and council_build_override bypasses only severity, so both are needed to bypass both gates.",
             parameters: {
                 type: "object",
                 properties: {
@@ -298,7 +298,7 @@ const session = await joinSession({
                     extra_args: {
                         type: "array",
                         items: { type: "string" },
-                        description: "Optional additional args. Same validation as zerotrust_safe_install.",
+                        description: "Optional args, max 32 × 256 chars. Redirect/negation flags, URL schemes, traversal, and absolute-path values are refused; unlike install, benign relative positional tokens are not categorically rejected.",
                     },
                     mode: {
                         type: "string",
@@ -375,7 +375,7 @@ const session = await joinSession({
         {
             name: "zerotrust_cleanup_audit",
             description:
-                "Delete the cloned source tree (and optionally the report and quarantine subdirs) at end of audit. Refuses paths outside build_root. The packet's epilogue instructs the agent to call this as the LAST step of every audit so clones do not accumulate. By default the REPORT.md is preserved (operators usually want it); pass `also_delete_report: true` to nuke that too. Quarantine is deleted by default (downloaded binaries should never persist past the audit).",
+                "Delete a canonical build-mode clone and optionally its report/quarantine siblings. This runs before the final scratch sweep, not last. It cannot clean API-direct verify_release quarantine because clone_path is required. Report is kept by default; matching quarantine is deleted by default.",
             parameters: {
                 type: "object",
                 properties: {
@@ -404,7 +404,7 @@ const session = await joinSession({
         {
             name: "zerotrust_sweep_audit_scratch",
             description:
-                "Delete stray scratch files left at the top level of build_root and (optionally) its immediate parent dir at the end of an audit. Sub-agents are SUPPOSED to use API-direct tools (zerotrust_safe_fetch_file / zerotrust_safe_list_tree) but sometimes write source bytes or path lists to disk via PowerShell `Out-File` / `Set-Content` / `iwr -OutFile`. The `preToolUseHook` policy in enforcement.mjs would deny most of those — but the hook is not registered (see top-of-file comment) and even if it were, Copilot CLI 1.0.x does not invoke `onPreToolUse` for built-in tools — so this wrapper runs the cleanup inside the extension process where we control execution unconditionally. Only deletes top-level FILES (never directories) and skips known-good names (README, .gitignore, etc.). Pass `dry_run: true` to inspect the list before deleting. Recommended call site: as part of the audit's epilogue, AFTER zerotrust_finalize_report / zerotrust_record_council_outcome and AFTER any zerotrust_cleanup_audit you do for build modes.",
+                "Final audit-lifecycle sweep: delete unrecognized top-level files in build_root and, by default, its immediate parent, then deactivate the audit on non-dry-run success. It never deletes directories. Parent sweeping can affect unrelated files because the whitelist is finite; dry-run first and normally pass also_sweep_parent:false unless the parent is dedicated audit scratch.",
             parameters: {
                 type: "object",
                 properties: {
@@ -414,7 +414,7 @@ const session = await joinSession({
                     },
                     also_sweep_parent: {
                         type: "boolean",
-                        description: "Optional. When true (default), ALSO sweep the immediate parent directory of build_root (catches scratch files that sub-agents wrote one level up via cwd-relative paths). Pass false to limit sweeping to build_root itself.",
+                        description: "Optional. Runtime default true: also sweep the immediate parent. This can delete unrelated unrecognized top-level files; dry-run first and prefer false unless the parent is dedicated audit scratch.",
                     },
                     dry_run: {
                         type: "boolean",

@@ -16,7 +16,7 @@ const session = await joinSession({
         {
             name: "duck-council",
             description:
-                "Critique a topic with 6 role-specialized rubber-duck reviewers (security / stability / performance / maintainer / skeptic / user) + a judge synthesis pass. Each role uses a tiered model (the top reasoning model for reasoning-heavy roles, GPT for cross-family diversity, Sonnet for UX). Use INSTEAD of triple_duck when you want different angles, not consensus. The judge produces cross-role contradiction adjudication + ranked top priorities + a premise challenge (\"what no duck noticed\") + executive summary; raw role outputs preserved in an appendix. Returns an instruction packet — the calling agent then executes the pattern using the built-in `task` tool.",
+                "Critique a topic with 6 role-specialized rubber-duck reviewers (security / stability / performance / maintainer / skeptic / user) plus an optional judge synthesis pass. Use instead of triple-duck when you want different angles rather than same-lens consensus. With the judge enabled, the output includes contradiction adjudication, ranked priorities, a premise challenge, an executive summary, and raw-role appendix. Returns an instruction packet — the calling agent executes it with the built-in `task` tool.",
             parameters: {
                 type: "object",
                 properties: {
@@ -52,19 +52,19 @@ const session = await joinSession({
                     judge: {
                         type: "string",
                         description:
-                            "Optional. Override the judge model. Default is gpt-5.6-sol with context_tier:\"long_context\" (cheap mode: claude-opus-4.7).",
+                            "Optional. Override the judge model. Default is gpt-5.6-sol (cheap mode: claude-opus-4.7). Every judge gets context_tier:\"long_context\"; full-quality mode requests elevated effort when supported.",
                     },
                     skip_judge: {
                         type: "boolean",
                         default: false,
                         description:
-                            "Optional. When true, skip the judge synthesis pass and present the 6 raw role outputs directly. Saves 2 premium calls (one judge + one retry slot). Use when you want to read the raw critiques yourself.",
+                            "Optional. Skip judge synthesis and present raw role outputs. Removes one normal judge call and its one-call retry allowance: successful runs save one actual call; worst-case reservation drops from 14 to 12.",
                     },
                     cheap: {
                         type: "boolean",
                         default: false,
                         description:
-                            "Optional. Use cheap-tier role models — drops the premium reasoning models to cheaper variants to save cost. Note: cheap stability default keeps the `claude-opus-4.6-1m` alias, but every spawned role still runs with context_tier:\"long_context\"; cheap performance/skeptic/user defaults are unchanged from defaults. MUTUALLY EXCLUSIVE with `roles` (an empty `roles: {}` object is treated as no override and is allowed alongside `cheap`).",
+                            "Optional. Use the cheap-tier role presets. Every role still gets context_tier:\"long_context\", but automatic elevated reasoning is suppressed. An explicit judge effort alias remains pinned because judge overrides are compatible with cheap mode. The stability alias claude-opus-4.6-1m spawns base claude-opus-4.6. Mutually exclusive with non-empty roles overrides.",
                     },
                     max_premium_calls: {
                         type: "integer",

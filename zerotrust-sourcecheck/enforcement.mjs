@@ -18,7 +18,8 @@
 //      they ran on the operator's host. Empirically, Copilot CLI 1.0.x
 //      does not invoke onPreToolUse for built-in tools (powershell, view,
 //      glob, grep) — the SDK's types.d.ts documents the contract but the
-//      runtime doesn't honor it. A bug report was filed.
+//      runtime did not honor it in tested 1.0.x builds. This repository does
+//      not record a public issue URL.
 //
 //      As of v4-r3 we no longer REGISTER this hook in extension.mjs.
 //      Registering hooks at all triggers an "extension wants elevated

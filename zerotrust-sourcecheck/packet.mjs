@@ -498,8 +498,8 @@ Stop after writing the report.
     // Pre-build Section 4. Three flavors:
     //   - mode is metadata_only: no clone, no API enumeration (recon-only).
     //   - mode is API-direct (audit_source / audit_source_council / verify_release):
-    //     fetch via gh api, never write source to disk.
-    //   - mode is build: hardened on-disk clone (existing v3 path).
+    //     fetch via gh api without intentionally creating source files.
+    //   - mode is build: hardened on-disk clone.
     let cloneSection;
     if (modeUsesApiDirect(mode)) {
         cloneSection = `---

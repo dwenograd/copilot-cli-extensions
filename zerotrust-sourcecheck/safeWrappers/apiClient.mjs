@@ -1,7 +1,7 @@
 // safeWrappers/apiClient.mjs
 //
-// Pure helper around `gh api` for v4 API-direct audits — fetches GitHub
-// content without ever writing source bytes to disk.
+// Pure helper around `gh api` for API-direct audits. It does not intentionally
+// create source files; Copilot CLI/tool-result logging is outside this module.
 //
 // Why `gh api` and not raw HTTPS:
 //   - Re-uses the operator's existing GitHub authentication (5000 req/hr
@@ -13,8 +13,8 @@
 // Trust model:
 //   - All `gh` invocations go through resolveTrustedProgram (round-11
 //     hardening) so a repo-planted `gh.cmd` cannot shadow-execute.
-//   - File contents are returned in-memory only. Callers pass them to
-//     the agent for analysis; they never touch the filesystem.
+//   - File contents are returned through the tool result. This module performs
+//     no source-file write, but host/runtime output retention is out of scope.
 //   - There is a per-fetch byte cap (configurable). Above the cap, only
 //     SHA256 + size + first-N-bytes are returned (so the audit can still
 //     reason about large files without pulling them into memory).

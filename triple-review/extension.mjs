@@ -13,14 +13,14 @@ const session = await joinSession({
         {
             name: "triple-review",
             description:
-                "Multi-model code review with iterative consensus loop. Launches 3 code-review agents in parallel on the same diff, clusters findings by consensus (3/3, 2/3, 1/3), uses a 4th synthesis agent to merge 3/3 fixes into a single canonical patch, auto-applies after validation, and iterates until findings stabilize. Use AFTER implementing changes to find bugs in actual code (vs. triple-duck which critiques plans/designs). Returns an instruction packet — the calling agent then executes the multi-round protocol via the built-in `task` and `edit` tools.",
+                "Multi-model code review with an iterative consensus loop. Launches 3 code-review agents against a materialized git diff, or current files in `paths:` mode; clusters findings, synthesizes applicable fixes, verifies patch preconditions, applies, then runs project validation before iterating. Returns an instruction packet for the calling agent.",
             parameters: {
                 type: "object",
                 properties: {
                     scope: {
                         type: "string",
                         description:
-                            "Optional. What to review. One of: 'staged' | 'unstaged' | 'all-uncommitted' | 'branch:<base>' (e.g. 'branch:main') | 'commit:<sha>' (e.g. 'commit:HEAD') | 'files:<comma-separated-paths>' | 'paths:<comma-separated-paths>' (no-git mode — reviewers `view` files directly with no diff baseline; required for non-git directories or when reviewing current file state without a baseline). Default: auto-detect (staged > unstaged > last commit), with disambiguation gate if both staged and unstaged overlap.",
+                            "Optional. One of staged, unstaged, all-uncommitted, branch:<base>, commit:<sha>, files:<comma-paths>, or paths:<comma-paths>. paths: is current-state/no-baseline mode and does not require git. Default auto-detect checks staged, unstaged, and untracked sets; asks if multiple are non-empty, refuses an untracked-only silent omission, and falls back to the last commit only when the tree is otherwise clean.",
                     },
                     models: {
                         type: "array",
@@ -28,7 +28,7 @@ const session = await joinSession({
                         minItems: 3,
                         maxItems: 3,
                         description:
-                            "Optional. Exactly 3 model IDs for the reviewer trio. Default: claude-opus-4.8, gpt-5.6-sol, claude-opus-4.7-1m-internal: senior review, operator/tool reasoning, and generational diversity. (Aliases are translated at spawn time; every spawned reviewer runs with context_tier:\"long_context\".)",
+                            "Optional. Exactly 3 model preset IDs. Defaults to claude-opus-4.8, gpt-5.6-sol, and capability alias claude-opus-4.7-1m-internal (spawned as base claude-opus-4.7). Every reviewer gets context_tier:\"long_context\"; full-quality mode adds elevated effort only for supported base models.",
                     },
                     focus: {
                         type: "string",
@@ -52,7 +52,7 @@ const session = await joinSession({
                         type: "boolean",
                         default: false,
                         description:
-                            "Optional. When true, use the cheap reviewer trio (claude-opus-4.7, claude-opus-4.6, gpt-5.5) instead of the default heavy trio. ~23% per-round reviewer-cost savings; synthesis model unchanged. Every spawned reviewer still runs with context_tier:\"long_context\"; reasoning effort/context are task() params, not ID suffixes. Set this when the user invokes 'triple review cheap' or asks for cheap mode. MUTUALLY EXCLUSIVE with `models` — pass one or the other, not both. Combine with `max_rounds: 1` for maximum savings.",
+                            "Optional. Use the cheap reviewer trio (claude-opus-4.7, claude-opus-4.6, gpt-5.5). The synthesis base model remains gpt-5.6-sol. Long context remains enabled, but automatic elevated reasoning is suppressed for reviewers and synthesis. Mutually exclusive with models.",
                     },
                     max_premium_calls: {
                         type: "integer",

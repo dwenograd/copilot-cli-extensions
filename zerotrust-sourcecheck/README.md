@@ -1,10 +1,11 @@
 # zerotrust-sourcecheck
 
 Copilot CLI extension that audits a GitHub URL (or an already-on-disk
-directory) for source-level malware indicators **without source files
-ever touching your disk during URL audits**, and — only when you
-explicitly ask — builds it from a pinned commit under a contained
-sandbox directory with hardened install/build flags.
+directory) for source-level malware indicators. API-direct wrappers do
+not intentionally create source files, but returned tool text can still
+be retained in Copilot CLI session logs or oversized-tool-output storage.
+Build modes clone a pinned commit under a contained directory and run
+wrapper-controlled install/build commands.
 
 This is the "would you trust this dependency / installer / random new
 repo from someone on the internet" tool. It surfaces the patterns that
@@ -18,14 +19,14 @@ gives the orchestrator a tight playbook for triaging them.
 |---|---|
 | `zerotrust_sourcecheck` | Main entry point. Returns an instruction packet the orchestrator follows. |
 | `zerotrust_safe_list_tree` | GitHub-API tree listing at a pinned SHA (API-direct mode). |
-| `zerotrust_safe_fetch_file` | GitHub-API source byte fetch, in-memory only (API-direct mode). |
+| `zerotrust_safe_fetch_file` | GitHub-API source fetch returned through the tool result; no source file is intentionally created by the wrapper. |
 | `zerotrust_safe_clone` | Hardened git clone (no submodules / hooks / LFS smudge / symlinks). Build modes only. |
-| `zerotrust_safe_install` | `npm/pip/cargo/dotnet` install with hardcoded safe flags. Build modes only. |
+| `zerotrust_safe_install` | `npm`, `npm-install`, `yarn`, `pnpm`, `pip`, `cargo`, or `dotnet` dependency operation with hardcoded flags. Build modes only. |
 | `zerotrust_safe_build` | Build step gated on prior council outcome (council-build modes). |
 | `zerotrust_record_council_outcome` | In-memory pass/fail recording the build-gate consults. |
 | `zerotrust_finalize_report` | Canonical-path `REPORT.md` write under `<build_root>/_reports/`. |
-| `zerotrust_cleanup_audit` | Removes the clone and quarantine artefacts; preserves the report unless explicitly asked to delete it. |
-| `zerotrust_sweep_audit_scratch` | Deletes stray scratch files at the top of `build_root` + parent. |
+| `zerotrust_cleanup_audit` | Removes a canonical build-mode clone and matching quarantine directory; preserves the report unless explicitly asked to delete it. |
+| `zerotrust_sweep_audit_scratch` | Deletes unrecognized top-level files in `build_root` and, by default, its parent. Dry-run first; parent sweeping can affect unrelated files. |
 
 ## Quick start
 
@@ -38,7 +39,7 @@ Copilot CLI (or `extensions_reload`) and you can invoke:
 ```
 
 That defaults to `audit_source_council` mode — a 32-role multi-model
-security council audit, API-direct (no source files on disk). The
+security council audit, API-direct (no wrapper-created source tree). The
 council is thorough but launches many sub-agents in parallel and can
 take several minutes for a small repo.
 
@@ -52,37 +53,43 @@ or set `ZEROTRUST_DETERMINISTIC_ONLY=1` in your environment to make the
 deterministic mode the workspace default. All other modes are opt-in
 — see [Modes](#modes) below.
 
-## API-direct by default — no files on disk for audits
+## API-direct by default
 
-Default audit modes (`audit_source`, `audit_source_council`,
-`verify_release`, `metadata_only`) obtain repository source through the GitHub API.
-The audit pipeline:
+`audit_source`, `audit_source_council`, and `verify_release` obtain source
+context through the GitHub API. `metadata_only` stops at metadata and does not
+read source. The API-direct audit pipeline:
 
 1. `zerotrust_safe_list_tree` enumerates the repo's file tree at a pinned
-   SHA via `gh api`. Returns `{sha, entries: [...]}` in memory.
+   SHA via `gh api`. It returns `coverageComplete`; this is false when GitHub
+   truncates the tree or the wrapper's 5,000-entry anti-spill cap fires. A
+   no-red-flags verdict is not valid until the gap is drilled into or reported.
 2. `zerotrust_safe_fetch_file` fetches each interesting file (manifests,
    lockfiles, install/build hooks, recently-changed files) from the
-   GitHub API. Text is returned in memory; binaries return metadata plus
-   a 256-byte magic-byte preview. Files >5MB return metadata plus a 4KB
-   preview instead of full content.
+   GitHub API. Text is returned through the tool result; binaries return
+   metadata plus a 256-byte magic-byte preview. Files above the fetch
+   ceiling return metadata-only or a bounded preview, depending on which
+   GitHub API response path supplied the size/content. Text above the inline
+   cap is truncated; there is currently no ranged follow-up API, so unresolved
+   truncation must be reported as a coverage limitation.
 3. The deterministic checklist + 32-role council overlay reason about
-   the in-memory content.
-4. The final `REPORT.md` is the only on-disk output for ordinary source
+   the returned content.
+4. The extension intentionally writes only `REPORT.md` for ordinary source
    audits. `verify_release` additionally downloads release artifacts into
-   `_quarantine/` for hash and magic-byte verification, then removes them
-   during cleanup.
+   `_quarantine/` for hash and magic-byte verification.
 
-This means: Defender / EDR never sees a source byte. Even if the audited
-repo is known-distributed malware, the audit can complete cleanly
-without triggering AV on your machine.
+The wrapper itself does not create source files in these modes. This is
+not a guarantee that source bytes never reach disk: Copilot CLI may retain
+tool results/conversation logs, and large outputs may be spilled to host
+temporary storage. Binary responses are deliberately tiny to reduce that
+risk, not eliminate it.
 
 **Build modes** (`audit_and_safe_build`, `audit_and_full_build`,
 `audit_and_*_build_council`) DO write source to a sandbox dir and run
-the build. **They are NOT offered by default audits** — the agent will
-NOT preemptively suggest building. You must explicitly invoke them as a
-follow-up step (`mode: 'audit_and_safe_build'` + the appropriate ack
-flag) AFTER reviewing the audit's `REPORT.md` and deciding you want
-runtime verification.
+the build. **They are NOT offered by default audits** — the agent should not
+preemptively suggest building. Invoke a build mode explicitly with the
+required acknowledgement. A separate prior audit/report is recommended,
+but the code does not enforce or authenticate one; a build-mode invocation
+runs its own audit packet before the build section.
 
 ## Local-path mode — audit an already-downloaded directory
 
@@ -119,8 +126,9 @@ clone, no GitHub API calls, no SHA pinning.
 
 ## Section 9b — defang / delete / keep (build modes + local mode)
 
-Any audit mode that produces on-disk content includes a Section 9b
-remediation flow in its packet: per HIGH/CRITICAL finding, the agent
+Build modes and local-source modes include a Section 9b remediation flow in
+their packet. API-direct `verify_release` can create quarantine files but does
+not apply this source-edit flow. Per HIGH/CRITICAL source finding, the agent
 walks you through three choices:
 
 - **defang** — surgical edit (specific files + lines, in diff form).
@@ -175,8 +183,9 @@ threats this extension targets. Common patterns it actively looks for:
 
 ## What it explicitly does NOT do
 
-- **Dynamic analysis / sandbox execution** — there is no sandbox; the
-  build step (when run) executes on your real host.
+- **Sandboxed dynamic analysis.** Build modes execute repo-controlled build
+  code on the real host. The wrapper constrains argv/path selection; it is not
+  an OS sandbox or network monitor.
 - **Decompiling release binaries.**
 - **Network behavior monitoring.**
 - **Proving "this repo is safe."** Static analysis catches patterns,
@@ -235,45 +244,62 @@ process.
 
 ### Defense-in-depth
 
-The packet is the **primary** control. The **second** layer is the set
-of `zerotrust_safe_*` wrapper tools listed at the top of this README
-— the packet directs the agent to perform every dangerous operation
-through these wrappers, with hardened flags hardcoded:
+The packet is the **primary** control. The wrapper tools are
+**substitutional controls** for calls routed through them; they do not
+intercept raw built-in `powershell`, `view`, `grep`, `glob`, or network
+tool calls. There is no registered pre-tool hook.
+
+Trusted-context binding is an in-memory, session-scoped control. Production
+SDK calls normally carry a `sessionId`; with one present, clone/install/build/
+fetch/list wrappers refuse an absent or expired active audit. Direct no-session
+callers (used by some tests/backward-compatible paths) can fall back to
+argument/default-root checks, and therefore do not receive the full
+operator-ack/mode binding. The wrappers are not a general authorization
+boundary outside the registered tool flow.
 
 - `zerotrust_safe_clone` resolves the ref to a SHA via `git ls-remote`,
-  refuses non-GitHub / SSH / credentialled URLs, refuses clones
-  outside `build_root`, and clones with
-  `protocol.file.allow=never`, `core.symlinks=false`,
-  `core.hooksPath=NUL` (on Windows; `/dev/null` on POSIX),
-  `--no-recurse-submodules --no-tags
-  --filter=blob:none --no-checkout`, `GIT_LFS_SKIP_SMUDGE=1`, then an
-  explicit checkout. Submodules, LFS smudge filters, symlinks, and
-  client-side hooks are all neutralized before any repo-controlled file
-  hits disk.
-- `zerotrust_safe_install` hardcodes `--ignore-scripts` for npm / yarn /
-  pnpm, `--only-binary=:all: --no-deps` for pip, `--locked` for cargo,
-  `--locked-mode` for dotnet. Refuses paths outside `build_root`.
-  Refuses install args that don't match `[A-Za-z0-9._=:@/\-]+`, capped
-  at 32 entries × 256 chars (no shell-injection surface).
+  refuses non-GitHub / SSH / credentialled URLs, binds the active
+  owner/repo/ref/SHA, and refuses clones outside `build_root`. Exact flags
+  are documented under [Hardened clone](#hardened-clone).
+- `zerotrust_safe_install` supports:
+  - `npm` → `npm ci --ignore-scripts --no-audit --no-fund`
+  - `npm-install` → `npm install --ignore-scripts --no-audit --no-fund`
+  - `yarn` → `yarn install --ignore-scripts --frozen-lockfile`
+  - `pnpm` → `pnpm install --ignore-scripts --frozen-lockfile`
+  - `pip` → `pip install --only-binary=:all: --no-deps`
+  - `cargo` → `cargo fetch --locked`
+  - `dotnet` → `dotnet restore --locked-mode`
+  It also binds the active clone and resolves the package-manager binary
+  outside the audit tree. Install option values must use a single
+  `--flag=value` token; split `--flag value` forms are rejected because the
+  second token is positional.
 - `zerotrust_safe_build` runs the build with the same containment +
   injection-resistance rules. In council-build modes it consults the
   recorded council outcome and **refuses to build** if the council
-  didn't pass.
+  didn't pass. Selectors are:
+  - `npm` → `npm run build --if-present`
+  - `yarn` → `yarn build`
+  - `pnpm` → `pnpm build`
+  - `cargo` → `cargo build --locked --offline`
+  - `dotnet` → `dotnet build --no-restore`
+  - `dotnet-publish` → `dotnet publish --no-restore`
 - `zerotrust_finalize_report` writes `REPORT.md` only to the canonical
-  `<build_root>/_reports/<owner>-<repo>-<sha>/REPORT.md` path. Refuses
+  `<build_root>/_reports/<owner>-<repo>-<short-sha>/REPORT.md` path. Refuses
   oversized writes (>1MB) and any agent-supplied `build_root` that
   doesn't match either the active audit's `buildPath` or the default
   (defence against destructive arbitrary-write via missing sessionId).
-- `zerotrust_sweep_audit_scratch` deletes top-level stray scratch files
-  left in `build_root` and (optionally) its immediate parent directory.
+- `zerotrust_sweep_audit_scratch` deletes top-level unrecognized files
+  left in `build_root` and, by default, its immediate parent directory.
   Sub-agents have been observed writing source bytes / path
   enumerations to disk via PowerShell `Out-File` / `Set-Content` /
   `iwr -OutFile` in violation of the API-direct contract; this wrapper
   is the active cleanup layer. Only deletes top-level **files**, never
-  directories, with a generous whitelist of known-good filenames
+  directories, with a finite whitelist of known-good filenames
   (README, package.json, .gitignore, Makefile, Cargo.toml, backup files
   matching `<orig>.zerotrust-backup-<utc-ts>`, etc.). The packet's
-  epilogue instructs the agent to call this at end-of-audit.
+  epilogue instructs the agent to call this at end-of-audit. Because the
+  parent may contain unrelated files, run `dry_run:true` first and normally
+  pass `also_sweep_parent:false` unless the parent is a dedicated audit area.
 
 If the agent tries to call `git clone` / `npm install` / `cargo build`
 directly via the shell instead of through these wrappers, **nothing
@@ -287,8 +313,9 @@ Earlier versions of this extension registered an `onPreToolUse` hook in
 strayed from the packet. Empirical probes against Copilot CLI **1.0.x**
 (May 2026) showed that `onPreToolUse` and `onPostToolUse` do NOT fire
 for built-in tools (`powershell`, `view`, `glob`, `grep`, etc.) — the
-SDK's `types.d.ts` documents the contract, but the runtime doesn't
-honor it. A bug report has been filed with the GitHub Copilot CLI team.
+SDK's `types.d.ts` documents the contract, but the tested runtime did not
+honor it. This repository does not record a public issue URL, so there is
+no issue link to cite here.
 
 As of v4-r3 we go further: **the hook is no longer registered at all.**
 Registering any `hooks: {}` block triggers an "extension wants elevated
@@ -308,12 +335,11 @@ The **substitutional-safety wrappers** described above are the actual
 enforcement mechanism — they always have been, even when the hook was
 registered.
 
-#### How to re-enable the hook if/when the runtime fix lands
+#### How to re-enable the hook if/when the runtime changes
 
-When [the Copilot CLI bug](https://github.com/) is fixed (or if a future
-SDK release introduces an opt-in deny-only hook surface that doesn't
-require the broad elevated-permissions prompt), restore the second-layer
-defence by adding back to `extension.mjs`:
+If a future SDK/runtime provides a tested opt-in deny-only hook surface
+without the broad elevated-permissions prompt, the existing policy could
+be wired back into `extension.mjs`:
 
 ```js
 // near the top, with the other imports
@@ -332,11 +358,10 @@ hooks: {
 },
 ```
 
-That's the entire diff. `preToolUseHook`, `deactivateAudit`,
-`clearRecordedOutcome`, `inspectToolCall`, and the full deny-policy
-pattern set in `enforcement.mjs` are all still present, exported, and
-unit-tested by `__tests__/enforcement.test.mjs` — no other code changes
-needed.
+Those are the current integration points. `preToolUseHook`,
+`deactivateAudit`, `clearRecordedOutcome`, `inspectToolCall`, and the
+deny-policy patterns remain present and unit-tested, but any future wiring
+must be revalidated against that SDK/runtime version.
 
 For the specific case of sub-agents leaving scratch files in
 `build_root` after an audit, the active mitigation is
@@ -351,12 +376,48 @@ call it in the audit epilogue.
 | `audit_source` | Recon + static audit via GH API (no clone) + verdict. | repo / commit / tree / pull URLs when `ZEROTRUST_DETERMINISTIC_ONLY=1` is set |
 | `audit_source_council` | `audit_source` plus the 32-role council and meta-judge synthesis. | **Default** for repo / commit / tree / pull URLs |
 | `audit_local_source` | Same as `audit_source` but against an already-on-disk path. | (explicit; `local_path=...`) |
-| `audit_local_source_council` | Council audit against an on-disk path. | (explicit; `local_path=...`) |
+| `audit_local_source_council` | Council audit against an on-disk path. | **Default when `local_path` is supplied** |
 | `verify_release` | Release-artifact provenance: signed tag, attestations, Authenticode, `workflow_run` cross-check. | `/releases/...` URLs |
 | `audit_and_safe_build` | `audit_source` + safe build (mandates `--ignore-scripts` etc.). Requires `i_understand_build_executes_code`. | (explicit) |
-| `audit_and_full_build` | `audit_source` + lifecycle-script build. Requires `i_understand_build_executes_code` AND `unsafe`. | (explicit) |
+| `audit_and_full_build` | Build mode requiring both acknowledgements. It currently uses the same install/build wrappers as safe mode; see below. | (explicit) |
 | `audit_and_safe_build_council` | Council audit + safe build. The build wrapper refuses to proceed until a passing council outcome is recorded, unless the explicit wrapper override is supplied. | (explicit) |
-| `audit_and_full_build_council` | Council audit + full build. Requires both build acknowledgements and the same recorded-outcome gate. | (explicit) |
+| `audit_and_full_build_council` | Council build requiring both acknowledgements and the recorded-outcome gate; wrapper commands remain the same as safe mode. | (explicit) |
+
+### Safe vs full build: current behavior
+
+The `unsafe` acknowledgement changes admission and warning text, but it does
+not select a different installer implementation. Both safe and full modes call
+the same `zerotrust_safe_install` and `zerotrust_safe_build` wrappers. Install
+lifecycle scripts remain suppressed by the hardcoded install flags. Build
+scripts/`build.rs`/MSBuild targets may execute in **both** modes because the
+build command itself is arbitrary repo-controlled code.
+
+### Council-build overrides are orthogonal
+
+- `proceed_on_council_failure:true` bypasses only the incomplete-council gate.
+- `council_build_override:true` bypasses only the severity gate.
+- Both are required to bypass both conditions.
+- Neither flag bypasses the requirement to record an outcome first.
+
+The recorder accepts only `critical`, `high`, `medium`, `low`,
+`no red flags found`, or `incomplete`. `info` is a finding severity, not an
+overall recorded verdict. The local-source report template also contains older
+`clean / suspicious / malicious` prose; translate it to the canonical
+vocabulary before calling `zerotrust_record_council_outcome`. Likewise,
+`reconnaissance only` is a report label, not a recordable council verdict.
+The recorder also rejects inconsistent severity counts and requires
+`verdict:"incomplete"` to use `complete:false`.
+
+### Council role tool whitelists
+
+| Source mode | Source-inspection roles | Provenance roles |
+|---|---|---|
+| API-direct URL | `zerotrust_safe_fetch_file`, `zerotrust_safe_list_tree`, `web_fetch` for external context | Same, plus `gh api` metadata verification |
+| Build-mode clone | `view`, `grep`, `glob`, `web_fetch` | Same, plus git verification commands and GitHub CLI |
+| Local source | `view`, `grep`, `glob` under `local_path` only | Same, plus `web_fetch` only for external advisory/CVE lookup |
+
+These are prompt-enforced whitelists, not runtime interception of built-in
+tools.
 
 ### Default-mode env vars
 
@@ -422,11 +483,17 @@ under `build_root`:
       REPORT.md                 ← audit report
   _quarantine/
     owner-repo-abc1234/
-      <asset>.bin               ← downloaded release binaries (MOTW-stripped)
+      <asset>.bin               ← downloaded release binaries (Windows MOTW removed when present)
 ```
 
-Reports are written **outside** the cloned tree so the report can be
-trusted and the clone can be deleted independently.
+Reports are written **outside** the cloned tree so they are not repo-controlled
+files and the clone can be deleted independently. Their conclusions still
+depend on audit coverage and model/tool behavior.
+
+The basename is constructed literally as
+`<owner>-<repo>-<sha.slice(0,7)>`. Because owner/repo names may contain
+hyphens, wrappers do not reverse-parse that string into owner and repo; active
+audit state binds the exact resolved path.
 
 ### `build_root` default
 
@@ -446,6 +513,25 @@ Override per-call with the `build_root:` argument:
 The default directory is created automatically the first time the
 extension's handler runs.
 
+### Cleanup sequence
+
+1. Write/finalize `REPORT.md`.
+2. For council builds, ensure the council outcome was recorded before the
+   build; recording is not an end-of-audit cleanup step.
+3. For build modes, call `zerotrust_cleanup_audit` to remove the canonical
+   clone. It deletes the matching quarantine directory by default and keeps
+   the report by default.
+4. For API-direct `verify_release`, there is no clone path, so
+   `zerotrust_cleanup_audit` cannot be used. Delete the canonical
+   `_quarantine/<owner>-<repo>-<short-sha>/` directory manually when finished.
+5. Call a **non-dry-run** `zerotrust_sweep_audit_scratch` last; that call closes
+   the in-memory audit state.
+
+The sweep's runtime default is `also_sweep_parent:true`. That parent can hold
+unrelated files, and the filename whitelist is not exhaustive. Prefer
+`dry_run:true` first and `also_sweep_parent:false` unless the parent directory
+is dedicated to audit scratch.
+
 ## Hardened clone
 
 The packet uses this exact command (substitute variants — missing
@@ -458,15 +544,32 @@ at runtime so git can never find a hook script via that path on either
 platform:
 
 ```text
-git -c protocol.file.allow=never -c protocol.allow=https \
-    -c core.symlinks=false -c core.fsmonitor=false \
-    -c core.hooksPath=<NULL> -c core.longpaths=true \
-    clone --no-recurse-submodules --no-tags --filter=blob:none --no-checkout \
-    <canonical-url> <build_path>
-git -C <build_path> checkout <RESOLVED_FULL_SHA>
+git \
+  -c protocol.file.allow=never \
+  -c protocol.ext.allow=never \
+  -c protocol.allow=never \
+  -c protocol.https.allow=always \
+  -c core.symlinks=false \
+  -c core.fsmonitor=false \
+  -c core.hooksPath=<NULL> \
+  -c core.longpaths=true \
+  clone --no-recurse-submodules --no-tags --filter=blob:none --no-checkout \
+  <canonical-url> <build_path>
+
+git -C <build_path> \
+  -c protocol.file.allow=never \
+  -c protocol.ext.allow=never \
+  -c protocol.allow=never \
+  -c protocol.https.allow=always \
+  -c core.symlinks=false \
+  -c core.fsmonitor=false \
+  -c core.hooksPath=<NULL> \
+  -c core.longpaths=true \
+  checkout <RESOLVED_FULL_SHA>
 ```
 
-Plus `GIT_LFS_SKIP_SMUDGE=1` in the environment. This neutralises:
+Both calls set `GIT_TERMINAL_PROMPT=0` and `GIT_LFS_SKIP_SMUDGE=1`.
+This neutralises:
 
 - File-protocol fetches that submodule CVEs have abused
 - Symlink-based work-tree escapes
@@ -475,7 +578,24 @@ Plus `GIT_LFS_SKIP_SMUDGE=1` in the environment. This neutralises:
 - `.gitattributes` filter directives (inspected as text only)
 - Pre-checkout submodule init
 
-Minimum git version: 2.39.
+The wrapper does not enforce a minimum Git version. If the installed Git does
+not support one of these flags, the clone fails rather than silently dropping
+the flag.
+
+## `extra_args` restrictions
+
+Both install and build wrappers cap `extra_args` at 32 strings of 256
+characters and allow only `[A-Za-z0-9._=:@/\\-]+`.
+
+- **Install:** every argument must start with `-`; positional package specs,
+  URLs, paths, version pins, registry/index redirects, output/root/cwd/project
+  redirects, traversal, absolute paths, and flags that negate the hardcoded
+  safety options are refused. Values must be inline (`--flag=value`), not split
+  into a following positional token.
+- **Build:** redirect/negation flags, URL schemes, traversal, and absolute path
+  values are refused. Unlike install, the build validator does not impose the
+  blanket "must start with `-`" rule, so benign relative positional tokens can
+  pass if they satisfy the remaining checks.
 
 ## What's deferred
 
@@ -535,7 +655,7 @@ zerotrust-sourcecheck/
   council/                ← role manifest + per-role prompt templates
   safeWrappers/           ← clone / install / build / report / cleanup / sweep / fetch / list-tree
   __corpus__/             ← regression corpus harness (see its own README)
-  __tests__/              ← node:test unit + integration tests
+  __tests__/              ← node:test in-process suite
   AGENTS.md               ← agent design notes (read before modifying sub-agent prompts)
 ```
 
@@ -552,9 +672,12 @@ node --test "__tests__/*.test.mjs"
 (Pass the glob explicitly — `node --test __tests__/` errors with
 "cannot find module".)
 
-The command runs the complete zerotrust unit and integration suite; the
-Windows-only development-mode symlink case may be skipped when the host
-cannot create symlinks.
+The command runs the checked-in `node:test` suite: parser/handler, packet,
+state, wrapper, and in-process integration coverage. It is not a live
+end-to-end guarantee: API-direct tests do not call GitHub, build-wrapper tests
+do not establish an OS sandbox, the unregistered hook is not exercised by the
+Copilot runtime, and host AV behavior is not automated. A Windows symlink case
+may skip when the host cannot create symlinks.
 
 ## Contributing
 
@@ -584,6 +707,13 @@ OpenAI tiers. If your provider doesn't offer a specific default model
 loudly at runtime** rather than silently substituting — zerotrust does
 not currently wire through the `_shared/resolveModels()` fallback chain
 that the other extensions in this workspace use.
+
+Category sub-judges default to `claude-opus-4.8`; the meta-judge defaults to
+`gpt-5.6-sol`. Zero Trust renders every council/judge spawn with
+`context_tier:"long_context"` and requests elevated effort for supported base
+models. Roster entries such as `claude-opus-4.7-1m-internal` are capability
+aliases; `task()` receives the translated base model plus separate
+context/effort arguments.
 
 To work around an unavailable default, pass an explicit `roles`
 override (the value is the model ID as a flat string, not a nested

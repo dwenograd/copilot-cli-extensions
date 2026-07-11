@@ -4,9 +4,13 @@ User-level Copilot CLI extension that registers a `triple-review` tool — a mul
 
 ## What it does
 
-`triple-review` launches three `code-review` sub-agents in parallel against the same diff, clusters their findings by consensus (3/3, 2/3, 1/3 agreement), runs a fourth **synthesis agent** to merge the 3 reviewer-proposed fixes for each 3/3 cluster into one canonical patch, validates and auto-applies, then iterates until findings stabilize.
+`triple-review` launches three `code-review` sub-agents in parallel against a
+materialized git diff, or current files in `paths:` mode. It clusters findings
+by consensus, synthesizes applicable fixes, verifies patch preconditions,
+applies them, then runs project validation before iterating.
 
-Default reviewer trio: **Claude Opus 4.8**, **GPT-5.6 Sol**, **Claude Opus 4.7**.
+Default reviewer preset aliases: `claude-opus-4.8`, `gpt-5.6-sol`,
+`claude-opus-4.7-1m-internal` (the third spawns base `claude-opus-4.7`).
 Synthesis model: **GPT-5.6 Sol**.
 
 The tool's handler does NOT spawn agents. It returns an instruction packet that the calling agent executes via its built-in `task` and `edit` tools. This keeps orchestration adaptive (multi-round, with user-interactive gates) and avoids re-implementing agent lifecycle in the extension process.
@@ -15,7 +19,7 @@ The tool's handler does NOT spawn agents. It returns an instruction packet that 
 
 | | `triple-duck` | `triple-review` |
 |---|---|---|
-| **Input** | A plan, design, or approach (prose) | A code diff (staged/unstaged/branch/commit) |
+| **Input** | A plan, design, or approach (prose) | A git diff, or current files via `paths:` |
 | **Output** | Critique of the design, ranked by consensus | Findings + auto-applied fixes + final report |
 | **Iterates?** | No — single pass | Yes — up to `max_rounds` |
 | **Modifies code?** | No | Yes (with synthesis + validation gate) |
@@ -38,11 +42,13 @@ triple-review({
                               // default: auto-detect (with disambiguation)
   models?: string[],          // exactly 3 distinct model IDs
                               // default: claude-opus-4.8,
-                              //          gpt-5.6-sol, claude-opus-4.7
+                              //          gpt-5.6-sol,
+                              //          claude-opus-4.7-1m-internal alias
   focus?: string,             // e.g., "security, error handling"
   max_rounds?: number,        // 1..10, default 3
   severity_threshold?: string // "critical"|"high"|"medium"|"low"|"nit"
-                              // default "high" (stop when no open ≥ this remain)
+                              // default "high" (early-stop when no unresolved
+                              // finding at/above this remains and none is new)
   cheap?: boolean,            // Optional. Use cheap trio (see Cheap mode below).
                               // Mutually exclusive with `models`.
   max_premium_calls?: number  // Optional worst-case call cap:
@@ -58,13 +64,15 @@ Pass `cheap: true` (or invoke as "triple review cheap") to swap the default revi
 |---|---|---|
 | 1 | claude-opus-4.8 | claude-opus-4.7 |
 | 2 | gpt-5.6-sol | claude-opus-4.6 |
-| 3 | claude-opus-4.7 | gpt-5.5 |
+| 3 | claude-opus-4.7 (`-1m-internal` preset alias) | gpt-5.5 |
 
-**Synthesis model is unchanged in cheap mode** (`gpt-5.6-sol`).
+**Synthesis base model is unchanged in cheap mode** (`gpt-5.6-sol`), but cheap mode suppresses its automatic elevated reasoning effort.
 
-**Tradeoffs:**
-- The default's slot-1 (`claude-opus-4.8`) is the current top reasoning model. Every spawned reviewer runs with `context_tier:"long_context"`; override `models` only when you want different model families or reasoning presets.
-- Cheap mode's slot-1 (`claude-opus-4.7`) is meaningfully cheaper and weaker than the default slot-1 model.
+**Spawn parameters:**
+- Every reviewer and synthesis agent gets `context_tier:"long_context"`.
+- Full-quality mode requests elevated (`xhigh`) effort only for supported resolved base models.
+- Cheap mode suppresses automatic elevation for both reviewers and synthesis.
+- Context aliases such as `claude-opus-4.7-1m-internal` are translated to base model IDs before `task()` is called.
 
 **For maximum savings**, pair `cheap: true` with `max_rounds: 1`.
 
@@ -74,9 +82,10 @@ Pass `cheap: true` (or invoke as "triple review cheap") to swap the default revi
 
 **Step 0 — Pre-flight**
 1. Verify git repo (bail if not — UNLESS `scope: "paths:..."`, which skips this and the steps below that depend on git)
-2. Resolve scope (with disambiguation when staged + unstaged overlap)
+2. Resolve scope (auto-detect asks whenever more than one of staged,
+   unstaged, or untracked is non-empty; untracked-only state is not silently omitted)
 3. Diff-size sanity gate (warn >1500 lines; force `max_rounds=1` <30 lines) — skipped in `paths:` mode
-4. Non-destructive backup snapshot (`git stash create` + `git update-ref refs/triple-review/backup` — does NOT modify the working tree, unlike `git stash push`) with restore command in final report — skipped in `paths:` mode (no backup is created and auto-applied edits are NOT recoverable through this protocol)
+4. Non-destructive tracked-file backup (`git stash create` + `git update-ref`) with restore metadata — skipped in `paths:` mode. `git stash create` does not modify the working tree, but it also does **not** capture untracked files.
 5. Cost preview to user
 
 **Step 1 — Round loop (1..max_rounds)**
@@ -86,7 +95,8 @@ Pass `cheap: true` (or invoke as "triple review cheap") to swap the default revi
 - **1c** Cluster findings: same file + overlapping/±10 lines + root-cause keyword overlap; cluster severity = **MAX**
 - **1d** For each 3/3 cluster: pre-check conflicts → synthesis agent merges 3 fixes → validate `before`-block matches → show diff → apply via `edit` → run validation gate (typecheck/lint/test). Stop loop on validation failure.
 - **1e** Present top 10 of 2/3 + 1/3 + demoted-contested findings batched per file (accept / reject / defer). Auto-defer the rest.
-- **1f** Stop if `(round ≥ max_rounds) OR (no open ≥ threshold AND zero new clusters introduced)`. Otherwise increment round and re-review.
+- **1f** Stop at `max_rounds`, or early when no deferred/unresolved finding
+  meets the threshold and no new cluster was introduced.
 
 **Step 2 — Final report**
 
@@ -97,8 +107,8 @@ Auto-applied / accepted / deferred / rejected lists, validation status per round
 - **Synthesis-then-apply:** never directly applies a single reviewer's prose-form fix as "consensus." A separate agent merges all 3 proposed fixes into one canonical patch.
 - **`before`-block validation:** synthesized patches must match current file content exactly before applying.
 - **Validation gate:** typecheck/lint/test runs after each round's auto-applies. Loop stops on failure.
-- **Backup snapshot (non-destructive):** `git stash create` + `git update-ref refs/triple-review/backup` before any modification — this captures the working tree as a stash COMMIT without touching the working tree itself (unlike `git stash push`). Restore command in final report. Skipped in `paths:` mode.
-- **Scope disambiguation:** asks the user when staged + unstaged changes overlap (no silent prioritization).
+- **Backup snapshot (non-destructive, tracked files only):** `git stash create` captures tracked staged/unstaged state without touching the working tree. It does not capture untracked files. The packet's POSIX example writes a timestamped `refs/triple-review/backup-...` ref, while its PowerShell/final-report examples use `refs/triple-review/backup`; record the exact ref and SHA actually created rather than assuming one name. Skipped in `paths:` mode.
+- **Scope disambiguation:** asks when multiple staged/unstaged/untracked sets are non-empty; untracked files are never silently treated as part of a git diff.
 - **Rejected findings tracked across rounds:** users aren't pestered to re-decide.
 - **Deferred findings passed to round 2+ reviewers:** so they don't waste calls re-flagging.
 - **Round 2+ reviewers see applied diffs but NOT prior commentary:** preserves independence.

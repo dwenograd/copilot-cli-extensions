@@ -4,12 +4,13 @@
 // fails because the server connection went stale (e.g. you closed & reopened
 // Unreal, killing the in-editor MCP server on 127.0.0.1:8765).
 //
-// Behaviour (matches the agreed spec):
-//   1. An MCP tool fails with a connection-type error  -> auto-reload that
-//      server once, verify it reconnected, then tell the agent to retry.
-//   2. The SAME server fails a second time (after a reload) -> stop and ask
-//      the user to intervene (confirm UE is running) instead of looping.
-//   3. Any successful MCP tool call clears that server's armed state.
+// Behaviour:
+//   1. A completed MCP call fails with a recognized connection error -> call
+//      the SDK's GLOBAL reload, then poll the owning server's status.
+//   2. If it reconnects, tell the agent to retry the exact action.
+//   3. If recovery fails, or the same server has another connection failure
+//      before a successful call clears its armed state, ask the user to
+//      intervene instead of looping.
 //
 // Domain failures (e.g. UE says "actor not found") are NOT treated as
 // connection failures and never trigger a reload.
@@ -284,7 +285,7 @@ const session = await joinSession({
         {
             name: "mcp_reload_now",
             description:
-                "Force an immediate reload of all MCP server connections (re-handshakes each configured MCP server). Use this if an MCP tool just failed with a connection/transport error, or after restarting an app that hosts an MCP server (e.g. the Unreal Editor). Returns the post-reload connection status of every server.",
+                "Force a global reload of all configured MCP connections, wait one second, then query current server status. If the reload succeeds but the status query fails, the tool returns success with that limitation; use the CLI/MCP status surface for manual confirmation.",
             parameters: { type: "object", properties: {} },
             handler: async () => {
                 try {

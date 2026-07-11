@@ -14,7 +14,7 @@ const session = await joinSession({
         {
             name: "triple-plan",
             description:
-                "Launch three planning agents in parallel using different models, then have a dedicated judge agent (highest-quality model) merge their plans into a single canonical plan with consensus, alternatives, and contested decisions surfaced. Use BEFORE starting non-trivial implementation work to get a high-confidence plan that's been pressure-tested across models. Returns an instruction packet — the calling agent then executes the pattern using the built-in `task` tool.",
+                "Launch three planning agents in parallel using different models, then have a configured judge merge their plans into a canonical plan with consensus, alternatives, and contested decisions surfaced. Use BEFORE starting non-trivial implementation work. Returns an instruction packet — the calling agent executes the pattern using the built-in `task` tool.",
             parameters: {
                 type: "object",
                 properties: {
@@ -39,18 +39,18 @@ const session = await joinSession({
                         minItems: 3,
                         maxItems: 3,
                         description:
-                            "Optional. Exactly 3 model IDs to override the default planner trio. Defaults to claude-opus-4.8, gpt-5.6-sol, claude-opus-4.7-1m-internal: architectural judgment, operator/tool reasoning, and generational diversity. (Aliases are translated at spawn time; every spawned planner runs with context_tier:\"long_context\".)",
+                            "Optional. Exactly 3 model preset IDs. Defaults to claude-opus-4.8, gpt-5.6-sol, and capability alias claude-opus-4.7-1m-internal (spawned as base claude-opus-4.7). Every planner gets context_tier:\"long_context\"; full-quality mode adds elevated effort only for supported base models.",
                     },
                     judge: {
                         type: "string",
                         description:
-                            "Optional. Model ID for the judge that merges the 3 planner outputs into one canonical plan. Defaults to `gpt-5.6-sol`; every spawned judge runs with context_tier:\"long_context\" and full-quality judges use elevated reasoning. Compatible with `cheap: true` (cheap planner trio + premium judge is a sensible config).",
+                            "Optional. Judge model preset. Defaults to gpt-5.6-sol. Every judge gets context_tier:\"long_context\"; full-quality mode requests elevated effort when supported. Compatible with cheap:true, but a plain base-model override still inherits cheap effort suppression.",
                     },
                     cheap: {
                         type: "boolean",
                         default: false,
                         description:
-                            "Optional. When true, use the cheap planner trio (claude-opus-4.7, claude-opus-4.6, gpt-5.5). ~23% planner-cost savings; every spawned planner still runs with context_tier:\"long_context\". Judge defaults to `claude-opus-4.7` in cheap mode unless overridden via `judge`. Set this when the user invokes 'triple plan cheap <task>' or asks for cheap mode. MUTUALLY EXCLUSIVE with `models` (but compatible with explicit `judge`).",
+                            "Optional. Use the cheap planner trio (claude-opus-4.7, claude-opus-4.6, gpt-5.5). Long context remains enabled, but automatic elevated reasoning is suppressed; an explicit effort alias still pins its effort. Judge defaults to claude-opus-4.7 unless overridden. Mutually exclusive with models, compatible with judge.",
                     },
                     max_premium_calls: {
                         type: "integer",

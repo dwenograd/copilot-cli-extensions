@@ -4,7 +4,7 @@ Sibling to `triple-duck` and `triple-review`. Where `triple-duck` **critiques** 
 
 ## What it does
 
-Launches three planning agents in parallel using different models, then has a **dedicated judge agent** (highest-quality model) merge their plans into ONE canonical plan with:
+Launches three planning agents in parallel using different models, then has a **dedicated judge agent** merge their plans into one canonical plan with:
 
 - **Agreed steps (N/N)** — every model included this; high confidence
 - **Majority steps ((N-1)/N)** — most included; likely belongs
@@ -12,7 +12,7 @@ Launches three planning agents in parallel using different models, then has a **
 - **Contested decisions** — where models took different approaches
 - **Risks & open questions** — merged across all planners
 
-The judge defaults to `gpt-5.6-sol` with elevated reasoning. Every spawned judge runs with `context_tier:"long_context"`; override `judge` only when you want a different model.
+The judge defaults to `gpt-5.6-sol`.
 
 If the judge fails twice, the orchestrator falls back to merging the plans itself — but **explicitly labels the output** so you know the judge layer was bypassed.
 
@@ -25,7 +25,8 @@ triple-plan({
   constraints?: string,      // Optional hard constraints every plan MUST respect
   models?: string[],         // Optional planner trio override (must be 3 distinct model IDs)
   judge?: string,            // Optional judge override (default: gpt-5.6-sol)
-                             // Compatible with `cheap: true` for "cheap planners, premium judge"
+                             // Compatible with `cheap: true`; plain base-model
+                             // overrides still inherit cheap effort suppression
   cheap?: boolean,           // Optional. Use cheap planner trio (see Cheap mode below).
                              // Mutually exclusive with `models` (NOT with `judge`).
   max_premium_calls?: number // Optional worst-case call cap; minimum 8 for a full run.
@@ -47,16 +48,16 @@ Don't use for trivial single-file edits — overkill.
 - **Worst case:** 8 premium calls (3 planners + up to 3 planner retries + 1 judge + 1 judge retry)
 - The orchestrator only invokes the judge if ≥2 planners succeeded.
 
-Use `cheap: true` for ~23% planner-cost savings by switching to cheaper planner models. Context remains global long-context for every spawned planner and judge; pass `judge: "..."` explicitly only when you want a different judge model or reasoning preset.
+Use `cheap: true` to switch to the lower-tier planner preset. It keeps global long context but suppresses automatic elevated reasoning.
 
 ## Defaults
 
-- **Planner trio:** `claude-opus-4.8`, `gpt-5.6-sol`, `claude-opus-4.7`
+- **Planner preset aliases:** `claude-opus-4.8`, `gpt-5.6-sol`, `claude-opus-4.7-1m-internal` (spawns base `claude-opus-4.7`)
 - **Cheap planner trio:** `claude-opus-4.7`, `claude-opus-4.6`, `gpt-5.5`
 - **Judge:** `gpt-5.6-sol`
 - **Cheap judge:** `claude-opus-4.7`
 
-**Context:** every spawned planner and judge runs with `context_tier:"long_context"`; override `models` only when you want different model families or reasoning presets.
+**Spawn parameters:** every planner and judge gets `context_tier:"long_context"`. Full-quality mode requests elevated (`xhigh`) effort only for supported resolved base models. Cheap mode suppresses automatic elevation; explicit effort aliases still pin their effort.
 
 ---
 

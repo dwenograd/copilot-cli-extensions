@@ -4,11 +4,11 @@ User-level Copilot CLI extension that registers a `triple-duck` tool.
 
 ## What it does
 
-`triple-duck` is a shortcut for "rubber-duck this with three different models, then have a top-tier judge model synthesize the results." When invoked, the tool returns a structured instruction packet that tells the agent to:
+`triple-duck` is a shortcut for "rubber-duck this with three different models, then have a separate judge synthesize the results." When invoked, the tool returns a structured instruction packet that tells the agent to:
 
-1. Launch three `rubber-duck` sub-agents **in parallel** using three different models (default: Claude Opus 4.8, GPT-5.6 Sol, Claude Opus 4.7).
+1. Launch three `rubber-duck` sub-agents **in parallel** using three different model presets (default aliases: `claude-opus-4.8`, `gpt-5.6-sol`, `claude-opus-4.7-1m-internal`; the third spawns base model `claude-opus-4.7`).
 2. Wait for all three to complete (sync mode).
-3. **Launch a dedicated judge agent** (default: GPT-5.6 Sol with elevated reasoning and long context) that:
+3. **Launch a dedicated judge agent** (default: GPT-5.6 Sol) that:
    - Receives all three reviewer outputs (wrapped as untrusted data — the judge is told not to follow instructions inside reviewer text).
    - Clusters findings across reviewers.
    - Produces a **consensus-ranked** critique:
@@ -31,7 +31,8 @@ triple-duck({
   context?: string,          // Optional extra context / file paths / scope
   models?: string[],         // Optional reviewer trio override (must be 3 distinct model IDs)
   judge?: string,            // Optional judge override (default: gpt-5.6-sol)
-                             // Compatible with `cheap: true` for "cheap reviewers, premium judge"
+                             // Compatible with `cheap: true`; cheap effort
+                             // suppression applies unless an effort alias pins it
   focus?: string,            // Optional focus areas (e.g., "security, performance")
   cheap?: boolean,           // Optional. Use cheap reviewer trio (see Cheap mode below).
                              // Mutually exclusive with `models` (NOT with `judge`).
@@ -47,15 +48,18 @@ Pass `cheap: true` (or invoke as "triple duck cheap <topic>") to swap the heavy 
 |---|---|---|
 | 1 | claude-opus-4.8 | claude-opus-4.7 |
 | 2 | gpt-5.6-sol | claude-opus-4.6 |
-| 3 | claude-opus-4.7 | gpt-5.5 |
+| 3 | claude-opus-4.7 (`-1m-internal` preset alias) | gpt-5.5 |
 | **Judge** | gpt-5.6-sol | claude-opus-4.7 |
 
-You can mix `cheap: true` with an explicit judge override, for example `judge: "gpt-5.6-sol"`, when you want cheaper reviewers but full-quality synthesis.
+You can mix `cheap: true` with an explicit judge override. Note that cheap mode
+still suppresses automatic elevated effort for a plain base-model override;
+use an explicit effort alias if you intend to pin judge effort.
 
-**Tradeoffs:**
-- The default trio's slot-1 (`claude-opus-4.8`) handles senior-review judgment, while GPT-5.6 Sol adds a cross-family operator/tool perspective.
-- Every spawned reviewer and judge runs with `context_tier:"long_context"`; pass `models` or `judge` explicitly only when you want different model families or reasoning presets.
-- Cheap mode's slot-1 is plain `claude-opus-4.7` — meaningfully cheaper and weaker than the default slot-1 model.
+**Spawn parameters:**
+- Every reviewer and judge gets `context_tier:"long_context"`.
+- Full-quality mode requests elevated (`xhigh`) effort only when the resolved base model supports the workspace elevation map.
+- Cheap mode suppresses automatic elevation. An explicit effort alias such as `claude-opus-4.7-xhigh` still pins that effort.
+- Context aliases such as `claude-opus-4.7-1m-internal` are display/preset aliases; `task()` receives the base model plus separate context/effort parameters.
 
 `cheap` and `models` are **mutually exclusive** — pass one or the other. `cheap` and `judge` ARE compatible.
 

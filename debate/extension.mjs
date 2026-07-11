@@ -59,13 +59,13 @@ const session = await joinSession({
                     judge: {
                         type: "string",
                         description:
-                            "Optional. Model ID for the judge. Should differ from both debaters to stay independent. Defaults to gpt-5.6-sol with context_tier:\"long_context\".",
+                            "Optional. Judge model preset; it must differ from both debaters. Defaults to gpt-5.6-sol. Every judge gets context_tier:\"long_context\"; full-quality mode requests elevated effort when supported.",
                     },
                     cheap: {
                         type: "boolean",
                         default: false,
                         description:
-                            "Optional. When true, use cheap variants (claude-opus-4.7, gpt-5.5 debaters; claude-opus-4.6 judge). Every spawned debater and judge still runs with context_tier:\"long_context\". Set when the user invokes 'debate cheap <question>'. MUTUALLY EXCLUSIVE with explicit `debaters` or `judge`.",
+                            "Optional. Use lower-tier presets (claude-opus-4.7 and gpt-5.5 debaters; claude-opus-4.6 judge). Long context remains enabled, but automatic elevated reasoning is suppressed. Mutually exclusive with explicit debaters or judge.",
                     },
                     max_premium_calls: {
                         type: "integer",
