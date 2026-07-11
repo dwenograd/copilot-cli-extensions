@@ -1,7 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import { PassThrough } from "node:stream";
 
 import {
     ANNOTATION_LIMITS,
@@ -13,6 +12,7 @@ import {
     buildCandidateArchive,
     canonicalEqual,
     canonicalJson,
+    constructInvestigationResumedEvent,
     createEvidenceProvenance,
     createMeasurementProvenance,
     createSnapshotProvenance,
@@ -24,6 +24,7 @@ import {
     hashCanonical,
     harnessCandidateEvidenceItems,
     immutableCanonical,
+    latestUnhandledStopRequest,
 } from "../domain/index.mjs";
 import {
     openArtifactStore,
@@ -33,6 +34,7 @@ import {
     PARSER_VERSION,
     RECEIPT_VERSION,
     STREAM_HASH_ALGORITHM,
+    DEFAULT_MEASUREMENT_BYTE_BUDGETS,
     createMeasurementExecutor,
     createDefaultProcessAdapter,
     createWindowsSandboxProvider,
@@ -43,6 +45,7 @@ import {
     verifyFrozenHarnessIdentity,
 } from "../measurement/index.mjs";
 import { normalizeRunnerConfig } from "./config.mjs";
+import { deriveRunnerExecutionLimits } from "./config-validation.mjs";
 import { createDomainRepositoryAdapter, formatAttemptCommand } from "./domain-adapter.mjs";
 import { projectRunnerOutcome } from "./outcome.mjs";
 import {
@@ -91,6 +94,43 @@ const IMPOSSIBILITY_STDERR_ARTIFACT_HASH_ALGORITHM =
 const IMPOSSIBILITY_REQUEST_FILENAME = "crucible-impossibility-request.json";
 const SNAPSHOT_CLOSURE_HASH =
     /^sha256:crucible-measurement-snapshot-closure-v1:[a-f0-9]{64}$/u;
+export const DEFAULT_RUNTIME_BYTE_BUDGETS = Object.freeze({
+    ...DEFAULT_MEASUREMENT_BYTE_BUDGETS,
+    perAttemptCasBytes: 32 * 1024 * 1024,
+    perInvestigationCasBytes: 2 * 1024 * 1024 * 1024,
+});
+
+function normalizeRuntimeByteBudgets(value = {}) {
+    if (value === null || typeof value !== "object" || Array.isArray(value)) {
+        throw new RuntimeConfigError("byteBudgets must be an object");
+    }
+    const unknown = Object.keys(value).filter((key) =>
+        !Object.hasOwn(DEFAULT_RUNTIME_BYTE_BUDGETS, key));
+    if (unknown.length > 0) {
+        throw new RuntimeConfigError("byteBudgets contain unknown keys", { unknown });
+    }
+    const normalized = {};
+    for (const [key, fallback] of Object.entries(DEFAULT_RUNTIME_BYTE_BUDGETS)) {
+        const actual = value[key] ?? fallback;
+        if (!Number.isSafeInteger(actual)
+            || actual < 1
+            || actual > 4 * 1024 * 1024 * 1024) {
+            throw new RuntimeConfigError(
+                `byteBudgets.${key} must be a positive safe integer <= 4 GiB`,
+                { value: actual },
+            );
+        }
+        normalized[key] = actual;
+    }
+    if (normalized.perInvestigationOutputBytes < normalized.perAttemptOutputBytes
+        || normalized.perInvestigationReceiptBytes < normalized.perAttemptReceiptBytes
+        || normalized.perInvestigationCasBytes < normalized.perAttemptCasBytes) {
+        throw new RuntimeConfigError(
+            "per-investigation byte budgets must be at least their per-attempt budgets",
+        );
+    }
+    return Object.freeze(normalized);
+}
 
 function compareStable(left, right) {
     return left < right ? -1 : left > right ? 1 : 0;
@@ -119,11 +159,45 @@ function stagedHarnessHashesMatch(receipt) {
     );
 }
 
+function receiptHasCompleteOutput(receipt) {
+    const capture = receipt?.outputCapture;
+    if (capture === null
+        || typeof capture !== "object"
+        || capture.overflowed !== false
+        || capture.truncated !== false) {
+        return false;
+    }
+    return ["stdout", "stderr"].every((stream) => {
+        const value = capture[stream];
+        return value !== null
+            && typeof value === "object"
+            && Number.isSafeInteger(value.capBytes)
+            && value.capBytes > 0
+            && Number.isSafeInteger(value.totalObservedBytes)
+            && value.totalObservedBytes >= 0
+            && value.retainedBytes === value.totalObservedBytes
+            && value.retainedBytes <= value.capBytes
+            && value.overflowed === false
+            && value.truncated === false;
+    });
+}
+
 function receiptHasVerifiedSnapshotBytes(receipt, candidateSnapshotHash) {
     const identity = receipt?.candidateSnapshotIdentitySummary;
+    const stagedIdentity = receipt?.stagedCandidateSnapshotIdentitySummary;
     const mutation = receipt?.candidateSnapshotMutationCheck;
     return receipt?.version === RECEIPT_VERSION
         && receipt.candidateSnapshotHash === candidateSnapshotHash
+        && receipt.stagedCandidateSnapshotHash === candidateSnapshotHash
+        && SNAPSHOT_CLOSURE_HASH.test(
+            receipt.stagedCandidateSnapshotClosureHash ?? "",
+        )
+        && stagedIdentity !== null
+        && typeof stagedIdentity === "object"
+        && Array.isArray(receipt.launchFileBindings)
+        && receipt.launchFileBindings.some((file) =>
+            file?.role === "candidate"
+            && typeof file?.sha256 === "string")
         && SNAPSHOT_CLOSURE_HASH.test(
             receipt.candidateSnapshotPreClosureHash ?? "",
         )
@@ -139,11 +213,17 @@ function receiptHasVerifiedSnapshotBytes(receipt, candidateSnapshotHash) {
         && mutation.identityStable === true
         && mutation.openHandleRehashStable === true
         && mutation.reparseStable === true
+        && receiptHasCompleteOutput(receipt)
         && stagedHarnessHashesMatch(receipt);
 }
 
 function snapshotExecutionHash(receipt) {
     return hashCanonical({
+        stagedCandidateSnapshotHash: receipt.stagedCandidateSnapshotHash,
+        stagedCandidateSnapshotClosureHash:
+            receipt.stagedCandidateSnapshotClosureHash,
+        stagedCandidateSnapshotIdentitySummary:
+            receipt.stagedCandidateSnapshotIdentitySummary,
         candidateSnapshotPreClosureHash: receipt.candidateSnapshotPreClosureHash,
         candidateSnapshotPostClosureHash: receipt.candidateSnapshotPostClosureHash,
         candidateSnapshotIdentitySummary: receipt.candidateSnapshotIdentitySummary,
@@ -190,55 +270,6 @@ function uniqueNonexistentPath(root, prefix, idFactory) {
     );
 }
 
-function createOutputCapturingProcessAdapter(baseAdapter, captures) {
-    if (baseAdapter === null
-        || typeof baseAdapter !== "object"
-        || typeof baseAdapter.spawn !== "function"
-        || typeof baseAdapter.terminateTree !== "function") {
-        throw new RuntimeConfigError(
-            "processAdapter must expose spawn() and terminateTree()",
-        );
-    }
-    return Object.freeze({
-        spawn(executable, argv, options) {
-            const child = baseAdapter.spawn(executable, argv, options);
-            const attemptId = options?.env?.CRUCIBLE_ATTEMPT_ID;
-            if (typeof attemptId !== "string" || attemptId.length === 0) {
-                return child;
-            }
-            const capture = { stdout: [], stderr: [] };
-            captures.set(attemptId, capture);
-            const tee = (stream, sink) => {
-                if (stream === null || stream === undefined) return stream;
-                const pass = new PassThrough();
-                stream.on("data", (chunk) => {
-                    sink.push(Buffer.isBuffer(chunk) ? Buffer.from(chunk) : Buffer.from(chunk));
-                });
-                stream.on("error", (error) => pass.destroy(error));
-                stream.pipe(pass);
-                return pass;
-            };
-            const proxy = {
-                pid: child.pid,
-                stdout: tee(child.stdout, capture.stdout),
-                stderr: tee(child.stderr, capture.stderr),
-                on(eventName, listener) {
-                    child.on(eventName, listener);
-                    return proxy;
-                },
-                once(eventName, listener) {
-                    child.once(eventName, listener);
-                    return proxy;
-                },
-            };
-            return proxy;
-        },
-        terminateTree(pid) {
-            return baseAdapter.terminateTree(pid);
-        },
-    });
-}
-
 function terminalResult(aggregate) {
     return {
         kind: "TERMINAL",
@@ -279,11 +310,20 @@ function ensureReceiptObservationHash(receiptHash) {
     return receiptHash;
 }
 
-function boundedOptionalText(value, maximum) {
+function truncateUtf8(value, maximumCharacters, maximumBytes) {
+    let output = value.slice(0, maximumCharacters);
+    while (Buffer.byteLength(output, "utf8") > maximumBytes) {
+        output = output.slice(0, -1);
+    }
+    return output;
+}
+
+function boundedOptionalText(value, maximumCharacters, maximumBytes) {
     if (typeof value !== "string" || value.length === 0) {
         return null;
     }
-    return value.slice(0, maximum);
+    const output = truncateUtf8(value, maximumCharacters, maximumBytes);
+    return output.length === 0 ? null : output;
 }
 
 function normalizeCandidateAnnotations(proposal, command) {
@@ -311,19 +351,27 @@ function normalizeCandidateAnnotations(proposal, command) {
         mechanism: boundedOptionalText(
             supplied.mechanism ?? proposal?.mechanism,
             ANNOTATION_LIMITS.mechanismLength,
+            ANNOTATION_LIMITS.mechanismBytes,
         ),
         hypothesis: boundedOptionalText(
             supplied.hypothesis ?? proposal?.hypothesis,
             ANNOTATION_LIMITS.hypothesisLength,
+            ANNOTATION_LIMITS.hypothesisBytes,
         ),
         expectedEffects: expectedEffects
             .filter((effect) => typeof effect === "string" && effect.length > 0)
             .slice(0, ANNOTATION_LIMITS.expectedEffectCount)
-            .map((effect) => effect.slice(0, ANNOTATION_LIMITS.expectedEffectLength)),
+            .map((effect) => truncateUtf8(
+                effect,
+                ANNOTATION_LIMITS.expectedEffectLength,
+                ANNOTATION_LIMITS.expectedEffectBytes,
+            ))
+            .filter((effect) => effect.length > 0),
         citedEvidenceIds,
         finding: boundedOptionalText(
             supplied.finding ?? proposal?.finding,
             ANNOTATION_LIMITS.findingLength,
+            ANNOTATION_LIMITS.findingBytes,
         ),
     };
 }
@@ -333,9 +381,10 @@ function trustedHarnessFinding(parsed) {
     const metrics = parsed?.metrics !== null && typeof parsed?.metrics === "object"
         ? parsed.metrics
         : {};
-    return `Trusted harness outcome=${outcome}; metrics=${canonicalJson(metrics)}`.slice(
-        0,
+    return truncateUtf8(
+        `Trusted harness outcome=${outcome}; metrics=${canonicalJson(metrics)}`,
         ANNOTATION_LIMITS.findingLength,
+        ANNOTATION_LIMITS.findingBytes,
     );
 }
 
@@ -355,10 +404,21 @@ export class AutonomousRunner {
     #recovery = null;
     #runTempRoot = null;
     #attemptCounter = 0;
+    #effectAttemptCount = 0;
+    #executionLimits = null;
     #attemptCommands = new Map();
     #effectEvidenceBuffers = new Map();
     #workerAssignments = new Map();
     #capturedOutputs = new Map();
+    #recoveredDeadlineStopRequestSeqs = new Set();
+    #byteBudgets;
+    #investigationByteUsage = {
+        casBytes: 0,
+        outputBytes: 0,
+        receiptBytes: 0,
+    };
+    #attemptCasBytes = new Map();
+    #countedCasObjects = new Set();
     #domainDeadlineGuardDepth = 0;
     #domainDeadlineStage = null;
     #clock;
@@ -366,6 +426,9 @@ export class AutonomousRunner {
     constructor(config, dependencies = {}) {
         this.#config = normalizeRunnerConfig(config, { env: dependencies.env ?? process.env });
         this.#dependencies = dependencies;
+        this.#byteBudgets = normalizeRuntimeByteBudgets(
+            dependencies.byteBudgets,
+        );
         this.#clock = dependencies.clock ?? defaultClock();
         if (typeof this.#clock.now !== "function" || typeof this.#clock.isoNow !== "function") {
             throw new RuntimeConfigError("clock must expose now() and isoNow()");
@@ -397,12 +460,51 @@ export class AutonomousRunner {
                     thrown = deadlinePersistenceError;
                 }
             } else {
-                thrown = error;
+                const pauseOutcome = this.#pauseResultAfterOperationalError(error);
+                if (pauseOutcome === null) {
+                    thrown = error;
+                } else {
+                    result = pauseOutcome;
+                }
             }
         } finally {
             const cleanupError = await this.#cleanup();
-            if (thrown === null && cleanupError !== null) {
-                thrown = cleanupError;
+            if (cleanupError !== null && result?.kind === "PAUSE") {
+                result = {
+                    ...result,
+                    cleanupWarning: {
+                        code: cleanupError?.code ?? null,
+                        message: cleanupError?.message ?? String(cleanupError),
+                    },
+                };
+                this.#dependencies.log?.(
+                    `[crucible] paused runner cleanup warning: ${
+                        cleanupError?.message ?? String(cleanupError)
+                    }`,
+                );
+            } else if (cleanupError !== null) {
+                if (thrown === null) {
+                    thrown = cleanupError;
+                } else {
+                    try {
+                        thrown.details = {
+                            ...(thrown.details ?? {}),
+                            cleanupFailure: {
+                                name: cleanupError?.name ?? "Error",
+                                code: cleanupError?.code ?? null,
+                                message:
+                                    cleanupError?.message ?? String(cleanupError),
+                            },
+                        };
+                    } catch {
+                        // Preserve the original crash even if it is immutable.
+                    }
+                    this.#dependencies.log?.(
+                        `[crucible] runner cleanup failed while preserving ${
+                            thrown.code ?? thrown.name ?? "original failure"
+                        }: ${cleanupError?.message ?? String(cleanupError)}`,
+                    );
+                }
             }
         }
         if (thrown !== null) {
@@ -441,6 +543,56 @@ export class AutonomousRunner {
         };
     }
 
+    #loadRecoveredDeadlineStopRequestSeqs() {
+        const events = this.#adapter.listOperationalEvidence();
+        const bySeq = new Map(events.map((event) => [event.seq, event]));
+        const recovered = new Set();
+        for (const event of events) {
+            if (event.kind !== "runtime:non_result_recovery"
+                || event.payload?.policy !== "later_deadline") {
+                continue;
+            }
+            const previous = bySeq.get(event.payload.previousSeq) ?? null;
+            const stopRequestSeq =
+                previous?.kind === "runtime:non_result"
+                && previous.payload?.code === "DEADLINE_EXCEEDED"
+                    ? previous.payload?.details?.deadlineStopRequestSeq
+                    : null;
+            if (Number.isSafeInteger(stopRequestSeq) && stopRequestSeq > 0) {
+                recovered.add(stopRequestSeq);
+            }
+        }
+        return recovered;
+    }
+
+    #pauseResultAfterOperationalError(error) {
+        if (this.#adapter === null
+            || error?.code === RUNTIME_ERROR_CODES.INTEGRITY_FAILURE
+            || error?.code === RUNTIME_ERROR_CODES.INVALID_CONFIG) {
+            return null;
+        }
+        try {
+            let { aggregate } = this.#adapter.replay();
+            if (aggregate.pause === null && error?.pauseBarrier === true) {
+                const recommendation = decideNext(aggregate);
+                if (recommendation.event?.type === EVENT_TYPES.INVESTIGATION_PAUSED) {
+                    this.#appendKernelDecisionFenced({ deadlineExempt: true });
+                    ({ aggregate } = this.#adapter.replay());
+                }
+            }
+            if (aggregate.pause === null) return null;
+            return {
+                ...pauseResult(aggregate),
+                drainedOperationalError: {
+                    code: error?.code ?? null,
+                    message: error?.message ?? String(error),
+                },
+            };
+        } catch {
+            return null;
+        }
+    }
+
     async #initialize() {
         const stateDir = ensureDirectory(this.#config.stateDir);
         const artifactRoot = ensureDirectory(this.#config.artifactRoot);
@@ -460,6 +612,13 @@ export class AutonomousRunner {
         this.#adapter = createDomainRepositoryAdapter({
             repository: this.#repository,
             investigationId: this.#config.investigationId,
+            beforeCasAttempt: () => {
+                if (this.#domainDeadlineGuardDepth > 0) {
+                    this.#assertDeadlineOpen(
+                        this.#domainDeadlineStage ?? "domain CAS retry",
+                    );
+                }
+            },
         });
         const opened = this.#adapter.replay();
         if (opened.domainEvents.length === 0 || opened.aggregate.contract === null) {
@@ -469,10 +628,15 @@ export class AutonomousRunner {
                 { investigationId: this.#config.investigationId },
             );
         }
+        this.#contract = opened.aggregate.contract;
+        this.#executionLimits = deriveRunnerExecutionLimits(this.#contract);
         const operationalNonResult = this.#adapter.latestOperationalNonResult();
+        this.#recoveredDeadlineStopRequestSeqs =
+            this.#loadRecoveredDeadlineStopRequestSeqs();
 
         const artifactStoreFactory = this.#dependencies.artifactStoreFactory ?? openArtifactStore;
         this.#artifactStore = artifactStoreFactory({ root: artifactRoot });
+        this.#seedByteUsage();
         if (opened.aggregate.terminal !== null
             || opened.aggregate.pause !== null
             || opened.aggregate.nonResults.length > 0
@@ -502,6 +666,22 @@ export class AutonomousRunner {
         });
         this.#lease = acquired.lease;
         this.#recovery = acquired.recovery;
+        const unresolvedEffects = this.#unresolvedExternalEffects();
+        if (unresolvedEffects.length > 0) {
+            this.#recordOperationalNonResultFenced({
+                scope: "uncertain-external-effect",
+                code: RUNTIME_ERROR_CODES.UNCERTAIN_EXTERNAL_EFFECT,
+                reason:
+                    "A prior runner stopped after dispatching an external effect but before durably recording its outcome. Automatic replay is blocked to prevent duplicating that effect.",
+                details: {
+                    count: unresolvedEffects.length,
+                    effects: unresolvedEffects.slice(0, 64),
+                    omittedCount: Math.max(0, unresolvedEffects.length - 64),
+                    resetRequired: true,
+                },
+            });
+            return;
+        }
         if (this.#deadlineReached()) {
             return;
         }
@@ -518,14 +698,9 @@ export class AutonomousRunner {
         this.#writeRuntimeTempOwnerMarker();
         const allowlistLoader = this.#dependencies.allowlistLoader ?? loadHarnessAllowlist;
         this.#allowlist = allowlistLoader(this.#config.allowlistPath);
-        this.#contract = opened.aggregate.contract;
-
         const baseProcessAdapter = this.#dependencies.processAdapter
             ?? createDefaultProcessAdapter();
-        const processAdapter = createOutputCapturingProcessAdapter(
-            baseProcessAdapter,
-            this.#capturedOutputs,
-        );
+        const processAdapter = baseProcessAdapter;
         const sandboxProvider = Object.hasOwn(
             this.#dependencies,
             "sandboxProvider",
@@ -572,20 +747,50 @@ export class AutonomousRunner {
                 ),
                 capabilityCleanupTimeoutMs:
                     this.#config.options.shutdownTimeoutMs,
+                byteBudgets: {
+                    perAttemptOutputBytes:
+                        this.#byteBudgets.perAttemptOutputBytes,
+                    perInvestigationOutputBytes:
+                        this.#byteBudgets.perInvestigationOutputBytes,
+                    perAttemptReceiptBytes:
+                        this.#byteBudgets.perAttemptReceiptBytes,
+                    perInvestigationReceiptBytes:
+                        this.#byteBudgets.perInvestigationReceiptBytes,
+                    perAttemptCasBytes:
+                        this.#byteBudgets.perAttemptCasBytes,
+                    perInvestigationCasBytes:
+                        this.#byteBudgets.perInvestigationCasBytes,
+                },
+                initialByteUsage: {
+                    outputBytes:
+                        this.#investigationByteUsage.outputBytes,
+                    receiptBytes:
+                        this.#investigationByteUsage.receiptBytes,
+                    casBytes:
+                        this.#investigationByteUsage.casBytes,
+                },
                 onCapturedOutput: ({
                     attemptId,
                     stdout,
                     stderr,
                     launchPath,
                 }) => {
-                    if (launchPath === "host-process-adapter"
-                        && this.#capturedOutputs.has(attemptId)) {
-                        return;
-                    }
                     this.#capturedOutputs.set(attemptId, {
-                        stdout: [Buffer.from(stdout)],
-                        stderr: [Buffer.from(stderr)],
+                        stdout: [stdout],
+                        stderr: [stderr],
                     });
+                },
+                faultInjector: async (point, details = {}) => {
+                    let command = null;
+                    const attemptCommand = this.#attemptCommands.get(details.attemptId);
+                    if (attemptCommand !== undefined) {
+                        try {
+                            command = JSON.parse(attemptCommand)?.effect ?? null;
+                        } catch {
+                            command = null;
+                        }
+                    }
+                    await this.#fault(point, { ...details, command });
                 },
             });
 
@@ -748,6 +953,37 @@ export class AutonomousRunner {
         });
     }
 
+    #recordOperationalNonResultFenced({ scope, code, reason, details }) {
+        const identity = stableHex({ scope, code, reason, details });
+        const attemptId = this.#stableAttemptId("operational-non-result", {
+            scope,
+            code,
+            identity,
+        });
+        const command = formatAttemptCommand("operational-non-result", {
+            scope,
+            code,
+            identity,
+        });
+        this.#reserveAttempt(attemptId, command);
+        this.#adapter.dispatchAttempt(attemptId, this.#lease);
+        this.#adapter.observeAttempt(attemptId, this.#lease);
+        const result = this.#adapter.ingestOperationalEvidenceBatchFenced([{
+            attemptId,
+            evidenceKind: `non-result:${code}`,
+            kind: "runtime:non_result",
+            payload: { code, reason, details },
+        }], {
+            attemptId,
+            command,
+            lease: this.#lease,
+            fromState: "observed",
+            toState: "committed",
+        });
+        this.#attemptCommands.delete(attemptId);
+        return result;
+    }
+
     #appendDedicatedDomainEvent({
         scope,
         domainEvent,
@@ -810,6 +1046,22 @@ export class AutonomousRunner {
             append: (authority) =>
                 this.#adapter.appendKernelDecisionFenced(authority),
             deadlineExempt,
+        });
+    }
+
+    #resumeRecoveredDeadlinePause() {
+        const { aggregate } = this.#adapter.replay();
+        if (aggregate.pause === null) {
+            throw new RuntimeIntegrityError(
+                "Recovered deadline pause resume requires a persisted pause",
+            );
+        }
+        const domainEvent = constructInvestigationResumedEvent(aggregate);
+        return this.#appendDedicatedDomainEvent({
+            scope: "deadline-recovery-resume",
+            domainEvent,
+            append: (authority) =>
+                this.#adapter.resumeInvestigationFenced(authority),
         });
     }
 
@@ -899,6 +1151,60 @@ export class AutonomousRunner {
         }, LOGICAL_EFFECT_KEY_ALGORITHM);
     }
 
+    #unresolvedExternalEffects() {
+        const uncertain = Array.isArray(this.#recovery?.uncertain)
+            ? this.#recovery.uncertain
+            : [];
+        const unresolved = [];
+        const seen = new Set();
+        for (const attempt of uncertain) {
+            let metadata;
+            try {
+                metadata = JSON.parse(attempt.command);
+            } catch (error) {
+                throw new RuntimeIntegrityError(
+                    "Recovered command-attempt metadata is not valid JSON",
+                    { attemptId: attempt.attemptId },
+                    { cause: error },
+                );
+            }
+            if (metadata?.scope !== "external-effect") {
+                continue;
+            }
+            const command = metadata.effect;
+            const logicalEffectKey = metadata.logicalEffectKey;
+            if (command === null
+                || typeof command !== "object"
+                || Array.isArray(command)
+                || typeof logicalEffectKey !== "string"
+                || logicalEffectKey !== this.#logicalEffectKey(command)) {
+                throw new RuntimeIntegrityError(
+                    "Recovered external-effect attempt has invalid logical identity",
+                    {
+                        attemptId: attempt.attemptId,
+                        logicalEffectKey: logicalEffectKey ?? null,
+                    },
+                );
+            }
+            if (seen.has(logicalEffectKey)) {
+                continue;
+            }
+            seen.add(logicalEffectKey);
+            if (this.#readEffectRecoveryCapsule(logicalEffectKey, command) !== null) {
+                continue;
+            }
+            unresolved.push(Object.freeze({
+                attemptId: attempt.attemptId,
+                previousState: attempt.previousState ?? attempt.state,
+                logicalEffectKey,
+                kind: command.kind ?? null,
+                commandId: command.commandId ?? null,
+                candidateId: command.candidateId ?? command.caseId ?? null,
+            }));
+        }
+        return Object.freeze(unresolved);
+    }
+
     #deadlineReached() {
         return deadlineReached(this.#config.deadlineMs, this.#clock.now());
     }
@@ -969,6 +1275,13 @@ export class AutonomousRunner {
                 { attemptId },
             );
         }
+        if (measurement.receipt.outputCapture.stdout.retainedBytes !== stdout.length
+            || measurement.receipt.outputCapture.stderr.retainedBytes !== stderr.length) {
+            throw new RuntimeIntegrityError(
+                "Captured harness output lengths do not match the trusted measurement receipt",
+                { attemptId },
+            );
+        }
         return { stdout, stderr };
     }
 
@@ -1003,7 +1316,11 @@ export class AutonomousRunner {
     }
 
     async #runLoop() {
-        for (let iteration = 0; iteration < this.#config.options.maxLoopIterations; iteration += 1) {
+        const maxLoopIterations = Math.max(
+            this.#config.options.maxLoopIterations,
+            this.#executionLimits?.maxLoopIterations ?? 0,
+        );
+        for (let iteration = 0; iteration < maxLoopIterations; iteration += 1) {
             const { aggregate } = this.#adapter.replay();
             if (aggregate.terminal !== null) {
                 return terminalResult(aggregate);
@@ -1042,7 +1359,26 @@ export class AutonomousRunner {
                             recommendation,
                         });
                     }
-                    this.#appendKernelDecisionFenced();
+                    const appended = this.#appendKernelDecisionFenced();
+                    const recoveredDeadlineStopRequestSeq =
+                        appended.domainEvent?.type === EVENT_TYPES.INVESTIGATION_PAUSED
+                            ? appended.domainEvent.payload?.sourceStopRequestSeq
+                            : null;
+                    if (this.#recoveredDeadlineStopRequestSeqs.has(
+                        recoveredDeadlineStopRequestSeq,
+                    )) {
+                        this.#resumeRecoveredDeadlinePause();
+                        this.#recoveredDeadlineStopRequestSeqs.delete(
+                            recoveredDeadlineStopRequestSeq,
+                        );
+                    }
+                    if (recommendation.kind === "TERMINAL") {
+                        await this.#fault("after_terminal_append", {
+                            type: appended.domainEvent?.type ?? null,
+                            seq: appended.repositoryEvent?.seq ?? null,
+                            eventHash: appended.repositoryEvent?.eventHash ?? null,
+                        });
+                    }
                 } catch (error) {
                     if (this.#isDeadlineError(error)) {
                         return this.#recordDeadlineNonResult(
@@ -1088,7 +1424,12 @@ export class AutonomousRunner {
         throw new CrucibleRuntimeError(
             RUNTIME_ERROR_CODES.CHILD_CRASH,
             "Runner exceeded maxLoopIterations without a persisted outcome",
-            { maxLoopIterations: this.#config.options.maxLoopIterations },
+            {
+                maxLoopIterations,
+                configuredMaxLoopIterations:
+                    this.#config.options.maxLoopIterations,
+                derivedExecutionLimits: this.#executionLimits,
+            },
         );
     }
 
@@ -1320,9 +1661,27 @@ export class AutonomousRunner {
             evidence: normalizedEvidence,
         };
         const bytes = Buffer.from(canonicalJson(capsule), "utf8");
+        const expectedObjectId = `sha256:${sha256Hex(bytes)}`;
+        this.#reserveCasBytes(
+            attemptId,
+            bytes.length,
+            expectedObjectId,
+            "effect-recovery-capsule",
+        );
         const stored = this.#artifactStore.putBytes(bytes, {
             contentType: "application/vnd.crucible.effect-recovery+json",
         });
+        if (stored.id !== expectedObjectId || stored.size !== bytes.length) {
+            throw new RuntimeIntegrityError(
+                "Effect recovery capsule CAS identity changed during persistence",
+                {
+                    expectedObjectId,
+                    actualObjectId: stored.id,
+                    expectedSize: bytes.length,
+                    actualSize: stored.size,
+                },
+            );
+        }
         const artifactId = this.#effectRecoveryCapsuleArtifactId(
             logicalEffectKey,
             command,
@@ -1516,7 +1875,47 @@ export class AutonomousRunner {
         };
     }
 
+    #assertEffectLaunchAllowed(command) {
+        const { aggregate } = this.#adapter.replay();
+        if (aggregate.pause === null) {
+            const stopRequest = latestUnhandledStopRequest(aggregate);
+            const admittedCommand = command?.commandId === undefined
+                ? null
+                : aggregate.commands[command.commandId] ?? null;
+            if (stopRequest === null
+                || (admittedCommand !== null
+                    && admittedCommand.reservedSeq < stopRequest.seq)) {
+                return;
+            }
+        }
+        const error = new CrucibleRuntimeError(
+            RUNTIME_ERROR_CODES.PAUSED,
+            "Persisted stop/pause authority forbids launching a new external effect",
+            {
+                commandKind: command?.kind ?? null,
+                commandId: command?.commandId ?? null,
+                paused: aggregate.pause !== null,
+                stopRequestSeq:
+                    latestUnhandledStopRequest(aggregate)?.seq ?? null,
+            },
+        );
+        error.pauseBarrier = true;
+        throw error;
+    }
+
     async #executeEffect(command, operation, persist = null, recover = null) {
+        this.#effectAttemptCount += 1;
+        if (this.#executionLimits !== null
+            && this.#effectAttemptCount > this.#executionLimits.maxExternalEffects) {
+            throw new RuntimeIntegrityError(
+                "Runner exceeded the frozen-contract external-effect budget",
+                {
+                    effectAttemptCount: this.#effectAttemptCount,
+                    executionLimits: this.#executionLimits,
+                    command,
+                },
+            );
+        }
         const logicalEffectKey = this.#logicalEffectKey(command);
         const committed = this.#findCommittedEffect(logicalEffectKey, command);
         if (committed !== null) {
@@ -1562,6 +1961,7 @@ export class AutonomousRunner {
                 recover,
             });
         }
+        this.#assertEffectLaunchAllowed(command);
         const attemptId = this.#stableAttemptId("external-effect", command);
         const attemptCommand = formatAttemptCommand("external-effect", {
             logicalEffectKey,
@@ -1582,6 +1982,7 @@ export class AutonomousRunner {
 
         let result;
         try {
+            this.#assertEffectLaunchAllowed(command);
             result = await operation(attemptId);
             await this.#fault("after_effect_operation", {
                 attemptId,
@@ -1593,6 +1994,7 @@ export class AutonomousRunner {
             if (error?.leaveAttemptActive === true) {
                 throw error;
             }
+            const deadlineFailure = this.#isDeadlineError(error);
             this.#adapter.observeAttempt(attemptId, this.#lease);
             this.#adapter.ingestOperationalEvidenceBatchFenced([{
                 attemptId,
@@ -1601,10 +2003,19 @@ export class AutonomousRunner {
                 payload: {
                     command,
                     logicalEffectKey,
+                    classification: deadlineFailure
+                        ? "deadline_expired"
+                        : error?.pauseBarrier === true
+                            ? "pause_barrier"
+                            : "effect_error",
+                    deadlineMs: deadlineFailure
+                        ? this.#config.deadlineMs
+                        : null,
                     error: {
                         name: error?.name ?? "Error",
                         code: error?.code ?? null,
                         message: error?.message ?? String(error),
+                        details: error?.details ?? null,
                     },
                 },
             }], {
@@ -1700,35 +2111,60 @@ export class AutonomousRunner {
                 committed.push(attempt);
             }
         }
-        if (committed.length > 1) {
-            throw new RuntimeIntegrityError(
-                "More than one committed attempt exists for one logical effect",
-                {
-                    logicalEffectKey,
-                    attemptIds: committed.map((attempt) => attempt.attemptId),
-                },
-            );
-        }
         if (committed.length === 0) {
             return null;
         }
-        const attempt = committed[0];
-        const events = this.#adapter.listOperationalEvidence()
-            .filter((event) =>
+        const operationalEvents = this.#adapter.listOperationalEvidence();
+        const successful = [];
+        for (const attempt of committed) {
+            const events = operationalEvents.filter((event) =>
                 event.attemptId === attempt.attemptId
                 && event.payload?.logicalEffectKey === logicalEffectKey);
-        const failure = events.find((event) => event.kind === "runtime:effect_failure");
-        if (failure !== undefined) {
+            const failure = events.find((event) =>
+                event.kind === "runtime:effect_failure");
+            if (failure === undefined) {
+                successful.push({ attempt, events });
+                continue;
+            }
+            const classification = failure.payload?.classification ?? null;
+            const previousDeadlineMs = failure.payload?.deadlineMs ?? null;
+            const laterDeadline = Number.isFinite(previousDeadlineMs)
+                && (this.#config.deadlineMs === null
+                    || this.#config.deadlineMs > previousDeadlineMs);
+            if ((classification === "deadline_expired" && laterDeadline)
+                || classification === "pause_barrier") {
+                continue;
+            }
             throw new CrucibleRuntimeError(
-                RUNTIME_ERROR_CODES.CHILD_CRASH,
-                "A previously committed logical effect recorded a failure",
+                classification === "deadline_expired"
+                    ? RUNTIME_ERROR_CODES.DEADLINE_EXCEEDED
+                    : RUNTIME_ERROR_CODES.CHILD_CRASH,
+                classification === "deadline_expired"
+                    ? "A previously committed logical effect expired under the current deadline"
+                    : "A previously committed logical effect recorded a failure",
                 {
                     logicalEffectKey,
                     attemptId: attempt.attemptId,
+                    classification,
+                    previousDeadlineMs,
+                    currentDeadlineMs: this.#config.deadlineMs,
                     persistedError: failure.payload?.error ?? null,
                 },
             );
         }
+        if (successful.length > 1) {
+            throw new RuntimeIntegrityError(
+                "More than one successful committed attempt exists for one logical effect",
+                {
+                    logicalEffectKey,
+                    attemptIds: successful.map(({ attempt }) => attempt.attemptId),
+                },
+            );
+        }
+        if (successful.length === 0) {
+            return null;
+        }
+        const { attempt, events } = successful[0];
         let effectAttemptId = attempt.attemptId;
         let metadata;
         try {
@@ -2450,7 +2886,7 @@ export class AutonomousRunner {
         };
     }
 
-    #ingestImpossibilityRequest(command) {
+    #ingestImpossibilityRequest(command, attemptId) {
         this.#assertDeadlineOpen("impossibility request artifact ingestion");
         const expectedRequestHash = hashCanonical(
             command.request,
@@ -2476,6 +2912,11 @@ export class AutonomousRunner {
                 path.join(sourceDir, IMPOSSIBILITY_REQUEST_FILENAME),
                 canonicalJson(command.request),
                 { encoding: "utf8", flag: "wx", mode: 0o600 },
+            );
+            this.#reserveDirectoryCas(
+                attemptId,
+                sourceDir,
+                `impossibility-request-${command.attemptOrdinal}`,
             );
             const snapshot = this.#artifactStore.ingestDirectory({ sourceDir });
             this.#assertDeadlineOpen("impossibility request artifact persistence");
@@ -2605,7 +3046,10 @@ export class AutonomousRunner {
                 { commandId, requestHash: command.requestHash },
             );
         }
-        const requestSnapshot = this.#ingestImpossibilityRequest(command);
+        const requestSnapshot = this.#ingestImpossibilityRequest(
+            command,
+            mainAttemptId,
+        );
         this.#persistImpossibilityRequestSnapshot({
             attemptId: mainAttemptId,
             commandId,
@@ -2735,7 +3179,7 @@ export class AutonomousRunner {
                     candidateId: command.candidateId,
                     seed: command.seed,
                 },
-                async () => {
+                async (attemptId) => {
                     const proposal = await workerPool.propose(request);
                     if (proposal?.candidateId !== command.candidateId) {
                         throw new CrucibleRuntimeError(
@@ -2747,6 +3191,17 @@ export class AutonomousRunner {
                             },
                         );
                     }
+                    await this.#fault("after_proposal_response", {
+                        attemptId,
+                        command: {
+                            kind: "sdk-proposal",
+                            commandId,
+                            round: command.round,
+                            slotIndex: command.slotIndex,
+                            candidateId: command.candidateId,
+                            model: command.model,
+                        },
+                    });
                     return proposal;
                 },
                 async (proposal, attemptId, logicalEffectKey) => {
@@ -2810,7 +3265,14 @@ export class AutonomousRunner {
             );
         }
         const annotations = normalizeCandidateAnnotations(proposal, command);
-        const snapshot = this.#ingestCandidate(proposal);
+        const persistedSnapshot = this.#loadPersistedCandidateSnapshot({
+            commandId,
+            command,
+            proposal,
+        });
+        const snapshot = persistedSnapshot === null
+            ? this.#ingestCandidate(proposal, mainAttemptId)
+            : { snapshot: persistedSnapshot.snapshotId };
         const candidateArtifactHash = measurementSnapshotHash(snapshot.snapshot);
         this.#persistCandidateSnapshot({
             attemptId: mainAttemptId,
@@ -3062,6 +3524,35 @@ export class AutonomousRunner {
         snapshotId,
         candidateArtifactHash,
     }) {
+        const existing = this.#adapter.listOperationalEvidence().filter((event) =>
+            event.kind === "runtime:candidate_snapshot"
+            && event.payload?.commandId === commandId
+            && event.payload?.candidateId === command.candidateId);
+        if (existing.length > 1) {
+            throw new RuntimeIntegrityError(
+                "More than one candidate-snapshot record exists for one reserved candidate",
+                { commandId, candidateId: command.candidateId },
+            );
+        }
+        if (existing.length === 1) {
+            const payload = existing[0].payload;
+            if (payload.round !== command.round
+                || payload.slotIndex !== command.slotIndex
+                || payload.snapshotId !== snapshotId
+                || payload.candidateArtifactHash !== candidateArtifactHash
+                || payload.artifactId
+                    !== payload.snapshotProvenance?.manifestArtifact?.artifactId) {
+                throw new RuntimeIntegrityError(
+                    "Persisted candidate snapshot does not match the reserved search assignment",
+                    { commandId, candidateId: command.candidateId },
+                );
+            }
+            return this.#verifySnapshotProvenance(
+                payload.snapshotProvenance,
+                snapshotId,
+                "Persisted candidate snapshot",
+            );
+        }
         const snapshotProvenance = this.#persistSnapshotProvenance({
             attemptId,
             kind: `candidate-snapshot-${command.candidateId}`,
@@ -3083,6 +3574,67 @@ export class AutonomousRunner {
             },
         });
         return snapshotProvenance;
+    }
+
+    #loadPersistedCandidateSnapshot({ commandId, command, proposal }) {
+        const existing = this.#adapter.listOperationalEvidence().filter((event) =>
+            event.kind === "runtime:candidate_snapshot"
+            && event.payload?.commandId === commandId
+            && event.payload?.candidateId === command.candidateId);
+        if (existing.length === 0) {
+            return null;
+        }
+        if (existing.length > 1) {
+            throw new RuntimeIntegrityError(
+                "More than one candidate-snapshot record exists for one reserved candidate",
+                { commandId, candidateId: command.candidateId },
+            );
+        }
+        const payload = existing[0].payload;
+        if (payload.round !== command.round
+            || payload.slotIndex !== command.slotIndex
+            || typeof payload.snapshotId !== "string"
+            || payload.candidateArtifactHash
+                !== measurementSnapshotHash(payload.snapshotId)
+            || payload.artifactId
+                !== payload.snapshotProvenance?.manifestArtifact?.artifactId) {
+            throw new RuntimeIntegrityError(
+                "Persisted candidate snapshot does not match the reserved search assignment",
+                { commandId, candidateId: command.candidateId },
+            );
+        }
+        this.#verifySnapshotProvenance(
+            payload.snapshotProvenance,
+            payload.snapshotId,
+            "Persisted candidate snapshot",
+        );
+        const manifest = this.#artifactStore.loadManifest(payload.snapshotId);
+        const expectedFiles = [...proposal.files]
+            .map((file) => ({ path: file.path, bytes: Buffer.from(file.content, "utf8") }))
+            .sort((left, right) => compareStable(left.path, right.path));
+        if (manifest.entries.length !== expectedFiles.length) {
+            throw new RuntimeIntegrityError(
+                "Persisted candidate snapshot file set does not match its proposal",
+                { commandId, candidateId: command.candidateId },
+            );
+        }
+        for (const [index, entry] of manifest.entries.entries()) {
+            const expected = expectedFiles[index];
+            const bytes = this.#artifactStore.readObject(entry.object, { verify: true });
+            if (entry.path !== expected.path
+                || entry.size !== expected.bytes.length
+                || !bytes.equals(expected.bytes)) {
+                throw new RuntimeIntegrityError(
+                    "Persisted candidate snapshot bytes do not match its proposal",
+                    {
+                        commandId,
+                        candidateId: command.candidateId,
+                        path: entry.path,
+                    },
+                );
+            }
+        }
+        return Object.freeze({ snapshotId: payload.snapshotId });
     }
 
     #findReusableMeasurement(aggregate, duplicateOf, candidateArtifactHash) {
@@ -3426,7 +3978,7 @@ export class AutonomousRunner {
         return this.#workerPool;
     }
 
-    #ingestCandidate(proposal) {
+    #ingestCandidate(proposal, attemptId) {
         this.#assertDeadlineOpen("candidate artifact ingestion");
         const sourceRoot = ensureDirectory(path.join(this.#runTempRoot, "submitted"));
         const sourceDir = makeUniqueDirectory(sourceRoot, proposal.candidateId);
@@ -3440,6 +3992,11 @@ export class AutonomousRunner {
                 fs.mkdirSync(path.dirname(target), { recursive: true });
                 fs.writeFileSync(target, file.content, { encoding: "utf8", flag: "wx", mode: 0o600 });
             }
+            this.#reserveDirectoryCas(
+                attemptId,
+                sourceDir,
+                `candidate-${proposal.candidateId}`,
+            );
             const snapshot = this.#artifactStore.ingestDirectory({ sourceDir });
             this.#assertDeadlineOpen("candidate artifact persistence");
             return snapshot;
@@ -3460,6 +4017,34 @@ export class AutonomousRunner {
         const root = ensureDirectory(path.join(this.#runTempRoot, "materialized"));
         const destDir = uniqueNonexistentPath(root, label, this.#idFactory());
         const manifest = this.#artifactStore.loadManifest(snapshotId);
+        let minimumBytes = manifest.totalBytes + 128;
+        for (const entry of manifest.entries) {
+            minimumBytes += 128 + Buffer.byteLength(entry.path, "utf8");
+            if (!Number.isSafeInteger(minimumBytes)
+                || minimumBytes > this.#byteBudgets.perAttemptCasBytes) {
+                throw new RuntimeIntegrityError(
+                    "Snapshot exceeds the per-attempt CAS/materialization byte budget",
+                    {
+                        snapshotId,
+                        minimumBytes,
+                        limit: this.#byteBudgets.perAttemptCasBytes,
+                    },
+                );
+            }
+        }
+        const logicalBytes = manifest.totalBytes
+            + Buffer.byteLength(canonicalJson(manifest), "utf8");
+        if (!Number.isSafeInteger(logicalBytes)
+            || logicalBytes > this.#byteBudgets.perAttemptCasBytes) {
+            throw new RuntimeIntegrityError(
+                "Snapshot exceeds the per-attempt CAS/materialization byte budget",
+                {
+                    snapshotId,
+                    logicalBytes,
+                    limit: this.#byteBudgets.perAttemptCasBytes,
+                },
+            );
+        }
         const materialized = this.#artifactStore.materializeSnapshot({
             snapshot: snapshotId,
             destDir,
@@ -3485,7 +4070,7 @@ export class AutonomousRunner {
         return result;
     }
 
-    #persistMeasurement({
+    async #persistMeasurement({
         measurement,
         rawOutput,
         attemptId,
@@ -3530,6 +4115,15 @@ export class AutonomousRunner {
             kind: `measurement-receipt-${candidateId}`,
             value: measurement.receipt,
             contentType: "application/vnd.crucible.measurement-receipt+json",
+        });
+        await this.#fault("after_measurement_receipt_persistence", {
+            attemptId,
+            logicalEffectKey,
+            purpose,
+            commandId,
+            candidateId,
+            artifactId: receiptArtifact.artifactId,
+            objectId: receiptArtifact.objectId,
         });
         const rawStdoutArtifact = this.#persistBytesArtifact({
             attemptId,
@@ -3612,7 +4206,7 @@ export class AutonomousRunner {
         };
     }
 
-    #persistImpossibilityVerification({
+    async #persistImpossibilityVerification({
         result,
         attemptId,
         logicalEffectKey,
@@ -3620,7 +4214,7 @@ export class AutonomousRunner {
         command,
         snapshotId,
     }) {
-        const persistedMeasurement = this.#persistMeasurement({
+        const persistedMeasurement = await this.#persistMeasurement({
             measurement: result.measurement,
             rawOutput: {
                 stdout: result.rawStdoutBytes,
@@ -3750,6 +4344,153 @@ export class AutonomousRunner {
         return provenance;
     }
 
+    #seedByteUsage() {
+        const seenArtifacts = new Set();
+        for (const ref of this.#repository.listArtifactRefs(
+            this.#config.investigationId,
+        )) {
+            if (seenArtifacts.has(ref.artifactId)) continue;
+            seenArtifacts.add(ref.artifactId);
+            const artifact = this.#repository.getArtifact(ref.artifactId);
+            if (artifact === null
+                || artifact.investigationId !== this.#config.investigationId
+                || !Number.isSafeInteger(artifact.sizeBytes)
+                || artifact.sizeBytes < 0) {
+                continue;
+            }
+            if (artifact.contentType
+                === "application/vnd.crucible.measurement-stdout"
+                || artifact.contentType
+                    === "application/vnd.crucible.measurement-stderr") {
+                this.#investigationByteUsage.outputBytes += artifact.sizeBytes;
+            } else if (artifact.contentType
+                === "application/vnd.crucible.measurement-receipt+json") {
+                this.#investigationByteUsage.receiptBytes += artifact.sizeBytes;
+            }
+            if (artifact.storage === "external"
+                && artifact.hashAlgo === "sha256"
+                && typeof artifact.hashValue === "string") {
+                const objectId = `sha256:${artifact.hashValue}`;
+                if (!this.#countedCasObjects.has(objectId)) {
+                    this.#countedCasObjects.add(objectId);
+                    this.#investigationByteUsage.casBytes += artifact.sizeBytes;
+                }
+            }
+        }
+        if (this.#investigationByteUsage.outputBytes
+                > this.#byteBudgets.perInvestigationOutputBytes
+            || this.#investigationByteUsage.receiptBytes
+                > this.#byteBudgets.perInvestigationReceiptBytes
+            || this.#investigationByteUsage.casBytes
+                > this.#byteBudgets.perInvestigationCasBytes) {
+            throw new RuntimeIntegrityError(
+                "Persisted investigation artifacts already exceed the runtime byte budgets",
+                {
+                    usage: this.#investigationByteUsage,
+                    limits: this.#byteBudgets,
+                },
+            );
+        }
+    }
+
+    #reserveCasBytes(attemptId, bytes, objectId, kind) {
+        if (!Number.isSafeInteger(bytes) || bytes < 0) {
+            throw new RuntimeIntegrityError(
+                "CAS byte reservation is invalid",
+                { attemptId, bytes, objectId, kind },
+            );
+        }
+        if (this.#countedCasObjects.has(objectId)) return;
+        const attemptBytes = (this.#attemptCasBytes.get(attemptId) ?? 0) + bytes;
+        const investigationBytes =
+            this.#investigationByteUsage.casBytes + bytes;
+        if (!Number.isSafeInteger(attemptBytes)
+            || !Number.isSafeInteger(investigationBytes)
+            || attemptBytes > this.#byteBudgets.perAttemptCasBytes
+            || investigationBytes
+                > this.#byteBudgets.perInvestigationCasBytes) {
+            throw new RuntimeIntegrityError(
+                "Runtime CAS byte budget exceeded before artifact persistence",
+                {
+                    attemptId,
+                    kind,
+                    objectId,
+                    bytes,
+                    attemptBytes,
+                    attemptLimit:
+                        this.#byteBudgets.perAttemptCasBytes,
+                    investigationBytes,
+                    investigationLimit:
+                        this.#byteBudgets.perInvestigationCasBytes,
+                },
+            );
+        }
+        this.#attemptCasBytes.set(attemptId, attemptBytes);
+        this.#investigationByteUsage.casBytes = investigationBytes;
+        this.#countedCasObjects.add(objectId);
+    }
+
+    #reserveDirectoryCas(attemptId, sourceDir, kind) {
+        const entries = [];
+        const walk = (directory, segments = []) => {
+            const dirents = fs.readdirSync(directory, { withFileTypes: true })
+                .sort((left, right) => compareStable(left.name, right.name));
+            for (const dirent of dirents) {
+                const absolute = path.join(directory, dirent.name);
+                const childSegments = [...segments, dirent.name];
+                if (dirent.isDirectory()) {
+                    walk(absolute, childSegments);
+                    continue;
+                }
+                if (!dirent.isFile()) {
+                    throw new RuntimeIntegrityError(
+                        "CAS reservation encountered a non-regular candidate entry",
+                        { path: absolute },
+                    );
+                }
+                const bytes = fs.readFileSync(absolute);
+                entries.push({
+                    path: childSegments.join("/"),
+                    size: bytes.length,
+                    object: `sha256:${sha256Hex(bytes)}`,
+                });
+            }
+        };
+        walk(sourceDir);
+        entries.sort((left, right) => compareStable(left.path, right.path));
+        const manifest = {
+            type: "crucible-snapshot",
+            version: 1,
+            algo: "sha256",
+            fileCount: entries.length,
+            totalBytes: entries.reduce((total, entry) => total + entry.size, 0),
+            entries,
+        };
+        const manifestBytes = Buffer.from(canonicalJson(manifest), "utf8");
+        const objects = [
+            ...entries.map((entry) => ({
+                id: entry.object,
+                size: entry.size,
+            })),
+            {
+                id: `sha256:${sha256Hex(manifestBytes)}`,
+                size: manifestBytes.length,
+            },
+        ];
+        const unique = new Map();
+        for (const object of objects) {
+            unique.set(object.id, object);
+        }
+        for (const object of unique.values()) {
+            this.#reserveCasBytes(
+                attemptId,
+                object.size,
+                object.id,
+                kind,
+            );
+        }
+    }
+
     #persistJsonArtifact({ attemptId, kind, value, contentType }) {
         const bytes = Buffer.from(canonicalJson(value), "utf8");
         return this.#persistBytesArtifact({
@@ -3762,7 +4503,26 @@ export class AutonomousRunner {
 
     #persistBytesArtifact({ attemptId, kind, bytes, contentType }) {
         this.#assertDeadlineOpen("artifact persistence");
+        const expectedObjectId = `sha256:${sha256Hex(bytes)}`;
+        this.#reserveCasBytes(
+            attemptId,
+            bytes.length,
+            expectedObjectId,
+            kind,
+        );
         const stored = this.#artifactStore.putBytes(bytes, { contentType });
+        if (stored.id !== expectedObjectId || stored.size !== bytes.length) {
+            throw new RuntimeIntegrityError(
+                "ArtifactStore returned an unexpected CAS identity",
+                {
+                    kind,
+                    expectedObjectId,
+                    actualObjectId: stored.id,
+                    expectedSize: bytes.length,
+                    actualSize: stored.size,
+                },
+            );
+        }
         const registered = this.#registerCasObject({
             attemptId,
             kind,
@@ -3816,11 +4576,8 @@ export class AutonomousRunner {
 
     #recordDeadlineNonResult(aggregate, cause = null) {
         const currentRecommendation = decideNext(aggregate);
-        const attemptId = this.#nextStableId("deadline", {
-            seq: aggregate.lastSeq,
-            deadlineMs: this.#config.deadlineMs,
-        });
         let domainPausePersisted = false;
+        let deadlineStopRequestSeq = null;
         try {
             const requested = this.#requestStopFenced({
                 requestId: this.#nextStableId("stop", { reason: "deadline" }),
@@ -3828,6 +4585,7 @@ export class AutonomousRunner {
                 pauseRequested: true,
             });
             if (requested.domainEvent !== null) {
+                deadlineStopRequestSeq = requested.domainEvent.seq;
                 const afterStop = requested.aggregate;
                 const recommendation = decideNext(afterStop);
                 if (recommendation.event?.type === EVENT_TYPES.INVESTIGATION_PAUSED) {
@@ -3840,14 +4598,15 @@ export class AutonomousRunner {
                 throw error;
             }
         }
-        this.#adapter.recordOperationalNonResult({
-            attemptId,
+        this.#recordOperationalNonResultFenced({
+            scope: "deadline",
             code: "DEADLINE_EXCEEDED",
             reason: "The wall-clock deadline expired before a terminal result.",
             details: {
                 deadlineMs: this.#config.deadlineMs,
                 observedAt: this.#clock.isoNow(),
                 domainPausePersisted,
+                deadlineStopRequestSeq,
                 terminalEmitted: false,
                 terminalRecommendationSuppressed:
                     currentRecommendation.kind === "TERMINAL",
@@ -3870,6 +4629,24 @@ export class AutonomousRunner {
         this.#capturedOutputs.clear();
         this.#effectEvidenceBuffers.clear();
         this.#attemptCommands.clear();
+        if (this.#executor !== null && typeof this.#executor.close === "function") {
+            const outcome = await settleWithin(
+                () => this.#executor.close({
+                    timeoutMs: this.#config.options.shutdownTimeoutMs,
+                }),
+                this.#config.options.shutdownTimeoutMs,
+                { timers: this.#dependencies.timers ?? globalThis },
+            );
+            if (outcome.status === "rejected") {
+                firstError ??= outcome.error;
+            } else if (outcome.status === "timed_out") {
+                firstError ??= new CrucibleRuntimeError(
+                    RUNTIME_ERROR_CODES.RUNTIME_FAILURE,
+                    "Runner external-effect process cleanup exceeded its final shutdown bound",
+                    { timeoutMs: this.#config.options.shutdownTimeoutMs },
+                );
+            }
+        }
         if (this.#workerPool !== null && typeof this.#workerPool.close === "function") {
             const outcome = await settleWithin(
                 () => this.#workerPool.close(),

@@ -14,9 +14,49 @@ export function fakeHarnessIdentity({
     const policyIdentity = executesCandidateCode
         ? {
             primitive: "fixture-containment",
+            providerId: "fixture-provider",
+            providerVersion: "v1",
             policyId: "fixture-policy-v1",
             helperSourceHash: hash("sandbox-helper-source", { harnessId }),
             helperBinaryHash: hash("measurement-file", { harnessId, helper: true }),
+            launcherId: "fixture-launcher-v1",
+            launcherBinaryHash: hash("measurement-file", {
+                harnessId,
+                launcher: true,
+            }),
+            launcherScriptHash: hash("sandbox-launcher-script", {
+                harnessId,
+            }),
+            securityContext: {
+                appContainer: true,
+                lowIntegrity: true,
+                capabilities: [],
+                loopbackExemptionRejected: true,
+            },
+            network: {
+                mode: "deny-by-default",
+                enforcement: "fixture zero-capability boundary",
+            },
+            filesystem: {
+                stagedHarness: "exact-manifest-read-execute",
+                immutableCandidate: "private-staged-copy-read-only",
+                outputTemp: "provider-owned",
+                aclJournalRestored: true,
+                exactLaunchClosure: true,
+                hostWriteDenied: true,
+            },
+            job: {
+                killOnJobClose: true,
+                descendantsContained: true,
+                uiRestrictions: true,
+                activeProcessLimit: 8,
+                processMemoryBytes: 512 * 1024 * 1024,
+                jobMemoryBytes: 768 * 1024 * 1024,
+                cpuRatePercent: 50,
+                cpuTimeMs: 30_000,
+                wallTimeMs: 120_000,
+                terminationGraceMs: 5_000,
+            },
         }
         : null;
     return {

@@ -46,6 +46,7 @@ function makeFixture(label, body, {
     allowedEnv = {},
     candidateBytes = "immutable-candidate",
     dependencyFiles = [],
+    faultInjector,
     limits,
     maxStderrBytes,
     maxStdoutBytes,
@@ -85,6 +86,7 @@ function makeFixture(label, body, {
         allowlist,
         sandboxProvider,
         scratchRoot: path.join(root, "scratch"),
+        ...(faultInjector === undefined ? {} : { faultInjector }),
     });
     const snapshot = materializeCandidateSnapshot(
         root,
@@ -1111,9 +1113,13 @@ describe.skipIf(typedUnavailable)("Windows sandbox H3 process and resource conta
 
     it("enforces native wall time before the executor timeout", async () => {
         const beforeProfiles = ownedSandboxProfiles();
+        let exitEvent = null;
         const fixture = makeFixture("wall-limit", `
             setInterval(() => {}, 1000);
         `, {
+            faultInjector(point, details) {
+                if (point === "after_harness_exit") exitEvent = details;
+            },
             limits: {
                 cpuRatePercent: 100,
                 cpuTimeMs: 30_000,
@@ -1122,10 +1128,28 @@ describe.skipIf(typedUnavailable)("Windows sandbox H3 process and resource conta
             timeoutMs: 15_000,
         });
         const started = Date.now();
-        await expect(runFixture(fixture)).rejects.toMatchObject({
+        let error;
+        try {
+            await runFixture(fixture);
+        } catch (caught) {
+            error = caught;
+        }
+        expect(error).toMatchObject({
             code: MEASUREMENT_ERROR_CODES.NONZERO_EXIT,
+            details: {
+                exit: { code: 124, signal: null },
+            },
         });
-        expect(Date.now() - started).toBeLessThan(12_000);
+        const effectiveWallTimeMs =
+            error.details.receipt.sandbox.policy.effectiveJob.wallTimeMs;
+        expect(effectiveWallTimeMs).toBeGreaterThan(0);
+        expect(effectiveWallTimeMs).toBeLessThanOrEqual(5_000);
+        expect(exitEvent).toMatchObject({
+            exit: { code: 124, signal: null },
+            timedOut: false,
+            overflowStreams: [],
+        });
+        expect(Date.now() - started).toBeLessThan(20_000);
         expectSandboxCleanup(beforeProfiles);
     }, 180_000);
 

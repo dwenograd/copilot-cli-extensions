@@ -1,6 +1,7 @@
 import { RuntimeConfigError } from "./errors.mjs";
 
 const SUPERVISOR_HEARTBEAT_OPERATION_MARGIN_MS = 1_000;
+const RUNNER_BUDGET_MINIMUM_SAFETY_MARGIN = 64;
 
 export const STRICT_ISO_TIMESTAMP_PATTERN_SOURCE =
     String.raw`^\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])T(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d{1,3})?(?:Z|[+-](?:[01]\d|2[0-3]):[0-5]\d)$`;
@@ -120,6 +121,7 @@ export function validateSupervisorTimingConstraints({
             },
         );
     }
+
     if (maxBackoffMs < baseBackoffMs) {
         throw new RuntimeConfigError("maxBackoffMs must be greater than or equal to baseBackoffMs", {
             baseBackoffMs,
@@ -129,5 +131,62 @@ export function validateSupervisorTimingConstraints({
     return Object.freeze({
         jitterOperationMarginMs,
         minimumExclusiveStaleLockMs,
+    });
+}
+
+export function deriveRunnerExecutionLimits(contract) {
+    if (contract === null || typeof contract !== "object" || Array.isArray(contract)) {
+        throw new RuntimeConfigError("contract is required to derive runner execution limits");
+    }
+    const maxRounds = contract.maxRounds;
+    const candidatesPerRound = contract.candidatesPerRound;
+    if (!Number.isSafeInteger(maxRounds)
+        || maxRounds < 1
+        || !Number.isSafeInteger(candidatesPerRound)
+        || candidatesPerRound < 1) {
+        throw new RuntimeConfigError(
+            "contract maxRounds/candidatesPerRound must be positive safe integers",
+            { maxRounds, candidatesPerRound },
+        );
+    }
+    const candidateEvaluations = maxRounds * candidatesPerRound;
+    if (!Number.isSafeInteger(candidateEvaluations)) {
+        throw new RuntimeConfigError("contract candidate evaluation capacity is not a safe integer");
+    }
+    const validationEffects = Array.isArray(contract.validationCases)
+        ? contract.validationCases.length
+        : 0;
+    const impossibilityEffects =
+        contract.hypothesisTopology === "certified_impossibility" ? 1 : 0;
+    const expectedExternalEffects = validationEffects
+        + (candidateEvaluations * 2)
+        + impossibilityEffects;
+    const effectSafetyMargin = Math.max(
+        RUNNER_BUDGET_MINIMUM_SAFETY_MARGIN,
+        Math.ceil(expectedExternalEffects / 4),
+    );
+    const maxExternalEffects = expectedExternalEffects + effectSafetyMargin;
+
+    const domainCommands = 1 + candidateEvaluations + impossibilityEffects;
+    const expectedKernelIterations = (domainCommands * 2)
+        + maxRounds
+        + 4;
+    const maxLoopIterations = expectedKernelIterations
+        + maxExternalEffects
+        + RUNNER_BUDGET_MINIMUM_SAFETY_MARGIN;
+    if (!Number.isSafeInteger(maxLoopIterations)) {
+        throw new RuntimeConfigError("derived runner loop budget is not a safe integer");
+    }
+    const maxRestarts = Math.min(
+        12,
+        2 + Math.ceil(expectedExternalEffects / 256),
+    );
+    return Object.freeze({
+        candidateEvaluations,
+        expectedExternalEffects,
+        maxExternalEffects,
+        maxLoopIterations,
+        maxRestarts,
+        safetyMargin: effectSafetyMargin,
     });
 }

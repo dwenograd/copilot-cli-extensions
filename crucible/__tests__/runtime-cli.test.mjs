@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import path from "node:path";
 
 import {
+    MAX_TRUSTED_OPERATOR_CONTEXT_BYTES,
     RUNTIME_ERROR_CODES,
     normalizeRunnerConfig,
 } from "../runtime/index.mjs";
@@ -45,6 +46,15 @@ describe("Crucible strict runtime CLIs", () => {
             resultPath: path.join(root, "outside.json"),
         })).toThrow(expect.objectContaining({
             code: RUNTIME_ERROR_CODES.PATH_ESCAPE,
+        }));
+        expect(() => normalizeRunnerConfig({
+            ...base,
+            options: {
+                workerAdditionalContext:
+                    "😀".repeat(MAX_TRUSTED_OPERATOR_CONTEXT_BYTES / 2),
+            },
+        })).toThrow(expect.objectContaining({
+            code: RUNTIME_ERROR_CODES.INVALID_CONFIG,
         }));
     });
 });

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+    CONTRACT_LIMITS,
     DEFAULT_SEARCH_POLICY,
     DOMAIN_VERSION,
     DomainVersionRestartRequiredError,
@@ -551,6 +552,74 @@ describe("Crucible domain version 3 kernel", () => {
         );
     });
 
+    it("rejects contract identifiers that cannot be addressed by domain events", () => {
+        const invalidIdentifiers = ["constructor", "prototype", "trailing."];
+        const contractCases = [
+            ["validationCases[0].id", (identifier) => {
+                const input = contractInput();
+                input.validationCases = [
+                    { ...input.validationCases[0], id: identifier },
+                    input.validationCases[1],
+                ];
+                return input;
+            }],
+            ["harnessId", (identifier) => contractInput({
+                harnessId: identifier,
+                harnessIdentity: fakeHarnessIdentity({
+                    harnessId: identifier,
+                    parserVersion: "parser-v2",
+                }),
+            })],
+            ["policyVersion", (identifier) => contractInput({ policyVersion: identifier })],
+            ["parserVersion", (identifier) => contractInput({
+                parserVersion: identifier,
+                harnessIdentity: fakeHarnessIdentity({
+                    harnessId: "primary-harness",
+                    parserVersion: identifier,
+                }),
+            })],
+            ["search.workerModels[0]", (identifier) => contractInput({
+                workerModels: [identifier],
+            })],
+            ["search.boundedCandidateIds[0]", (identifier) => contractInput({
+                hypothesisTopology: "finite_enumerable",
+                boundedCandidateIds: [identifier],
+            })],
+            ["metrics[0].key", (identifier) => contractInput({
+                metrics: [{ key: identifier, direction: "max", epsilon: 0 }],
+            })],
+            ["harnessIdentity.sandbox.policyIdentity.policyId", (identifier) => {
+                const harnessIdentity = fakeHarnessIdentity({
+                    harnessId: "primary-harness",
+                    parserVersion: "parser-v2",
+                    executesCandidateCode: true,
+                });
+                harnessIdentity.sandbox.policyIdentity.policyId = identifier;
+                return contractInput({ harnessIdentity });
+            }],
+        ];
+
+        for (const identifier of invalidIdentifiers) {
+            expect(() => normalizeEventIdentifier(identifier, "probeId")).toThrow(
+                expect.objectContaining({ code: ERROR_CODES.INVALID_EVENT }),
+            );
+            for (const [field, makeInput] of contractCases) {
+                expect(() => createInvestigationContract(makeInput(identifier))).toThrow(
+                    expect.objectContaining({
+                        code: ERROR_CODES.INVALID_CONTRACT,
+                        details: expect.objectContaining({ field }),
+                    }),
+                );
+            }
+        }
+
+        const safeIdentifier = "model.v3@provider-a";
+        expect(normalizeEventIdentifier(safeIdentifier, "probeId")).toBe(safeIdentifier);
+        expect(createInvestigationContract(contractInput({
+            workerModels: [safeIdentifier],
+        })).workerModels).toEqual([safeIdentifier]);
+    });
+
     it("canonical-compares every externally supplied payload before application", () => {
         const open = openInvestigation();
         const capability = createExternalEvent(
@@ -686,6 +755,11 @@ describe("Crucible domain version 3 kernel", () => {
             searchPolicy({
                 operatorWeights: { diversification: 0, adversarial: 0, restart: 0 },
             }),
+            searchPolicy({
+                operatorWeights: { diversification: 0, adversarial: 1, restart: 0 },
+            }),
+            searchPolicy({ archiveCaps: { accepted: 100000 } }),
+            searchPolicy({ promptCaps: { promptContextRefs: 100000 } }),
             searchPolicy({ promptCaps: { parentEvidenceIds: 3, promptContextRefs: 2 } }),
             { ...searchPolicy(), unexpected: true },
         ]) {
@@ -693,6 +767,31 @@ describe("Crucible domain version 3 kernel", () => {
                 searchPolicy: invalidPolicy,
             }))).toThrow(expect.objectContaining({ code: ERROR_CODES.INVALID_CONTRACT }));
         }
+    });
+
+    it("rejects impractical search, metric, and predicate contracts", () => {
+        expect(() => createInvestigationContract(contractInput({
+            candidatesPerRound: 8,
+            maxRounds: 100000,
+        }))).toThrow(expect.objectContaining({ code: ERROR_CODES.INVALID_CONTRACT }));
+        expect(() => createInvestigationContract(contractInput({
+            metrics: Array.from(
+                { length: CONTRACT_LIMITS.metrics + 1 },
+                (_unused, index) => ({
+                    key: `metric-${index}`,
+                    direction: "max",
+                }),
+            ),
+        }))).toThrow(expect.objectContaining({ code: ERROR_CODES.INVALID_CONTRACT }));
+        expect(() => createInvestigationContract(contractInput({
+            acceptancePredicate: {
+                kind: "all",
+                predicates: Array.from(
+                    { length: CONTRACT_LIMITS.acceptancePredicateChildren + 1 },
+                    () => ({ kind: "harness_pass" }),
+                ),
+            },
+        }))).toThrow(expect.objectContaining({ code: ERROR_CODES.INVALID_ACCEPTANCE_PREDICATE }));
     });
 
     it("commits accepted, near-miss, rejected, and invalid-metrics candidate evidence", () => {

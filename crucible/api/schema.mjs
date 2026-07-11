@@ -11,11 +11,12 @@
 // typed error. It never touches I/O.
 
 import {
+    CONTRACT_LIMITS,
     DEFAULT_SEARCH_POLICY,
     HYPOTHESIS_TOPOLOGIES,
+    SEARCH_POLICY_LIMITS,
 } from "../domain/constants.mjs";
 import { STRICT_ISO_TIMESTAMP_PATTERN_SOURCE } from "../runtime/config-validation.mjs";
-import { DEFAULT_PROMPT_CONTEXT_BYTE_CAP } from "../runtime/prompt-context.mjs";
 import { SchemaValidationError } from "./errors.mjs";
 
 // Re-exported so the schema module's public surface includes the error its
@@ -23,8 +24,10 @@ import { SchemaValidationError } from "./errors.mjs";
 export { SchemaValidationError };
 export { DEFAULT_SEARCH_POLICY };
 
-export const MAX_OBJECTIVE_CHARACTERS = 4096;
-export const MAX_ACCEPTANCE_PREDICATE_BYTES = DEFAULT_PROMPT_CONTEXT_BYTE_CAP;
+export const MAX_OBJECTIVE_CHARACTERS = CONTRACT_LIMITS.objectiveCharacters;
+export const MAX_OBJECTIVE_BYTES = CONTRACT_LIMITS.objectiveBytes;
+export const MAX_ACCEPTANCE_PREDICATE_BYTES =
+    CONTRACT_LIMITS.acceptancePredicateBytes;
 
 const IDENTIFIER_PATTERN = "^(?!.*\\.\\.)[A-Za-z0-9][A-Za-z0-9._@-]{0,127}$";
 const IDENTIFIER_RE = /^(?!.*\.\.)[A-Za-z0-9][A-Za-z0-9._@-]{0,127}$/u;
@@ -64,6 +67,7 @@ export function string({
     description,
     minLength = 1,
     maxLength = 4096,
+    maxBytes = Number.MAX_SAFE_INTEGER,
     pattern,
     format,
     optional = false,
@@ -91,6 +95,13 @@ export function string({
             }
             if (value.length < minLength || value.length > maxLength) {
                 fail(pathLabel, `must be ${minLength}..${maxLength} characters`);
+            }
+            const bytes = Buffer.byteLength(value, "utf8");
+            if (bytes > maxBytes) {
+                fail(pathLabel, `must be at most ${maxBytes} UTF-8 bytes`, {
+                    bytes,
+                    maxBytes,
+                });
             }
             if (compiled !== null && !compiled.test(value)) {
                 fail(pathLabel, `must match ${pattern}`);
@@ -449,13 +460,13 @@ const searchPolicyShape = object({
     plateauWindow: integer({
         description: "Consecutive completed non-improving rounds required to detect a plateau.",
         minimum: 1,
-        maximum: 1000,
+        maximum: SEARCH_POLICY_LIMITS.plateauWindow,
         default: DEFAULT_SEARCH_POLICY.plateauWindow,
     }),
     minRoundsBeforePlateau: integer({
         description: "Minimum completed rounds before plateau detection is permitted.",
         minimum: 1,
-        maximum: 100000,
+        maximum: SEARCH_POLICY_LIMITS.minRoundsBeforePlateau,
         default: DEFAULT_SEARCH_POLICY.minRoundsBeforePlateau,
     }),
     plateauMinImprovement: number({
@@ -467,7 +478,7 @@ const searchPolicyShape = object({
     mandatoryEscapeRounds: integer({
         description: "Full escape-phase rounds required after plateau detection.",
         minimum: 1,
-        maximum: 1000,
+        maximum: SEARCH_POLICY_LIMITS.mandatoryEscapeRounds,
         default: DEFAULT_SEARCH_POLICY.mandatoryEscapeRounds,
     }),
     operatorWeights: object({
@@ -479,23 +490,23 @@ const searchPolicyShape = object({
         restart: integer({ minimum: 0, maximum: 1000000, default: DEFAULT_SEARCH_POLICY.operatorWeights.restart }),
     }, { default: DEFAULT_SEARCH_POLICY.operatorWeights }),
     archiveCaps: object({
-        accepted: integer({ minimum: 1, maximum: 100000, default: DEFAULT_SEARCH_POLICY.archiveCaps.accepted }),
-        nearMisses: integer({ minimum: 1, maximum: 100000, default: DEFAULT_SEARCH_POLICY.archiveCaps.nearMisses }),
-        rejected: integer({ minimum: 1, maximum: 100000, default: DEFAULT_SEARCH_POLICY.archiveCaps.rejected }),
-        invalidMetrics: integer({ minimum: 1, maximum: 100000, default: DEFAULT_SEARCH_POLICY.archiveCaps.invalidMetrics }),
-        mechanismGroups: integer({ minimum: 1, maximum: 100000, default: DEFAULT_SEARCH_POLICY.archiveCaps.mechanismGroups }),
-        lessonGroups: integer({ minimum: 1, maximum: 100000, default: DEFAULT_SEARCH_POLICY.archiveCaps.lessonGroups }),
-        duplicateIndex: integer({ minimum: 1, maximum: 100000, default: DEFAULT_SEARCH_POLICY.archiveCaps.duplicateIndex }),
+        accepted: integer({ minimum: 1, maximum: SEARCH_POLICY_LIMITS.archiveCaps.accepted, default: DEFAULT_SEARCH_POLICY.archiveCaps.accepted }),
+        nearMisses: integer({ minimum: 1, maximum: SEARCH_POLICY_LIMITS.archiveCaps.nearMisses, default: DEFAULT_SEARCH_POLICY.archiveCaps.nearMisses }),
+        rejected: integer({ minimum: 1, maximum: SEARCH_POLICY_LIMITS.archiveCaps.rejected, default: DEFAULT_SEARCH_POLICY.archiveCaps.rejected }),
+        invalidMetrics: integer({ minimum: 1, maximum: SEARCH_POLICY_LIMITS.archiveCaps.invalidMetrics, default: DEFAULT_SEARCH_POLICY.archiveCaps.invalidMetrics }),
+        mechanismGroups: integer({ minimum: 1, maximum: SEARCH_POLICY_LIMITS.archiveCaps.mechanismGroups, default: DEFAULT_SEARCH_POLICY.archiveCaps.mechanismGroups }),
+        lessonGroups: integer({ minimum: 1, maximum: SEARCH_POLICY_LIMITS.archiveCaps.lessonGroups, default: DEFAULT_SEARCH_POLICY.archiveCaps.lessonGroups }),
+        duplicateIndex: integer({ minimum: 1, maximum: SEARCH_POLICY_LIMITS.archiveCaps.duplicateIndex, default: DEFAULT_SEARCH_POLICY.archiveCaps.duplicateIndex }),
     }, { default: DEFAULT_SEARCH_POLICY.archiveCaps }),
     promptCaps: object({
         parentEvidenceIds: integer({
             minimum: 1,
-            maximum: 16,
+            maximum: SEARCH_POLICY_LIMITS.promptCaps.parentEvidenceIds,
             default: DEFAULT_SEARCH_POLICY.promptCaps.parentEvidenceIds,
         }),
         promptContextRefs: integer({
             minimum: 1,
-            maximum: 256,
+            maximum: SEARCH_POLICY_LIMITS.promptCaps.promptContextRefs,
             default: DEFAULT_SEARCH_POLICY.promptCaps.promptContextRefs,
         }),
     }, { default: DEFAULT_SEARCH_POLICY.promptCaps }),
@@ -558,7 +569,7 @@ const validationCasesArray = array(validationCaseShape, {
     description:
         "At least one accept and one reject case. Paths are snapshot-staged in an isolated preflight store; symlinks/traversal are refused.",
     minItems: 2,
-    maxItems: 4096,
+    maxItems: CONTRACT_LIMITS.validationCases,
     uniqueBy: "id",
 });
 
@@ -596,6 +607,7 @@ const newInvestigationStartArgs = object({
         objective: string({
             description: "The falsifiable objective under investigation. Part of the deterministic investigationId.",
             maxLength: MAX_OBJECTIVE_CHARACTERS,
+            maxBytes: MAX_OBJECTIVE_BYTES,
         }),
         project_dir: string({
             description: "Absolute local project directory. Validation-case paths must resolve inside it. Part of the deterministic investigationId.",
@@ -627,7 +639,7 @@ const newInvestigationStartArgs = object({
             }),
             {
                 description: "Ranking metrics the harness emits. Order = priority.",
-                maxItems: 4096,
+                maxItems: CONTRACT_LIMITS.metrics,
                 uniqueBy: "key",
                 default: [],
             },
@@ -637,20 +649,20 @@ const newInvestigationStartArgs = object({
             {
                 description: "1..8 distinct worker model ids used to propose candidates.",
                 minItems: 1,
-                maxItems: 8,
+                maxItems: CONTRACT_LIMITS.workerModels,
                 uniqueItems: true,
             },
         ),
         candidates_per_round: integer({
             description: "Candidates generated per search round (1..8).",
             minimum: 1,
-            maximum: 8,
+            maximum: CONTRACT_LIMITS.candidatesPerRound,
         }),
         max_rounds: integer({
             description:
                 "Maximum number of frozen search rounds (>= 1). For certified_impossibility, verification is eligible only after all slots in these rounds have qualifying non-invalidated candidate evidence.",
             minimum: 1,
-            maximum: 100000,
+            maximum: CONTRACT_LIMITS.maxRounds,
         }),
         search_policy: searchPolicyField,
         bounded_candidate_ids: array(
@@ -658,6 +670,7 @@ const newInvestigationStartArgs = object({
             {
                 description: "Optional exhaustive candidate id set for finite_enumerable / bounded_parameterized topologies.",
                 minItems: 1,
+                maxItems: CONTRACT_LIMITS.boundedCandidateIds,
                 uniqueItems: true,
                 optional: true,
             },

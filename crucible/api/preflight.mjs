@@ -20,6 +20,7 @@ import {
 import { assertLocalDatabasePath } from "../persistence/index.mjs";
 import {
     assertPromptContractCoreFits,
+    deriveRunnerExecutionLimits,
     normalizeStartDeadline,
     supervisorPaths,
 } from "../runtime/index.mjs";
@@ -735,14 +736,18 @@ function validateSandboxAvailability(availability, harnessId) {
             },
         );
     }
+    const identity = availability.policyIdentity;
+    if (identity === null
+        || typeof identity !== "object"
+        || Array.isArray(identity)) {
+        throw new SandboxUnavailableApiError(
+            "sandbox availability probe did not return its explicit policy identity",
+            { harnessId },
+        );
+    }
     return Object.freeze({
+        ...identity,
         required: true,
-        available: true,
-        primitive: availability.primitive ?? null,
-        policyId: availability.policyId ?? null,
-        helperSourceHash: availability.helperSourceHash ?? null,
-        helperBinaryHash: availability.helperBinaryHash ?? null,
-        probe: availability.probe ?? null,
     });
 }
 
@@ -814,6 +819,20 @@ function finalizePreflight({
         );
     }
     const contractDigest = contractHash(contract);
+    const executionLimits = deriveRunnerExecutionLimits(contract);
+    if (supervisorConfig.runner.options.maxLoopIterations
+            < executionLimits.maxLoopIterations
+        || supervisorConfig.maxRestarts < executionLimits.maxRestarts) {
+        throw new StartPreflightError(
+            "normalized supervisor budgets are below the frozen contract requirements",
+            {
+                required: executionLimits,
+                maxLoopIterations:
+                    supervisorConfig.runner.options.maxLoopIterations,
+                maxRestarts: supervisorConfig.maxRestarts,
+            },
+        );
+    }
     const existing = inspectExistingInvestigation({
         deps,
         paths,
@@ -847,6 +866,8 @@ function finalizePreflight({
             parserSourceHash: harnessVerification.parserSourceHash,
             sandboxHelperSourceHash: sandbox?.helperSourceHash ?? null,
             sandboxHelperBinaryHash: sandbox?.helperBinaryHash ?? null,
+            sandboxLauncherBinaryHash: sandbox?.launcherBinaryHash ?? null,
+            sandboxLauncherScriptHash: sandbox?.launcherScriptHash ?? null,
         }),
         harnessVerification,
         sandbox,
@@ -880,7 +901,8 @@ export function preflightStartInvestigation(rawArgs, deps) {
     });
     const paths = resolveInvestigationPaths(environment.stateRoot, investigationId);
     const deadline = normalizeDeadline(args, deps);
-    validateContractShape(args, objective);
+    const contractShape = validateContractShape(args, objective);
+    const executionLimits = deriveRunnerExecutionLimits(contractShape.contract);
     const supervisorInput = buildSupervisorConfigInput({
         investigationId,
         stateDir: paths.stateDir,
@@ -889,6 +911,7 @@ export function preflightStartInvestigation(rawArgs, deps) {
         sdkPath: environment.sdkPath,
         cliPath: environment.cliPath,
         deadlineIso: deadline.deadlineIso,
+        executionLimits,
     });
     const supervisorConfig = validateSupervisorAdmission(
         normalizeSupervisor(supervisorInput, deps),
@@ -1128,7 +1151,13 @@ function compensateFailedReattach(plan, adapter, cause) {
 }
 
 function supervisorStartAccepted(supervisor) {
-    return !["not-restarted", "waiting-for-stale-lock"].includes(supervisor?.action);
+    return ["started", "already-running"].includes(supervisor?.action)
+        && supervisor?.acknowledged === true
+        && Number.isSafeInteger(supervisor?.acknowledgement?.supervisorGeneration)
+        && typeof supervisor?.acknowledgement?.runnerIncarnation === "string"
+        && supervisor.acknowledgement.runnerIncarnation.length > 0
+        && typeof supervisor?.acknowledgement?.configFingerprint === "string"
+        && Object.hasOwn(supervisor.acknowledgement, "deadlineMs");
 }
 
 function ensureOwnedInvestigationDirectory(plan) {
@@ -1176,6 +1205,63 @@ export function applyStartPreflight(plan, deps) {
     requireLivePlan(plan);
     const isNew = plan.existing.mode === "new";
     let ownership = null;
+    let repository = null;
+    let adapter = null;
+    let durableApplied = false;
+
+    const closeRepository = () => {
+        if (repository !== null) {
+            repository.close();
+            repository = null;
+            adapter = null;
+        }
+    };
+    const compensate = (cause) => {
+        if (!durableApplied) return;
+        if (adapter !== null) {
+            compensateFailedReattach(plan, adapter, cause);
+            return;
+        }
+        const compensationRepository = deps.openRepository({
+            file: plan.paths.eventsDbPath,
+            env: deps.env,
+        });
+        try {
+            compensateFailedReattach(
+                plan,
+                deps.createDomainRepositoryAdapter({
+                    repository: compensationRepository,
+                    investigationId: plan.investigationId,
+                }),
+                cause,
+            );
+        } finally {
+            compensationRepository.close();
+        }
+    };
+    const fail = (error) => {
+        if (durableApplied) {
+            try {
+                compensate(error);
+            } catch (compensationError) {
+                closeRepository();
+                throw compensationError;
+            }
+        } else {
+            closeRepository();
+            if (isNew && ownership !== null) {
+                cleanupFailedNewApply(plan, ownership);
+            }
+        }
+        closeRepository();
+        if (error instanceof CrucibleApiError) throw error;
+        throw new StartFailedError(
+            `crucible_start apply failed: ${error?.message ?? String(error)}`,
+            { cause: error?.code ?? null },
+            { cause: error },
+        );
+    };
+
     try {
         if (isNew) {
             ownership = ensureOwnedInvestigationDirectory(plan);
@@ -1184,64 +1270,80 @@ export function applyStartPreflight(plan, deps) {
             publishSnapshotStagingPlan(plan, deps);
         }
         fs.mkdirSync(plan.paths.stateDir, { recursive: true });
-        const repository = deps.openRepository({
+        repository = deps.openRepository({
             file: plan.paths.eventsDbPath,
             env: deps.env,
         });
-        let opened;
-        try {
-            const adapter = deps.createDomainRepositoryAdapter({
-                repository,
-                investigationId: plan.investigationId,
-            });
-            opened = applyContractPlan(plan, adapter);
-            let supervisor;
-            try {
-                supervisor = deps.ensureSupervisor(plan.supervisorConfig, {
-                    env: deps.env,
-                    resetOperationalState:
-                        opened.resumed || opened.operationalRecovery !== null,
-                });
-                if (!supervisorStartAccepted(supervisor)) {
-                    throw new StartFailedError(
-                        `supervisor did not accept resume (${supervisor?.reason ?? supervisor?.action ?? "unknown"})`,
-                        {
-                            investigationId: plan.investigationId,
-                            action: supervisor?.action ?? null,
-                            reason: supervisor?.reason ?? null,
-                        },
-                    );
-                }
-            } catch (error) {
-                if (plan.existing.mode === "reattach"
-                    && (opened?.resumed === true
-                        || opened?.operationalRecovery !== null)) {
-                    compensateFailedReattach(plan, adapter, error);
-                }
-                throw error;
+        adapter = deps.createDomainRepositoryAdapter({
+            repository,
+            investigationId: plan.investigationId,
+        });
+        const opened = applyContractPlan(plan, adapter);
+        durableApplied = true;
+        const acceptSupervisor = (supervisor) => {
+            if (!supervisorStartAccepted(supervisor)) {
+                throw new StartFailedError(
+                    `supervisor did not acknowledge the expected runtime authority (${
+                        supervisor?.reason ?? supervisor?.action ?? "unknown"
+                    })`,
+                    {
+                        investigationId: plan.investigationId,
+                        action: supervisor?.action ?? null,
+                        reason: supervisor?.reason ?? null,
+                        acknowledged: supervisor?.acknowledged === true,
+                    },
+                );
             }
             return Object.freeze({ opened, supervisor });
-        } finally {
-            repository.close();
+        };
+        const ensured = deps.ensureSupervisor(plan.supervisorConfig, {
+            env: deps.env,
+            resetOperationalState:
+                opened.resumed || opened.operationalRecovery !== null,
+            requireAcknowledgement: true,
+        });
+        if (isThenable(ensured)) {
+            return Promise.resolve(ensured)
+                .then(acceptSupervisor)
+                .then(
+                    (result) => {
+                        closeRepository();
+                        return result;
+                    },
+                    (error) => fail(error),
+                );
         }
+        const result = acceptSupervisor(ensured);
+        closeRepository();
+        return result;
     } catch (error) {
-        if (isNew && ownership !== null) {
-            cleanupFailedNewApply(plan, ownership);
-        }
-        if (error instanceof CrucibleApiError) throw error;
-        throw new StartFailedError(
-            `crucible_start apply failed: ${error?.message ?? String(error)}`,
-            { cause: error?.code ?? null },
-            { cause: error },
-        );
+        return fail(error);
     }
 }
 
-export function disposeStartPreflight(plan) {
+export function disposeStartPreflight(plan, dependencies = {}) {
     if (!PREFLIGHT_PLANS.has(plan) || DISPOSED_PLANS.has(plan)) {
         return false;
     }
-    cleanupWorkspace(plan.workspace);
+    const removeWorkspace =
+        dependencies.removePreflightWorkspace
+        ?? removePreflightWorkspace;
+    if (plan.workspace !== null) {
+        try {
+            removeWorkspace(plan.workspace);
+        } catch (cleanupError) {
+            throw new StartPreflightError(
+                `preflight cleanup failed: ${
+                    cleanupError?.message ?? String(cleanupError)
+                }`,
+                {
+                    originalCause: null,
+                    cleanupCause: cleanupError?.code ?? null,
+                },
+                { cause: cleanupError },
+            );
+        }
+    }
     DISPOSED_PLANS.add(plan);
     return true;
 }

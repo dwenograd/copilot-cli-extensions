@@ -8,6 +8,7 @@ import {
 import {
     contractHash,
     createInvestigationContract,
+    isSafeDomainIdentifier,
 } from "./contract.mjs";
 import {
     ANNOTATION_LIMITS,
@@ -34,11 +35,6 @@ import {
 import { deriveImpossibilityVerdict } from "./impossibility.mjs";
 import { createInitialAggregate } from "./state.mjs";
 
-const FORBIDDEN_IDENTIFIERS = new Set([
-    "__proto__",
-    "constructor",
-    "prototype",
-]);
 const RECEIPT_FIELDS = Object.freeze([
     "attemptId",
     "candidateArtifactHash",
@@ -90,12 +86,7 @@ function requirePlainObject(value, field) {
 
 export function normalizeEventIdentifier(value, field = "identifier") {
     const identifier = requireString(value, field, 128);
-    if (!/^[A-Za-z0-9][A-Za-z0-9._@-]*$/u.test(identifier)
-        || identifier === "."
-        || identifier === ".."
-        || identifier.endsWith(".")
-        || identifier.includes("..")
-        || FORBIDDEN_IDENTIFIERS.has(identifier.toLowerCase())) {
+    if (!isSafeDomainIdentifier(identifier)) {
         throw new TransitionError(
             ERROR_CODES.INVALID_EVENT,
             `${field} must be a safe identifier, not a filesystem path or prototype key`,
@@ -216,13 +207,28 @@ function normalizeAnnotations(value, maximumCitations = ANNOTATION_LIMITS.citedE
             );
         }
     }
-    const optionalString = (field, maximum) => {
+    const boundedString = (input, field, maximum, maximumBytes) => {
+        const text = requireString(input, field, maximum);
+        if (Buffer.byteLength(text, "utf8") > maximumBytes) {
+            throw new TransitionError(
+                ERROR_CODES.INVALID_EVENT,
+                `${field} exceeds ${maximumBytes} UTF-8 bytes`,
+            );
+        }
+        return text;
+    };
+    const optionalString = (field, maximum, maximumBytes) => {
         if (!Object.hasOwn(value, field)
             || value[field] === undefined
             || value[field] === null) {
             return null;
         }
-        return requireString(value[field], `annotations.${field}`, maximum);
+        return boundedString(
+            value[field],
+            `annotations.${field}`,
+            maximum,
+            maximumBytes,
+        );
     };
     const expectedEffects = Object.hasOwn(value, "expectedEffects")
         ? value.expectedEffects ?? []
@@ -255,18 +261,48 @@ function normalizeAnnotations(value, maximumCitations = ANNOTATION_LIMITS.citedE
             "annotations.citedEvidenceIds must be unique",
         );
     }
-    return {
-        mechanism: optionalString("mechanism", ANNOTATION_LIMITS.mechanismLength),
-        hypothesis: optionalString("hypothesis", ANNOTATION_LIMITS.hypothesisLength),
+    const normalized = {
+        mechanism: optionalString(
+            "mechanism",
+            ANNOTATION_LIMITS.mechanismLength,
+            ANNOTATION_LIMITS.mechanismBytes,
+        ),
+        hypothesis: optionalString(
+            "hypothesis",
+            ANNOTATION_LIMITS.hypothesisLength,
+            ANNOTATION_LIMITS.hypothesisBytes,
+        ),
         expectedEffects: expectedEffects.map((effect, index) =>
-            requireString(
+            boundedString(
                 effect,
                 `annotations.expectedEffects[${index}]`,
                 ANNOTATION_LIMITS.expectedEffectLength,
+                ANNOTATION_LIMITS.expectedEffectBytes,
             )),
         citedEvidenceIds: normalizedCitations,
-        finding: optionalString("finding", ANNOTATION_LIMITS.findingLength),
+        finding: optionalString(
+            "finding",
+            ANNOTATION_LIMITS.findingLength,
+            ANNOTATION_LIMITS.findingBytes,
+        ),
     };
+    const totalBytes = [
+        normalized.mechanism,
+        normalized.hypothesis,
+        normalized.finding,
+        ...normalized.expectedEffects,
+        ...normalized.citedEvidenceIds,
+    ].reduce(
+        (sum, item) => sum + (item === null ? 0 : Buffer.byteLength(item, "utf8")),
+        0,
+    );
+    if (totalBytes > ANNOTATION_LIMITS.totalBytes) {
+        throw new TransitionError(
+            ERROR_CODES.INVALID_EVENT,
+            `annotations exceed ${ANNOTATION_LIMITS.totalBytes} total UTF-8 bytes`,
+        );
+    }
+    return normalized;
 }
 
 function normalizeHarnessReceipt(value, purpose, { command = null, contract = null } = {}) {
@@ -502,17 +538,15 @@ export function normalizeCommandObservedPayload(payload, aggregate = null) {
         sourceKind,
         purpose,
         harnessId: sourceKind === "harness"
-            ? requireString(
+            ? normalizeEventIdentifier(
                 requireOwnField(input, "harnessId", "harnessId"),
                 "harnessId",
-                128,
             )
             : null,
         parserVersion: sourceKind === "harness"
-            ? requireString(
+            ? normalizeEventIdentifier(
                 requireOwnField(input, "parserVersion", "parserVersion"),
                 "parserVersion",
-                128,
             )
             : null,
         receipt,

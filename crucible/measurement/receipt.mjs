@@ -9,6 +9,8 @@
 //   - executableHash / dependencyHashes: verified source-file hashes
 //   - stagedExecutableHash / stagedDependencyHashes: re-hashes of the exact
 //     private copies used for execution
+//   - launchFileBindings   : identities/hashes of every pinned executable,
+//                            dependency, and staged candidate file
 //   - argvHash             : hash of the *concrete* argv passed to spawn
 //   - envHash              : hash of the *concrete* env passed to spawn
 //   - candidateSnapshotHash: hash of the immutable candidate snapshot
@@ -17,19 +19,20 @@
 //   - candidateSnapshotIdentitySummary: stable root/directory/file identities
 //     observed before and after execution
 //   - candidateSnapshotMutationCheck: fail-closed post-run verification status
-//   - stdoutHash / stderrHash: hashes of raw output bytes actually captured
+//   - stdoutHash / stderrHash: hashes of retained raw output bytes
+//   - outputCapture        : per-stream cap, observed/retained byte totals, and
+//                            overflow/truncation state
 //   - parserVersion        : version tag of the parser that produced facts
-//   - sandbox              : enforced capability/provider/policy binding | null
+//   - sandbox              : enforced capability/provider/full policy binding
+//                            (including explicit Job limits) | null
 //   - attemptId / runnerEpochId: caller-supplied stable identifiers
 //   - startedAt / completedAt / durationMs
 //   - exit                 : { code | signal | timedOut }
 //   - parsed               : the normalised harness result (facts)
 //
-// Two runs with identical inputs (same entry, same snapshot, same env, same
-// attemptId, same epoch, same wall-time) produce byte-identical receipts.
-// Callers that need a strict determinism check should elide the timing
-// fields (startedAt/completedAt/durationMs) before hashing; the module
-// exposes RECEIPT_DETERMINISM_KEYS for that purpose.
+// Physical staged-file identities and timing are intentionally per-run.
+// Callers that need a strict input/output determinism check should project the
+// receipt through RECEIPT_DETERMINISM_KEYS before hashing.
 
 import {
     CANONICAL_HASH_ALGORITHM,
@@ -41,7 +44,7 @@ import {
 export const RECEIPT_HASH_ALGORITHM = "sha256:crucible-measurement-receipt-v1";
 export const ARGV_HASH_ALGORITHM = "sha256:crucible-measurement-argv-v1";
 export const ENV_HASH_ALGORITHM = "sha256:crucible-measurement-env-v1";
-export const RECEIPT_VERSION = 3;
+export const RECEIPT_VERSION = 5;
 
 // Keys within the receipt that are input-derived (deterministic given the
 // same inputs). Timing fields are excluded so callers can prove determinism
@@ -57,12 +60,15 @@ export const RECEIPT_DETERMINISM_KEYS = Object.freeze([
     "argvHash",
     "envHash",
     "candidateSnapshotHash",
+    "stagedCandidateSnapshotHash",
+    "stagedCandidateSnapshotClosureHash",
     "candidateSnapshotPreClosureHash",
     "candidateSnapshotPostClosureHash",
     "candidateSnapshotIdentitySummary",
     "candidateSnapshotMutationCheck",
     "stdoutHash",
     "stderrHash",
+    "outputCapture",
     "parserVersion",
     "sandbox",
     "attemptId",
@@ -97,6 +103,56 @@ export function projectDeterministicReceipt(receipt) {
     return immutableCanonical(out);
 }
 
+function normalizeStreamCapture(value, field) {
+    if (value === null || typeof value !== "object" || Array.isArray(value)) {
+        throw new TypeError(`${field} must be an object`);
+    }
+    const capBytes = value.capBytes;
+    const totalObservedBytes = value.totalObservedBytes;
+    const retainedBytes = value.retainedBytes;
+    if (!Number.isSafeInteger(capBytes)
+        || capBytes < 1
+        || !Number.isSafeInteger(totalObservedBytes)
+        || totalObservedBytes < 0
+        || !Number.isSafeInteger(retainedBytes)
+        || retainedBytes < 0
+        || retainedBytes > capBytes
+        || retainedBytes > totalObservedBytes) {
+        throw new TypeError(`${field} byte counters are inconsistent`);
+    }
+    const overflowed = totalObservedBytes > capBytes;
+    const truncated = retainedBytes < totalObservedBytes;
+    if (value.overflowed !== overflowed || value.truncated !== truncated) {
+        throw new TypeError(`${field} overflow/truncation state is inconsistent`);
+    }
+    return {
+        capBytes,
+        totalObservedBytes,
+        retainedBytes,
+        overflowed,
+        truncated,
+    };
+}
+
+function normalizeOutputCapture(value) {
+    if (value === null || typeof value !== "object" || Array.isArray(value)) {
+        throw new TypeError("outputCapture must be an object");
+    }
+    const stdout = normalizeStreamCapture(value.stdout, "outputCapture.stdout");
+    const stderr = normalizeStreamCapture(value.stderr, "outputCapture.stderr");
+    const overflowed = stdout.overflowed || stderr.overflowed;
+    const truncated = stdout.truncated || stderr.truncated;
+    if (value.overflowed !== overflowed || value.truncated !== truncated) {
+        throw new TypeError("outputCapture aggregate state is inconsistent");
+    }
+    return {
+        stdout,
+        stderr,
+        overflowed,
+        truncated,
+    };
+}
+
 // Build the receipt object. All hash-typed fields are algorithm-tagged
 // SHA-256 strings. Timing fields are ISO strings + a numeric duration.
 export function buildMeasurementReceipt(input) {
@@ -116,15 +172,34 @@ export function buildMeasurementReceipt(input) {
             role: d.role,
             sha256: d.sha256,
         })).sort((a, b) => a.path.localeCompare(b.path)),
+        launchFileBindings: [...input.launchFileBindings].map((file) => ({
+            path: file.path,
+            role: file.role,
+            sha256: file.sha256,
+            identity: {
+                dev: file.identity.dev,
+                ino: file.identity.ino,
+                size: file.identity.size,
+                mode: file.identity.mode,
+                mtimeNs: file.identity.mtimeNs,
+                ctimeNs: file.identity.ctimeNs,
+            },
+        })).sort((a, b) => a.path.localeCompare(b.path)),
         argvHash: input.argvHash,
         envHash: input.envHash,
         candidateSnapshotHash: input.candidateSnapshotHash,
+        stagedCandidateSnapshotHash: input.stagedCandidateSnapshotHash,
+        stagedCandidateSnapshotClosureHash:
+            input.stagedCandidateSnapshotClosureHash,
+        stagedCandidateSnapshotIdentitySummary:
+            input.stagedCandidateSnapshotIdentitySummary,
         candidateSnapshotPreClosureHash: input.candidateSnapshotPreClosureHash,
         candidateSnapshotPostClosureHash: input.candidateSnapshotPostClosureHash,
         candidateSnapshotIdentitySummary: input.candidateSnapshotIdentitySummary,
         candidateSnapshotMutationCheck: input.candidateSnapshotMutationCheck,
         stdoutHash: input.stdoutHash,
         stderrHash: input.stderrHash,
+        outputCapture: normalizeOutputCapture(input.outputCapture),
         parserVersion: input.parserVersion,
         sandbox: input.sandbox === null
             ? null
@@ -135,6 +210,8 @@ export function buildMeasurementReceipt(input) {
                 providerVersion: input.sandbox.providerVersion,
                 policyId: input.sandbox.policyId,
                 policyDigest: input.sandbox.policyDigest,
+                policyIdentity: input.sandbox.policyIdentity,
+                policy: input.sandbox.policy,
                 capabilityId: input.sandbox.capabilityId,
                 launchPath: input.sandbox.launchPath,
                 capabilityLaunchUsed: input.sandbox.capabilityLaunchUsed,

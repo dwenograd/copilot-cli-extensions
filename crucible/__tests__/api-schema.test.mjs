@@ -10,7 +10,9 @@ import { describe, expect, it } from "vitest";
 
 import { SchemaValidationError } from "../api/schema.mjs";
 import {
+    CONTRACT_LIMITS,
     DEFAULT_SEARCH_POLICY,
+    SEARCH_POLICY_LIMITS,
 } from "../domain/index.mjs";
 import {
     PUBLIC_TOOL_NAMES,
@@ -269,6 +271,14 @@ describe("crucible API schema (single source)", () => {
             .toThrow(SchemaValidationError);
         expect(() => crucibleStartSpec.parse(validStartArgs({ candidates_per_round: 2.5 })))
             .toThrow(SchemaValidationError);
+        expect(() => crucibleStartSpec.parse(validStartArgs({
+            candidates_per_round: 8,
+            max_rounds: 100000,
+        }))).toThrow(SchemaValidationError);
+        expect(() => crucibleStartSpec.parse(validStartArgs({
+            candidates_per_round: CONTRACT_LIMITS.candidatesPerRound,
+            max_rounds: CONTRACT_LIMITS.maxRounds,
+        }))).not.toThrow();
     });
 
     it("rejects a harness_id that looks like a filesystem path", () => {
@@ -283,10 +293,14 @@ describe("crucible API schema (single source)", () => {
     });
 
     it("aligns objective/predicate/deadline limits with preflight", () => {
-        expect(crucibleStartSpec.parameters.properties.objective.maxLength).toBe(4096);
+        expect(crucibleStartSpec.parameters.properties.objective.maxLength)
+            .toBe(CONTRACT_LIMITS.objectiveCharacters);
         expect(crucibleStartSpec.parameters.properties.deadline_iso.format).toBe("date-time");
         expect(() => crucibleStartSpec.parse(validStartArgs({
-            objective: "x".repeat(4097),
+            objective: "x".repeat(CONTRACT_LIMITS.objectiveCharacters + 1),
+        }))).toThrow(SchemaValidationError);
+        expect(() => crucibleStartSpec.parse(validStartArgs({
+            objective: "😀".repeat(600),
         }))).toThrow(SchemaValidationError);
         expect(() => crucibleStartSpec.parse(validStartArgs({
             acceptance_predicate: {
@@ -297,6 +311,36 @@ describe("crucible API schema (single source)", () => {
         }))).toThrow(SchemaValidationError);
         expect(() => crucibleStartSpec.parse(validStartArgs({
             deadline_iso: "2026-07-10",
+        }))).toThrow(SchemaValidationError);
+    });
+
+    it("bounds metrics, archive entries, prompt references, and bounded ids", () => {
+        expect(() => crucibleStartSpec.parse(validStartArgs({
+            metrics: Array.from({ length: CONTRACT_LIMITS.metrics + 1 }, (_unused, index) => ({
+                key: `metric-${index}`,
+                direction: "max",
+            })),
+        }))).toThrow(SchemaValidationError);
+        expect(() => crucibleStartSpec.parse(validStartArgs({
+            search_policy: {
+                archiveCaps: {
+                    accepted: SEARCH_POLICY_LIMITS.archiveCaps.accepted + 1,
+                },
+            },
+        }))).toThrow(SchemaValidationError);
+        expect(() => crucibleStartSpec.parse(validStartArgs({
+            search_policy: {
+                promptCaps: {
+                    promptContextRefs:
+                        SEARCH_POLICY_LIMITS.promptCaps.promptContextRefs + 1,
+                },
+            },
+        }))).toThrow(SchemaValidationError);
+        expect(() => crucibleStartSpec.parse(validStartArgs({
+            bounded_candidate_ids: Array.from(
+                { length: CONTRACT_LIMITS.boundedCandidateIds + 1 },
+                (_unused, index) => `candidate-${index}`,
+            ),
         }))).toThrow(SchemaValidationError);
     });
 

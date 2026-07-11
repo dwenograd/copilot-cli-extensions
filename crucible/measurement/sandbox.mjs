@@ -11,6 +11,10 @@ import fs from "node:fs";
 import path from "node:path";
 
 import {
+    canonicalEqual,
+    immutableCanonical,
+} from "../domain/canonical.mjs";
+import {
     MEASUREMENT_ERROR_CODES,
     MeasurementError,
     SandboxCapabilityError,
@@ -18,7 +22,7 @@ import {
 
 const SAFE_ID = /^[a-z0-9][a-z0-9._-]{0,127}$/u;
 const HASH_TAG = /^sha256:[a-z0-9][a-z0-9._-]*:[a-f0-9]{64}$/u;
-const CAPABILITY_KEYS = Object.freeze([
+const CAPABILITY_REQUIRED_KEYS = Object.freeze([
     "capabilityId",
     "cleanup",
     "launch",
@@ -26,6 +30,25 @@ const CAPABILITY_KEYS = Object.freeze([
     "policyDigest",
     "policyId",
     "terminate",
+]);
+const CAPABILITY_ALLOWED_KEYS = new Set([
+    ...CAPABILITY_REQUIRED_KEYS,
+    "policy",
+    "policyIdentity",
+]);
+const LAUNCH_FILE_KEYS = Object.freeze([
+    "identity",
+    "path",
+    "role",
+    "sha256",
+]);
+const FILE_IDENTITY_KEYS = Object.freeze([
+    "ctimeNs",
+    "dev",
+    "ino",
+    "mode",
+    "mtimeNs",
+    "size",
 ]);
 const CAPABILITY_CONSTRUCTION_KEY = Object.freeze({});
 const PROVIDER_RECORDS = new WeakMap();
@@ -160,6 +183,99 @@ function rootsEqual(left, right) {
         && left.every((root, index) => samePath(root, right[index]));
 }
 
+function normalizeLaunchFiles(value, roots, field, { optional = false } = {}) {
+    if (value === undefined && optional) return null;
+    if (!Array.isArray(value) || value.length === 0 || value.length > 8192) {
+        throw capabilityError(
+            MEASUREMENT_ERROR_CODES.SANDBOX_CAPABILITY_BINDING,
+            `${field} must be a non-empty array of at most 8192 files`,
+        );
+    }
+    const seen = new Set();
+    const files = value.map((item, index) => {
+        if (item === null || typeof item !== "object" || Array.isArray(item)) {
+            throw capabilityError(
+                MEASUREMENT_ERROR_CODES.SANDBOX_CAPABILITY_BINDING,
+                `${field}[${index}] must be an object`,
+            );
+        }
+        const keys = Object.keys(item).sort();
+        if (keys.length !== LAUNCH_FILE_KEYS.length
+            || keys.some((key, keyIndex) => key !== LAUNCH_FILE_KEYS[keyIndex])) {
+            throw capabilityError(
+                MEASUREMENT_ERROR_CODES.SANDBOX_CAPABILITY_BINDING,
+                `${field}[${index}] has an invalid shape`,
+                { keys },
+            );
+        }
+        const resolved = requirePathInsideRoots(
+            item.path,
+            roots,
+            `${field}[${index}].path`,
+        );
+        const key = process.platform === "win32"
+            ? resolved.toLowerCase()
+            : resolved;
+        if (seen.has(key)) {
+            throw capabilityError(
+                MEASUREMENT_ERROR_CODES.SANDBOX_CAPABILITY_BINDING,
+                `${field} contains a duplicate file`,
+                { path: resolved },
+            );
+        }
+        seen.add(key);
+        if (typeof item.role !== "string"
+            || item.role.length === 0
+            || item.role.length > 128) {
+            throw capabilityError(
+                MEASUREMENT_ERROR_CODES.SANDBOX_CAPABILITY_BINDING,
+                `${field}[${index}].role is invalid`,
+            );
+        }
+        const sha256 = validateTaggedHash(
+            item.sha256,
+            `${field}[${index}].sha256`,
+        );
+        if (item.identity === null
+            || typeof item.identity !== "object"
+            || Array.isArray(item.identity)) {
+            throw capabilityError(
+                MEASUREMENT_ERROR_CODES.SANDBOX_CAPABILITY_BINDING,
+                `${field}[${index}].identity is invalid`,
+            );
+        }
+        const identityKeys = Object.keys(item.identity).sort();
+        if (identityKeys.length !== FILE_IDENTITY_KEYS.length
+            || identityKeys.some((identityKey, identityIndex) =>
+                identityKey !== FILE_IDENTITY_KEYS[identityIndex])) {
+            throw capabilityError(
+                MEASUREMENT_ERROR_CODES.SANDBOX_CAPABILITY_BINDING,
+                `${field}[${index}].identity has an invalid shape`,
+                { keys: identityKeys },
+            );
+        }
+        const identity = {};
+        for (const identityKey of FILE_IDENTITY_KEYS) {
+            const identityValue = item.identity[identityKey];
+            if (typeof identityValue !== "string"
+                || !/^\d+$/u.test(identityValue)) {
+                throw capabilityError(
+                    MEASUREMENT_ERROR_CODES.SANDBOX_CAPABILITY_BINDING,
+                    `${field}[${index}].identity.${identityKey} is invalid`,
+                );
+            }
+            identity[identityKey] = identityValue;
+        }
+        return {
+            path: resolved,
+            role: item.role,
+            sha256,
+            identity,
+        };
+    }).sort((left, right) => comparePath(left.path, right.path));
+    return immutableCanonical(files);
+}
+
 function pathInsideRoot(candidate, root) {
     const relative = path.relative(root, candidate);
     return relative === ""
@@ -239,6 +355,12 @@ function normalizeAdmissionRequest(request) {
         request.stagedRoots,
         "SandboxProvider request.stagedRoots",
     );
+    const launchFiles = normalizeLaunchFiles(
+        request.launch?.launchFiles,
+        stagedRoots,
+        "SandboxProvider request.launch.launchFiles",
+        { optional: true },
+    );
     return Object.freeze({
         attemptId,
         runnerEpochId,
@@ -248,7 +370,12 @@ function normalizeAdmissionRequest(request) {
         stagedRoots,
         executesCandidateCode: true,
         requestedLaunchPath: "sandbox-capability",
-        launch: request.launch,
+        launch: request.launch === null || typeof request.launch !== "object"
+            ? request.launch
+            : Object.freeze({
+                ...request.launch,
+                ...(launchFiles === null ? {} : { launchFiles }),
+            }),
     });
 }
 
@@ -260,12 +387,18 @@ function normalizeCapabilitySpec(spec, provider, providerRecord, request, admiss
         );
     }
     const keys = Object.keys(spec).sort();
-    if (keys.length !== CAPABILITY_KEYS.length
-        || keys.some((key, index) => key !== CAPABILITY_KEYS[index])) {
+    const missing = CAPABILITY_REQUIRED_KEYS.filter((key) => !Object.hasOwn(spec, key));
+    const unknown = keys.filter((key) => !CAPABILITY_ALLOWED_KEYS.has(key));
+    if (missing.length > 0 || unknown.length > 0) {
         throw capabilityError(
             MEASUREMENT_ERROR_CODES.SANDBOX_CAPABILITY_INVALID,
             "Sandbox capability issuance has an invalid shape",
-            { expectedKeys: CAPABILITY_KEYS, actualKeys: keys },
+            {
+                requiredKeys: CAPABILITY_REQUIRED_KEYS,
+                missing,
+                unknown,
+                actualKeys: keys,
+            },
         );
     }
     const capabilityId = validateSafeId(
@@ -279,6 +412,20 @@ function normalizeCapabilitySpec(spec, provider, providerRecord, request, admiss
         MEASUREMENT_ERROR_CODES.SANDBOX_CAPABILITY_INVALID,
     );
     const policyDigest = validateTaggedHash(spec.policyDigest, "Sandbox policyDigest");
+    const defaultPolicyIdentity = {
+        providerId: providerRecord.providerId,
+        providerVersion: providerRecord.providerVersion,
+        policyId,
+    };
+    const policyIdentity = immutableCanonical(
+        spec.policyIdentity ?? defaultPolicyIdentity,
+    );
+    const policy = immutableCanonical(
+        spec.policy ?? {
+            version: 1,
+            identity: policyIdentity,
+        },
+    );
     const permittedStagedRoots = normalizeRootList(
         spec.permittedStagedRoots,
         "Sandbox permittedStagedRoots",
@@ -315,7 +462,10 @@ function normalizeCapabilitySpec(spec, provider, providerRecord, request, admiss
         capabilityId,
         policyId,
         policyDigest,
+        policyIdentity,
+        policy,
         permittedStagedRoots,
+        launchFiles: request.launch?.launchFiles ?? null,
         launchController: spec.launch,
         terminateController: spec.terminate,
         cleanupController: spec.cleanup,
@@ -619,6 +769,8 @@ export function describeSandboxCapability(capability, expected) {
         providerVersion: record.providerVersion,
         policyId: record.policyId,
         policyDigest: record.policyDigest,
+        policyIdentity: record.policyIdentity,
+        policy: record.policy,
         capabilityId: record.capabilityId,
         launchPath: "sandbox-capability",
         capabilityLaunchUsed: record.launchUsed,
@@ -685,6 +837,24 @@ export async function launchSandboxCapability(capability, expected, launchInput)
             record.permittedStagedRoots,
             `Sandbox launch stagedPaths[${index}]`,
         ));
+    const launchFiles = normalizeLaunchFiles(
+        launchInput.launchFiles,
+        record.permittedStagedRoots,
+        "Sandbox launch launchFiles",
+        { optional: record.launchFiles === null },
+    );
+    if (record.launchFiles !== null
+        && (launchFiles === null
+            || !canonicalEqual(launchFiles, record.launchFiles))) {
+        throw capabilityError(
+            MEASUREMENT_ERROR_CODES.SANDBOX_CAPABILITY_BINDING,
+            "Sandbox launch file binding changed after admission",
+            {
+                expected: record.launchFiles,
+                actual: launchFiles,
+            },
+        );
+    }
 
     record.state = "launching";
     const request = Object.freeze({
@@ -692,6 +862,8 @@ export async function launchSandboxCapability(capability, expected, launchInput)
         providerVersion: record.providerVersion,
         policyId: record.policyId,
         policyDigest: record.policyDigest,
+        policyIdentity: record.policyIdentity,
+        policy: record.policy,
         capabilityId: record.capabilityId,
         attemptId: record.attemptId,
         runnerEpochId: record.runnerEpochId,
@@ -700,6 +872,7 @@ export async function launchSandboxCapability(capability, expected, launchInput)
         candidateSnapshotHash: record.candidateSnapshotHash,
         permittedStagedRoots: Object.freeze([...record.permittedStagedRoots]),
         stagedPaths: Object.freeze(stagedPaths),
+        launchFiles,
         executable,
         argv: Object.freeze([...launchInput.argv]),
         options: Object.freeze({

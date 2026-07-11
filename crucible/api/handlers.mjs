@@ -149,16 +149,51 @@ function summarizeSupervisorAction(result) {
         action: result.action ?? "ensured",
         pid: result.pid ?? result.status?.childPid ?? result.status?.pid ?? null,
         status_state: result.status?.state ?? null,
+        acknowledged: result.acknowledged === true,
+        supervisor_generation:
+            result.acknowledgement?.supervisorGeneration ?? null,
+        runner_incarnation:
+            result.acknowledgement?.runnerIncarnation ?? null,
+        config_fingerprint:
+            result.acknowledgement?.configFingerprint ?? null,
+        deadline_ms:
+            result.acknowledgement?.deadlineMs ?? null,
     };
 }
 
 export function startInvestigation(args, deps) {
     const apply = (plan) => {
-        try {
-            const { opened, supervisor } = applyStartPreflight(plan, deps);
+        const cleanupBeforeFailure = (error) => {
+            try {
+                disposeStartPreflight(plan, deps);
+            } catch (cleanupError) {
+                deps.log?.(
+                    `[crucible] crucible_start pre-success cleanup also failed: ${
+                    cleanupError?.message ?? String(cleanupError)
+                    }`,
+                );
+            }
+            throw error;
+        };
+        const finish = ({ opened, supervisor }) => {
+            const supervisorSummary = summarizeSupervisorAction(supervisor);
+            let cleanupWarning = null;
+            try {
+                disposeStartPreflight(plan, deps);
+            } catch (cleanupError) {
+                cleanupWarning = {
+                    code: cleanupError?.code ?? null,
+                    cause_code: cleanupError?.details?.cleanupCause ?? null,
+                    message: cleanupError?.message ?? String(cleanupError),
+                };
+                deps.log?.(
+                    `[crucible] crucible_start ${plan.investigationId} durable start succeeded, `
+                    + `but preflight cleanup failed: ${cleanupWarning.message}`,
+                );
+            }
             deps.log?.(
                 `[crucible] crucible_start ${plan.investigationId} (${opened.idempotent ? "idempotent" : "new"}); `
-                + `supervisor=${summarizeSupervisorAction(supervisor).action}`,
+                + `supervisor=${supervisorSummary.action}`,
             );
             return {
                 is_result: false,
@@ -172,16 +207,27 @@ export function startInvestigation(args, deps) {
                 status_path: plan.supervisorConfig.paths.statusPath,
                 events_db_path: plan.paths.eventsDbPath,
                 artifact_root: plan.paths.artifactRoot,
-                supervisor: summarizeSupervisorAction(supervisor),
+                supervisor: supervisorSummary,
+                ...(cleanupWarning === null
+                    ? {}
+                    : { cleanup_warning: cleanupWarning }),
                 message: plan.kind === "reattach"
-                    ? "Persisted investigation reattached by id; frozen contract/config/snapshots were verified and the supervisor was ensured. Poll crucible_status."
+                    ? "Persisted investigation reattached by id; frozen contract/config/snapshots and the acknowledged supervisor authority were verified. Poll crucible_status."
                     : opened.idempotent
-                        ? "Investigation already open with an identical contract; re-attached and ensured supervisor. Poll crucible_status."
-                    : "Investigation started. Poll crucible_status; only crucible_result may report a terminal decision.",
+                    ? "Investigation already open with an identical contract; re-attached to an acknowledged supervisor. Poll crucible_status."
+                    : "Investigation started with an acknowledged supervisor. Poll crucible_status; only crucible_result may report a terminal decision.",
             };
-        } finally {
-            disposeStartPreflight(plan);
+        };
+
+        let applied;
+        try {
+            applied = applyStartPreflight(plan, deps);
+        } catch (error) {
+            return cleanupBeforeFailure(error);
         }
+        return applied !== null && typeof applied?.then === "function"
+            ? Promise.resolve(applied).then(finish, cleanupBeforeFailure)
+            : finish(applied);
     };
     const preflight = preflightStartInvestigation(args, deps);
     return preflight !== null && typeof preflight?.then === "function"
@@ -382,9 +428,15 @@ export function statusInvestigation(args, deps) {
         };
     }
     const { aggregate, operationalNonResult } = verifiedRead.read;
+    if (aggregate.terminal !== null) {
+        return {
+            is_result: false,
+            investigation_id: investigationId,
+            terminal_available: true,
+        };
+    }
 
     const recommendation = aggregate.contract === null
-        || aggregate.terminal !== null
         || aggregate.pause !== null
         || aggregate.nonResults.length > 0
         || operationalNonResult !== null
@@ -417,7 +469,7 @@ export function statusInvestigation(args, deps) {
         is_result: false,
         investigation_id: investigationId,
         integrity_blocked: false,
-        terminal_available: aggregate.terminal !== null,
+        terminal_available: false,
         non_result: aggregate.nonResults.length > 0 || operationalNonResult !== null,
         non_result_code:
             operationalNonResult?.payload?.code
@@ -428,11 +480,13 @@ export function statusInvestigation(args, deps) {
         progress: buildProgress(aggregate),
         supervisor_health: { ...health, ensure_action: ensureAction },
         next_recommendation: recommendation,
-        note: aggregate.terminal !== null
-            ? "A terminal decision is recorded — call crucible_result to obtain it."
-            : operationalNonResult !== null
+        note: operationalNonResult !== null
                 ? "An operational non-result is recorded; reattach by investigation_id with any required recovery inputs."
-            : "In progress or paused. This status is not a result.",
+                : aggregate.nonResults.length > 0
+                    ? `A persisted non-result (${aggregate.nonResults.at(-1)?.code ?? "unknown"}) is recorded; this status is not a result.`
+                    : aggregate.pause !== null
+                        ? "The investigation is paused and resumable; this status is not a result."
+                        : "The investigation is in progress; this status is not a result.",
     };
 }
 

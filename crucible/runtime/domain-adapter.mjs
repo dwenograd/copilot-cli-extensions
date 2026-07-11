@@ -82,10 +82,15 @@ const MEASUREMENT_RECEIPT_KEYS = Object.freeze([
     "executableHash",
     "exit",
     "harnessEntryHash",
+    "launchFileBindings",
+    "outputCapture",
     "parsed",
     "parserVersion",
     "runnerEpochId",
     "sandbox",
+    "stagedCandidateSnapshotClosureHash",
+    "stagedCandidateSnapshotHash",
+    "stagedCandidateSnapshotIdentitySummary",
     "stagedDependencyHashes",
     "stagedExecutableHash",
     "startedAt",
@@ -153,11 +158,45 @@ function normalizedDependencies(items) {
         ));
 }
 
+function receiptHasCompleteOutput(receipt) {
+    const capture = receipt?.outputCapture;
+    if (capture === null
+        || typeof capture !== "object"
+        || capture.overflowed !== false
+        || capture.truncated !== false) {
+        return false;
+    }
+    return ["stdout", "stderr"].every((stream) => {
+        const value = capture[stream];
+        return value !== null
+            && typeof value === "object"
+            && Number.isSafeInteger(value.capBytes)
+            && value.capBytes > 0
+            && Number.isSafeInteger(value.totalObservedBytes)
+            && value.totalObservedBytes >= 0
+            && value.retainedBytes === value.totalObservedBytes
+            && value.retainedBytes <= value.capBytes
+            && value.overflowed === false
+            && value.truncated === false;
+    });
+}
+
 function receiptBindsExecutedBytes(receipt, snapshotHash) {
     const identity = receipt?.candidateSnapshotIdentitySummary;
+    const stagedIdentity = receipt?.stagedCandidateSnapshotIdentitySummary;
     const mutation = receipt?.candidateSnapshotMutationCheck;
     return receipt?.version === RECEIPT_VERSION
         && receipt.candidateSnapshotHash === snapshotHash
+        && receipt.stagedCandidateSnapshotHash === snapshotHash
+        && SNAPSHOT_CLOSURE_HASH_RE.test(
+            receipt.stagedCandidateSnapshotClosureHash ?? "",
+        )
+        && stagedIdentity !== null
+        && typeof stagedIdentity === "object"
+        && Array.isArray(receipt.launchFileBindings)
+        && receipt.launchFileBindings.some((file) =>
+            file?.role === "candidate"
+            && typeof file?.sha256 === "string")
         && SNAPSHOT_CLOSURE_HASH_RE.test(receipt.candidateSnapshotPreClosureHash ?? "")
         && receipt.candidateSnapshotPreClosureHash === receipt.candidateSnapshotPostClosureHash
         && identity !== null
@@ -170,6 +209,7 @@ function receiptBindsExecutedBytes(receipt, snapshotHash) {
         && mutation.identityStable === true
         && mutation.openHandleRehashStable === true
         && mutation.reparseStable === true
+        && receiptHasCompleteOutput(receipt)
         && receipt.executableHash === receipt.stagedExecutableHash
         && canonicalEqual(
             dependencyIdentity(receipt.dependencyHashes),
@@ -179,6 +219,11 @@ function receiptBindsExecutedBytes(receipt, snapshotHash) {
 
 function snapshotExecutionHash(receipt) {
     return hashCanonical({
+        stagedCandidateSnapshotHash: receipt.stagedCandidateSnapshotHash,
+        stagedCandidateSnapshotClosureHash:
+            receipt.stagedCandidateSnapshotClosureHash,
+        stagedCandidateSnapshotIdentitySummary:
+            receipt.stagedCandidateSnapshotIdentitySummary,
         candidateSnapshotPreClosureHash: receipt.candidateSnapshotPreClosureHash,
         candidateSnapshotPostClosureHash: receipt.candidateSnapshotPostClosureHash,
         candidateSnapshotIdentitySummary: receipt.candidateSnapshotIdentitySummary,
@@ -633,7 +678,9 @@ function verifyMeasurementArtifactClosure(
     const stdout = reader.read(measurement.rawStdoutArtifact, `${label} raw stdout`);
     const stderr = reader.read(measurement.rawStderrArtifact, `${label} raw stderr`);
     if (sha256Bytes(stdout.bytes, STREAM_HASH_ALGORITHM) !== measurement.rawStdoutHash
-        || sha256Bytes(stderr.bytes, STREAM_HASH_ALGORITHM) !== measurement.rawStderrHash) {
+        || sha256Bytes(stderr.bytes, STREAM_HASH_ALGORITHM) !== measurement.rawStderrHash
+        || receipt.outputCapture.stdout.retainedBytes !== stdout.bytes.length
+        || receipt.outputCapture.stderr.retainedBytes !== stderr.bytes.length) {
         integrityFailure("Raw output artifact bytes disagree with the full measurement receipt", {
             label,
         });
@@ -1046,8 +1093,14 @@ export class DomainRepositoryAdapter {
     #repository;
     #investigationId;
     #operationalInvestigationId;
+    #beforeCasAttempt;
 
-    constructor({ repository, investigationId, ensure = true } = {}) {
+    constructor({
+        repository,
+        investigationId,
+        ensure = true,
+        beforeCasAttempt = null,
+    } = {}) {
         if (repository === null
             || typeof repository !== "object"
             || typeof repository.appendEvents !== "function"
@@ -1061,7 +1114,11 @@ export class DomainRepositoryAdapter {
             || typeof repository.getInlineArtifact !== "function") {
             throw new RuntimeConfigError("repository must be an EventRepository");
         }
+        if (beforeCasAttempt !== null && typeof beforeCasAttempt !== "function") {
+            throw new RuntimeConfigError("beforeCasAttempt must be a function or null");
+        }
         this.#repository = repository;
+        this.#beforeCasAttempt = beforeCasAttempt;
         this.#investigationId = requireIdentifier(investigationId, "investigationId");
         this.#operationalInvestigationId =
             `${this.#investigationId}${OPERATIONAL_INVESTIGATION_SUFFIX}`;
@@ -1331,6 +1388,11 @@ export class DomainRepositoryAdapter {
         }
         let boundDomainFactHash = expectedDomainFactHash;
         for (let attempt = 0; attempt <= maxCasRetries; attempt += 1) {
+            this.#beforeCasAttempt?.(Object.freeze({
+                attempt,
+                maxCasRetries,
+                fenced: attemptTransition !== null,
+            }));
             if (attemptTransition !== null) {
                 this.#repository.assertAttemptAuthority({
                     authorityInvestigationId:
@@ -1417,6 +1479,27 @@ export class DomainRepositoryAdapter {
         return this.appendFromFactory((aggregate) => {
             if (aggregate.pause === null) return null;
             return constructInvestigationResumedEvent(aggregate);
+        });
+    }
+
+    resumeInvestigationFenced({
+        attemptId,
+        command,
+        lease,
+        expectedDomainFactHash = null,
+    } = {}) {
+        return this.appendFromFactory((aggregate) => {
+            if (aggregate.pause === null) return null;
+            return constructInvestigationResumedEvent(aggregate);
+        }, {
+            attemptTransition: this.#attemptTransition({
+                attemptId,
+                command,
+                lease,
+                fromState: "observed",
+                toState: "committed",
+            }),
+            expectedDomainFactHash,
         });
     }
 
@@ -1624,6 +1707,7 @@ export class DomainRepositoryAdapter {
         requirePlainObject(lease, "lease");
         const attempts = this.#repository.listCommandAttempts(this.#investigationId);
         const abandoned = [];
+        const uncertain = [];
         let uncertainDispatched = 0;
         for (const attempt of attempts) {
             if (attempt.state === "committed"
@@ -1633,6 +1717,10 @@ export class DomainRepositoryAdapter {
             }
             if (attempt.state === "dispatched" || attempt.state === "observed") {
                 uncertainDispatched += 1;
+                uncertain.push(Object.freeze({
+                    ...attempt,
+                    previousState: attempt.state,
+                }));
             }
             abandoned.push(this.#repository.abandonStaleCommand({
                 investigationId: this.#investigationId,
@@ -1648,6 +1736,7 @@ export class DomainRepositoryAdapter {
             abandoned: Object.freeze(abandoned),
             abandonedCount: abandoned.length,
             uncertainDispatched,
+            uncertain: Object.freeze(uncertain),
         });
     }
 

@@ -749,20 +749,20 @@ function adapterRows(adapter, method, fallback, db, check) {
 }
 
 export function verifyDatabaseIntegrity(db, { adapter = undefined } = {}) {
-    const quickRows = adapterRows(
+    const integrityRows = adapterRows(
         adapter,
-        "quickCheck",
-        (database) => database.prepare("PRAGMA quick_check;").all(),
+        "integrityCheck",
+        (database) => database.prepare("PRAGMA integrity_check;").all(),
         db,
-        "quick_check",
+        "integrity_check",
     );
-    const quickOk = Array.isArray(quickRows)
-        && quickRows.length === 1
-        && String(Object.values(quickRows[0] ?? {})[0] ?? "") === "ok";
-    if (!quickOk) {
+    const integrityOk = Array.isArray(integrityRows)
+        && integrityRows.length === 1
+        && String(Object.values(integrityRows[0] ?? {})[0] ?? "") === "ok";
+    if (!integrityOk) {
         throw new DatabaseIntegrityError(
-            "SQLite quick_check did not return exactly one 'ok' row",
-            { check: "quick_check", rows: quickRows },
+            "SQLite integrity_check did not return exactly one 'ok' row",
+            { check: "integrity_check", rows: integrityRows },
         );
     }
 
@@ -779,7 +779,7 @@ export function verifyDatabaseIntegrity(db, { adapter = undefined } = {}) {
             { check: "foreign_key_check", rows: foreignKeyRows },
         );
     }
-    return { quickCheck: "ok", foreignKeyViolations: 0 };
+    return { integrityCheck: "ok", foreignKeyViolations: 0 };
 }
 
 function validateLegacyEventLog(db) {

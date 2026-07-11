@@ -23,6 +23,8 @@ import {
 
 export const SUBMIT_CANDIDATE_TOOL_NAME = "crucible_submit_candidate";
 export const READ_PARENT_ARTIFACT_TOOL_NAME = "crucible_read_parent_artifact";
+export const MAX_TRUSTED_OPERATOR_CONTEXT_BYTES = 2048;
+export const MAX_PROPOSAL_PROMPT_BYTES = 32 * 1024;
 
 export const DEFAULT_CANDIDATE_LIMITS = Object.freeze({
     maxFiles: 32,
@@ -180,17 +182,30 @@ function validateAnnotations(value, options) {
         value.mechanism,
         "annotations.mechanism",
         ANNOTATION_LIMITS.mechanismLength,
-        limits.maxMechanismBytes,
+        Math.min(limits.maxMechanismBytes, ANNOTATION_LIMITS.mechanismBytes),
     );
 
-    const optional = (field, maxLength) => {
+    const optional = (field, maxLength, maxBytes) => {
         if (value[field] === undefined || value[field] === null) {
             return null;
         }
-        return boundedAnnotationText(value[field], `annotations.${field}`, maxLength);
+        return boundedAnnotationText(
+            value[field],
+            `annotations.${field}`,
+            maxLength,
+            maxBytes,
+        );
     };
-    const hypothesis = optional("hypothesis", ANNOTATION_LIMITS.hypothesisLength);
-    const finding = optional("finding", ANNOTATION_LIMITS.findingLength);
+    const hypothesis = optional(
+        "hypothesis",
+        ANNOTATION_LIMITS.hypothesisLength,
+        ANNOTATION_LIMITS.hypothesisBytes,
+    );
+    const finding = optional(
+        "finding",
+        ANNOTATION_LIMITS.findingLength,
+        ANNOTATION_LIMITS.findingBytes,
+    );
 
     const rawEffects = value.expectedEffects ?? [];
     if (!Array.isArray(rawEffects) || rawEffects.length > ANNOTATION_LIMITS.expectedEffectCount) {
@@ -204,6 +219,7 @@ function validateAnnotations(value, options) {
             effect,
             `annotations.expectedEffects[${index}]`,
             ANNOTATION_LIMITS.expectedEffectLength,
+            ANNOTATION_LIMITS.expectedEffectBytes,
         ));
 
     const rawCitations = value.citedEvidenceIds ?? [];
@@ -239,13 +255,20 @@ function validateAnnotations(value, options) {
         );
     }
 
-    return {
+    const normalized = {
         mechanism,
         hypothesis,
         expectedEffects,
         citedEvidenceIds,
         finding,
     };
+    if (annotationBytes(normalized) > ANNOTATION_LIMITS.totalBytes) {
+        throw protocolError(
+            RUNTIME_ERROR_CODES.WORKER_INVALID_CANDIDATE,
+            `annotations exceed ${ANNOTATION_LIMITS.totalBytes} total UTF-8 bytes`,
+        );
+    }
+    return normalized;
 }
 
 function normalizeRelativeFilePath(rawPath, limits) {
@@ -603,6 +626,13 @@ export function buildProposalPrompt({
     const resolvedOperator = operator ?? promptContext?.assignment?.operator ?? null;
     const nonce = dataNonce
         ?? untrustedDataNonce({ challengeNonce, contextHash: contextHash ?? null, candidateId });
+    if (trustedOperatorContext !== null
+        && Buffer.byteLength(String(trustedOperatorContext), "utf8")
+            > MAX_TRUSTED_OPERATOR_CONTEXT_BYTES) {
+        throw new RuntimeConfigError(
+            `trustedOperatorContext must not exceed ${MAX_TRUSTED_OPERATOR_CONTEXT_BYTES} UTF-8 bytes`,
+        );
+    }
 
     const lines = [
         "You are a Crucible search/diversity worker.",
@@ -689,7 +719,15 @@ export function buildProposalPrompt({
         "Provide structured annotations (at least a one-line mechanism) and the complete bounded file map.",
         "Do not return a prose-only candidate. After the tool call, stop.",
     );
-    return lines.join("\n");
+    const prompt = lines.join("\n");
+    const promptBytes = Buffer.byteLength(prompt, "utf8");
+    if (promptBytes > MAX_PROPOSAL_PROMPT_BYTES) {
+        throw new RuntimeConfigError(
+            `proposal prompt exceeds ${MAX_PROPOSAL_PROMPT_BYTES} UTF-8 bytes`,
+            { promptBytes, maximumBytes: MAX_PROPOSAL_PROMPT_BYTES },
+        );
+    }
+    return prompt;
 }
 
 // ---------------------------------------------------------------------------

@@ -35,8 +35,10 @@ import {
 import {
     FILE_HASH_ALGORITHM,
     closeVerifiedFileHandle,
+    closeStagedFileHandle,
     normalizeExpectedHash,
     openVerifiedFileHandle,
+    reverifyStagedFileHandle,
     sha256File,
     stageVerifiedFileHandle,
     verifyAndHashFile,
@@ -383,6 +385,7 @@ function normalizeValidationCases(validationCases, entryId) {
                 : requireString(spec.description, `entries.${entryId}.validationCases[${key}].description`, { maxLength: 4096 }),
         });
     }
+
     return Object.freeze(out);
 }
 
@@ -733,21 +736,114 @@ function requireFrozenHash(value, field) {
     return value;
 }
 
-function frozenSandboxIdentity(sandbox, executesCandidateCode) {
-    if (!executesCandidateCode) {
-        return Object.freeze({
-            required: false,
-            policyIdentity: null,
-            policyDigest: null,
-        });
+function requireFrozenBoolean(value, field) {
+    if (typeof value !== "boolean") invalid(`${field} must be boolean`);
+    return value;
+}
+
+function requireFrozenPositiveInteger(value, field) {
+    if (!Number.isSafeInteger(value) || value < 1) {
+        invalid(`${field} must be a positive safe integer`);
     }
-    if (sandbox?.required !== true) {
-        invalid("A candidate-code harness requires a frozen sandbox policy identity");
+    return value;
+}
+
+function requireFrozenExactKeys(value, field, keys) {
+    requireObject(value, field);
+    const actual = Object.keys(value).sort();
+    const expected = [...keys].sort();
+    if (actual.length !== expected.length
+        || actual.some((key, index) => key !== expected[index])) {
+        invalid(`${field} has an invalid shape`, { expected, actual });
     }
-    const policyIdentity = immutableCanonical({
+}
+
+function normalizeFrozenSandboxPolicyIdentity(sandbox) {
+    requireFrozenExactKeys(
+        sandbox,
+        "sandbox",
+        [
+            "required",
+            "primitive",
+            "providerId",
+            "providerVersion",
+            "policyId",
+            "helperSourceHash",
+            "helperBinaryHash",
+            "launcherId",
+            "launcherBinaryHash",
+            "launcherScriptHash",
+            "securityContext",
+            "network",
+            "filesystem",
+            "job",
+        ],
+    );
+    requireFrozenExactKeys(
+        sandbox.securityContext,
+        "sandbox.securityContext",
+        [
+            "appContainer",
+            "lowIntegrity",
+            "capabilities",
+            "loopbackExemptionRejected",
+        ],
+    );
+    if (!Array.isArray(sandbox.securityContext.capabilities)
+        || sandbox.securityContext.capabilities.length > 64
+        || sandbox.securityContext.capabilities.some((capability) =>
+            typeof capability !== "string"
+            || capability.length === 0
+            || capability.length > 256)) {
+        invalid("sandbox.securityContext.capabilities must be a bounded string array");
+    }
+    requireFrozenExactKeys(
+        sandbox.network,
+        "sandbox.network",
+        ["mode", "enforcement"],
+    );
+    requireFrozenExactKeys(
+        sandbox.filesystem,
+        "sandbox.filesystem",
+        [
+            "stagedHarness",
+            "immutableCandidate",
+            "outputTemp",
+            "aclJournalRestored",
+            "exactLaunchClosure",
+            "hostWriteDenied",
+        ],
+    );
+    requireFrozenExactKeys(
+        sandbox.job,
+        "sandbox.job",
+        [
+            "killOnJobClose",
+            "descendantsContained",
+            "uiRestrictions",
+            "activeProcessLimit",
+            "processMemoryBytes",
+            "jobMemoryBytes",
+            "cpuRatePercent",
+            "cpuTimeMs",
+            "wallTimeMs",
+            "terminationGraceMs",
+        ],
+    );
+    const identity = immutableCanonical({
         primitive: requireString(
             sandbox.primitive,
             "sandbox.primitive",
+            { maxLength: 128 },
+        ),
+        providerId: requireString(
+            sandbox.providerId,
+            "sandbox.providerId",
+            { maxLength: 128 },
+        ),
+        providerVersion: requireString(
+            sandbox.providerVersion,
+            "sandbox.providerVersion",
             { maxLength: 128 },
         ),
         policyId: requireString(
@@ -763,7 +859,139 @@ function frozenSandboxIdentity(sandbox, executesCandidateCode) {
             sandbox.helperBinaryHash,
             "sandbox.helperBinaryHash",
         ),
+        launcherId: requireString(
+            sandbox.launcherId,
+            "sandbox.launcherId",
+            { maxLength: 128 },
+        ),
+        launcherBinaryHash: requireFrozenHash(
+            sandbox.launcherBinaryHash,
+            "sandbox.launcherBinaryHash",
+        ),
+        launcherScriptHash: requireFrozenHash(
+            sandbox.launcherScriptHash,
+            "sandbox.launcherScriptHash",
+        ),
+        securityContext: {
+            appContainer: requireFrozenBoolean(
+                sandbox.securityContext.appContainer,
+                "sandbox.securityContext.appContainer",
+            ),
+            lowIntegrity: requireFrozenBoolean(
+                sandbox.securityContext.lowIntegrity,
+                "sandbox.securityContext.lowIntegrity",
+            ),
+            capabilities: [...sandbox.securityContext.capabilities],
+            loopbackExemptionRejected: requireFrozenBoolean(
+                sandbox.securityContext.loopbackExemptionRejected,
+                "sandbox.securityContext.loopbackExemptionRejected",
+            ),
+        },
+        network: {
+            mode: requireString(
+                sandbox.network.mode,
+                "sandbox.network.mode",
+                { maxLength: 128 },
+            ),
+            enforcement: requireString(
+                sandbox.network.enforcement,
+                "sandbox.network.enforcement",
+                { maxLength: 1024 },
+            ),
+        },
+        filesystem: {
+            stagedHarness: requireString(
+                sandbox.filesystem.stagedHarness,
+                "sandbox.filesystem.stagedHarness",
+                { maxLength: 128 },
+            ),
+            immutableCandidate: requireString(
+                sandbox.filesystem.immutableCandidate,
+                "sandbox.filesystem.immutableCandidate",
+                { maxLength: 128 },
+            ),
+            outputTemp: requireString(
+                sandbox.filesystem.outputTemp,
+                "sandbox.filesystem.outputTemp",
+                { maxLength: 128 },
+            ),
+            aclJournalRestored: requireFrozenBoolean(
+                sandbox.filesystem.aclJournalRestored,
+                "sandbox.filesystem.aclJournalRestored",
+            ),
+            exactLaunchClosure: requireFrozenBoolean(
+                sandbox.filesystem.exactLaunchClosure,
+                "sandbox.filesystem.exactLaunchClosure",
+            ),
+            hostWriteDenied: requireFrozenBoolean(
+                sandbox.filesystem.hostWriteDenied,
+                "sandbox.filesystem.hostWriteDenied",
+            ),
+        },
+        job: {
+            killOnJobClose: requireFrozenBoolean(
+                sandbox.job.killOnJobClose,
+                "sandbox.job.killOnJobClose",
+            ),
+            descendantsContained: requireFrozenBoolean(
+                sandbox.job.descendantsContained,
+                "sandbox.job.descendantsContained",
+            ),
+            uiRestrictions: requireFrozenBoolean(
+                sandbox.job.uiRestrictions,
+                "sandbox.job.uiRestrictions",
+            ),
+            activeProcessLimit: requireFrozenPositiveInteger(
+                sandbox.job.activeProcessLimit,
+                "sandbox.job.activeProcessLimit",
+            ),
+            processMemoryBytes: requireFrozenPositiveInteger(
+                sandbox.job.processMemoryBytes,
+                "sandbox.job.processMemoryBytes",
+            ),
+            jobMemoryBytes: requireFrozenPositiveInteger(
+                sandbox.job.jobMemoryBytes,
+                "sandbox.job.jobMemoryBytes",
+            ),
+            cpuRatePercent: requireFrozenPositiveInteger(
+                sandbox.job.cpuRatePercent,
+                "sandbox.job.cpuRatePercent",
+            ),
+            cpuTimeMs: requireFrozenPositiveInteger(
+                sandbox.job.cpuTimeMs,
+                "sandbox.job.cpuTimeMs",
+            ),
+            wallTimeMs: requireFrozenPositiveInteger(
+                sandbox.job.wallTimeMs,
+                "sandbox.job.wallTimeMs",
+            ),
+            terminationGraceMs: requireFrozenPositiveInteger(
+                sandbox.job.terminationGraceMs,
+                "sandbox.job.terminationGraceMs",
+            ),
+        },
     });
+    if (identity.job.cpuRatePercent > 100) {
+        invalid("sandbox.job.cpuRatePercent must be <= 100");
+    }
+    if (identity.job.jobMemoryBytes < identity.job.processMemoryBytes) {
+        invalid("sandbox.job.jobMemoryBytes must be >= processMemoryBytes");
+    }
+    return identity;
+}
+
+function frozenSandboxIdentity(sandbox, executesCandidateCode) {
+    if (!executesCandidateCode) {
+        return Object.freeze({
+            required: false,
+            policyIdentity: null,
+            policyDigest: null,
+        });
+    }
+    if (sandbox?.required !== true) {
+        invalid("A candidate-code harness requires a frozen sandbox policy identity");
+    }
+    const policyIdentity = normalizeFrozenSandboxPolicyIdentity(sandbox);
     const policyDigest = hashCanonical(
         policyIdentity,
         SANDBOX_POLICY_IDENTITY_HASH_ALGORITHM,
@@ -863,6 +1091,9 @@ export function verifyFrozenHarnessIdentity(
 function closeLeaseState(state) {
     if (state.closed) return false;
     state.closed = true;
+    for (const staged of state.stagedFiles) {
+        closeStagedFileHandle(staged);
+    }
     closeVerifiedFileHandle(state.executable);
     for (const dependency of state.dependencies) {
         closeVerifiedFileHandle(dependency.handle);
@@ -922,6 +1153,7 @@ export function acquireVerifiedHarnessRun(verifiedEntry, expectedAllowlist) {
         allowlistFileHash: state.allowlistFileHash,
         executable,
         dependencies,
+        stagedFiles: [],
     });
     return lease;
 }
@@ -1011,16 +1243,18 @@ export function stageVerifiedHarnessRun(lease, stageRoot) {
         executableDestination,
         { label: `entries.${state.entry.id}.executable` },
     );
+    state.stagedFiles.push(executable);
     const dependencies = state.dependencies.map((dependency, index) => {
         const staged = stageVerifiedFileHandle(
             dependency.handle,
             layout.paths[index],
-            { label: `entries.${state.entry.id}.dependencies[${index}]` },
+            {
+                label: `entries.${state.entry.id}.dependencies[${index}]`,
+                role: dependency.spec.role,
+            },
         );
-        return Object.freeze({
-            ...staged,
-            role: dependency.spec.role,
-        });
+        state.stagedFiles.push(staged);
+        return staged;
     });
     return Object.freeze({
         entry: state.entry,
@@ -1029,6 +1263,26 @@ export function stageVerifiedHarnessRun(lease, stageRoot) {
         executable,
         dependencies: Object.freeze(dependencies),
         cwd: layout.workRoot,
+    });
+}
+
+export function reverifyStagedHarnessRun(stagedRun) {
+    if (stagedRun === null
+        || typeof stagedRun !== "object"
+        || !Object.isFrozen(stagedRun)) {
+        throw new MeasurementError(
+            MEASUREMENT_ERROR_CODES.INVALID_ARGUMENT,
+            "staged harness run descriptor is invalid",
+        );
+    }
+    const executable = reverifyStagedFileHandle(stagedRun.executable);
+    const dependencies = stagedRun.dependencies.map((dependency) => ({
+        ...reverifyStagedFileHandle(dependency),
+        role: dependency.role,
+    }));
+    return Object.freeze({
+        executable,
+        dependencies: Object.freeze(dependencies),
     });
 }
 

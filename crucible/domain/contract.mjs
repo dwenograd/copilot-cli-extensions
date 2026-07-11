@@ -1,14 +1,17 @@
 import {
     CONTRACT_HASH_ALGORITHM,
     canonicalEqual,
+    canonicalJson,
     hashCanonical,
     immutableCanonical,
 } from "./canonical.mjs";
 import {
+    CONTRACT_LIMITS,
     DEFAULT_IMPOSSIBILITY_POLICY,
     DEFAULT_SEARCH_POLICY,
     ESCAPE_SEARCH_OPERATORS,
     HYPOTHESIS_TOPOLOGIES,
+    SEARCH_POLICY_LIMITS,
     SEARCH_OPERATORS,
 } from "./constants.mjs";
 import { ContractError, ERROR_CODES } from "./errors.mjs";
@@ -17,6 +20,12 @@ const COMPARISON_OPERATORS = Object.freeze(["<", "<=", "==", ">=", ">"]);
 const VALIDATION_EXPECTATIONS = Object.freeze(["accept", "reject"]);
 const METRIC_DIRECTIONS = Object.freeze(["min", "max"]);
 const TAGGED_SHA256 = /^sha256:[a-z0-9][a-z0-9._-]*:[a-f0-9]{64}$/u;
+const SAFE_IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._@-]*$/u;
+const FORBIDDEN_IDENTIFIERS = new Set([
+    "__proto__",
+    "constructor",
+    "prototype",
+]);
 const HARNESS_IDENTITY_KEYS = Object.freeze([
     "allowedEnvHash",
     "allowlistFileHash",
@@ -40,10 +49,49 @@ const HARNESS_SANDBOX_KEYS = Object.freeze([
     "required",
 ]);
 const HARNESS_SANDBOX_IDENTITY_KEYS = Object.freeze([
+    "filesystem",
     "helperBinaryHash",
     "helperSourceHash",
+    "job",
+    "launcherBinaryHash",
+    "launcherId",
+    "launcherScriptHash",
+    "network",
     "policyId",
     "primitive",
+    "providerId",
+    "providerVersion",
+    "securityContext",
+]);
+const HARNESS_SANDBOX_SECURITY_CONTEXT_KEYS = Object.freeze([
+    "appContainer",
+    "capabilities",
+    "loopbackExemptionRejected",
+    "lowIntegrity",
+]);
+const HARNESS_SANDBOX_NETWORK_KEYS = Object.freeze([
+    "enforcement",
+    "mode",
+]);
+const HARNESS_SANDBOX_FILESYSTEM_KEYS = Object.freeze([
+    "aclJournalRestored",
+    "exactLaunchClosure",
+    "hostWriteDenied",
+    "immutableCandidate",
+    "outputTemp",
+    "stagedHarness",
+]);
+const HARNESS_SANDBOX_JOB_KEYS = Object.freeze([
+    "activeProcessLimit",
+    "cpuRatePercent",
+    "cpuTimeMs",
+    "descendantsContained",
+    "jobMemoryBytes",
+    "killOnJobClose",
+    "processMemoryBytes",
+    "terminationGraceMs",
+    "uiRestrictions",
+    "wallTimeMs",
 ]);
 const SANDBOX_POLICY_IDENTITY_HASH_ALGORITHM =
     "sha256:crucible-measurement-sandbox-policy-identity-v1";
@@ -81,16 +129,40 @@ function requireNonEmptyString(value, field, maximum = 4096) {
     return value;
 }
 
+function requireBoundedText(value, field, maximumCharacters, maximumBytes) {
+    if (typeof value !== "string"
+        || value.trim().length === 0
+        || value.length > maximumCharacters
+        || Buffer.byteLength(value, "utf8") > maximumBytes) {
+        throw new ContractError(
+            `${field} must be non-empty text of at most ${maximumCharacters} characters and ${maximumBytes} UTF-8 bytes`,
+            { field, maximumCharacters, maximumBytes },
+        );
+    }
+    return value;
+}
+
+export function isSafeDomainIdentifier(value) {
+    return typeof value === "string"
+        && value.length > 0
+        && value.length <= 128
+        && SAFE_IDENTIFIER.test(value)
+        && value !== "."
+        && value !== ".."
+        && !value.endsWith(".")
+        && !value.includes("..")
+        && !FORBIDDEN_IDENTIFIERS.has(value.toLowerCase());
+}
+
 function requireIdentifier(value, field) {
-    requireNonEmptyString(value, field, 128);
-    if (!/^[A-Za-z0-9][A-Za-z0-9._@-]*$/u.test(value)
-        || value === "."
-        || value === ".."
-        || value.includes("..")) {
-        throw new ContractError(`${field} must be an identifier, not a filesystem path`, {
-            field,
-            value,
-        });
+    if (!isSafeDomainIdentifier(value)) {
+        throw new ContractError(
+            `${field} must be a safe identifier, not a filesystem path or prototype key`,
+            {
+                field,
+                value,
+            },
+        );
     }
     return value;
 }
@@ -217,11 +289,56 @@ function normalizeHarnessSandbox(value, executesCandidateCode) {
             "harnessIdentity.sandbox.policyIdentity",
             HARNESS_SANDBOX_IDENTITY_KEYS,
         );
+        requireExactObjectKeys(
+            value.policyIdentity.securityContext,
+            "harnessIdentity.sandbox.policyIdentity.securityContext",
+            HARNESS_SANDBOX_SECURITY_CONTEXT_KEYS,
+        );
+        requireExactObjectKeys(
+            value.policyIdentity.network,
+            "harnessIdentity.sandbox.policyIdentity.network",
+            HARNESS_SANDBOX_NETWORK_KEYS,
+        );
+        requireExactObjectKeys(
+            value.policyIdentity.filesystem,
+            "harnessIdentity.sandbox.policyIdentity.filesystem",
+            HARNESS_SANDBOX_FILESYSTEM_KEYS,
+        );
+        requireExactObjectKeys(
+            value.policyIdentity.job,
+            "harnessIdentity.sandbox.policyIdentity.job",
+            HARNESS_SANDBOX_JOB_KEYS,
+        );
+        const requireBoolean = (input, field) => {
+            if (typeof input !== "boolean") {
+                throw new ContractError(`${field} must be boolean`);
+            }
+            return input;
+        };
+        const capabilities = value.policyIdentity.securityContext.capabilities;
+        if (!Array.isArray(capabilities)
+            || capabilities.length > 64
+            || capabilities.some((capability) =>
+                typeof capability !== "string"
+                || capability.length === 0
+                || capability.length > 256)) {
+            throw new ContractError(
+                "harnessIdentity.sandbox.policyIdentity.securityContext.capabilities must be a bounded string array",
+            );
+        }
         const policyIdentity = {
             primitive: requireNonEmptyString(
                 value.policyIdentity.primitive,
                 "harnessIdentity.sandbox.policyIdentity.primitive",
                 128,
+            ),
+            providerId: requireIdentifier(
+                value.policyIdentity.providerId,
+                "harnessIdentity.sandbox.policyIdentity.providerId",
+            ),
+            providerVersion: requireIdentifier(
+                value.policyIdentity.providerVersion,
+                "harnessIdentity.sandbox.policyIdentity.providerVersion",
             ),
             policyId: requireIdentifier(
                 value.policyIdentity.policyId,
@@ -235,7 +352,128 @@ function normalizeHarnessSandbox(value, executesCandidateCode) {
                 value.policyIdentity.helperBinaryHash,
                 "harnessIdentity.sandbox.policyIdentity.helperBinaryHash",
             ),
+            launcherId: requireIdentifier(
+                value.policyIdentity.launcherId,
+                "harnessIdentity.sandbox.policyIdentity.launcherId",
+            ),
+            launcherBinaryHash: requireTaggedSha256(
+                value.policyIdentity.launcherBinaryHash,
+                "harnessIdentity.sandbox.policyIdentity.launcherBinaryHash",
+            ),
+            launcherScriptHash: requireTaggedSha256(
+                value.policyIdentity.launcherScriptHash,
+                "harnessIdentity.sandbox.policyIdentity.launcherScriptHash",
+            ),
+            securityContext: {
+                appContainer: requireBoolean(
+                    value.policyIdentity.securityContext.appContainer,
+                    "harnessIdentity.sandbox.policyIdentity.securityContext.appContainer",
+                ),
+                lowIntegrity: requireBoolean(
+                    value.policyIdentity.securityContext.lowIntegrity,
+                    "harnessIdentity.sandbox.policyIdentity.securityContext.lowIntegrity",
+                ),
+                capabilities: [...capabilities],
+                loopbackExemptionRejected: requireBoolean(
+                    value.policyIdentity.securityContext.loopbackExemptionRejected,
+                    "harnessIdentity.sandbox.policyIdentity.securityContext.loopbackExemptionRejected",
+                ),
+            },
+            network: {
+                mode: requireNonEmptyString(
+                    value.policyIdentity.network.mode,
+                    "harnessIdentity.sandbox.policyIdentity.network.mode",
+                    128,
+                ),
+                enforcement: requireNonEmptyString(
+                    value.policyIdentity.network.enforcement,
+                    "harnessIdentity.sandbox.policyIdentity.network.enforcement",
+                    1024,
+                ),
+            },
+            filesystem: {
+                stagedHarness: requireNonEmptyString(
+                    value.policyIdentity.filesystem.stagedHarness,
+                    "harnessIdentity.sandbox.policyIdentity.filesystem.stagedHarness",
+                    128,
+                ),
+                immutableCandidate: requireNonEmptyString(
+                    value.policyIdentity.filesystem.immutableCandidate,
+                    "harnessIdentity.sandbox.policyIdentity.filesystem.immutableCandidate",
+                    128,
+                ),
+                outputTemp: requireNonEmptyString(
+                    value.policyIdentity.filesystem.outputTemp,
+                    "harnessIdentity.sandbox.policyIdentity.filesystem.outputTemp",
+                    128,
+                ),
+                aclJournalRestored: requireBoolean(
+                    value.policyIdentity.filesystem.aclJournalRestored,
+                    "harnessIdentity.sandbox.policyIdentity.filesystem.aclJournalRestored",
+                ),
+                exactLaunchClosure: requireBoolean(
+                    value.policyIdentity.filesystem.exactLaunchClosure,
+                    "harnessIdentity.sandbox.policyIdentity.filesystem.exactLaunchClosure",
+                ),
+                hostWriteDenied: requireBoolean(
+                    value.policyIdentity.filesystem.hostWriteDenied,
+                    "harnessIdentity.sandbox.policyIdentity.filesystem.hostWriteDenied",
+                ),
+            },
+            job: {
+                killOnJobClose: requireBoolean(
+                    value.policyIdentity.job.killOnJobClose,
+                    "harnessIdentity.sandbox.policyIdentity.job.killOnJobClose",
+                ),
+                descendantsContained: requireBoolean(
+                    value.policyIdentity.job.descendantsContained,
+                    "harnessIdentity.sandbox.policyIdentity.job.descendantsContained",
+                ),
+                uiRestrictions: requireBoolean(
+                    value.policyIdentity.job.uiRestrictions,
+                    "harnessIdentity.sandbox.policyIdentity.job.uiRestrictions",
+                ),
+                activeProcessLimit: requirePositiveSafeInteger(
+                    value.policyIdentity.job.activeProcessLimit,
+                    "harnessIdentity.sandbox.policyIdentity.job.activeProcessLimit",
+                ),
+                processMemoryBytes: requirePositiveSafeInteger(
+                    value.policyIdentity.job.processMemoryBytes,
+                    "harnessIdentity.sandbox.policyIdentity.job.processMemoryBytes",
+                ),
+                jobMemoryBytes: requirePositiveSafeInteger(
+                    value.policyIdentity.job.jobMemoryBytes,
+                    "harnessIdentity.sandbox.policyIdentity.job.jobMemoryBytes",
+                ),
+                cpuRatePercent: requirePositiveSafeInteger(
+                    value.policyIdentity.job.cpuRatePercent,
+                    "harnessIdentity.sandbox.policyIdentity.job.cpuRatePercent",
+                ),
+                cpuTimeMs: requirePositiveSafeInteger(
+                    value.policyIdentity.job.cpuTimeMs,
+                    "harnessIdentity.sandbox.policyIdentity.job.cpuTimeMs",
+                ),
+                wallTimeMs: requirePositiveSafeInteger(
+                    value.policyIdentity.job.wallTimeMs,
+                    "harnessIdentity.sandbox.policyIdentity.job.wallTimeMs",
+                ),
+                terminationGraceMs: requirePositiveSafeInteger(
+                    value.policyIdentity.job.terminationGraceMs,
+                    "harnessIdentity.sandbox.policyIdentity.job.terminationGraceMs",
+                ),
+            },
         };
+        if (policyIdentity.job.cpuRatePercent > 100) {
+            throw new ContractError(
+                "harnessIdentity.sandbox.policyIdentity.job.cpuRatePercent must be <= 100",
+            );
+        }
+        if (policyIdentity.job.jobMemoryBytes
+            < policyIdentity.job.processMemoryBytes) {
+            throw new ContractError(
+                "harnessIdentity.sandbox.policyIdentity.job.jobMemoryBytes must be >= processMemoryBytes",
+            );
+        }
         const policyDigest = requireTaggedSha256(
             value.policyDigest,
             "harnessIdentity.sandbox.policyDigest",
@@ -322,9 +560,18 @@ function normalizePath(path, field) {
     const segments = typeof path === "string" ? path.split(".") : path;
     if (!Array.isArray(segments)
         || segments.length === 0
-        || segments.some((segment) => typeof segment !== "string" || segment.length === 0)) {
+        || segments.length > CONTRACT_LIMITS.acceptancePathSegments
+        || segments.some((segment) =>
+            typeof segment !== "string"
+            || segment.length === 0
+            || segment.length > CONTRACT_LIMITS.acceptancePathSegmentCharacters
+            || Buffer.byteLength(segment, "utf8")
+                > CONTRACT_LIMITS.acceptanceValueStringBytes)) {
         throw new ContractError(`${field} must be a non-empty field path`, {
             field,
+            maximumSegments: CONTRACT_LIMITS.acceptancePathSegments,
+            maximumSegmentCharacters:
+                CONTRACT_LIMITS.acceptancePathSegmentCharacters,
         }, ERROR_CODES.INVALID_ACCEPTANCE_PREDICATE);
     }
     return [...segments];
@@ -334,29 +581,148 @@ function predicateError(message, details = null) {
     throw new ContractError(message, details, ERROR_CODES.INVALID_ACCEPTANCE_PREDICATE);
 }
 
-function normalizePredicate(predicate, depth = 0) {
-    if (depth > 32) {
+function normalizeAcceptanceValue(value, field, state, depth = 0) {
+    if (depth > CONTRACT_LIMITS.acceptanceValueDepth) {
+        predicateError("Acceptance predicate comparison value exceeds maximum nesting depth", {
+            field,
+            maximumDepth: CONTRACT_LIMITS.acceptanceValueDepth,
+        });
+    }
+    state.nodes += 1;
+    if (state.nodes > CONTRACT_LIMITS.acceptanceValueNodes) {
+        predicateError("Acceptance predicate comparison value exceeds maximum complexity", {
+            field,
+            maximumNodes: CONTRACT_LIMITS.acceptanceValueNodes,
+        });
+    }
+    if (value === null || typeof value === "boolean") {
+        return value;
+    }
+    if (typeof value === "number") {
+        if (!Number.isFinite(value)) {
+            predicateError("Acceptance predicate comparison numbers must be finite", { field });
+        }
+        return value;
+    }
+    if (typeof value === "string") {
+        if (value.length > CONTRACT_LIMITS.acceptanceValueStringCharacters
+            || Buffer.byteLength(value, "utf8")
+                > CONTRACT_LIMITS.acceptanceValueStringBytes) {
+            predicateError("Acceptance predicate comparison string exceeds its bound", {
+                field,
+                maximumCharacters:
+                    CONTRACT_LIMITS.acceptanceValueStringCharacters,
+                maximumBytes: CONTRACT_LIMITS.acceptanceValueStringBytes,
+            });
+        }
+        return value;
+    }
+    if (Array.isArray(value)) {
+        if (value.length > CONTRACT_LIMITS.acceptanceValueArrayItems) {
+            predicateError("Acceptance predicate comparison array exceeds its item bound", {
+                field,
+                maximumItems: CONTRACT_LIMITS.acceptanceValueArrayItems,
+            });
+        }
+        return value.map((item, index) =>
+            normalizeAcceptanceValue(item, `${field}[${index}]`, state, depth + 1));
+    }
+    if (value === null || typeof value !== "object") {
+        predicateError("Acceptance predicate comparison value must be canonical JSON", {
+            field,
+        });
+    }
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) {
+        predicateError("Acceptance predicate comparison objects must be plain objects", {
+            field,
+        });
+    }
+    if (Object.getOwnPropertySymbols(value).length > 0) {
+        predicateError("Acceptance predicate comparison objects cannot have symbol keys", {
+            field,
+        });
+    }
+    const keys = Object.keys(value);
+    if (keys.length > CONTRACT_LIMITS.acceptanceValueObjectProperties) {
+        predicateError("Acceptance predicate comparison object exceeds its property bound", {
+            field,
+            maximumProperties:
+                CONTRACT_LIMITS.acceptanceValueObjectProperties,
+        });
+    }
+    const output = {};
+    for (const key of keys) {
+        if (key.length > CONTRACT_LIMITS.acceptanceValueStringCharacters
+            || Buffer.byteLength(key, "utf8")
+                > CONTRACT_LIMITS.acceptanceValueStringBytes) {
+            predicateError("Acceptance predicate comparison object key exceeds its bound", {
+                field,
+                key,
+            });
+        }
+        const descriptor = Object.getOwnPropertyDescriptor(value, key);
+        if (descriptor === undefined || !Object.hasOwn(descriptor, "value")) {
+            predicateError("Acceptance predicate comparison objects cannot use accessors", {
+                field,
+                key,
+            });
+        }
+        output[key] = normalizeAcceptanceValue(
+            descriptor.value,
+            `${field}.${key}`,
+            state,
+            depth + 1,
+        );
+    }
+    return output;
+}
+
+function normalizePredicateNode(predicate, state, depth = 0) {
+    if (depth > CONTRACT_LIMITS.acceptancePredicateDepth) {
         predicateError("Acceptance predicate exceeds maximum nesting depth");
     }
     if (predicate === null || typeof predicate !== "object" || Array.isArray(predicate)) {
         predicateError("Acceptance predicate must be an object");
     }
+    state.nodes += 1;
+    if (state.nodes > CONTRACT_LIMITS.acceptancePredicateNodes) {
+        predicateError("Acceptance predicate exceeds maximum node complexity", {
+            maximumNodes: CONTRACT_LIMITS.acceptancePredicateNodes,
+        });
+    }
 
     switch (predicate.kind) {
         case "harness_pass":
+            requireExactObjectKeys(predicate, "acceptancePredicate", ["kind"]);
             return { kind: "harness_pass" };
         case "constant":
+            requireExactObjectKeys(predicate, "acceptancePredicate", ["kind", "value"]);
             if (typeof predicate.value !== "boolean") {
                 predicateError("constant predicate value must be boolean");
             }
             return { kind: "constant", value: predicate.value };
         case "field_equals":
+            requireExactObjectKeys(
+                predicate,
+                "acceptancePredicate",
+                ["kind", "path", "value"],
+            );
             return {
                 kind: "field_equals",
                 path: normalizePath(predicate.path, "acceptancePredicate.path"),
-                value: immutableCanonical(predicate.value),
+                value: normalizeAcceptanceValue(
+                    predicate.value,
+                    "acceptancePredicate.value",
+                    { nodes: 0 },
+                ),
             };
         case "number_compare":
+            requireExactObjectKeys(
+                predicate,
+                "acceptancePredicate",
+                ["kind", "operator", "path", "value"],
+            );
             if (!COMPARISON_OPERATORS.includes(predicate.operator)) {
                 predicateError("number_compare predicate has an unsupported operator", {
                     operator: predicate.operator,
@@ -372,6 +738,11 @@ function normalizePredicate(predicate, depth = 0) {
                 value: predicate.value,
             };
         case "metric_compare":
+            requireExactObjectKeys(
+                predicate,
+                "acceptancePredicate",
+                ["kind", "metric", "operator", "value"],
+            );
             requireNonEmptyString(predicate.metric, "acceptancePredicate.metric", 128);
             if (!COMPARISON_OPERATORS.includes(predicate.operator)) {
                 predicateError("metric_compare predicate has an unsupported operator", {
@@ -389,23 +760,49 @@ function normalizePredicate(predicate, depth = 0) {
             };
         case "all":
         case "any":
-            if (!Array.isArray(predicate.predicates) || predicate.predicates.length === 0) {
+            requireExactObjectKeys(
+                predicate,
+                "acceptancePredicate",
+                ["kind", "predicates"],
+            );
+            if (!Array.isArray(predicate.predicates)
+                || predicate.predicates.length === 0
+                || predicate.predicates.length
+                    > CONTRACT_LIMITS.acceptancePredicateChildren) {
                 predicateError(`${predicate.kind} predicate requires at least one child`);
             }
             return {
                 kind: predicate.kind,
-                predicates: predicate.predicates.map((child) => normalizePredicate(child, depth + 1)),
+                predicates: predicate.predicates.map((child) =>
+                    normalizePredicateNode(child, state, depth + 1)),
             };
         case "not":
+            requireExactObjectKeys(
+                predicate,
+                "acceptancePredicate",
+                ["kind", "predicate"],
+            );
             return {
                 kind: "not",
-                predicate: normalizePredicate(predicate.predicate, depth + 1),
+                predicate: normalizePredicateNode(predicate.predicate, state, depth + 1),
             };
         default:
             predicateError("Unknown acceptance predicate kind", {
                 kind: predicate.kind ?? null,
             });
     }
+}
+
+function normalizePredicate(predicate) {
+    const normalized = normalizePredicateNode(predicate, { nodes: 0 });
+    const bytes = Buffer.byteLength(canonicalJson(normalized), "utf8");
+    if (bytes > CONTRACT_LIMITS.acceptancePredicateBytes) {
+        predicateError("Acceptance predicate exceeds maximum serialized size", {
+            bytes,
+            maximumBytes: CONTRACT_LIMITS.acceptancePredicateBytes,
+        });
+    }
+    return normalized;
 }
 
 function valueAtPath(root, path) {
@@ -625,7 +1022,9 @@ function normalizeDeclaredLimits(limits) {
 }
 
 function normalizeValidationCases(cases) {
-    if (!Array.isArray(cases) || cases.length < 2) {
+    if (!Array.isArray(cases)
+        || cases.length < 2
+        || cases.length > CONTRACT_LIMITS.validationCases) {
         throw new ContractError("validationCases must contain at least one accept and one reject case");
     }
     const ids = new Set();
@@ -676,14 +1075,29 @@ function normalizeSearch(search, topology) {
         throw new ContractError("search must be an object");
     }
     const normalized = {
-        workerModels: normalizeIdentifierArray(search.workerModels, "search.workerModels", 1, 8),
+        workerModels: normalizeIdentifierArray(
+            search.workerModels,
+            "search.workerModels",
+            1,
+            CONTRACT_LIMITS.workerModels,
+        ),
         candidatesPerRound: requirePositiveSafeInteger(
             search.candidatesPerRound,
             "search.candidatesPerRound",
-            8,
+            CONTRACT_LIMITS.candidatesPerRound,
         ),
-        maxRounds: requirePositiveSafeInteger(search.maxRounds, "search.maxRounds"),
+        maxRounds: requirePositiveSafeInteger(
+            search.maxRounds,
+            "search.maxRounds",
+            CONTRACT_LIMITS.maxRounds,
+        ),
     };
+    if (normalized.candidatesPerRound * normalized.maxRounds
+        > CONTRACT_LIMITS.maxEvaluations) {
+        throw new ContractError(
+            `search capacity cannot exceed ${CONTRACT_LIMITS.maxEvaluations} candidate evaluations`,
+        );
+    }
     if (search.boundedCandidateIds !== undefined && search.boundedCandidateIds !== null) {
         if (topology !== "finite_enumerable" && topology !== "bounded_parameterized") {
             throw new ContractError(
@@ -694,7 +1108,7 @@ function normalizeSearch(search, topology) {
             search.boundedCandidateIds,
             "search.boundedCandidateIds",
             1,
-            Number.MAX_SAFE_INTEGER,
+            CONTRACT_LIMITS.boundedCandidateIds,
         );
         if (normalized.boundedCandidateIds.length
             > normalized.candidatesPerRound * normalized.maxRounds) {
@@ -741,13 +1155,13 @@ export function createSearchPolicy(input) {
         input.plateauWindow,
         "searchPolicy.plateauWindow",
         1,
-        1000,
+        SEARCH_POLICY_LIMITS.plateauWindow,
     );
     const minRoundsBeforePlateau = requireSafeIntegerInRange(
         input.minRoundsBeforePlateau,
         "searchPolicy.minRoundsBeforePlateau",
         1,
-        100000,
+        SEARCH_POLICY_LIMITS.minRoundsBeforePlateau,
     );
     if (minRoundsBeforePlateau < plateauWindow) {
         throw new ContractError(
@@ -764,7 +1178,7 @@ export function createSearchPolicy(input) {
         input.mandatoryEscapeRounds,
         "searchPolicy.mandatoryEscapeRounds",
         1,
-        1000,
+        SEARCH_POLICY_LIMITS.mandatoryEscapeRounds,
     );
 
     requireExactObjectKeys(
@@ -792,6 +1206,11 @@ export function createSearchPolicy(input) {
             "searchPolicy.operatorWeights must enable at least one mandatory-escape operator",
         );
     }
+    if (operatorWeights.diversification + operatorWeights.restart < 1) {
+        throw new ContractError(
+            "searchPolicy.operatorWeights must enable a parent-free mandatory-escape fallback",
+        );
+    }
 
     requireExactObjectKeys(
         input.archiveCaps,
@@ -804,7 +1223,7 @@ export function createSearchPolicy(input) {
             input.archiveCaps[key],
             `searchPolicy.archiveCaps.${key}`,
             1,
-            100000,
+            SEARCH_POLICY_LIMITS.archiveCaps[key],
         );
     }
 
@@ -818,13 +1237,13 @@ export function createSearchPolicy(input) {
             input.promptCaps.parentEvidenceIds,
             "searchPolicy.promptCaps.parentEvidenceIds",
             1,
-            16,
+            SEARCH_POLICY_LIMITS.promptCaps.parentEvidenceIds,
         ),
         promptContextRefs: requireSafeIntegerInRange(
             input.promptCaps.promptContextRefs,
             "searchPolicy.promptCaps.promptContextRefs",
             1,
-            256,
+            SEARCH_POLICY_LIMITS.promptCaps.promptContextRefs,
         ),
     };
     if (promptCaps.parentEvidenceIds > promptCaps.promptContextRefs) {
@@ -863,6 +1282,9 @@ function normalizeMetrics(metrics) {
     if (!Array.isArray(metrics)) {
         throw new ContractError("metrics must be an array");
     }
+    if (metrics.length > CONTRACT_LIMITS.metrics) {
+        throw new ContractError(`metrics must contain at most ${CONTRACT_LIMITS.metrics} items`);
+    }
     const keys = new Set();
     return metrics.map((metric, index) => {
         if (metric === null || typeof metric !== "object" || Array.isArray(metric)) {
@@ -893,7 +1315,12 @@ export function createInvestigationContract(input) {
         throw new ContractError("Investigation contract input must be an object");
     }
 
-    const objective = requireNonEmptyString(input.objective, "objective");
+    const objective = requireBoundedText(
+        input.objective,
+        "objective",
+        CONTRACT_LIMITS.objectiveCharacters,
+        CONTRACT_LIMITS.objectiveBytes,
+    );
     const harnessId = requireIdentifier(input.harnessId, "harnessId");
     if (!HYPOTHESIS_TOPOLOGIES.includes(input.hypothesisTopology)) {
         throw new ContractError("hypothesisTopology is not supported", {

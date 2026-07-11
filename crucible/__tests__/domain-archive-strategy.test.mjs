@@ -5,6 +5,7 @@ import {
     adaptiveOperatorWeights,
     buildCandidateArchive,
     buildSearchCandidateCommand,
+    compareCandidateEvidence,
     contractHash,
     createInvestigationContract,
     hashCanonical,
@@ -183,6 +184,69 @@ describe("Crucible deterministic archive and strategy", () => {
         expect(first.lessonGroups).toHaveLength(1);
     });
 
+    it("ranks tiny-epsilon metrics without overflow and preserves lexicographic ties", () => {
+        const searchPolicy = policy();
+        const worse = evidence({
+            evidenceId: "earlier-worse",
+            committedSeq: 1,
+            score: 1,
+            outcomeClass: "accepted",
+            artifact: hashCanonical({ artifact: "earlier-worse" }),
+        });
+        const better = evidence({
+            evidenceId: "later-better",
+            committedSeq: 2,
+            score: 2,
+            outcomeClass: "accepted",
+            artifact: hashCanonical({ artifact: "later-better" }),
+        });
+        const tinyEpsilonContract = {
+            ...contract(searchPolicy),
+            metrics: [{ key: "score", direction: "max", epsilon: Number.MIN_VALUE }],
+        };
+        const aggregate = {
+            contract: tinyEpsilonContract,
+            contractHash: contractHash(tinyEpsilonContract),
+            evidenceOrder: [worse.evidenceId, better.evidenceId],
+            evidence: {
+                [worse.evidenceId]: worse,
+                [better.evidenceId]: better,
+            },
+        };
+
+        expect(buildCandidateArchive(aggregate).incumbent.evidenceId).toBe("later-better");
+        expect(compareCandidateEvidence(
+            [{ key: "score", direction: "min", epsilon: Number.MIN_VALUE }],
+            better,
+            worse,
+        )).toBeGreaterThan(0);
+
+        const lexicographicMetrics = [
+            { key: "primary", direction: "max", epsilon: 0.25 },
+            { key: "secondary", direction: "min", epsilon: 0 },
+        ];
+        const lexicographicWinner = {
+            evidenceId: "later-lexicographic-winner",
+            committedSeq: 2,
+            metrics: { primary: 1, secondary: 1 },
+        };
+        const earlierLoser = {
+            evidenceId: "earlier-lexicographic-loser",
+            committedSeq: 1,
+            metrics: { primary: 1.0625, secondary: 2 },
+        };
+        expect(compareCandidateEvidence(
+            lexicographicMetrics,
+            lexicographicWinner,
+            earlierLoser,
+        )).toBeLessThan(0);
+        expect(compareCandidateEvidence(
+            lexicographicMetrics,
+            earlierLoser,
+            lexicographicWinner,
+        )).toBeGreaterThan(0);
+    });
+
     it("keeps one active artifact primary after the historical duplicate root is invalidated", () => {
         const searchPolicy = policy({
             archiveCaps: {
@@ -271,6 +335,41 @@ describe("Crucible deterministic archive and strategy", () => {
 
         const escape = selectAdaptiveOperator({ ...input, phase: "mandatory_escape" });
         expect(ESCAPE_SEARCH_OPERATORS).toContain(escape);
+    });
+
+    it("uses an enabled parent-free escape operator when no incumbent exists", () => {
+        const searchPolicy = contract(policy({
+            operatorWeights: {
+                fresh: 1,
+                refinement: 0,
+                crossover: 0,
+                diversification: 1,
+                adversarial: 1_000_000,
+                restart: 0,
+            },
+        })).searchPolicy;
+        const archive = {
+            accepted: [],
+            nearMisses: [],
+            rejected: [],
+            invalidMetrics: [],
+            mechanismGroups: [],
+            lessonGroups: [],
+            duplicateIndex: {},
+            incumbent: null,
+        };
+        const input = {
+            searchPolicy,
+            archive,
+            contractHash: hashCanonical({ contract: "parent-free-escape" }),
+            round: 4,
+            slotIndex: 0,
+            phase: "mandatory_escape",
+        };
+
+        expect(selectAdaptiveOperator(input)).toBe("diversification");
+        expect(selectAdaptiveOperator(input)).toBe(selectAdaptiveOperator(input));
+        expect(searchPolicy.operatorWeights[selectAdaptiveOperator(input)]).toBeGreaterThan(0);
     });
 
     it("disables parent-dependent operators unless their distinct parents are eligible", () => {

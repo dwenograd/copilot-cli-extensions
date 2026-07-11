@@ -87,6 +87,158 @@ afterEach(() => {
     }
 });
 
+describe("H7 concurrent runner ownership failure matrix", () => {
+    it.each([
+        ["reserved", []],
+        ["dispatched", ["dispatched"]],
+        ["observed", ["dispatched", "observed"]],
+    ])("fences a same-generation old incarnation after takeover from %s", (
+        expectedState,
+        transitions,
+    ) => {
+        const {
+            repositoryA,
+            repositoryB,
+            adapterA,
+        } = openSharedAdapters(`h7-incarnation-${expectedState}`);
+        adapterA.openInvestigation(createInvestigationContract(contractInput()));
+        repositoryA.claimSupervisorGeneration({
+            investigationId: "inv-runtime",
+            supervisorGeneration: 9,
+            supervisorNonce: "supervisor-nine",
+        });
+        repositoryA.issueRunnerIncarnation({
+            investigationId: "inv-runtime",
+            supervisorGeneration: 9,
+            supervisorNonce: "supervisor-nine",
+            runnerIncarnation: "runner-nine-old",
+        });
+        const oldLease = repositoryA.acquireLease({
+            investigationId: "inv-runtime",
+            leaseId: `lease-old-${expectedState}`,
+            owner: "runner-old",
+            supervisorGeneration: 9,
+            runnerIncarnation: "runner-nine-old",
+        });
+        const attemptId = `attempt-${expectedState}`;
+        const command = `command-${expectedState}`;
+        repositoryA.reserveCommand({
+            investigationId: "inv-runtime",
+            attemptId,
+            command,
+            leaseId: oldLease.leaseId,
+            fencingToken: oldLease.fencingToken,
+            owner: oldLease.owner,
+            supervisorGeneration: 9,
+            runnerIncarnation: "runner-nine-old",
+        });
+        for (const toState of transitions) {
+            repositoryA.transitionCommand({
+                investigationId: "inv-runtime",
+                attemptId,
+                toState,
+                leaseId: oldLease.leaseId,
+                fencingToken: oldLease.fencingToken,
+                owner: oldLease.owner,
+                supervisorGeneration: 9,
+                runnerIncarnation: "runner-nine-old",
+            });
+        }
+        expect(repositoryA.getCommandAttempt(attemptId).state).toBe(expectedState);
+
+        repositoryB.issueRunnerIncarnation({
+            investigationId: "inv-runtime",
+            supervisorGeneration: 9,
+            supervisorNonce: "supervisor-nine",
+            runnerIncarnation: "runner-nine-current",
+        });
+        const currentLease = repositoryB.acquireLease({
+            investigationId: "inv-runtime",
+            leaseId: `lease-current-${expectedState}`,
+            owner: "runner-current",
+            supervisorGeneration: 9,
+            runnerIncarnation: "runner-nine-current",
+        });
+        const nextState = {
+            reserved: "dispatched",
+            dispatched: "observed",
+            observed: "committed",
+        }[expectedState];
+        const before = repositoryB.getCommandAttempt(attemptId);
+
+        expect(() => repositoryA.transitionCommand({
+            investigationId: "inv-runtime",
+            attemptId,
+            toState: nextState,
+            leaseId: oldLease.leaseId,
+            fencingToken: oldLease.fencingToken,
+            owner: oldLease.owner,
+            supervisorGeneration: 9,
+            runnerIncarnation: "runner-nine-old",
+        })).toThrow(expect.objectContaining({
+            code: PERSISTENCE_ERROR_CODES.FENCE_REJECTED,
+        }));
+        expect(repositoryB.getCommandAttempt(attemptId)).toEqual(before);
+
+        const abandoned = repositoryB.abandonStaleCommand({
+            investigationId: "inv-runtime",
+            attemptId,
+            leaseId: currentLease.leaseId,
+            fencingToken: currentLease.fencingToken,
+            owner: currentLease.owner,
+            supervisorGeneration: 9,
+            runnerIncarnation: "runner-nine-current",
+        });
+        expect(abandoned.state).toBe("abandoned");
+    });
+
+    it("rejects a delayed stale generation before it can acquire or resume authority", () => {
+        const { repositoryA, repositoryB, adapterA } =
+            openSharedAdapters("h7-delayed-generation");
+        adapterA.openInvestigation(createInvestigationContract(contractInput()));
+        repositoryA.claimSupervisorGeneration({
+            investigationId: "inv-runtime",
+            supervisorGeneration: 4,
+            supervisorNonce: "supervisor-four",
+        });
+        repositoryA.issueRunnerIncarnation({
+            investigationId: "inv-runtime",
+            supervisorGeneration: 4,
+            supervisorNonce: "supervisor-four",
+            runnerIncarnation: "runner-four",
+        });
+        repositoryA.claimSupervisorGeneration({
+            investigationId: "inv-runtime",
+            supervisorGeneration: 5,
+            supervisorNonce: "supervisor-five",
+        });
+        repositoryB.issueRunnerIncarnation({
+            investigationId: "inv-runtime",
+            supervisorGeneration: 5,
+            supervisorNonce: "supervisor-five",
+            runnerIncarnation: "runner-five",
+        });
+        const current = repositoryB.acquireLease({
+            investigationId: "inv-runtime",
+            leaseId: "lease-five",
+            owner: "runner-five",
+            supervisorGeneration: 5,
+            runnerIncarnation: "runner-five",
+        });
+
+        expect(() => repositoryA.acquireLease({
+            investigationId: "inv-runtime",
+            leaseId: "lease-four-delayed",
+            owner: "runner-four-delayed",
+            supervisorGeneration: 4,
+            runnerIncarnation: "runner-four",
+        })).toThrow(expect.objectContaining({
+            code: PERSISTENCE_ERROR_CODES.FENCE_REJECTED,
+        }));
+        expect(repositoryB.getActiveLease("inv-runtime")).toMatchObject(current);
+    });
+});
+
 function artifactHash(character) {
     return `sha256:${character.repeat(64)}`;
 }

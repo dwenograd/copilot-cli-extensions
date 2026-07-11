@@ -5,6 +5,10 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
+    CONTRACT_LIMITS,
+} from "../domain/index.mjs";
+import {
+    DEFAULT_PROMPT_CONTEXT_BYTE_CAP,
     RuntimeConfigError,
     createDomainRepositoryAdapter,
     normalizeSupervisorConfig,
@@ -155,7 +159,17 @@ function makeDeps(workspace, overrides = {}) {
             createDomainRepositoryAdapter,
             ensureSupervisor: (config, options) => {
                 calls.ensure.push({ config, options });
-                return { action: "started", pid: 4242 };
+                return {
+                    action: "started",
+                    pid: 4242,
+                    acknowledged: true,
+                    acknowledgement: {
+                        supervisorGeneration: 1,
+                        runnerIncarnation: "fixture-runner-incarnation",
+                        configFingerprint: "sha256:fixture-supervisor-config",
+                        deadlineMs: config.runner.deadlineMs,
+                    },
+                };
             },
             ...overrides,
         },
@@ -181,7 +195,7 @@ describe("crucible_start lifecycle preflight", () => {
         [
             "oversized objective",
             (workspace) => startArgs(workspace.projectDir, {
-                objective: "x".repeat(4097),
+                objective: "x".repeat(CONTRACT_LIMITS.objectiveCharacters + 1),
             }),
         ],
         [
@@ -263,11 +277,10 @@ describe("crucible_start lifecycle preflight", () => {
         );
     });
 
-    it("rejects an irreducible prompt core above the runtime byte cap", async () => {
+    it("rejects oversized prompt inputs before state", async () => {
         const workspace = makeWorkspace("prompt-core");
         const { deps } = makeDeps(workspace);
-        await expectRejectedWithoutState(
-            workspace,
+        await expect(Promise.resolve().then(() => startInvestigation(
             startArgs(workspace.projectDir, {
                 objective: "o".repeat(4000),
                 acceptance_predicate: {
@@ -277,8 +290,92 @@ describe("crucible_start lifecycle preflight", () => {
                 },
             }),
             deps,
-            StartPreflightError,
+        ))).rejects.toThrow();
+        expectNoPersistentSideEffects(workspace);
+    });
+
+    it("rejects predicate complexity and metric-count audit reproductions before state", async () => {
+        const cases = [
+            (() => {
+                let predicate = { kind: "harness_pass" };
+                for (let index = 0;
+                    index <= CONTRACT_LIMITS.acceptancePredicateDepth;
+                    index += 1) {
+                    predicate = { kind: "not", predicate };
+                }
+                return { acceptance_predicate: predicate };
+            })(),
+            {
+                acceptance_predicate: {
+                    kind: "all",
+                    predicates: Array.from(
+                        { length: CONTRACT_LIMITS.acceptancePredicateChildren + 1 },
+                        () => ({ kind: "harness_pass" }),
+                    ),
+                },
+            },
+            {
+                acceptance_predicate: {
+                    kind: "field_equals",
+                    path: "payload",
+                    value: Array.from(
+                        { length: CONTRACT_LIMITS.acceptanceValueArrayItems + 1 },
+                        (_unused, index) => index,
+                    ),
+                },
+            },
+            {
+                metrics: Array.from(
+                    { length: CONTRACT_LIMITS.metrics + 1 },
+                    (_unused, index) => ({
+                        key: `metric-${index}`,
+                        direction: "max",
+                    }),
+                ),
+            },
+        ];
+        for (const [index, overrides] of cases.entries()) {
+            const workspace = makeWorkspace(`contract-limit-${index}`);
+            const { deps } = makeDeps(workspace);
+            await expect(Promise.resolve().then(() =>
+                startInvestigation(startArgs(workspace.projectDir, overrides), deps)))
+                .rejects.toThrow();
+            expectNoPersistentSideEffects(workspace);
+        }
+    });
+
+    it("serializes the worst-case legal trusted core before creating state", () => {
+        const workspace = makeWorkspace("worst-legal-core");
+        const { deps } = makeDeps(workspace);
+        const metrics = Array.from(
+            { length: CONTRACT_LIMITS.metrics },
+            (_unused, index) => ({
+                key: `metric-${index}-`.padEnd(128, String(index % 10)),
+                direction: index % 2 === 0 ? "max" : "min",
+                epsilon: Number.MAX_SAFE_INTEGER,
+            }),
         );
+        const plan = preflightStartInvestigation(startArgs(workspace.projectDir, {
+            objective: "o".repeat(CONTRACT_LIMITS.objectiveBytes),
+            acceptance_predicate: {
+                kind: "field_equals",
+                path: "payload",
+                value: Array.from({ length: 4 }, () => "p".repeat(900)),
+            },
+            metrics,
+            candidates_per_round: CONTRACT_LIMITS.candidatesPerRound,
+            max_rounds: CONTRACT_LIMITS.maxRounds,
+        }), deps);
+        try {
+            expect(plan.promptCore.coreBytes)
+                .toBeLessThanOrEqual(DEFAULT_PROMPT_CONTEXT_BYTE_CAP);
+            expect(plan.supervisorConfig.runner.options.maxLoopIterations)
+                .toBeGreaterThan(1000);
+            expect(plan.supervisorConfig.maxRestarts).toBeGreaterThanOrEqual(3);
+            expect(fs.existsSync(workspace.stateRoot)).toBe(false);
+        } finally {
+            disposeStartPreflight(plan);
+        }
     });
 
     it("validates normalized supervisor/runner configuration before staging or state", async () => {
@@ -390,7 +487,7 @@ describe("crucible_start lifecycle preflight", () => {
         );
     });
 
-    it("removes new investigation, artifact, state, and config paths when apply fails", async () => {
+    it("compensates a post-persistence supervisor failure to a durable pause", async () => {
         const workspace = makeWorkspace("apply-failure-cleanup");
         const { deps } = makeDeps(workspace, {
             ensureSupervisor: (config) => {
@@ -402,7 +499,50 @@ describe("crucible_start lifecycle preflight", () => {
         await expect(Promise.resolve().then(() =>
             startInvestigation(startArgs(workspace.projectDir), deps)))
             .rejects.toThrow("injected supervisor launch failure");
-        expectNoPersistentSideEffects(workspace);
+        expect(fs.existsSync(workspace.stateRoot)).toBe(true);
+        const investigationDir = fs.readdirSync(workspace.stateRoot)
+            .map((name) => path.join(workspace.stateRoot, name))
+            .find((candidate) => fs.existsSync(path.join(candidate, "state", "events.sqlite")));
+        expect(investigationDir).toBeTruthy();
+        const repository = openRepositoryReadOnly({
+            file: path.join(investigationDir, "state", "events.sqlite"),
+        });
+        try {
+            const adapter = createDomainRepositoryAdapter({
+                repository,
+                investigationId: path.basename(investigationDir),
+                ensure: false,
+            });
+            expect(adapter.replay().aggregate.pause).not.toBeNull();
+        } finally {
+            repository.close();
+        }
+    });
+
+    it("reports post-success preflight cleanup as a warning without failing start", async () => {
+        const workspace = makeWorkspace("post-success-cleanup-warning");
+        const messages = [];
+        const { deps } = makeDeps(workspace, {
+            log: (message) => messages.push(message),
+            removePreflightWorkspace: () => {
+                throw Object.assign(new Error("injected cleanup failure"), {
+                    code: "EBUSY",
+                });
+            },
+        });
+        const result = await Promise.resolve(
+            startInvestigation(startArgs(workspace.projectDir), deps),
+        );
+        expect(result.supervisor.acknowledged).toBe(true);
+        expect(result.cleanup_warning).toMatchObject({
+            code: "CRUCIBLE_API_PREFLIGHT_FAILED",
+            cause_code: "EBUSY",
+            message: expect.stringContaining("injected cleanup failure"),
+        });
+        expect(messages.some((message) =>
+            message.includes("durable start succeeded")
+            && message.includes("injected cleanup failure"))).toBe(true);
+        expect(fs.existsSync(result.events_db_path)).toBe(true);
     });
 
     it("returns one canonical plan and applies only its staged snapshots/config", () => {

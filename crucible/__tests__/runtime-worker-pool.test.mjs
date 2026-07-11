@@ -458,6 +458,7 @@ describe("Crucible SDK worker pool", () => {
                 { annotations: { hypothesis: "no mechanism" } },
                 { annotations: { mechanism: "m", surprise: "x" } },
                 { annotations: { mechanism: "x".repeat(257) } },
+                { annotations: { mechanism: "m", finding: "😀".repeat(300) } },
                 { annotations: { mechanism: "m", expectedEffects: Array.from({ length: 17 }, () => "e") } },
                 { annotations: { mechanism: "m", citedEvidenceIds: ["not a valid id!"] } },
                 { annotations: "not-an-object" },

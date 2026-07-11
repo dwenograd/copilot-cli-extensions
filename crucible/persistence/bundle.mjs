@@ -16,7 +16,7 @@ import { TextDecoder } from "node:util";
 
 import { CruciblePersistenceError, InvalidArgumentError } from "./errors.mjs";
 import { assertLocalDatabasePath } from "./paths.mjs";
-import { canonicalize } from "./canonical.mjs";
+import { canonicalize, normalizeCreatedAt } from "./canonical.mjs";
 import { DatabaseSync } from "./sqlite.mjs";
 import { openRepositoryReadOnly } from "./repository.mjs";
 import {
@@ -50,6 +50,11 @@ const WINDOWS_RESERVED_DEVICE_RE =
     /^(?:aux|clock\$|com[1-9¹²³]|con|conin\$|conout\$|lpt[1-9¹²³]|nul|prn)(?:\..*)?$/iu;
 const HEX64_RE = /^[0-9a-f]{64}$/u;
 const UTF8 = new TextDecoder("utf-8", { fatal: true });
+const QUIET_DURABILITY_CONTROL = Object.freeze({
+    operation: "durability",
+    faultInjector: null,
+    hooks: null,
+});
 
 const MANIFEST_KEYS = Object.freeze([
     "algo",
@@ -357,7 +362,7 @@ function assertSafeExistingPath(absPath, expectedType) {
     };
 }
 
-function ensureSafeDirectory(absPath) {
+function ensureSafeDirectory(absPath, control) {
     const resolved = path.resolve(absPath);
     const parsed = path.parse(resolved);
     const relative = path.relative(parsed.root, resolved);
@@ -375,6 +380,7 @@ function ensureSafeDirectory(absPath) {
                 // Windows applies the available subset; identity checks remain mandatory.
             }
             stat = fs.lstatSync(current, { bigint: true });
+            fsyncDirectory(path.dirname(current), control, "bundle directory creation parent");
         }
         if (stat.isSymbolicLink() || !stat.isDirectory()) {
             throw new BundleUnsafePathError("destination path component is not a private directory", {
@@ -430,6 +436,73 @@ function inject(control, point, details = {}) {
     }
 }
 
+function fsyncDirectory(dirPath, control, purpose) {
+    let fd;
+    let failure = null;
+    try {
+        inject(control, "before-directory-fsync", { path: dirPath, purpose });
+        fd = fs.openSync(dirPath, process.platform === "win32" ? "r+" : "r");
+        fs.fsyncSync(fd);
+    } catch (err) {
+        failure = err;
+    }
+    if (fd !== undefined) {
+        try {
+            fs.closeSync(fd);
+        } catch (err) {
+            if (failure === null) {
+                failure = err;
+            }
+        }
+    }
+    if (failure !== null) {
+        throw new BundleError(
+            BUNDLE_ERROR_CODES.IO_ERROR,
+            `failed to fsync directory for ${purpose}: ${failure.message}`,
+            {
+                path: dirPath,
+                purpose,
+                fsCode: failure.code,
+                syscall: failure.syscall,
+            },
+        );
+    }
+    inject(control, "after-directory-fsync", { path: dirPath, purpose });
+}
+
+function fsyncDirectoryChain(startDir, stopDir, control, purpose) {
+    const start = path.resolve(startDir);
+    const stop = path.resolve(stopDir);
+    if (!isInsideDir(start, stop)) {
+        throw new BundleUnsafePathError("bundle durability fence escaped its trusted root", {
+            start,
+            stop,
+            purpose,
+        });
+    }
+    let current = start;
+    let depth = 0;
+    for (;;) {
+        fsyncDirectory(
+            current,
+            control,
+            depth === 0 ? purpose : `${purpose} ancestor`,
+        );
+        if (sameCanonicalPath(current, stop)) {
+            break;
+        }
+        const parent = path.dirname(current);
+        if (parent === current) {
+            throw new BundleUnsafePathError(
+                "bundle durability fence reached a filesystem root early",
+                { start, stop, purpose },
+            );
+        }
+        current = parent;
+        depth += 1;
+    }
+}
+
 function removeTreeNoFollow(rootPath, rootAnchor = null) {
     const stat = lstatOrNull(rootPath);
     if (stat === null) {
@@ -476,7 +549,7 @@ function createPrivateStage(destResolved, control) {
             dest: destResolved,
         });
     }
-    const parentInfo = ensureSafeDirectory(parent);
+    const parentInfo = ensureSafeDirectory(parent, control);
     const existing = lstatOrNull(destResolved);
     if (existing !== null) {
         const checked = assertSafeExistingPath(destResolved, "directory");
@@ -486,6 +559,8 @@ function createPrivateStage(destResolved, control) {
                 { dest: destResolved },
             );
         }
+        fs.rmdirSync(checked.path);
+        fsyncDirectory(parent, control, "empty bundle destination removal parent");
     }
 
     for (let attempt = 0; attempt < 32; attempt += 1) {
@@ -499,6 +574,7 @@ function createPrivateStage(destResolved, control) {
                 // Best available Windows semantics.
             }
             const stageInfo = assertSafeExistingPath(stage, "directory");
+            fsyncDirectory(parent, control, "bundle staging parent");
             assertDirectoryAnchor(parent, parentInfo.anchor);
             return {
                 dest: destResolved,
@@ -531,7 +607,7 @@ function assertStageRoot(stageContext) {
     return checked;
 }
 
-function ensureStageParent(stageContext, segments) {
+function ensureStageParent(stageContext, segments, control) {
     assertStageRoot(stageContext);
     let current = stageContext.stage;
     for (const segment of segments) {
@@ -546,6 +622,11 @@ function ensureStageParent(stageContext, segments) {
                 // Best available Windows semantics.
             }
             stat = fs.lstatSync(current, { bigint: true });
+            fsyncDirectory(
+                path.dirname(current),
+                control,
+                "bundle staged directory parent",
+            );
         }
         if (stat.isSymbolicLink() || !stat.isDirectory()) {
             throw new BundleUnsafePathError("staging path component changed into a link/non-directory", {
@@ -566,7 +647,7 @@ function ensureStageParent(stageContext, segments) {
 
 function openStageFile(stageContext, relPath, control) {
     const segments = safeRelSegments(relPath);
-    const parent = ensureStageParent(stageContext, segments.slice(0, -1));
+    const parent = ensureStageParent(stageContext, segments.slice(0, -1), control);
     const target = path.join(parent, segments.at(-1));
     inject(control, "before-stage-file-open", {
         relativePath: relPath,
@@ -919,12 +1000,45 @@ function compareScans(before, after, rootPath) {
     }
 }
 
+function fsyncBundleTree(rootPath, control, purpose) {
+    const root = assertSafeExistingPath(rootPath, "directory");
+    const walk = (dirPath) => {
+        const before = assertSafeExistingPath(dirPath, "directory");
+        if (!isInsideDir(before.real, root.real)) {
+            throw new BundleUnsafePathError("bundle durability walk escaped its root", {
+                root: root.path,
+                path: dirPath,
+                real: before.real,
+            });
+        }
+        for (const name of fs.readdirSync(dirPath).sort(compareStable)) {
+            assertSafeComponent(name, dirPath);
+            const child = path.join(dirPath, name);
+            const stat = fs.lstatSync(child, { bigint: true });
+            if (stat.isSymbolicLink()) {
+                throw new BundleUnsafePathError(
+                    "bundle durability walk encountered a link or reparse point",
+                    { path: child },
+                );
+            }
+            if (stat.isDirectory()) {
+                walk(child);
+            } else if (!stat.isFile()) {
+                throw new BundleUnsafePathError(
+                    "bundle durability walk encountered a non-regular entry",
+                    { path: child },
+                );
+            }
+        }
+        fsyncDirectory(dirPath, control, purpose);
+        const after = assertSafeExistingPath(dirPath, "directory");
+        assertIdentity(before.identity, after.identity, dirPath,
+            "bundle directory changed while durability was fenced");
+    };
+    walk(root.path);
+}
+
 function publishStage(stageContext, control) {
-    inject(control, "before-publish", {
-        stagingDir: stageContext.stage,
-        destDir: stageContext.dest,
-        parentDir: stageContext.parent,
-    });
     assertStageRoot(stageContext);
     assertDirectoryAnchor(stageContext.parent, stageContext.parentAnchor);
 
@@ -937,16 +1051,14 @@ function publishStage(stageContext, control) {
                 { dest: stageContext.dest },
             );
         }
-        fs.rmdirSync(stageContext.dest);
-    }
-    if (lstatOrNull(stageContext.dest) !== null) {
-        throw new BundleDestinationExistsError("destination appeared before publication", {
+        throw new BundleDestinationExistsError("empty destination appeared before publication", {
             dest: stageContext.dest,
         });
     }
 
     fs.renameSync(stageContext.stage, stageContext.dest);
     try {
+        fsyncDirectory(stageContext.parent, control, "bundle publication parent");
         const published = assertSafeExistingPath(stageContext.dest, "directory");
         assertIdentity(stageContext.stageAnchor, published.anchor, stageContext.dest,
             "published destination is not the verified staging directory");
@@ -961,30 +1073,69 @@ function publishStage(stageContext, control) {
     } catch (err) {
         try {
             removeTreeNoFollow(stageContext.dest, stageContext.stageAnchor);
-        } catch {
-            // Preserve the publication failure.
+            fsyncDirectory(
+                stageContext.parent,
+                control,
+                "failed bundle rename cleanup parent",
+            );
+        } catch (cleanupError) {
+            if (err && typeof err === "object") {
+                err.cleanupError = cleanupError;
+            }
         }
         throw err;
     }
 }
 
-function withPrivateStage(destDir, control, work) {
+function withPrivateStage(destDir, control, work, finalize) {
     const destResolved = assertLocalDatabasePath(destDir);
     const stageContext = createPrivateStage(destResolved, control);
     let published = false;
     try {
-        const result = work(stageContext);
+        const draft = work(stageContext);
+        inject(control, "before-publish", {
+            stagingDir: stageContext.stage,
+            destDir: stageContext.dest,
+            parentDir: stageContext.parent,
+        });
+        fsyncBundleTree(stageContext.stage, control, "staged bundle directory");
+        const prepared = finalize(stageContext.stage, draft, {
+            phase: "staged",
+            prepared: null,
+        });
+        fsyncBundleTree(
+            stageContext.stage,
+            QUIET_DURABILITY_CONTROL,
+            "verified staged bundle directory",
+        );
         const dest = publishStage(stageContext, control);
         published = true;
+        fsyncBundleTree(dest, control, "published bundle directory");
+        const result = finalize(dest, draft, {
+            phase: "published",
+            prepared,
+        });
+        fsyncBundleTree(
+            dest,
+            QUIET_DURABILITY_CONTROL,
+            "verified published bundle directory",
+        );
         return { ...result, dest };
     } catch (err) {
-        if (!published) {
-            try {
+        try {
+            if (published) {
+                removeTreeNoFollow(stageContext.dest, stageContext.stageAnchor);
+                fsyncDirectory(
+                    stageContext.parent,
+                    control,
+                    "failed bundle publication cleanup parent",
+                );
+            } else {
                 removeTreeNoFollow(stageContext.stage, stageContext.stageAnchor);
-            } catch (cleanupError) {
-                if (err && typeof err === "object") {
-                    err.cleanupError = cleanupError;
-                }
+            }
+        } catch (cleanupError) {
+            if (err && typeof err === "object") {
+                err.cleanupError = cleanupError;
             }
         }
         if (err instanceof CruciblePersistenceError) {
@@ -1449,7 +1600,7 @@ function onlineBackupDatabase(dbFile, stageContext, control) {
         throw err;
     }
     const dbDest = path.join(stageContext.stage, ...DB_RELPATH.split("/"));
-    ensureStageParent(stageContext, DB_RELPATH.split("/").slice(0, -1));
+    ensureStageParent(stageContext, DB_RELPATH.split("/").slice(0, -1), control);
     inject(control, "before-database-backup", {
         sourcePath: resolvedDb,
         stagedPath: dbDest,
@@ -1459,49 +1610,115 @@ function onlineBackupDatabase(dbFile, stageContext, control) {
         "database source changed before backup");
     assertStageRoot(stageContext);
 
-    let db;
+    let backupFd;
+    let backupAnchor;
     try {
-        db = new DatabaseSync(resolvedDb, { readOnly: true });
-        const escaped = dbDest.replaceAll("'", "''");
-        db.exec(`VACUUM INTO '${escaped}'`);
+        const opened = openStageFile(stageContext, DB_RELPATH, control);
+        backupFd = opened.fd;
+        const openedStat = fs.fstatSync(backupFd, { bigint: true });
+        backupAnchor = identity(openedStat, { mutable: false });
+        if (BigInt(openedStat.size) !== 0n) {
+            throw new BundleUnsafePathError("secure backup destination was not empty", {
+                path: opened.target,
+            });
+        }
     } catch (err) {
-        throw new BundleError(BUNDLE_ERROR_CODES.IO_ERROR,
-            `online database backup failed: ${err.message}`, { dbFile: resolvedDb });
-    } finally {
-        try {
-            db?.close();
-        } catch {
-            // Preserve the backup result.
+        if (backupFd !== undefined) {
+            try {
+                fs.closeSync(backupFd);
+            } catch {
+                // Preserve the secure-open failure.
+            }
         }
+        throw err;
     }
+
+    let backup;
     try {
-        db = new DatabaseSync(dbDest);
-        configureConnection(db, { busyTimeoutMs: 5000 });
-    } catch (err) {
-        throw new BundleError(BUNDLE_ERROR_CODES.IO_ERROR,
-            `failed to normalize backup database pragmas: ${err.message}`, { dbFile: dbDest });
-    } finally {
+        let db;
         try {
-            db?.close();
-        } catch {
-            // Preserve the pragma-normalization result.
+            db = new DatabaseSync(resolvedDb, { readOnly: true });
+            const escaped = dbDest.replaceAll("'", "''");
+            db.exec(`VACUUM INTO '${escaped}'`);
+        } catch (err) {
+            throw new BundleError(BUNDLE_ERROR_CODES.IO_ERROR,
+                `online database backup failed: ${err.message}`, { dbFile: resolvedDb });
+        } finally {
+            try {
+                db?.close();
+            } catch {
+                // Preserve the backup result.
+            }
         }
-    }
-    removeBundleDatabaseSidecars(dbDest);
-    const sourceAfter = assertSafeExistingPath(resolvedDb, "file");
-    assertIdentity(source.identity, sourceAfter.identity, resolvedDb,
-        "database source changed during backup");
-    assertStageRoot(stageContext);
-    const backup = assertSafeExistingPath(dbDest, "file");
-    let fd;
-    try {
-        fd = fs.openSync(dbDest, "r+");
-        fs.fsyncSync(fd);
+        const afterVacuumPath = assertSafeExistingPath(dbDest, "file");
+        assertIdentity(
+            backupAnchor,
+            afterVacuumPath.anchor,
+            dbDest,
+            "database backup path was replaced during VACUUM INTO",
+        );
+        assertIdentity(
+            backupAnchor,
+            identity(fs.fstatSync(backupFd, { bigint: true }), { mutable: false }),
+            dbDest,
+            "secure database backup handle changed identity",
+        );
+        if (!isInsideDir(afterVacuumPath.real, stageContext.stage)) {
+            throw new BundleUnsafePathError("database backup escaped the private stage", {
+                path: dbDest,
+                real: afterVacuumPath.real,
+            });
+        }
+        try {
+            db = new DatabaseSync(dbDest);
+            configureConnection(db, { busyTimeoutMs: 5000 });
+        } catch (err) {
+            throw new BundleError(BUNDLE_ERROR_CODES.IO_ERROR,
+                `failed to normalize backup database pragmas: ${err.message}`, { dbFile: dbDest });
+        } finally {
+            try {
+                db?.close();
+            } catch {
+                // Preserve the pragma-normalization result.
+            }
+        }
+        const afterNormalize = assertSafeExistingPath(dbDest, "file");
+        assertIdentity(
+            backupAnchor,
+            afterNormalize.anchor,
+            dbDest,
+            "database backup path was replaced during pragma normalization",
+        );
+        removeBundleDatabaseSidecars(dbDest);
+        const sourceAfter = assertSafeExistingPath(resolvedDb, "file");
+        assertIdentity(source.identity, sourceAfter.identity, resolvedDb,
+            "database source changed during backup");
+        assertStageRoot(stageContext);
+        backup = assertSafeExistingPath(dbDest, "file");
+        assertIdentity(
+            backupAnchor,
+            backup.anchor,
+            dbDest,
+            "database backup path changed before durability fencing",
+        );
+        if (!isInsideDir(backup.real, stageContext.stage)) {
+            throw new BundleUnsafePathError(
+                "database backup escaped the private stage before publication",
+                { path: dbDest, real: backup.real, stage: stageContext.stage },
+            );
+        }
+        fs.fsyncSync(backupFd);
     } finally {
-        if (fd !== undefined) {
-            fs.closeSync(fd);
+        if (backupFd !== undefined) {
+            fs.closeSync(backupFd);
+            backupFd = undefined;
         }
     }
+    fsyncDirectory(
+        path.dirname(dbDest),
+        control,
+        "database backup parent",
+    );
     const hashed = hashStableFile(backup.path, stageContext.stage);
     return { path: dbDest, hash: hashed.hash, size: hashed.size };
 }
@@ -1702,6 +1919,27 @@ function verifyBundleStage(stageRoot, expectedInvestigationId = null) {
     };
 }
 
+function assertSameVerifiedBundle(staged, published) {
+    const sameDigest = digestMatches(staged.digest, published.digest);
+    const sameInventory = Buffer.from(staged.inventoryBytes)
+        .equals(Buffer.from(published.inventoryBytes));
+    const sameManifest = Buffer.from(staged.manifestBytes)
+        .equals(Buffer.from(published.manifestBytes));
+    const sameBinding = canonicalEqual(staged.binding, published.binding);
+    if (!sameDigest || !sameInventory || !sameManifest || !sameBinding) {
+        throw new BundleTamperError(
+            "published bundle bytes differ from the verified private stage",
+            {
+                stagedDigest: staged.digest,
+                publishedDigest: published.digest,
+                sameInventory,
+                sameManifest,
+                sameBinding,
+            },
+        );
+    }
+}
+
 function authenticateImport(verification, options) {
     const {
         expectedDigest = null,
@@ -1846,7 +2084,7 @@ export function exportBundle(options = {}) {
             type: BUNDLE_TYPE,
             version: BUNDLE_VERSION,
             algo: ALGO,
-            createdAt: now(),
+            createdAt: normalizeCreatedAt(now(), "bundle.createdAt"),
             database: {
                 path: DB_RELPATH,
                 size: dbInfo.size,
@@ -1876,17 +2114,28 @@ export function exportBundle(options = {}) {
         const inventoryBytes = Buffer.from(serializeInventory(inventoryEntries), "utf8");
         writeStageBytes(stageContext, INVENTORY_NAME, inventoryBytes, control);
 
-        const verification = verifyBundleStage(stageContext.stage, binding.investigationId);
         return {
-            objectCount: manifest.objects.length,
-            referencedArtifactCount: manifest.artifacts.length,
-            databaseSize: dbInfo.size,
-            databaseSha256: dbInfo.hash,
-            fileCount: inventoryEntries.length,
+            binding,
+            dbInfo,
+            manifest,
+            inventoryEntries,
+        };
+    }, (root, draft, publication) => {
+        const verification = verifyBundleStage(root, draft.binding.investigationId);
+        if (publication.phase === "staged") {
+            return { verification };
+        }
+        assertSameVerifiedBundle(publication.prepared.verification, verification);
+        return {
+            objectCount: draft.manifest.objects.length,
+            referencedArtifactCount: draft.manifest.artifacts.length,
+            databaseSize: draft.dbInfo.size,
+            databaseSha256: draft.dbInfo.hash,
+            fileCount: draft.inventoryEntries.length,
             digest: verification.digest,
             trustLevel: "self-consistent",
-            investigationId: binding.investigationId,
-            domainHead: binding.domainHead,
+            investigationId: verification.binding.investigationId,
+            domainHead: verification.binding.domainHead,
         };
     });
 }
@@ -1988,14 +2237,25 @@ export function importBundle(options = {}) {
         const secondScan = scanTree(sourceRoot.path, control);
         compareScans(firstScan, secondScan, sourceRoot.path);
 
-        const verification = verifyBundleStage(stageContext.stage);
-        const trustLevel = authenticateImport(verification, options);
+        return {};
+    }, (root, _draft, publication) => {
+        const verification = verifyBundleStage(root);
+        if (publication.phase === "staged") {
+            const trustLevel = authenticateImport(verification, options);
+            const postAuthentication = verifyBundleStage(root);
+            assertSameVerifiedBundle(verification, postAuthentication);
+            return {
+                verification: postAuthentication,
+                trustLevel,
+            };
+        }
+        assertSameVerifiedBundle(publication.prepared.verification, verification);
         return {
             fileCount: verification.inventory.length,
             objectCount: verification.manifest.objects.length,
             verified: true,
             digest: verification.digest,
-            trustLevel,
+            trustLevel: publication.prepared.trustLevel,
             investigationId: verification.binding.investigationId,
             domainHead: verification.binding.domainHead,
         };

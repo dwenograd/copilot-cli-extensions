@@ -46,7 +46,9 @@ const SNAPSHOT_ID = /^sha256:[a-f0-9]{64}$/u;
 const SNAPSHOT_HASH =
     /^sha256:crucible-measurement-snapshot-v1:[a-f0-9]{64}$/u;
 const verifiedFileHandles = new WeakMap();
+const stagedFileHandles = new WeakMap();
 const verifiedSnapshotClosures = new WeakMap();
+const stagedSnapshotClosures = new WeakMap();
 
 function fail(code, message, details) {
     throw new FileVerificationError(code, message, details);
@@ -118,6 +120,21 @@ function assertIdentityStable(before, after, filePath, label) {
         fail(
             MEASUREMENT_ERROR_CODES.FILE_CHANGED_DURING_VERIFICATION,
             `${label} changed while it was being verified`,
+            { path: filePath, before, after },
+        );
+    }
+
+}
+
+function assertLaunchIdentityStable(before, after, filePath, label) {
+    if (before.dev !== after.dev
+        || before.ino !== after.ino
+        || before.size !== after.size
+        || before.mode !== after.mode
+        || before.mtimeNs !== after.mtimeNs) {
+        fail(
+            MEASUREMENT_ERROR_CODES.FILE_CHANGED_DURING_VERIFICATION,
+            `${label} launch identity changed while it was pinned`,
             { path: filePath, before, after },
         );
     }
@@ -392,6 +409,7 @@ export function openVerifiedFileHandle(filePath, expected, options = {}) {
             hash,
             size: Number(openedStat.size),
             mode: Number(openedStat.mode),
+            identity: immutableCanonical(opened),
         });
         verifiedFileHandles.set(token, {
             fd,
@@ -402,6 +420,7 @@ export function openVerifiedFileHandle(filePath, expected, options = {}) {
             hash,
             size: Number(openedStat.size),
             mode: Number(openedStat.mode),
+            allowCtimeChange: options.allowCtimeChange === true,
             closed: false,
         });
         fd = undefined;
@@ -430,7 +449,10 @@ function recheckOpenSource(state) {
         state.resolvedPath,
         state.label,
     );
-    assertIdentityStable(state.identity, afterHandle, state.resolvedPath, state.label);
+    const assertStable = state.allowCtimeChange
+        ? assertLaunchIdentityStable
+        : assertIdentityStable;
+    assertStable(state.identity, afterHandle, state.resolvedPath, state.label);
     const afterPath = fileIdentity(
         bigintStat(
             state.resolvedPath,
@@ -439,7 +461,7 @@ function recheckOpenSource(state) {
         state.resolvedPath,
         state.label,
     );
-    assertIdentityStable(state.identity, afterPath, state.resolvedPath, state.label);
+    assertStable(state.identity, afterPath, state.resolvedPath, state.label);
     const realAfter = fs.realpathSync.native(state.resolvedPath);
     if (!samePath(state.realPath, realAfter)) {
         fail(
@@ -452,6 +474,25 @@ function recheckOpenSource(state) {
             },
         );
     }
+
+}
+
+function rehashVerifiedHandle(state, message) {
+    recheckOpenSource(state);
+    const actual = hashOpenFd(state.fd, FILE_HASH_ALGORITHM);
+    if (actual !== state.hash) {
+        fail(
+            MEASUREMENT_ERROR_CODES.FILE_CHANGED_DURING_VERIFICATION,
+            message,
+            {
+                path: state.resolvedPath,
+                expected: state.hash,
+                actual,
+            },
+        );
+    }
+    recheckOpenSource(state);
+    return actual;
 }
 
 // Copy bytes from the already-verified open handle, fsync the staged copy,
@@ -492,17 +533,50 @@ export function stageVerifiedFileHandle(token, destination, options = {}) {
     }
 
     recheckOpenSource(state);
-    const staged = verifyAndHashFile(destination, state.hash, {
+    const stagedToken = openVerifiedFileHandle(destination, state.hash, {
         label: `staged ${label}`,
         algorithm: FILE_HASH_ALGORITHM,
+        allowCtimeChange: true,
     });
-    return Object.freeze({
-        path: staged.resolvedPath,
+    const staged = Object.freeze({
+        path: stagedToken.resolvedPath,
         sourcePath: state.resolvedPath,
         sourceHash: state.hash,
-        stagedHash: staged.hash,
-        size: staged.size,
+        stagedHash: stagedToken.hash,
+        size: stagedToken.size,
+        identity: stagedToken.identity,
+        ...(options.role === undefined ? {} : { role: options.role }),
     });
+    stagedFileHandles.set(staged, stagedToken);
+    return staged;
+}
+
+export function reverifyStagedFileHandle(staged) {
+    const token = stagedFileHandles.get(staged);
+    if (token === undefined) {
+        throw new MeasurementError(
+            MEASUREMENT_ERROR_CODES.INVALID_ARGUMENT,
+            "staged file descriptor is not live",
+        );
+    }
+    const state = requireVerifiedHandle(token);
+    rehashVerifiedHandle(
+        state,
+        `${state.label} bytes changed after private staging`,
+    );
+    return Object.freeze({
+        path: state.resolvedPath,
+        hash: state.hash,
+        size: state.size,
+        identity: immutableCanonical(state.identity),
+    });
+}
+
+export function closeStagedFileHandle(staged) {
+    const token = stagedFileHandles.get(staged);
+    if (token === undefined) return false;
+    stagedFileHandles.delete(staged);
+    return closeVerifiedFileHandle(token);
 }
 
 export function closeVerifiedFileHandle(token) {
@@ -512,6 +586,61 @@ export function closeVerifiedFileHandle(token) {
     fs.closeSync(state.fd);
     verifiedFileHandles.delete(token);
     return true;
+}
+
+function stageHeldCandidateFile(file, destination) {
+    fs.mkdirSync(path.dirname(destination), { recursive: true, mode: 0o700 });
+    let fd;
+    try {
+        fd = fs.openSync(destination, "wx", 0o400);
+        const buffer = Buffer.allocUnsafe(64 * 1024);
+        let position = 0;
+        while (true) {
+            const bytes = fs.readSync(file.fd, buffer, 0, buffer.length, position);
+            if (bytes <= 0) break;
+            let offset = 0;
+            while (offset < bytes) {
+                offset += fs.writeSync(fd, buffer, offset, bytes - offset);
+            }
+            position += bytes;
+        }
+        fs.fsyncSync(fd);
+    } catch (error) {
+        if (fd !== undefined) {
+            try { fs.closeSync(fd); } catch { /* already closed */ }
+            fd = undefined;
+        }
+        fs.rmSync(destination, { force: true });
+        if (error instanceof MeasurementError) throw error;
+        throw new MeasurementError(
+            MEASUREMENT_ERROR_CODES.STAGING_REFUSED,
+            `failed to stage candidate file ${JSON.stringify(file.path)}: ${error?.message ?? String(error)}`,
+            {
+                source: file.absPath,
+                destination,
+                cause: error?.code ?? null,
+            },
+        );
+    } finally {
+        if (fd !== undefined) fs.closeSync(fd);
+    }
+    const stagedToken = openVerifiedFileHandle(destination, file.hash, {
+        label: `staged candidate file ${JSON.stringify(file.path)}`,
+        algorithm: FILE_HASH_ALGORITHM,
+        allowCtimeChange: true,
+    });
+    const staged = Object.freeze({
+        path: file.path,
+        absPath: stagedToken.resolvedPath,
+        sourcePath: file.absPath,
+        sourceHash: file.hash,
+        stagedHash: stagedToken.hash,
+        size: stagedToken.size,
+        identity: stagedToken.identity,
+        role: "candidate",
+    });
+    stagedFileHandles.set(staged, stagedToken);
+    return staged;
 }
 
 function invalidSnapshot(message, details = null) {
@@ -1139,15 +1268,16 @@ function captureCandidateSnapshot(spec, {
     }
 }
 
-// Pin and verify the exact materialized candidate closure before spawn.
-// Every file is held open until closeVerifiedSnapshotClosure(), so unlink and
-// replacement are observable even on platforms that permit deleting open files.
+// Pin and verify the exact materialized source closure before staging. Source
+// files are never permission-mutated; every file is held open until
+// closeVerifiedSnapshotClosure(), while the private execution copy is made
+// read-only separately.
 export function openVerifiedSnapshotClosure(snapshot) {
     const spec = normalizeCandidateSnapshot(snapshot);
     let captured;
     try {
         captured = captureCandidateSnapshot(spec, {
-            enforceReadOnly: true,
+            enforceReadOnly: false,
             holdOpen: true,
         });
     } catch (error) {
@@ -1172,8 +1302,149 @@ export function openVerifiedSnapshotClosure(snapshot) {
         spec,
         captured,
         closed: false,
+        stagedDescriptors: [],
     });
     return token;
+}
+
+// Copy the already-open candidate bytes into the same private per-attempt
+// staging root as the harness. The source handles stay live, and each private
+// copy is independently opened, identity-pinned, and held until the attempt is
+// complete. Harnesses execute only against this staged path.
+export function stageVerifiedSnapshotClosure(token, destination) {
+    const state = requireSnapshotClosure(token);
+    if (typeof destination !== "string" || !path.isAbsolute(destination)) {
+        invalidSnapshot("staged candidate destination must be an absolute path");
+    }
+    if (fs.existsSync(destination)) {
+        throw new MeasurementError(
+            MEASUREMENT_ERROR_CODES.STAGING_REFUSED,
+            "staged candidate destination already exists",
+            { destination },
+        );
+    }
+    const files = [];
+    try {
+        fs.mkdirSync(destination, { recursive: false, mode: 0o700 });
+        for (const directory of state.captured.directories) {
+            fs.mkdirSync(
+                path.join(destination, ...directory.path.split("/")),
+                { recursive: true, mode: 0o700 },
+            );
+        }
+        for (const file of state.captured.files) {
+            files.push(stageHeldCandidateFile(
+                file,
+                path.join(destination, ...file.path.split("/")),
+            ));
+        }
+        const stagedSpec = {
+            ...state.spec,
+            path: fs.realpathSync.native(destination),
+        };
+        const captured = captureCandidateSnapshot(stagedSpec, {
+            enforceReadOnly: true,
+            holdOpen: false,
+        });
+        const descriptor = Object.freeze({
+            path: stagedSpec.path,
+            hash: state.spec.hash,
+            snapshotId: state.spec.snapshotId,
+            preClosureHash: captured.closureHash,
+            identitySummary: captured.identitySummary,
+            files: Object.freeze(files),
+            directories: Object.freeze([
+                stagedSpec.path,
+                ...captured.directories.map((directory) => directory.absPath),
+            ]),
+        });
+        stagedSnapshotClosures.set(descriptor, {
+            sourceToken: token,
+            spec: stagedSpec,
+            captured,
+            files,
+            closed: false,
+        });
+        state.stagedDescriptors.push(descriptor);
+        return descriptor;
+    } catch (error) {
+        for (const file of files) {
+            try { closeStagedFileHandle(file); } catch { /* preserve cause */ }
+        }
+        try {
+            fs.rmSync(destination, { recursive: true, force: true });
+        } catch {
+            // The executor performs a final private-stage cleanup as well.
+        }
+        throw error;
+    }
+}
+
+export function reverifyStagedSnapshotClosure(descriptor) {
+    const state = stagedSnapshotClosures.get(descriptor);
+    if (state === undefined || state.closed) {
+        invalidSnapshot("staged candidate snapshot closure is not live");
+    }
+    for (const file of state.files) {
+        reverifyStagedFileHandle(file);
+    }
+    const post = captureCandidateSnapshot(state.spec, {
+        enforceReadOnly: false,
+        holdOpen: false,
+    });
+    const stableIdentityProjection = (summary) => ({
+        root: {
+            ...summary.root,
+            ctimeNs: null,
+        },
+        directories: summary.directories.map((directory) => ({
+            ...directory,
+            ctimeNs: null,
+        })),
+        files: summary.files.map((file) => ({
+            ...file,
+            ctimeNs: null,
+        })),
+    });
+    if (post.closureHash !== state.captured.closureHash
+        || canonicalJson(stableIdentityProjection(post.identitySummary))
+            !== canonicalJson(
+                stableIdentityProjection(state.captured.identitySummary),
+            )) {
+        fail(
+            MEASUREMENT_ERROR_CODES.FILE_CHANGED_DURING_VERIFICATION,
+            "private staged candidate closure changed before or during launch",
+            {
+                beforeClosureHash: state.captured.closureHash,
+                afterClosureHash: post.closureHash,
+                beforeIdentity: state.captured.identitySummary,
+                afterIdentity: post.identitySummary,
+            },
+        );
+    }
+    return immutableCanonical({
+        closureHash: post.closureHash,
+        identitySummary: post.identitySummary,
+        fileCount: post.files.length,
+        totalBytes: post.files.reduce((total, file) => total + file.size, 0),
+    });
+}
+
+export function closeStagedSnapshotClosure(descriptor) {
+    const state = stagedSnapshotClosures.get(descriptor);
+    if (state === undefined || state.closed) return false;
+    state.closed = true;
+    let firstError = null;
+    for (const file of state.files) {
+        try {
+            closeStagedFileHandle(file);
+        } catch (error) {
+            firstError ??= error;
+        }
+    }
+    stagedSnapshotClosures.delete(descriptor);
+    if (firstError !== null) throw firstError;
+    return true;
 }
 
 function requireSnapshotClosure(token) {
@@ -1293,6 +1564,13 @@ export function closeVerifiedSnapshotClosure(token) {
     if (state === undefined || state.closed) return false;
     state.closed = true;
     let firstError = null;
+    for (const descriptor of state.stagedDescriptors) {
+        try {
+            closeStagedSnapshotClosure(descriptor);
+        } catch (error) {
+            firstError ??= error;
+        }
+    }
     for (const file of state.captured.files) {
         if (file.fd === null) continue;
         try {

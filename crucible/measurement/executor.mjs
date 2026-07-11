@@ -31,13 +31,14 @@ import fs from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
-import { immutableCanonical } from "../domain/canonical.mjs";
+import { canonicalJson, immutableCanonical } from "../domain/canonical.mjs";
 import {
     ARGV_PLACEHOLDERS,
     acquireVerifiedHarnessRun,
     isLoadedHarnessAllowlist,
     isVerifiedHarnessEntry,
     releaseVerifiedHarnessRun,
+    reverifyStagedHarnessRun,
     stageVerifiedHarnessRun,
 } from "./allowlist.mjs";
 import {
@@ -49,12 +50,19 @@ import {
 } from "./errors.mjs";
 import {
     closeVerifiedSnapshotClosure,
+    closeStagedSnapshotClosure,
     openVerifiedSnapshotClosure,
+    reverifyStagedSnapshotClosure,
     reverifySnapshotClosure,
     sha256Bytes,
+    stageVerifiedSnapshotClosure,
     STREAM_HASH_ALGORITHM,
 } from "./fs-verify.mjs";
-import { PARSER_VERSION, parseHarnessResult } from "./parser.mjs";
+import {
+    PARSER_MAX_INPUT_BYTES,
+    PARSER_VERSION,
+    parseHarnessResult,
+} from "./parser.mjs";
 import {
     buildMeasurementReceipt,
     hashArgv,
@@ -74,6 +82,14 @@ const SAFE_ID = /^[a-z0-9][a-z0-9._-]{0,127}$/u;
 const HASH_TAG = /^sha256:[a-z0-9][a-z0-9._-]*:[a-f0-9]{64}$/u;
 const DEFAULT_TERMINATION_DRAIN_TIMEOUT_MS = 5_000;
 const DEFAULT_CAPABILITY_CLEANUP_TIMEOUT_MS = 10_000;
+export const DEFAULT_MEASUREMENT_BYTE_BUDGETS = Object.freeze({
+    perAttemptOutputBytes: 16 * 1024 * 1024,
+    perInvestigationOutputBytes: 256 * 1024 * 1024,
+    perAttemptReceiptBytes: 2 * 1024 * 1024,
+    perInvestigationReceiptBytes: 64 * 1024 * 1024,
+    perAttemptCasBytes: 32 * 1024 * 1024,
+    perInvestigationCasBytes: 2 * 1024 * 1024 * 1024,
+});
 
 // Minimal fixed env keys we always pass through so the child process can
 // find fundamental system resources. NOT candidate for allowedEnv override:
@@ -145,6 +161,57 @@ function validateCandidateSnapshot(snapshot) {
         );
     }
     return snapshot;
+}
+
+function candidateCasCharge(snapshot, maximumBytes) {
+    const manifest = snapshot.manifest;
+    if (manifest === null
+        || typeof manifest !== "object"
+        || Array.isArray(manifest)
+        || !Array.isArray(manifest.entries)
+        || !Number.isSafeInteger(manifest.totalBytes)
+        || manifest.totalBytes < 0) {
+        throw new MeasurementError(
+            MEASUREMENT_ERROR_CODES.INVALID_ARGUMENT,
+            "candidate snapshot manifest counters are malformed",
+        );
+    }
+    let fileBytes = 0;
+    let minimumManifestBytes = 128;
+    for (const [index, entry] of manifest.entries.entries()) {
+        if (entry === null
+            || typeof entry !== "object"
+            || Array.isArray(entry)
+            || typeof entry.path !== "string"
+            || !Number.isSafeInteger(entry.size)
+            || entry.size < 0) {
+            throw new MeasurementError(
+                MEASUREMENT_ERROR_CODES.INVALID_ARGUMENT,
+                "candidate snapshot manifest entry is malformed",
+                { index },
+            );
+        }
+        fileBytes = boundedAdd(fileBytes, entry.size);
+        minimumManifestBytes = boundedAdd(
+            minimumManifestBytes,
+            128 + Buffer.byteLength(entry.path, "utf8"),
+        );
+    }
+    if (fileBytes !== manifest.totalBytes) {
+        throw new MeasurementError(
+            MEASUREMENT_ERROR_CODES.FILE_HASH_MISMATCH,
+            "candidate snapshot manifest totalBytes is inconsistent",
+            { expected: manifest.totalBytes, actual: fileBytes },
+        );
+    }
+    const lowerBound = boundedAdd(fileBytes, minimumManifestBytes);
+    if (lowerBound > maximumBytes) {
+        return lowerBound;
+    }
+    return boundedAdd(
+        fileBytes,
+        Buffer.byteLength(canonicalJson(manifest), "utf8"),
+    );
 }
 
 function validateIdentifier(value, field) {
@@ -250,12 +317,200 @@ function normalizeLifecycleTimeout(value, fallback, field) {
     return actual;
 }
 
+function normalizePositiveByteBudget(value, fallback, field) {
+    const actual = value ?? fallback;
+    if (!Number.isSafeInteger(actual) || actual < 1 || actual > 4 * 1024 * 1024 * 1024) {
+        throw new MeasurementError(
+            MEASUREMENT_ERROR_CODES.INVALID_ARGUMENT,
+            `${field} must be a positive safe integer <= 4 GiB`,
+            { field, value: actual },
+        );
+    }
+    return actual;
+}
+
+function normalizeMeasurementByteBudgets(value = {}) {
+    if (value === null || typeof value !== "object" || Array.isArray(value)) {
+        throw new MeasurementError(
+            MEASUREMENT_ERROR_CODES.INVALID_ARGUMENT,
+            "byteBudgets must be an object",
+        );
+    }
+    const unknown = Object.keys(value).filter((key) =>
+        !Object.hasOwn(DEFAULT_MEASUREMENT_BYTE_BUDGETS, key));
+    if (unknown.length > 0) {
+        throw new MeasurementError(
+            MEASUREMENT_ERROR_CODES.INVALID_ARGUMENT,
+            "byteBudgets contain unknown keys",
+            { unknown },
+        );
+    }
+    const normalized = {};
+    for (const [key, fallback] of Object.entries(DEFAULT_MEASUREMENT_BYTE_BUDGETS)) {
+        normalized[key] = normalizePositiveByteBudget(
+            value[key],
+            fallback,
+            `byteBudgets.${key}`,
+        );
+    }
+    if (normalized.perInvestigationOutputBytes < normalized.perAttemptOutputBytes
+        || normalized.perInvestigationReceiptBytes < normalized.perAttemptReceiptBytes) {
+        throw new MeasurementError(
+            MEASUREMENT_ERROR_CODES.INVALID_ARGUMENT,
+            "per-investigation byte budgets must be at least their per-attempt budgets",
+        );
+    }
+    if (normalized.perInvestigationCasBytes < normalized.perAttemptCasBytes) {
+        throw new MeasurementError(
+            MEASUREMENT_ERROR_CODES.INVALID_ARGUMENT,
+            "perInvestigationCasBytes must be at least perAttemptCasBytes",
+        );
+    }
+    return Object.freeze(normalized);
+}
+
+function normalizeInitialByteUsage(value = {}) {
+    if (value === null || typeof value !== "object" || Array.isArray(value)) {
+        throw new MeasurementError(
+            MEASUREMENT_ERROR_CODES.INVALID_ARGUMENT,
+            "initialByteUsage must be an object",
+        );
+    }
+    const allowed = new Set(["outputBytes", "receiptBytes", "casBytes"]);
+    const unknown = Object.keys(value).filter((key) => !allowed.has(key));
+    if (unknown.length > 0) {
+        throw new MeasurementError(
+            MEASUREMENT_ERROR_CODES.INVALID_ARGUMENT,
+            "initialByteUsage contains unknown keys",
+            { unknown },
+        );
+    }
+    const normalize = (field) => {
+        const actual = value[field] ?? 0;
+        if (!Number.isSafeInteger(actual) || actual < 0) {
+            throw new MeasurementError(
+                MEASUREMENT_ERROR_CODES.INVALID_ARGUMENT,
+                `initialByteUsage.${field} must be a non-negative safe integer`,
+                { value: actual },
+            );
+        }
+        return actual;
+    };
+    return Object.freeze({
+        outputBytes: normalize("outputBytes"),
+        receiptBytes: normalize("receiptBytes"),
+        casBytes: normalize("casBytes"),
+    });
+}
+
+function boundedAdd(left, right) {
+    if (!Number.isSafeInteger(right) || right < 0) {
+        throw new MeasurementError(
+            MEASUREMENT_ERROR_CODES.INVALID_ARGUMENT,
+            "byte count must be a non-negative safe integer",
+            { bytes: right },
+        );
+    }
+    return left > Number.MAX_SAFE_INTEGER - right
+        ? Number.MAX_SAFE_INTEGER
+        : left + right;
+}
+
+function createMeasurementByteLedger(budgets, initialUsage) {
+    let investigationOutputBytes = initialUsage.outputBytes;
+    let investigationReceiptBytes = initialUsage.receiptBytes;
+    let investigationCasBytes = initialUsage.casBytes;
+    const attempts = new Map();
+    const attempt = (attemptId) => {
+        let value = attempts.get(attemptId);
+        if (value === undefined) {
+            value = { outputBytes: 0, receiptBytes: 0, casBytes: 0 };
+            attempts.set(attemptId, value);
+        }
+        return value;
+    };
+    const consume = (attemptId, bytes, kind) => {
+        const state = attempt(attemptId);
+        const attemptField = `${kind}Bytes`;
+        const attemptLimit = kind === "output"
+            ? budgets.perAttemptOutputBytes
+            : kind === "receipt"
+                ? budgets.perAttemptReceiptBytes
+                : budgets.perAttemptCasBytes;
+        const investigationLimit = kind === "output"
+            ? budgets.perInvestigationOutputBytes
+            : kind === "receipt"
+                ? budgets.perInvestigationReceiptBytes
+                : budgets.perInvestigationCasBytes;
+        const nextAttempt = boundedAdd(state[attemptField], bytes);
+        const currentInvestigation = kind === "output"
+            ? investigationOutputBytes
+            : kind === "receipt"
+                ? investigationReceiptBytes
+                : investigationCasBytes;
+        const nextInvestigation = boundedAdd(currentInvestigation, bytes);
+        state[attemptField] = nextAttempt;
+        if (kind === "output") investigationOutputBytes = nextInvestigation;
+        else if (kind === "receipt") {
+            investigationReceiptBytes = nextInvestigation;
+        } else {
+            investigationCasBytes = nextInvestigation;
+        }
+        return Object.freeze({
+            allowed: nextAttempt <= attemptLimit
+                && nextInvestigation <= investigationLimit,
+            kind,
+            bytes,
+            attemptBytes: nextAttempt,
+            attemptLimit,
+            investigationBytes: nextInvestigation,
+            investigationLimit,
+        });
+    };
+    return Object.freeze({
+        consumeOutput(attemptId, bytes) {
+            return consume(attemptId, bytes, "output");
+        },
+        consumeReceipt(attemptId, bytes) {
+            return consume(attemptId, bytes, "receipt");
+        },
+        consumeCas(attemptId, bytes) {
+            return consume(attemptId, bytes, "cas");
+        },
+        snapshot(attemptId) {
+            const state = attempt(attemptId);
+            return immutableCanonical({
+                limits: budgets,
+                attempt: state,
+                investigation: {
+                    outputBytes: investigationOutputBytes,
+                    receiptBytes: investigationReceiptBytes,
+                    casBytes: investigationCasBytes,
+                },
+            });
+        },
+    });
+}
+
+function byteBudgetError(result, attemptId, stage) {
+    return new MeasurementError(
+        MEASUREMENT_ERROR_CODES.BYTE_BUDGET_EXCEEDED,
+        `measurement ${result.kind} byte budget exceeded during ${stage}`,
+        {
+            attemptId,
+            stage,
+            ...result,
+        },
+    );
+}
+
 // Build a MeasurementExecutor. Options:
 //   sandboxProvider    : registered provider from createSandboxProvider() | null
 //   processAdapter     : injected for tests; defaults to real Windows adapter
 //   clock              : { now(): number, isoNow(): string } for tests
 //   scratchRoot        : operator-owned root for private per-attempt staging
 //   onCapturedOutput   : trusted raw-output observer used by the runtime runner
+//   faultInjector      : optional async boundary injector used by failure tests
 //   terminationDrainMs : final child-output drain bound after termination
 //   capabilityCleanupTimeoutMs : final sandbox cleanup / Job Object close bound
 export function createMeasurementExecutor(options = {}) {
@@ -297,6 +552,13 @@ export function createMeasurementExecutor(options = {}) {
             "onCapturedOutput must be a function or null",
         );
     }
+    const faultInjector = options.faultInjector ?? null;
+    if (faultInjector !== null && typeof faultInjector !== "function") {
+        throw new MeasurementError(
+            MEASUREMENT_ERROR_CODES.INVALID_ARGUMENT,
+            "faultInjector must be a function or null",
+        );
+    }
     const scratchRoot = normalizeScratchRoot(options.scratchRoot);
     const terminationDrainMs = normalizeLifecycleTimeout(
         options.terminationDrainMs,
@@ -308,6 +570,18 @@ export function createMeasurementExecutor(options = {}) {
         DEFAULT_CAPABILITY_CLEANUP_TIMEOUT_MS,
         "capabilityCleanupTimeoutMs",
     );
+    const byteBudgets = normalizeMeasurementByteBudgets(options.byteBudgets);
+    const initialByteUsage = normalizeInitialByteUsage(options.initialByteUsage);
+    if (initialByteUsage.outputBytes > byteBudgets.perInvestigationOutputBytes
+        || initialByteUsage.receiptBytes > byteBudgets.perInvestigationReceiptBytes
+        || initialByteUsage.casBytes > byteBudgets.perInvestigationCasBytes) {
+        throw new MeasurementError(
+            MEASUREMENT_ERROR_CODES.BYTE_BUDGET_EXCEEDED,
+            "initial measurement byte usage already exceeds the investigation budget",
+            { byteBudgets, initialByteUsage },
+        );
+    }
+    const byteLedger = createMeasurementByteLedger(byteBudgets, initialByteUsage);
 
     return Object.freeze({
         sandboxProvider,
@@ -322,9 +596,15 @@ export function createMeasurementExecutor(options = {}) {
                 scratchRoot,
                 allowlist,
                 onCapturedOutput,
+                faultInjector,
                 terminationDrainMs,
                 capabilityCleanupTimeoutMs,
+                byteLedger,
             });
+        },
+        async close(closeOptions = {}) {
+            if (typeof adapter.close !== "function") return true;
+            return adapter.close(closeOptions);
         },
     });
 }
@@ -374,6 +654,47 @@ function makeAttemptStage(scratchRoot, attemptId) {
     }
 }
 
+function makeStageWritable(stageRoot) {
+    if (!fs.existsSync(stageRoot)) return;
+    const visit = (directory) => {
+        let entries = [];
+        try {
+            entries = fs.readdirSync(directory, { withFileTypes: true });
+        } catch {
+            return;
+        }
+        for (const entry of entries) {
+            const item = path.join(directory, entry.name);
+            if (entry.isDirectory()) {
+                visit(item);
+                try { fs.chmodSync(item, 0o700); } catch { /* best effort */ }
+            } else {
+                try { fs.chmodSync(item, 0o600); } catch { /* best effort */ }
+            }
+        }
+        try { fs.chmodSync(directory, 0o700); } catch { /* best effort */ }
+    };
+    visit(stageRoot);
+}
+
+async function removeAttemptStage(stageRoot) {
+    let lastError = null;
+    for (let attempt = 0; attempt < 200; attempt += 1) {
+        try {
+            fs.rmSync(stageRoot, { recursive: true, force: true });
+            return;
+        } catch (error) {
+            lastError = error;
+            if (!["EBUSY", "ENOTEMPTY", "EPERM"].includes(error?.code)) {
+                throw error;
+            }
+            if (attempt === 0) makeStageWritable(stageRoot);
+            await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+    }
+    throw lastError;
+}
+
 function rewriteDependencyArgv(entry, concreteArgv, stagedDependencies) {
     const rewritten = [...concreteArgv];
     for (const ref of entry.argvDependencyRefs) {
@@ -397,8 +718,10 @@ async function runOnce({
     scratchRoot,
     allowlist,
     onCapturedOutput,
+    faultInjector,
     terminationDrainMs,
     capabilityCleanupTimeoutMs,
+    byteLedger,
 }) {
     if (runInput === null || typeof runInput !== "object" || Array.isArray(runInput)) {
         throw new MeasurementError(
@@ -417,9 +740,28 @@ async function runOnce({
     const attemptId = validateIdentifier(runInput.attemptId, "attemptId");
     const runnerEpochId = validateIdentifier(runInput.runnerEpochId, "runnerEpochId");
     const deadlineMs = normalizeDeadline(runInput.deadlineMs);
+    const budgetLimits = byteLedger.snapshot(attemptId).limits;
+    const casBudget = byteLedger.consumeCas(
+        attemptId,
+        candidateCasCharge(
+            snapshot,
+            Math.min(
+                budgetLimits.perAttemptCasBytes,
+                budgetLimits.perInvestigationCasBytes,
+            ),
+        ),
+    );
+    if (!casBudget.allowed) {
+        throw byteBudgetError(
+            casBudget,
+            attemptId,
+            "candidate snapshot admission",
+        );
+    }
     let runLease = null;
     let stageRoot = null;
     let snapshotLease = null;
+    let stagedSnapshot = null;
     let capability = null;
     let capabilityBinding = null;
     let capabilityCleaned = false;
@@ -432,12 +774,16 @@ async function runOnce({
         const stagedRun = stageVerifiedHarnessRun(runLease, stageRoot);
         const entry = stagedRun.entry;
         snapshotLease = openVerifiedSnapshotClosure(snapshot);
+        stagedSnapshot = stageVerifiedSnapshotClosure(
+            snapshotLease,
+            path.join(stageRoot, "candidate"),
+        );
         assertDeadline(deadlineMs, clock, "harness staging");
 
         // Substitute only data placeholders, then replace every declared
         // static file reference with its private staged path.
         const concreteArgv = substituteArgv(entry.argvTemplate, {
-            candidatePath: snapshot.path,
+            candidatePath: stagedSnapshot.path,
             attemptId,
         });
         const spawnExecutable = stagedRun.executable.path;
@@ -458,7 +804,7 @@ async function runOnce({
         for (const [k, v] of Object.entries(entry.allowedEnv)) {
             env[k] = v;
         }
-        env.CANDIDATE_SNAPSHOT_PATH = snapshot.path;
+        env.CANDIDATE_SNAPSHOT_PATH = stagedSnapshot.path;
         env.CRUCIBLE_ATTEMPT_ID = attemptId;
         env.CRUCIBLE_RUNNER_EPOCH_ID = runnerEpochId;
 
@@ -468,7 +814,50 @@ async function runOnce({
             stagedRun.executable.path,
             stagedRun.cwd,
             ...stagedRun.dependencies.map((dependency) => dependency.path),
+            stagedSnapshot.path,
+            ...stagedSnapshot.directories,
+            ...stagedSnapshot.files.map((file) => file.absPath),
         ];
+        const launchFiles = Object.freeze([
+            Object.freeze({
+                path: stagedRun.executable.path,
+                sha256: stagedRun.executable.stagedHash,
+                role: "executable",
+                identity: stagedRun.executable.identity,
+            }),
+            ...stagedRun.dependencies.map((dependency) => Object.freeze({
+                path: dependency.path,
+                sha256: dependency.stagedHash,
+                role: dependency.role,
+                identity: dependency.identity,
+            })),
+            ...stagedSnapshot.files.map((file) => Object.freeze({
+                path: file.absPath,
+                sha256: file.stagedHash,
+                role: "candidate",
+                identity: file.identity,
+            })),
+        ]);
+        const executionSnapshot = Object.freeze({
+            ...snapshot,
+            path: stagedSnapshot.path,
+        });
+        await faultInjector?.("after_harness_staging", Object.freeze({
+            attemptId,
+            runnerEpochId,
+            harnessId: entry.id,
+            stageRoot,
+            executable: spawnExecutable,
+            dependencies: Object.freeze(
+                stagedRun.dependencies.map((dependency) => dependency.path),
+            ),
+            candidateRoot: stagedSnapshot.path,
+            candidateFiles: Object.freeze(
+                stagedSnapshot.files.map((file) => file.absPath),
+            ),
+        }));
+        reverifyStagedHarnessRun(stagedRun);
+        reverifyStagedSnapshotClosure(stagedSnapshot);
         const admissionTimeoutMs = Math.max(
             1,
             Math.min(entry.timeoutMs, remainingDeadlineMs(deadlineMs, clock)),
@@ -489,7 +878,7 @@ async function runOnce({
             try {
                 admission = await sandboxProvider.admitAndPrepare(Object.freeze({
                     verifiedEntry,
-                    candidateSnapshot: snapshot,
+                    candidateSnapshot: executionSnapshot,
                     attemptId,
                     runnerEpochId,
                     harnessId: entry.id,
@@ -503,6 +892,7 @@ async function runOnce({
                         deadlineMs,
                         timeoutMs: admissionTimeoutMs,
                         stagedPaths: Object.freeze([...stagedPaths]),
+                        launchFiles,
                     }),
                 }));
             } catch (error) {
@@ -538,6 +928,22 @@ async function runOnce({
         );
         const startedAt = clock.isoNow();
         const startTimeMs = clock.now();
+        await faultInjector?.("before_harness_launch", Object.freeze({
+            attemptId,
+            runnerEpochId,
+            harnessId: entry.id,
+            stageRoot,
+            executable: spawnExecutable,
+            dependencies: Object.freeze(
+                stagedRun.dependencies.map((dependency) => dependency.path),
+            ),
+            candidateRoot: stagedSnapshot.path,
+            candidateFiles: Object.freeze(
+                stagedSnapshot.files.map((file) => file.absPath),
+            ),
+        }));
+        reverifyStagedHarnessRun(stagedRun);
+        reverifyStagedSnapshotClosure(stagedSnapshot);
 
         let child;
         let terminationController;
@@ -553,6 +959,7 @@ async function runOnce({
                     deadlineMs,
                     timeoutMs: effectiveTimeoutMs,
                     stagedPaths,
+                    launchFiles,
                 },
             );
             terminationController = Object.freeze({
@@ -566,7 +973,7 @@ async function runOnce({
             });
         } else {
             try {
-                child = adapter.spawn(spawnExecutable, spawnArgv, {
+                child = await adapter.spawn(spawnExecutable, spawnArgv, {
                     cwd,
                     env,
                     stdio: ["ignore", "pipe", "pipe"],
@@ -574,6 +981,10 @@ async function runOnce({
                     launchPath: "host-process-adapter",
                     deadlineMs,
                     timeoutMs: effectiveTimeoutMs,
+                    ownerRoot: path.join(
+                        scratchRoot,
+                        ".crucible-process-owners",
+                    ),
                 });
             } catch (err) {
                 throw new StagingRefusedError(
@@ -598,14 +1009,55 @@ async function runOnce({
             );
         }
 
-        const outcome = await captureChild(child, {
+        const capture = captureChild(child, {
             pid: child.pid,
-            maxStdoutBytes: entry.maxStdoutBytes,
+            maxStdoutBytes: Math.min(
+                entry.maxStdoutBytes,
+                PARSER_MAX_INPUT_BYTES,
+            ),
             maxStderrBytes: entry.maxStderrBytes,
             timeoutMs: effectiveTimeoutMs,
             terminationDrainMs,
             terminationController,
+            attemptId,
+            byteLedger,
         });
+        try {
+            await faultInjector?.("after_harness_launch", Object.freeze({
+                attemptId,
+                runnerEpochId,
+                harnessId: entry.id,
+                pid: child.pid,
+                launchPath: capability === null
+                    ? "host-process-adapter"
+                    : "sandbox-capability",
+            }));
+        } catch (error) {
+            capture.terminate("fault-after-harness-launch");
+            let drained = await settleWithin(
+                Promise.all([capture.outcome, capture.closed]),
+                Math.max(terminationDrainMs * 2, terminationDrainMs + 1),
+            );
+            if (drained.status === "timed_out") {
+                try {
+                    child.kill?.("SIGKILL");
+                } catch {
+                    // The launch owner remains authoritative for cleanup.
+                }
+                drained = await settleWithin(capture.closed, terminationDrainMs);
+            }
+            throw error;
+        }
+        const outcome = await capture.outcome;
+        await faultInjector?.("after_harness_exit", Object.freeze({
+            attemptId,
+            runnerEpochId,
+            harnessId: entry.id,
+            pid: child.pid,
+            exit: outcome.exit,
+            timedOut: outcome.timedOut,
+            overflowStreams: Object.freeze([...outcome.overflowStreams]),
+        }));
 
         // Containment cleanup is part of the measured operation. Complete it
         // before the post-run candidate closure check so cleanup cannot mutate
@@ -618,6 +1070,8 @@ async function runOnce({
             );
             capabilityCleaned = true;
         }
+        const stagedSnapshotBinding =
+            reverifyStagedSnapshotClosure(stagedSnapshot);
         const snapshotBinding = reverifySnapshotClosure(snapshotLease);
         assertDeadline(deadlineMs, clock, "measurement fact acceptance");
 
@@ -628,24 +1082,93 @@ async function runOnce({
         const stderrBytes = outcome.stderr;
         const stdoutHash = sha256Bytes(stdoutBytes, STREAM_HASH_ALGORITHM);
         const stderrHash = sha256Bytes(stderrBytes, STREAM_HASH_ALGORITHM);
-        if (onCapturedOutput !== null) {
-            await onCapturedOutput(Object.freeze({
-                attemptId,
-                runnerEpochId,
-                stdout: Buffer.from(stdoutBytes),
-                stderr: Buffer.from(stderrBytes),
+        const outputCapture = immutableCanonical(outcome.outputCapture);
+        const sandbox = capability === null
+            ? null
+            : describeSandboxCapability(capability, capabilityBinding);
+        if (sandbox !== null && sandbox.capabilityLaunchUsed !== true) {
+            throw new MeasurementError(
+                MEASUREMENT_ERROR_CODES.SANDBOX_LIFECYCLE,
+                "Sandbox receipt cannot attest a capability launch that was not used",
+                { attemptId, capabilityId: sandbox.capabilityId },
+            );
+        }
+        const buildReceiptFor = (parsed, timedOut = outcome.timedOut) => {
+            const receipt = buildMeasurementReceipt({
+                allowlistFileHash: stagedRun.allowlistFileHash,
+                harnessEntryHash: stagedRun.entryHash,
+                executableHash: stagedRun.executable.sourceHash,
+                stagedExecutableHash: stagedRun.executable.stagedHash,
+                dependencyHashes: stagedRun.dependencies.map((d) => ({
+                    path: d.sourcePath,
+                    role: d.role,
+                    sha256: d.sourceHash,
+                })),
+                launchFileBindings: launchFiles.map((file) => ({
+                    path: file.path,
+                    role: file.role,
+                    sha256: file.sha256,
+                    identity: file.identity,
+                })),
+                stagedDependencyHashes: stagedRun.dependencies.map((d) => ({
+                    path: d.path,
+                    role: d.role,
+                    sha256: d.stagedHash,
+                })),
+                argvHash,
+                envHash,
+                candidateSnapshotHash: snapshot.hash,
+                stagedCandidateSnapshotHash: stagedSnapshot.hash,
+                stagedCandidateSnapshotClosureHash:
+                    stagedSnapshotBinding.closureHash,
+                stagedCandidateSnapshotIdentitySummary:
+                    stagedSnapshotBinding.identitySummary,
+                candidateSnapshotPreClosureHash: snapshotBinding.preClosureHash,
+                candidateSnapshotPostClosureHash: snapshotBinding.postClosureHash,
+                candidateSnapshotIdentitySummary: snapshotBinding.identitySummary,
+                candidateSnapshotMutationCheck: snapshotBinding.mutationCheck,
                 stdoutHash,
                 stderrHash,
-                launchPath: capability === null
-                    ? "host-process-adapter"
-                    : "sandbox-capability",
-            }));
-        }
+                outputCapture,
+                parserVersion: PARSER_VERSION,
+                sandbox,
+                attemptId,
+                runnerEpochId,
+                startedAt,
+                completedAt,
+                durationMs,
+                exit: {
+                    code: outcome.exit.code,
+                    signal: outcome.exit.signal,
+                    timedOut,
+                },
+                parsed,
+            });
+            const receiptBytes = Buffer.byteLength(canonicalJson(receipt), "utf8");
+            const receiptBudget =
+                byteLedger.consumeReceipt(attemptId, receiptBytes);
+            if (!receiptBudget.allowed) {
+                throw byteBudgetError(
+                    receiptBudget,
+                    attemptId,
+                    "receipt construction",
+                );
+            }
+            return receipt;
+        };
 
         // Timeout / overflow: reject BEFORE attempting to parse. Even if the
         // partial output happens to contain valid JSON, the run itself was not
         // a valid measurement.
+        if (outcome.byteBudgetExceeded !== null) {
+            throw byteBudgetError(
+                outcome.byteBudgetExceeded,
+                attemptId,
+                "streaming output capture",
+            );
+        }
         if (outcome.timedOut) {
+            const receipt = buildReceiptFor(null, true);
             throw new MeasurementError(
                 MEASUREMENT_ERROR_CODES.TIMEOUT,
                 `harness ${entry.id} exceeded timeout of ${effectiveTimeoutMs}ms`,
@@ -657,11 +1180,14 @@ async function runOnce({
                         && remainingDeadlineMs(deadlineMs, clock) === 0,
                     stdoutBytes: stdoutBytes.length,
                     stderrBytes: stderrBytes.length,
+                    outputCapture,
+                    receipt,
                     terminationError: outcome.terminationError?.message ?? null,
                 },
             );
         }
         if (outcome.overflowStream !== null) {
+            const receipt = buildReceiptFor(null, false);
             throw new MeasurementError(
                 MEASUREMENT_ERROR_CODES.OUTPUT_OVERFLOW,
                 `harness ${entry.id} exceeded ${outcome.overflowStream} cap`,
@@ -669,8 +1195,11 @@ async function runOnce({
                     harnessId: entry.id,
                     stream: outcome.overflowStream,
                     capBytes: outcome.overflowStream === "stdout"
-                        ? entry.maxStdoutBytes
-                        : entry.maxStderrBytes,
+                        ? outputCapture.stdout.capBytes
+                        : outputCapture.stderr.capBytes,
+                    streams: outcome.overflowStreams,
+                    outputCapture,
+                    receipt,
                     terminationError: outcome.terminationError?.message ?? null,
                 },
             );
@@ -682,6 +1211,7 @@ async function runOnce({
             );
         }
         if (outcome.exit.code !== 0 || outcome.exit.signal !== null) {
+            const receipt = buildReceiptFor(null, false);
             throw new MeasurementError(
                 MEASUREMENT_ERROR_CODES.NONZERO_EXIT,
                 `harness ${entry.id} exited non-zero`,
@@ -689,63 +1219,38 @@ async function runOnce({
                     harnessId: entry.id,
                     exit: outcome.exit,
                     stderr: safeStderrPreview(stderrBytes),
+                    outputCapture,
+                    receipt,
                 },
             );
         }
 
         // Parse result. The parser is strict — anything wrong throws
         // ResultParseError which the caller sees directly.
-        const rawStdoutText = stdoutBytes.toString("utf8");
-        const parsed = parseHarnessResult(rawStdoutText);
-        const sandbox = capability === null
-            ? null
-            : describeSandboxCapability(capability, capabilityBinding);
-        if (sandbox !== null && sandbox.capabilityLaunchUsed !== true) {
+        if (stdoutBytes.length > PARSER_MAX_INPUT_BYTES) {
             throw new MeasurementError(
-                MEASUREMENT_ERROR_CODES.SANDBOX_LIFECYCLE,
-                "Sandbox receipt cannot attest a capability launch that was not used",
-                { attemptId, capabilityId: sandbox.capabilityId },
+                MEASUREMENT_ERROR_CODES.PARSE_OVERSIZED,
+                `harness result exceeds parser maximum of ${PARSER_MAX_INPUT_BYTES} bytes`,
+                { bytes: stdoutBytes.length },
             );
         }
-
-        const receipt = buildMeasurementReceipt({
-            allowlistFileHash: stagedRun.allowlistFileHash,
-            harnessEntryHash: stagedRun.entryHash,
-            executableHash: stagedRun.executable.sourceHash,
-            stagedExecutableHash: stagedRun.executable.stagedHash,
-            dependencyHashes: stagedRun.dependencies.map((d) => ({
-                path: d.sourcePath,
-                role: d.role,
-                sha256: d.sourceHash,
-            })),
-            stagedDependencyHashes: stagedRun.dependencies.map((d) => ({
-                path: d.path,
-                role: d.role,
-                sha256: d.stagedHash,
-            })),
-            argvHash,
-            envHash,
-            candidateSnapshotHash: snapshot.hash,
-            candidateSnapshotPreClosureHash: snapshotBinding.preClosureHash,
-            candidateSnapshotPostClosureHash: snapshotBinding.postClosureHash,
-            candidateSnapshotIdentitySummary: snapshotBinding.identitySummary,
-            candidateSnapshotMutationCheck: snapshotBinding.mutationCheck,
-            stdoutHash,
-            stderrHash,
-            parserVersion: PARSER_VERSION,
-            sandbox,
-            attemptId,
-            runnerEpochId,
-            startedAt,
-            completedAt,
-            durationMs,
-            exit: {
-                code: outcome.exit.code,
-                signal: outcome.exit.signal,
-                timedOut: false,
-            },
-            parsed,
-        });
+        const rawStdoutText = stdoutBytes.toString("utf8");
+        const parsed = parseHarnessResult(rawStdoutText);
+        const receipt = buildReceiptFor(parsed, false);
+        if (onCapturedOutput !== null) {
+            await onCapturedOutput(Object.freeze({
+                attemptId,
+                runnerEpochId,
+                stdout: Buffer.from(stdoutBytes),
+                stderr: Buffer.from(stderrBytes),
+                stdoutHash,
+                stderrHash,
+                outputCapture,
+                launchPath: capability === null
+                    ? "host-process-adapter"
+                    : "sandbox-capability",
+            }));
+        }
 
         return immutableCanonical({
             receipt,
@@ -753,6 +1258,11 @@ async function runOnce({
             exit: outcome.exit,
             stdoutBytes: stdoutBytes.length,
             stderrBytes: stderrBytes.length,
+            stdoutTotalObservedBytes:
+                outputCapture.stdout.totalObservedBytes,
+            stderrTotalObservedBytes:
+                outputCapture.stderr.totalObservedBytes,
+            outputCapture,
             stdoutHash,
             stderrHash,
             // NB: we do NOT expose the raw stdout/stderr text in the result.
@@ -770,6 +1280,10 @@ async function runOnce({
             }
         } finally {
             try {
+                if (stagedSnapshot !== null) {
+                    closeStagedSnapshotClosure(stagedSnapshot);
+                    stagedSnapshot = null;
+                }
                 if (snapshotLease !== null) {
                     closeVerifiedSnapshotClosure(snapshotLease);
                 }
@@ -780,7 +1294,7 @@ async function runOnce({
                     }
                 } finally {
                     if (stageRoot !== null) {
-                        fs.rmSync(stageRoot, { recursive: true, force: true });
+                        await removeAttemptStage(stageRoot);
                     }
                 }
             }
@@ -789,14 +1303,17 @@ async function runOnce({
 }
 
 function safeStderrPreview(bytes) {
-    const s = bytes.toString("utf8");
-    return s.length > 512 ? `${s.slice(0, 512)}... (+${s.length - 512} more)` : s;
+    const preview = bytes.subarray(0, Math.min(bytes.length, 512)).toString("utf8");
+    return bytes.length > 512
+        ? `${preview}... (+${bytes.length - 512} more bytes)`
+        : preview;
 }
 
 // Consume a child process's stdout/stderr up to per-stream byte caps, with
 // a wall-clock timeout, terminating the process through its launch owner on
-// overflow or timeout. Resolves with { stdout, stderr, exit, timedOut,
-// overflowStream } — never rejects for these reasons; the executor
+// overflow or timeout. Resolves with retained stdout/stderr, exact observed
+// byte counters, exit, timeout, and per-stream overflow state — never rejects
+// for these reasons; the executor
 // interprets the shape.
 function captureChild(
     child,
@@ -807,14 +1324,30 @@ function captureChild(
         timeoutMs,
         terminationDrainMs,
         terminationController,
+        attemptId,
+        byteLedger,
     },
 ) {
-    return new Promise((resolve) => {
+    let terminate = () => {};
+    let resolveClosed;
+    let closeRecorded = false;
+    const closed = new Promise((resolve) => {
+        resolveClosed = resolve;
+    });
+    const recordClosed = (value) => {
+        if (closeRecorded) return;
+        closeRecorded = true;
+        resolveClosed(value);
+    };
+    const outcome = new Promise((resolve) => {
         const stdoutChunks = [];
         const stderrChunks = [];
-        let stdoutBytes = 0;
-        let stderrBytes = 0;
-        let overflowStream = null;
+        let stdoutRetainedBytes = 0;
+        let stderrRetainedBytes = 0;
+        let stdoutTotalObservedBytes = 0;
+        let stderrTotalObservedBytes = 0;
+        const overflowStreams = new Set();
+        let byteBudgetExceeded = null;
         let timedOut = false;
         let settled = false;
         let exit = { code: null, signal: null };
@@ -849,6 +1382,10 @@ function captureChild(
             }, terminationDrainMs);
             forcedFinalizeTimer.unref?.();
         }
+        terminate = (reason) => {
+            requestTermination(reason);
+            armForcedFinalize();
+        };
 
         const timer = setTimeout(() => {
             timedOut = true;
@@ -864,38 +1401,109 @@ function captureChild(
             clearTimeout(forcedFinalizeTimer);
             await Promise.all(terminationPromises);
             resolve({
-                stdout: Buffer.concat(stdoutChunks, stdoutBytes),
-                stderr: Buffer.concat(stderrChunks, stderrBytes),
+                stdout: Buffer.concat(stdoutChunks, stdoutRetainedBytes),
+                stderr: Buffer.concat(stderrChunks, stderrRetainedBytes),
                 exit,
                 timedOut,
-                overflowStream,
+                overflowStream: [...overflowStreams][0] ?? null,
+                overflowStreams: [...overflowStreams],
+                byteBudgetExceeded,
+                outputCapture: {
+                    stdout: {
+                        capBytes: maxStdoutBytes,
+                        totalObservedBytes: stdoutTotalObservedBytes,
+                        retainedBytes: stdoutRetainedBytes,
+                        overflowed: stdoutTotalObservedBytes > maxStdoutBytes,
+                        truncated: stdoutRetainedBytes < stdoutTotalObservedBytes,
+                    },
+                    stderr: {
+                        capBytes: maxStderrBytes,
+                        totalObservedBytes: stderrTotalObservedBytes,
+                        retainedBytes: stderrRetainedBytes,
+                        overflowed: stderrTotalObservedBytes > maxStderrBytes,
+                        truncated: stderrRetainedBytes < stderrTotalObservedBytes,
+                    },
+                    overflowed: overflowStreams.size > 0,
+                    truncated: stdoutRetainedBytes < stdoutTotalObservedBytes
+                        || stderrRetainedBytes < stderrTotalObservedBytes,
+                },
                 terminationError,
             });
         }
 
         function attachStream(stream, chunks, sinkName, cap) {
             stream.on("data", (chunk) => {
-                const remaining = cap - (sinkName === "stdout" ? stdoutBytes : stderrBytes);
+                const bytes = Buffer.isBuffer(chunk)
+                    ? chunk
+                    : (ArrayBuffer.isView(chunk)
+                        ? Buffer.from(
+                            chunk.buffer,
+                            chunk.byteOffset,
+                            chunk.byteLength,
+                        )
+                        : Buffer.from(String(chunk), "utf8"));
+                if (bytes.length === 0) return;
+                const budget = byteLedger.consumeOutput(attemptId, bytes.length);
+                const priorAttemptBytes = budget.attemptBytes - bytes.length;
+                const priorInvestigationBytes =
+                    budget.investigationBytes - bytes.length;
+                const budgetRemaining = Math.max(
+                    0,
+                    Math.min(
+                        budget.attemptLimit - priorAttemptBytes,
+                        budget.investigationLimit - priorInvestigationBytes,
+                    ),
+                );
+                if (sinkName === "stdout") {
+                    stdoutTotalObservedBytes =
+                        boundedAdd(stdoutTotalObservedBytes, bytes.length);
+                } else {
+                    stderrTotalObservedBytes =
+                        boundedAdd(stderrTotalObservedBytes, bytes.length);
+                }
+                const retainedBytes = sinkName === "stdout"
+                    ? stdoutRetainedBytes
+                    : stderrRetainedBytes;
+                const remaining = Math.min(
+                    cap - retainedBytes,
+                    budgetRemaining,
+                );
                 if (remaining <= 0) {
-                    if (chunk.length > 0 && overflowStream === null) {
-                        overflowStream = sinkName;
+                    if (!budget.allowed && byteBudgetExceeded === null) {
+                        byteBudgetExceeded = budget;
+                        requestTermination("cumulative-output-byte-budget");
+                        armForcedFinalize();
+                        return;
+                    }
+                    const firstOverflow = overflowStreams.size === 0;
+                    overflowStreams.add(sinkName);
+                    if (firstOverflow) {
                         requestTermination(`${sinkName}-overflow`);
                         armForcedFinalize();
                     }
                     return;
                 }
-                let toAppend = chunk;
-                if (chunk.length > remaining) {
-                    toAppend = chunk.subarray(0, remaining);
+                let toAppend = bytes;
+                if (bytes.length > remaining) {
+                    toAppend = bytes.subarray(0, remaining);
                 }
                 chunks.push(toAppend);
-                if (sinkName === "stdout") stdoutBytes += toAppend.length;
-                else stderrBytes += toAppend.length;
+                if (sinkName === "stdout") stdoutRetainedBytes += toAppend.length;
+                else stderrRetainedBytes += toAppend.length;
                 // If the original chunk overflowed the cap, tree-kill and mark.
-                if (chunk.length > remaining) {
-                    if (overflowStream === null) overflowStream = sinkName;
-                    requestTermination(`${sinkName}-overflow`);
-                    armForcedFinalize();
+                if (bytes.length > remaining) {
+                    if (!budget.allowed && byteBudgetExceeded === null) {
+                        byteBudgetExceeded = budget;
+                        requestTermination("cumulative-output-byte-budget");
+                        armForcedFinalize();
+                    } else {
+                        const firstOverflow = overflowStreams.size === 0;
+                        overflowStreams.add(sinkName);
+                        if (firstOverflow) {
+                            requestTermination(`${sinkName}-overflow`);
+                            armForcedFinalize();
+                        }
+                    }
                 }
             });
             stream.on("error", () => { /* surfaced via child.on('error') */ });
@@ -915,10 +1523,12 @@ function captureChild(
         });
         child.on("close", (code, signal) => {
             exit = { code: code ?? null, signal: signal ?? null };
+            recordClosed({ kind: "close", code: code ?? null, signal: signal ?? null });
             // Wait a tick for late data events.
             setImmediate(() => { void finalize(); });
         });
     });
+    return Object.freeze({ outcome, closed, terminate });
 }
 
 // Small convenience for tests / callers that need a file:// URL from an

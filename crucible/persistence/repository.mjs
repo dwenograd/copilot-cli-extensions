@@ -40,6 +40,7 @@ import {
     canonicalize,
     computeEventHash,
     inspectCanonicalJson,
+    normalizeCreatedAt,
     parseCanonicalJson,
     sha256Hex,
     GENESIS_PREV_HASH,
@@ -51,6 +52,7 @@ import {
     configureConnection,
     configureReadOnlyConnection,
     applySchema,
+    verifyDatabaseIntegrity,
     verifySchema,
 } from "./schema.mjs";
 
@@ -74,6 +76,18 @@ function requireNonEmptyString(value, name) {
         throw new InvalidArgumentError(`${name} must be a non-empty string`, { [name]: value });
     }
     return value;
+}
+
+function requireCanonicalTimestamp(value, field) {
+    const normalized = normalizeCreatedAt(value, field);
+    if (normalized !== value) {
+        throw new InvalidArgumentError(`${field} must use canonical UTC ISO-8601 form`, {
+            field,
+            value,
+            normalized,
+        });
+    }
+    return normalized;
 }
 
 function normalizeSupervisorGeneration(value) {
@@ -137,12 +151,19 @@ export class EventRepository {
     #now;
     #file;
     #readOnly;
+    #integrityCheckAdapter;
 
-    constructor(db, { now, file, readOnly = false }) {
+    constructor(db, {
+        now,
+        file,
+        readOnly = false,
+        integrityCheckAdapter = undefined,
+    }) {
         this.#db = db;
         this.#now = now;
         this.#file = file;
         this.#readOnly = readOnly;
+        this.#integrityCheckAdapter = integrityCheckAdapter;
     }
 
     static open(options = {}) {
@@ -153,7 +174,11 @@ export class EventRepository {
             denyRoots,
             env,
             readOnly = false,
+            integrityCheckAdapter = undefined,
         } = options;
+        if (typeof now !== "function") {
+            throw new InvalidArgumentError("now must be a function");
+        }
 
         const resolved = assertLocalDatabasePath(file, { denyRoots, env });
 
@@ -167,10 +192,10 @@ export class EventRepository {
         try {
             if (readOnly === true) {
                 configureReadOnlyConnection(db, { busyTimeoutMs });
-                verifySchema(db, { busyTimeoutMs });
+                verifySchema(db, { busyTimeoutMs, integrityCheckAdapter });
             } else {
                 configureConnection(db, { busyTimeoutMs });
-                applySchema(db, { busyTimeoutMs });
+                applySchema(db, { busyTimeoutMs, integrityCheckAdapter });
             }
         } catch (err) {
             db.close();
@@ -183,7 +208,12 @@ export class EventRepository {
             throw err;
         }
 
-        return new EventRepository(db, { now, file: resolved, readOnly: readOnly === true });
+        return new EventRepository(db, {
+            now,
+            file: resolved,
+            readOnly: readOnly === true,
+            integrityCheckAdapter,
+        });
     }
 
     get databaseFile() {
@@ -228,6 +258,10 @@ export class EventRepository {
         }
     }
 
+    #timestamp(field) {
+        return normalizeCreatedAt(this.#now(), field);
+    }
+
     // --- investigations ----------------------------------------------------
 
     ensureInvestigation({ investigationId, metadata = {} } = {}) {
@@ -240,7 +274,7 @@ export class EventRepository {
             if (existing) {
                 return this.#rowToInvestigation(existing);
             }
-            const createdAt = this.#now();
+            const createdAt = this.#timestamp("investigation.createdAt");
             this.#db
                 .prepare("INSERT INTO investigations(investigation_id, created_at, metadata) VALUES(:id, :createdAt, :metadata)")
                 .run({ id: investigationId, createdAt, metadata: meta });
@@ -272,7 +306,10 @@ export class EventRepository {
     #rowToInvestigation(row) {
         return {
             investigationId: row.investigation_id,
-            createdAt: row.created_at,
+            createdAt: requireCanonicalTimestamp(
+                row.created_at,
+                "stored investigation.createdAt",
+            ),
             metadata: JSON.parse(row.metadata),
         };
     }
@@ -341,7 +378,7 @@ export class EventRepository {
             terminalKind: row.terminal_kind ?? null,
             attemptId: row.attempt_id ?? null,
             evidenceKind: row.evidence_kind ?? null,
-            createdAt: row.created_at,
+            createdAt: requireCanonicalTimestamp(row.created_at, "stored event.createdAt"),
         };
     }
 
@@ -421,7 +458,10 @@ export class EventRepository {
                 );
             }
             const payloadCanonical = canonicalize(ev.payload === undefined ? {} : ev.payload);
-            const createdAt = ev.createdAt ?? this.#now();
+            const createdAt = normalizeCreatedAt(
+                ev.createdAt === undefined ? this.#now() : ev.createdAt,
+                "event.createdAt",
+            );
             const seq = prevSeq + 1;
             const eventHash = computeEventHash({
                 investigationId,
@@ -634,7 +674,10 @@ export class EventRepository {
             const head = this.getHead(investigationId);
             const prevHash = head.eventHash ?? GENESIS_PREV_HASH;
             const seq = head.seq + 1;
-            const ts = createdAt ?? this.#now();
+            const ts = normalizeCreatedAt(
+                createdAt === undefined ? this.#now() : createdAt,
+                "evidence.createdAt",
+            );
             const eventHash = computeEventHash({
                 investigationId,
                 seq,
@@ -866,7 +909,10 @@ export class EventRepository {
                 payloadCanonical: canonicalize(
                     item.payload === undefined ? {} : item.payload,
                 ),
-                createdAt: item.createdAt ?? this.#now(),
+                createdAt: normalizeCreatedAt(
+                    item.createdAt === undefined ? this.#now() : item.createdAt,
+                    "evidence.createdAt",
+                ),
             };
         });
         if (new Set(normalized.map((item) => item.evidenceKind)).size !== normalized.length) {
@@ -1025,7 +1071,7 @@ export class EventRepository {
                 }
             }
 
-            const claimedAt = this.#now();
+            const claimedAt = this.#timestamp("supervisor.claimedAt");
             this.#db.prepare(`
                 UPDATE runner_incarnations
                 SET revoked_at = COALESCE(revoked_at, :at)
@@ -1117,7 +1163,7 @@ export class EventRepository {
                 );
             }
 
-            const issuedAt = this.#now();
+            const issuedAt = this.#timestamp("runnerIncarnation.issuedAt");
             if (authority.current_runner_incarnation !== null) {
                 this.#db.prepare(`
                     UPDATE runner_incarnations
@@ -1286,7 +1332,7 @@ export class EventRepository {
                 .prepare("SELECT COALESCE(MAX(fencing_token), 0) AS maxToken FROM runner_leases WHERE investigation_id = ?")
                 .get(investigationId);
             const fencingToken = Number(maxRow.maxToken) + 1;
-            const acquiredAt = this.#now();
+            const acquiredAt = this.#timestamp("lease.acquiredAt");
 
             // Supersede any currently-active leases: the newest token wins.
             this.#db
@@ -1633,7 +1679,7 @@ export class EventRepository {
                 { fromState, toState },
             );
         }
-        const ts = this.#now();
+        const ts = this.#timestamp(`command.${toState}At`);
         const tsColumn = STATE_TIMESTAMP_COLUMN[toState];
         const result = this.#db.prepare(`
             UPDATE command_attempts
@@ -1729,7 +1775,7 @@ export class EventRepository {
             });
             this.#assertFencingCurrent(investigationId, fencingToken, { leaseId });
 
-            const ts = this.#now();
+            const ts = this.#timestamp("command.reservedAt");
             try {
                 this.#db.prepare(`
                     INSERT INTO command_attempts(
@@ -1909,7 +1955,7 @@ export class EventRepository {
                 );
             }
 
-            const ts = this.#now();
+            const ts = this.#timestamp("command.abandonedAt");
             this.#db.prepare(`
                 UPDATE command_attempts
                 SET state = 'abandoned', lease_id = :lease, fencing_token = :token,
@@ -1976,7 +2022,7 @@ export class EventRepository {
 
         return this.#tx(() => {
             this.#requireInvestigation(investigationId);
-            const createdAt = this.#now();
+            const createdAt = this.#timestamp("artifact.createdAt");
             try {
                 this.#db.prepare(`
                     INSERT INTO artifacts(
@@ -2004,7 +2050,7 @@ export class EventRepository {
 
         return this.#tx(() => {
             this.#requireInvestigation(investigationId);
-            const createdAt = this.#now();
+            const createdAt = this.#timestamp("artifact.createdAt");
             try {
                 this.#db.prepare(`
                     INSERT INTO artifacts(
@@ -2049,7 +2095,7 @@ export class EventRepository {
             investigationId,
             artifactId,
             seq,
-            createdAt: this.#now(),
+            createdAt: this.#timestamp("artifactReference.createdAt"),
         }));
     }
 
@@ -2296,7 +2342,7 @@ export class EventRepository {
         }
         const checkpointJson = checkpoint === null ? null : canonicalize(checkpoint);
         return this.#tx(() => {
-            const updatedAt = this.#now();
+            const updatedAt = this.#timestamp("projection.updatedAt");
             this.#db.prepare(`
                 INSERT INTO projection_metadata(projection_name, investigation_id, last_applied_seq, checkpoint, updated_at)
                 VALUES(:name, :inv, :seq, :cp, :at)
@@ -2317,6 +2363,7 @@ export class EventRepository {
     // are internally consistent and untampered. Returns a report; never mutates.
     verifyInvestigation(investigationId) {
         requireNonEmptyString(investigationId, "investigationId");
+        verifyDatabaseIntegrity(this.#db, { adapter: this.#integrityCheckAdapter });
         this.#requireInvestigation(investigationId);
 
         const violations = [];
@@ -2350,6 +2397,15 @@ export class EventRepository {
                     code: ERROR_CODES.EVENT_PAYLOAD_NOT_CANONICAL,
                     seq,
                     detail: inspectedPayload.reason,
+                });
+            }
+            try {
+                requireCanonicalTimestamp(row.created_at, "stored event.createdAt");
+            } catch (err) {
+                violations.push({
+                    code: ERROR_CODES.INTEGRITY_VIOLATION,
+                    seq,
+                    detail: err.message,
                 });
             }
             try {

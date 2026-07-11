@@ -17,6 +17,7 @@ import {
     createDefaultProcessAdapter,
     createMeasurementExecutor,
     createSandboxProvider,
+    canonicalizeReceipt,
     hashReceipt,
     loadHarnessAllowlist,
     projectDeterministicReceipt,
@@ -88,6 +89,79 @@ function createMutationProcessAdapter(mutate) {
     };
 }
 
+function createChunkedProcessAdapter(events) {
+    const terminations = [];
+    return {
+        terminations,
+        adapter: {
+            spawn() {
+                const child = new EventEmitter();
+                child.pid = 4343;
+                child.stdout = new PassThrough();
+                child.stderr = new PassThrough();
+                let index = 0;
+                const emitNext = () => {
+                    if (index >= events.length) {
+                        child.stdout.end();
+                        child.stderr.end();
+                        setImmediate(() => child.emit("close", 0, null));
+                        return;
+                    }
+                    const event = events[index];
+                    index += 1;
+                    child[event.stream].write(Buffer.from(event.bytes));
+                    setImmediate(emitNext);
+                };
+                setImmediate(emitNext);
+                return child;
+            },
+            terminateTree(pid) {
+                terminations.push(pid);
+            },
+        },
+    };
+}
+
+async function runChunkedOutput({
+    root,
+    events,
+    maxStdoutBytes,
+    maxStderrBytes,
+    byteBudgets,
+    attemptId,
+}) {
+    const scriptPath = writeHarnessScript(
+        root,
+        "chunked",
+        `process.stdout.write('{"pass":true}');`,
+    );
+    const allowlistPath = writeAllowlist(root, "chunked", {
+        argvTemplate: [scriptPath],
+        maxStdoutBytes,
+        maxStderrBytes,
+    });
+    const list = loadHarnessAllowlist(allowlistPath);
+    const verified = list.verifyEntry("chunked");
+    const snapshot = materializeCandidateSnapshot(root, "chunked-snap", "candidate");
+    const process = createChunkedProcessAdapter(events);
+    const executor = createMeasurementExecutor({
+        allowlist: list,
+        processAdapter: process.adapter,
+        clock: fixedClock(),
+        scratchRoot: root,
+        ...(byteBudgets === undefined ? {} : { byteBudgets }),
+    });
+    return {
+        process,
+        promise: executor.run({
+            verifiedEntry: verified,
+            candidateSnapshot: snapshot,
+            ...fixedIds(),
+            ...(attemptId === undefined ? {} : { attemptId }),
+        }),
+    };
+}
+
 function mutableClock(start = 20_000) {
     let now = start;
     return {
@@ -113,7 +187,7 @@ describe("MeasurementExecutor happy path", () => {
         expect(result.stdoutBytes).toBeGreaterThan(0);
 
         const rec = result.receipt;
-        expect(rec.version).toBe(3);
+        expect(rec.version).toBe(5);
         expect(rec.harnessEntryHash).toBe(verified.entryHash);
         expect(rec.executableHash).toBe(verified.executableHash);
         expect(rec.stagedExecutableHash).toBe(verified.executableHash);
@@ -146,6 +220,531 @@ describe("MeasurementExecutor happy path", () => {
         expect(rec.envHash).toMatch(/^sha256:crucible-measurement-env-v1:[a-f0-9]{64}$/);
         expect(rec.stdoutHash).toMatch(/^sha256:crucible-measurement-stream-v1:[a-f0-9]{64}$/);
         expect(rec.stderrHash).toMatch(/^sha256:crucible-measurement-stream-v1:[a-f0-9]{64}$/);
+        expect(rec.outputCapture).toEqual({
+            stdout: {
+                capBytes: 1024 * 1024,
+                totalObservedBytes: result.stdoutBytes,
+                retainedBytes: result.stdoutBytes,
+                overflowed: false,
+                truncated: false,
+            },
+            stderr: {
+                capBytes: 256 * 1024,
+                totalObservedBytes: result.stderrBytes,
+                retainedBytes: result.stderrBytes,
+                overflowed: false,
+                truncated: false,
+            },
+            overflowed: false,
+            truncated: false,
+        });
+    });
+
+    describe("H7 harness lifecycle failure matrix", () => {
+        it("terminates the launched harness and removes staging when the runner crashes after launch", async () => {
+            const root = tmp("fault-after-launch");
+            const scriptPath = writeHarnessScript(
+                root,
+                "fault-after-launch",
+                `process.stdout.write('{"pass":true}');`,
+            );
+            const allowlistPath = writeAllowlist(root, "fault-after-launch", {
+                argvTemplate: [scriptPath],
+                timeoutMs: 5_000,
+            });
+            const list = loadHarnessAllowlist(allowlistPath);
+            const verified = list.verifyEntry("fault-after-launch");
+            const snapshot = materializeCandidateSnapshot(
+                root,
+                "fault-after-launch-snap",
+                "x",
+            );
+            const child = new EventEmitter();
+            child.pid = 7171;
+            child.stdout = new PassThrough();
+            child.stderr = new PassThrough();
+            const terminations = [];
+            const executor = createMeasurementExecutor({
+                allowlist: list,
+                scratchRoot: root,
+                terminationDrainMs: 20,
+                processAdapter: {
+                    spawn() {
+                        return child;
+                    },
+                    terminateTree(pid) {
+                        terminations.push(pid);
+                        child.stdout.end();
+                        child.stderr.end();
+                        setImmediate(() => child.emit("close", null, "SIGKILL"));
+                        return true;
+                    },
+                },
+                faultInjector(point) {
+                    if (point === "after_harness_launch") {
+                        throw new Error("injected launch crash");
+                    }
+                },
+            });
+
+            await expect(executor.run({
+                verifiedEntry: verified,
+                candidateSnapshot: snapshot,
+                ...fixedIds(),
+            })).rejects.toThrow("injected launch crash");
+            expect(terminations).toEqual([child.pid]);
+            expect(fs.readdirSync(root)
+                .filter((name) => name.startsWith(".crucible-stage-"))).toEqual([]);
+        });
+
+        it("rejects facts when the absolute deadline crosses inside sandbox launch", async () => {
+            const root = tmp("deadline-sandbox-launch");
+            const scriptPath = writeHarnessScript(
+                root,
+                "deadline-sandbox-launch",
+                `process.stdout.write('{"pass":true}');`,
+            );
+            const allowlistPath = writeAllowlist(root, "deadline-sandbox-launch", {
+                argvTemplate: [scriptPath],
+                timeoutMs: 5_000,
+                executesCandidateCode: true,
+            });
+            const list = loadHarnessAllowlist(allowlistPath);
+            const verified = list.verifyEntry("deadline-sandbox-launch");
+            const snapshot = materializeCandidateSnapshot(
+                root,
+                "deadline-sandbox-launch-snap",
+                "x",
+            );
+            const clock = mutableClock();
+            const deadlineMs = clock.now() + 500;
+            let cleanupCalls = 0;
+            const provider = createSandboxProvider({
+                providerId: "deadline-launch-provider",
+                providerVersion: "v1",
+                admitAndPrepare(request, issueLaunchCapability) {
+                    return issueLaunchCapability({
+                        capabilityId: "deadline-launch-capability",
+                        policyId: "deadline-launch-policy",
+                        policyDigest:
+                            `sha256:deadline-launch-policy:${"d".repeat(64)}`,
+                        permittedStagedRoots: request.stagedRoots,
+                        launch() {
+                            const child = new EventEmitter();
+                            child.pid = 7272;
+                            child.stdout = new PassThrough();
+                            child.stderr = new PassThrough();
+                            clock.advance(501);
+                            setImmediate(() => {
+                                child.stdout.end(Buffer.from('{"pass":true}', "utf8"));
+                                child.stderr.end();
+                                child.emit("close", 0, null);
+                            });
+                            return child;
+                        },
+                        terminate() {
+                            return true;
+                        },
+                        cleanup() {
+                            cleanupCalls += 1;
+                            return true;
+                        },
+                    });
+                },
+            });
+            const executor = createMeasurementExecutor({
+                allowlist: list,
+                sandboxProvider: provider,
+                scratchRoot: root,
+                clock,
+                processAdapter: {
+                    spawn() {
+                        throw new Error("host launch is forbidden");
+                    },
+                    terminateTree() {
+                        throw new Error("host termination is forbidden");
+                    },
+                },
+            });
+
+            await expect(executor.run({
+                verifiedEntry: verified,
+                candidateSnapshot: snapshot,
+                ...fixedIds(),
+                deadlineMs,
+            })).rejects.toMatchObject({
+                code: MEASUREMENT_ERROR_CODES.TIMEOUT,
+                details: {
+                    deadlineExceeded: true,
+                    deadlineMs,
+                },
+            });
+            expect(cleanupCalls).toBe(1);
+        });
+    });
+
+    it("accepts output exactly at the cap and records exact observed/retained totals", async () => {
+        const root = tmp("exact-cap");
+        const cap = 64;
+        const json = Buffer.from('{"pass":true}', "utf8");
+        const exact = Buffer.concat([json, Buffer.alloc(cap - json.length, 0x20)]);
+        const run = await runChunkedOutput({
+            root,
+            maxStdoutBytes: cap,
+            maxStderrBytes: 8,
+            events: [
+                { stream: "stdout", bytes: exact.subarray(0, 7) },
+                { stream: "stdout", bytes: exact.subarray(7) },
+                { stream: "stderr", bytes: Buffer.from("12345678") },
+            ],
+        });
+        const result = await run.promise;
+        expect(result.parsed.pass).toBe(true);
+        expect(result.outputCapture).toMatchObject({
+            stdout: {
+                totalObservedBytes: cap,
+                retainedBytes: cap,
+                overflowed: false,
+                truncated: false,
+            },
+            stderr: {
+                totalObservedBytes: 8,
+                retainedBytes: 8,
+                overflowed: false,
+                truncated: false,
+            },
+            overflowed: false,
+            truncated: false,
+        });
+        expect(run.process.terminations).toEqual([]);
+    });
+
+    it("rejects a later chunk after an exact-cap valid JSON prefix", async () => {
+        const root = tmp("cap-later");
+        const cap = 64;
+        const json = Buffer.from('{"pass":true}', "utf8");
+        const exact = Buffer.concat([json, Buffer.alloc(cap - json.length, 0x20)]);
+        const contradictory = Buffer.from('{"pass":false}', "utf8");
+        const run = await runChunkedOutput({
+            root,
+            maxStdoutBytes: cap,
+            maxStderrBytes: 8,
+            events: [
+                { stream: "stdout", bytes: exact },
+                { stream: "stdout", bytes: contradictory },
+            ],
+        });
+        let error;
+        try {
+            await run.promise;
+        } catch (caught) {
+            error = caught;
+        }
+        expect(error.code).toBe(MEASUREMENT_ERROR_CODES.OUTPUT_OVERFLOW);
+        expect(error.details.outputCapture.stdout).toEqual({
+            capBytes: cap,
+            totalObservedBytes: cap + contradictory.length,
+            retainedBytes: cap,
+            overflowed: true,
+            truncated: true,
+        });
+        expect(error.details.receipt.parsed).toBeNull();
+        expect(error.details.receipt.outputCapture)
+            .toEqual(error.details.outputCapture);
+        expect(run.process.terminations).toEqual([4343]);
+    });
+
+    it("counts every multi-chunk byte while retaining only the cap", async () => {
+        const root = tmp("multi-overflow");
+        const run = await runChunkedOutput({
+            root,
+            maxStdoutBytes: 16,
+            maxStderrBytes: 8,
+            events: [
+                { stream: "stdout", bytes: Buffer.from("12345") },
+                { stream: "stdout", bytes: Buffer.from("6789012") },
+                { stream: "stdout", bytes: Buffer.from("3456789012") },
+            ],
+        });
+        let error;
+        try {
+            await run.promise;
+        } catch (caught) {
+            error = caught;
+        }
+        expect(error.code).toBe(MEASUREMENT_ERROR_CODES.OUTPUT_OVERFLOW);
+        expect(error.details.outputCapture.stdout).toMatchObject({
+            totalObservedBytes: 22,
+            retainedBytes: 16,
+            overflowed: true,
+            truncated: true,
+        });
+    });
+
+    it("records overflow independently for stdout and stderr", async () => {
+        const root = tmp("both-overflow");
+        const run = await runChunkedOutput({
+            root,
+            maxStdoutBytes: 8,
+            maxStderrBytes: 8,
+            events: [
+                { stream: "stdout", bytes: Buffer.from("1234567890") },
+                { stream: "stderr", bytes: Buffer.from("abcdefghijkl") },
+            ],
+        });
+        let error;
+        try {
+            await run.promise;
+        } catch (caught) {
+            error = caught;
+        }
+        expect(error.code).toBe(MEASUREMENT_ERROR_CODES.OUTPUT_OVERFLOW);
+        expect(error.details.streams).toEqual(["stdout", "stderr"]);
+        expect(error.details.outputCapture.stdout).toMatchObject({
+            totalObservedBytes: 10,
+            retainedBytes: 8,
+            overflowed: true,
+            truncated: true,
+        });
+        expect(error.details.outputCapture.stderr).toMatchObject({
+            totalObservedBytes: 12,
+            retainedBytes: 8,
+            overflowed: true,
+            truncated: true,
+        });
+    });
+
+    it("enforces a combined attempt output budget before retaining a huge chunk", async () => {
+        const root = tmp("combined-output-budget");
+        const run = await runChunkedOutput({
+            root,
+            maxStdoutBytes: 1024 * 1024,
+            maxStderrBytes: 1024 * 1024,
+            byteBudgets: {
+                perAttemptOutputBytes: 64,
+                perInvestigationOutputBytes: 128,
+            },
+            events: [
+                { stream: "stdout", bytes: Buffer.alloc(2 * 1024 * 1024, 0x61) },
+            ],
+        });
+        await expect(run.promise).rejects.toMatchObject({
+            code: MEASUREMENT_ERROR_CODES.BYTE_BUDGET_EXCEEDED,
+            details: {
+                kind: "output",
+                attemptLimit: 64,
+                bytes: 2 * 1024 * 1024,
+            },
+        });
+        expect(run.process.terminations).toEqual([4343]);
+    });
+
+    it("enforces cumulative investigation output across attempts", async () => {
+        const root = tmp("investigation-output-budget");
+        const scriptPath = writeHarnessScript(
+            root,
+            "cumulative",
+            `process.stdout.write('{"pass":true}');`,
+        );
+        const allowlistPath = writeAllowlist(root, "cumulative", {
+            argvTemplate: [scriptPath],
+            maxStdoutBytes: 64,
+            maxStderrBytes: 8,
+        });
+        const list = loadHarnessAllowlist(allowlistPath);
+        const verified = list.verifyEntry("cumulative");
+        const snapshot = materializeCandidateSnapshot(
+            root,
+            "cumulative-snap",
+            "candidate",
+        );
+        const terminations = [];
+        const adapter = {
+            spawn() {
+                const child = new EventEmitter();
+                child.pid = 4444;
+                child.stdout = new PassThrough();
+                child.stderr = new PassThrough();
+                setImmediate(() => {
+                    child.stdout.end(Buffer.from('{"pass":true}', "utf8"));
+                    child.stderr.end();
+                    child.emit("close", 0, null);
+                });
+                return child;
+            },
+            terminateTree(pid) {
+                terminations.push(pid);
+                return true;
+            },
+        };
+        const executor = createMeasurementExecutor({
+            allowlist: list,
+            processAdapter: adapter,
+            scratchRoot: root,
+            byteBudgets: {
+                perAttemptOutputBytes: 16,
+                perInvestigationOutputBytes: 20,
+            },
+        });
+        await executor.run({
+            verifiedEntry: verified,
+            candidateSnapshot: snapshot,
+            ...fixedIds(),
+            attemptId: "att-budget-1",
+        });
+        await expect(executor.run({
+            verifiedEntry: verified,
+            candidateSnapshot: snapshot,
+            ...fixedIds(),
+            attemptId: "att-budget-2",
+        })).rejects.toMatchObject({
+            code: MEASUREMENT_ERROR_CODES.BYTE_BUDGET_EXCEEDED,
+            details: {
+                kind: "output",
+                investigationLimit: 20,
+                investigationBytes: 26,
+            },
+        });
+        expect(terminations).toContain(4444);
+    });
+
+    it("rejects an oversized receipt before exposing raw output", async () => {
+        const root = tmp("receipt-budget");
+        let captured = false;
+        const scriptPath = writeHarnessScript(
+            root,
+            "receipt-budget",
+            `process.stdout.write('{"pass":true}');`,
+        );
+        const allowlistPath = writeAllowlist(root, "receipt-budget", {
+            argvTemplate: [scriptPath],
+        });
+        const list = loadHarnessAllowlist(allowlistPath);
+        const executor = createMeasurementExecutor({
+            allowlist: list,
+            scratchRoot: root,
+            byteBudgets: {
+                perAttemptReceiptBytes: 256,
+                perInvestigationReceiptBytes: 256,
+            },
+            onCapturedOutput() {
+                captured = true;
+            },
+        });
+        await expect(executor.run({
+            verifiedEntry: list.verifyEntry("receipt-budget"),
+            candidateSnapshot: materializeCandidateSnapshot(
+                root,
+                "receipt-budget-snap",
+                "candidate",
+            ),
+            ...fixedIds(),
+        })).rejects.toMatchObject({
+            code: MEASUREMENT_ERROR_CODES.BYTE_BUDGET_EXCEEDED,
+            details: {
+                kind: "receipt",
+                attemptLimit: 256,
+            },
+        });
+        expect(captured).toBe(false);
+    });
+
+    it("enforces cumulative investigation receipt bytes from prior usage", async () => {
+        const root = tmp("cumulative-receipt-budget");
+        const scriptPath = writeHarnessScript(
+            root,
+            "cumulative-receipt-budget",
+            `process.stdout.write('{"pass":true}');`,
+        );
+        const allowlistPath = writeAllowlist(
+            root,
+            "cumulative-receipt-budget",
+            { argvTemplate: [scriptPath] },
+        );
+        const list = loadHarnessAllowlist(allowlistPath);
+        const verifiedEntry = list.verifyEntry("cumulative-receipt-budget");
+        const candidateSnapshot = materializeCandidateSnapshot(
+            root,
+            "cumulative-receipt-budget-snap",
+            "candidate",
+        );
+        const first = await createMeasurementExecutor({
+            allowlist: list,
+            scratchRoot: root,
+        }).run({
+            verifiedEntry,
+            candidateSnapshot,
+            ...fixedIds(),
+            attemptId: "att-receipt-seed",
+        });
+        const priorReceiptBytes = Buffer.byteLength(
+            canonicalizeReceipt(first.receipt),
+            "utf8",
+        );
+        const limit = priorReceiptBytes + 16;
+        const executor = createMeasurementExecutor({
+            allowlist: list,
+            scratchRoot: root,
+            byteBudgets: {
+                perAttemptReceiptBytes: limit,
+                perInvestigationReceiptBytes: limit,
+            },
+            initialByteUsage: {
+                receiptBytes: priorReceiptBytes,
+            },
+        });
+        await expect(executor.run({
+            verifiedEntry,
+            candidateSnapshot,
+            ...fixedIds(),
+            attemptId: "att-receipt-after-seed",
+        })).rejects.toMatchObject({
+            code: MEASUREMENT_ERROR_CODES.BYTE_BUDGET_EXCEEDED,
+            details: {
+                kind: "receipt",
+                investigationLimit: limit,
+            },
+        });
+    }, 30_000);
+
+    it("rejects an oversized candidate CAS closure before private staging", async () => {
+        const root = tmp("candidate-cas-budget");
+        const scriptPath = writeHarnessScript(
+            root,
+            "candidate-cas-budget",
+            `process.stdout.write('{"pass":true}');`,
+        );
+        const allowlistPath = writeAllowlist(root, "candidate-cas-budget", {
+            argvTemplate: [scriptPath],
+        });
+        const list = loadHarnessAllowlist(allowlistPath);
+        const executor = createMeasurementExecutor({
+            allowlist: list,
+            scratchRoot: root,
+            byteBudgets: {
+                perAttemptCasBytes: 512,
+                perInvestigationCasBytes: 1024,
+            },
+        });
+        await expect(executor.run({
+            verifiedEntry: list.verifyEntry("candidate-cas-budget"),
+            candidateSnapshot: materializeCandidateSnapshot(
+                root,
+                "candidate-cas-budget-snap",
+                "x".repeat(1024),
+            ),
+            ...fixedIds(),
+        })).rejects.toMatchObject({
+            code: MEASUREMENT_ERROR_CODES.BYTE_BUDGET_EXCEEDED,
+            details: {
+                kind: "cas",
+                attemptLimit: 512,
+                stage: "candidate snapshot admission",
+            },
+        });
+        expect(fs.readdirSync(root)
+            .filter((name) => name.startsWith(".crucible-stage-")))
+            .toEqual([]);
     });
 
     it("passes the candidate snapshot path via env AND via the argv placeholder", async () => {
@@ -207,7 +806,7 @@ describe("MeasurementExecutor happy path", () => {
         for (const key of RECEIPT_DETERMINISM_KEYS) {
             expect(p1).toHaveProperty(key);
         }
-    });
+    }, 30_000);
 
     it("only exposes allowedEnv + fixed platform keys to the child process", async () => {
         const root = tmp("env");
@@ -270,6 +869,92 @@ describe("MeasurementExecutor happy path", () => {
         expect(result.receipt.stagedExecutableHash).toBe(result.receipt.executableHash);
         expect(result.receipt.stagedDependencyHashes[0].sha256)
             .toBe(result.receipt.dependencyHashes[0].sha256);
+    });
+
+    for (const target of ["executable", "dependency", "candidate"]) {
+        it(`rejects concurrent staged ${target} substitution before launch`, async () => {
+            const root = tmp(`staged-substitution-${target}`);
+            const scriptPath = writeHarnessScript(
+                root,
+                `staged-substitution-${target}`,
+                `process.stdout.write('{"pass":true}');`,
+            );
+            const allowlistPath = writeAllowlist(
+                root,
+                `staged-substitution-${target}`,
+                { argvTemplate: [scriptPath, "{{candidatePath}}"] },
+            );
+            const list = loadHarnessAllowlist(allowlistPath);
+            let spawned = false;
+            const executor = createMeasurementExecutor({
+                allowlist: list,
+                scratchRoot: root,
+                processAdapter: {
+                    spawn() {
+                        spawned = true;
+                        throw new Error("substituted bytes must never launch");
+                    },
+                    terminateTree() {},
+                },
+                faultInjector(point, details) {
+                    if (point !== "after_harness_staging") return;
+                    const file = target === "executable"
+                        ? details.executable
+                        : target === "dependency"
+                            ? details.dependencies[0]
+                            : details.candidateFiles[0];
+                    fs.chmodSync(file, 0o600);
+                    fs.appendFileSync(file, "substituted");
+                },
+            });
+            await expect(executor.run({
+                verifiedEntry: list.verifyEntry(
+                    `staged-substitution-${target}`,
+                ),
+                candidateSnapshot: materializeCandidateSnapshot(
+                    root,
+                    `staged-substitution-${target}-snap`,
+                    "candidate",
+                ),
+                ...fixedIds(),
+            })).rejects.toMatchObject({
+                code: MEASUREMENT_ERROR_CODES.FILE_CHANGED_DURING_VERIFICATION,
+            });
+            expect(spawned).toBe(false);
+        });
+    }
+
+    it("rejects staged identity-only mutation before launch", async () => {
+        const root = tmp("staged-identity-mutation");
+        const scriptPath = writeHarnessScript(
+            root,
+            "staged-identity-mutation",
+            `process.stdout.write('{"pass":true}');`,
+        );
+        const allowlistPath = writeAllowlist(root, "staged-identity-mutation", {
+            argvTemplate: [scriptPath],
+        });
+        const list = loadHarnessAllowlist(allowlistPath);
+        const executor = createMeasurementExecutor({
+            allowlist: list,
+            scratchRoot: root,
+            faultInjector(point, details) {
+                if (point !== "after_harness_staging") return;
+                const now = new Date(Date.now() + 60_000);
+                fs.utimesSync(details.executable, now, now);
+            },
+        });
+        await expect(executor.run({
+            verifiedEntry: list.verifyEntry("staged-identity-mutation"),
+            candidateSnapshot: materializeCandidateSnapshot(
+                root,
+                "staged-identity-mutation-snap",
+                "candidate",
+            ),
+            ...fixedIds(),
+        })).rejects.toMatchObject({
+            code: MEASUREMENT_ERROR_CODES.FILE_CHANGED_DURING_VERIFICATION,
+        });
     });
 
     it("propagates the remaining deadline to the harness and rejects late facts", async () => {

@@ -10,8 +10,10 @@ import {
     ENTRY_HASH_ALGORITHM,
     MEASUREMENT_ERROR_CODES,
     PARSER_VERSION,
+    buildFrozenHarnessIdentity,
     isVerifiedHarnessEntry,
     loadHarnessAllowlist,
+    verifyFrozenHarnessIdentity,
     verifyHarnessPreflight,
 } from "../measurement/index.mjs";
 
@@ -266,6 +268,102 @@ describe("verifyEntry (re-verify before every run)", () => {
             ],
         }));
         expect(mismatch.code).toBe(MEASUREMENT_ERROR_CODES.ALLOWLIST_INVALID);
+    });
+
+    it("freezes provider identity, policy fields, and Job limits", () => {
+        const root = tmp("sandboxIdentity");
+        const validationHash = `sha256:${"c".repeat(64)}`;
+        const p = writeAllowlist(root, "e1", {
+            executesCandidateCode: true,
+            validationCases: {
+                pinned: { snapshotHash: validationHash },
+            },
+        });
+        const list = loadHarnessAllowlist(p);
+        const verification = verifyHarnessPreflight(list, "e1", {
+            parserVersion: PARSER_VERSION,
+            validationCases: [{
+                id: "pinned",
+                expectation: "accept",
+                artifactHash: validationHash,
+            }],
+        });
+        const sandbox = {
+            required: true,
+            primitive: "fixture-appcontainer",
+            providerId: "fixture-provider",
+            providerVersion: "v2",
+            policyId: "fixture-policy-v2",
+            helperSourceHash:
+                `sha256:fixture-helper-source:${"a".repeat(64)}`,
+            helperBinaryHash:
+                `sha256:fixture-helper-binary:${"b".repeat(64)}`,
+            launcherId: "fixture-launcher-v1",
+            launcherBinaryHash:
+                `sha256:fixture-launcher-binary:${"d".repeat(64)}`,
+            launcherScriptHash:
+                `sha256:fixture-launcher-script:${"e".repeat(64)}`,
+            securityContext: {
+                appContainer: true,
+                lowIntegrity: true,
+                capabilities: [],
+                loopbackExemptionRejected: true,
+            },
+            network: {
+                mode: "deny-by-default",
+                enforcement: "zero capabilities",
+            },
+            filesystem: {
+                stagedHarness: "exact-manifest-read-execute",
+                immutableCandidate: "private-staged-copy-read-only",
+                outputTemp: "provider-owned",
+                aclJournalRestored: true,
+                exactLaunchClosure: true,
+                hostWriteDenied: true,
+            },
+            job: {
+                killOnJobClose: true,
+                descendantsContained: true,
+                uiRestrictions: true,
+                activeProcessLimit: 4,
+                processMemoryBytes: 128 * 1024 * 1024,
+                jobMemoryBytes: 256 * 1024 * 1024,
+                cpuRatePercent: 25,
+                cpuTimeMs: 10_000,
+                wallTimeMs: 20_000,
+                terminationGraceMs: 2_000,
+            },
+        };
+        const identity = buildFrozenHarnessIdentity(verification, { sandbox });
+        expect(identity.sandbox.policyIdentity).toMatchObject({
+            providerId: "fixture-provider",
+            providerVersion: "v2",
+            filesystem: {
+                exactLaunchClosure: true,
+                hostWriteDenied: true,
+            },
+            job: {
+                activeProcessLimit: 4,
+                processMemoryBytes: 128 * 1024 * 1024,
+                jobMemoryBytes: 256 * 1024 * 1024,
+            },
+        });
+        expect(() => verifyFrozenHarnessIdentity(list, identity, {
+            validationCases: [{
+                id: "pinned",
+                expectation: "accept",
+                artifactHash: validationHash,
+            }],
+            sandbox: {
+                ...sandbox,
+                job: {
+                    ...sandbox.job,
+                    activeProcessLimit: 5,
+                },
+            },
+        })).toThrow(expect.objectContaining({
+            code: MEASUREMENT_ERROR_CODES.ALLOWLIST_INVALID,
+        }));
     });
 });
 

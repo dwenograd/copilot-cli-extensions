@@ -5,15 +5,17 @@
 // The executor MUST NOT talk to `child_process` directly. Instead it goes
 // through this adapter, which exposes exactly two operations:
 //
-//   - spawn(executable, argv, options): start a child process on Windows
-//     with shell:false, windowsHide:true, an explicit cwd, an explicit env,
-//     and its own process group (detached:true on Windows creates a new
-//     process group we can then tree-terminate by PID).
+//   - spawn(executable, argv, options): start a child process with an explicit
+//     cwd/env and no shell. On Windows a native owner creates the child
+//     suspended, assigns it to a kill-on-close Job Object, then resumes it.
+//     The owner also watches the caller PID, so parent death cannot orphan the
+//     harness or descendants. POSIX uses a detached process group.
 //
 //   - terminateTree(pid, policy): stop the child and descendants **by exact
-//     PID**, never by name. Windows uses bounded taskkill.exe calls, first
-//     without `/F` for drain and then with `/F` for escalation. Other
-//     platforms target the detached process group with SIGTERM/SIGKILL.
+//     PID**, never by name. Owned Windows launches stop through their Job
+//     Object owner; exact-PID taskkill remains the bounded fallback for
+//     externally supplied PIDs. Other platforms target the detached process
+//     group with SIGTERM/SIGKILL.
 //
 // Tests pass a fake adapter to the executor to observe termination calls
 // without actually spawning processes. Production code uses the real
@@ -27,6 +29,7 @@ import {
     MeasurementError,
     SandboxRequiredError,
 } from "./errors.mjs";
+import { createWindowsJobProcessAdapter } from "./windows-job-process-adapter.mjs";
 
 // System path to taskkill.exe. We resolve it via SystemRoot rather than
 // trusting PATH — the whole point of the boundary is to not depend on
@@ -50,17 +53,91 @@ export function createDefaultProcessAdapter(options = {}) {
             "terminationTimeoutMs must be a positive integer <= 60000",
         );
     }
-    return Object.freeze({
+    const jobAdapter = isWindows
+        ? (options.jobProcessAdapter
+            ?? createWindowsJobProcessAdapter({
+                platform,
+                controlRoot: options.controlRoot,
+                spawnProcess,
+                spawnCompiler: options.spawnCompiler,
+            }))
+        : null;
+    const directChildren = new Map();
+
+    const terminateTree = async (pid, termination = {}) => {
+        if (!Number.isInteger(pid) || pid <= 0) return false;
+        const force = termination?.force !== false;
+        const timeoutMs = Number.isSafeInteger(termination?.timeoutMs)
+            && termination.timeoutMs > 0
+            ? Math.min(termination.timeoutMs, 60_000)
+            : defaultTerminationTimeoutMs;
+        if (jobAdapter?.owns(pid)) {
+            return jobAdapter.terminate(pid, { ...termination, timeoutMs });
+        }
+        if (isWindows) {
+            try {
+                const args = [
+                    ...(force ? ["/F"] : []),
+                    "/T",
+                    "/PID",
+                    String(pid),
+                ];
+                const killer = spawnProcess(
+                    resolveTaskkill(),
+                    args,
+                    {
+                        shell: false,
+                        windowsHide: true,
+                        stdio: "ignore",
+                        detached: false,
+                    },
+                );
+                return await new Promise((resolve) => {
+                    let settled = false;
+                    let timer = null;
+                    const finish = (value) => {
+                        if (settled) return;
+                        settled = true;
+                        timers.clearTimeout?.(timer);
+                        resolve(value);
+                    };
+                    killer.once("error", () => finish(false));
+                    killer.once("close", (code) => finish(code === 0 || code === 128));
+                    timer = timers.setTimeout(() => {
+                        try { killer.kill(); } catch { /* bounded failure */ }
+                        finish(false);
+                    }, timeoutMs);
+                    timer?.unref?.();
+                });
+            } catch {
+                return false;
+            }
+        }
+        try {
+            // Negative pid targets the process group created by detached:true.
+            process.kill(-pid, force ? "SIGKILL" : "SIGTERM");
+            return true;
+        } catch {
+            try {
+                process.kill(pid, force ? "SIGKILL" : "SIGTERM");
+                return true;
+            } catch {
+                return false;
+            }
+        }
+    };
+
+    const adapter = {
         platform,
-        spawn(executable, argv, options) {
-            if (options?.executesCandidateCode !== false
-                || options?.launchPath !== "host-process-adapter") {
+        spawn(executable, argv, launchOptions) {
+            if (launchOptions?.executesCandidateCode !== false
+                || launchOptions?.launchPath !== "host-process-adapter") {
                 throw new SandboxRequiredError(
                     "ordinary host process adapters cannot launch candidate code",
                     {
                         executesCandidateCode:
-                            options?.executesCandidateCode ?? null,
-                        launchPath: options?.launchPath ?? null,
+                            launchOptions?.executesCandidateCode ?? null,
+                        launchPath: launchOptions?.launchPath ?? null,
                     },
                 );
             }
@@ -76,10 +153,13 @@ export function createDefaultProcessAdapter(options = {}) {
                     "adapter.spawn requires an argv array",
                 );
             }
+            if (isWindows) {
+                return jobAdapter.spawn(executable, argv, launchOptions);
+            }
             const spawnOptions = {
-                cwd: options.cwd,
-                env: options.env,
-                stdio: options.stdio ?? ["ignore", "pipe", "pipe"],
+                cwd: launchOptions.cwd,
+                env: launchOptions.env,
+                stdio: launchOptions.stdio ?? ["ignore", "pipe", "pipe"],
                 // HARDCODED FAIL-CLOSED: never let the caller enable a shell,
                 // and never let the caller un-hide the child window on Windows.
                 shell: false,
@@ -97,66 +177,39 @@ export function createDefaultProcessAdapter(options = {}) {
                     { executable, cause: err?.code ?? null },
                 );
             }
+            if (Number.isSafeInteger(child?.pid) && child.pid > 0) {
+                directChildren.set(child.pid, child);
+                child.once("close", () => directChildren.delete(child.pid));
+            }
             return child;
         },
-        async terminateTree(pid, termination = {}) {
-            if (!Number.isInteger(pid) || pid <= 0) return false;
-            const force = termination?.force !== false;
-            const timeoutMs = Number.isSafeInteger(termination?.timeoutMs)
-                && termination.timeoutMs > 0
-                ? Math.min(termination.timeoutMs, 60_000)
-                : defaultTerminationTimeoutMs;
-            if (isWindows) {
+        terminateTree,
+        async close(termination = {}) {
+            let firstError = null;
+            if (jobAdapter !== null) {
                 try {
-                    const args = [
-                        ...(force ? ["/F"] : []),
-                        "/T",
-                        "/PID",
-                        String(pid),
-                    ];
-                    const killer = spawnProcess(
-                        resolveTaskkill(),
-                        args,
-                        {
-                            shell: false,
-                            windowsHide: true,
-                            stdio: "ignore",
-                            detached: false,
-                        },
-                    );
-                    return await new Promise((resolve) => {
-                        let settled = false;
-                        let timer = null;
-                        const finish = (value) => {
-                            if (settled) return;
-                            settled = true;
-                            timers.clearTimeout?.(timer);
-                            resolve(value);
-                        };
-                        killer.once("error", () => finish(false));
-                        killer.once("close", (code) => finish(code === 0 || code === 128));
-                        timer = timers.setTimeout(() => {
-                            try { killer.kill(); } catch { /* bounded failure */ }
-                            finish(false);
-                        }, timeoutMs);
-                        timer?.unref?.();
-                    });
-                } catch {
-                    return false;
+                    await jobAdapter.close(termination);
+                } catch (error) {
+                    firstError = error;
                 }
             }
-            try {
-                // Negative pid targets the process group created by detached:true.
-                process.kill(-pid, force ? "SIGKILL" : "SIGTERM");
-                return true;
-            } catch {
-                try {
-                    process.kill(pid, force ? "SIGKILL" : "SIGTERM");
-                    return true;
-                } catch {
-                    return false;
-                }
+            const directPids = [...directChildren.keys()];
+            const results = await Promise.all(
+                directPids.map((pid) => terminateTree(pid, {
+                    force: true,
+                    ...termination,
+                })),
+            );
+            if (firstError !== null) throw firstError;
+            if (results.some((result) => result !== true)) {
+                throw new MeasurementError(
+                    MEASUREMENT_ERROR_CODES.SANDBOX_LIFECYCLE,
+                    "Process adapter did not terminate every owned child tree",
+                    { activePids: [...directChildren.keys()] },
+                );
             }
+            return true;
         },
-    });
+    };
+    return Object.freeze(adapter);
 }

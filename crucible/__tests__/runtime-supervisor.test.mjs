@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import {
     RUNTIME_ERROR_CODES,
     acquireSupervisorLock,
+    createDomainRepositoryAdapter,
     ensureSupervisor,
     normalizeStartDeadline,
     normalizeRunnerConfig,
@@ -14,6 +15,7 @@ import {
     releaseSupervisorLock,
     runSupervisor,
     startSupervisor,
+    supervisorConfigFingerprint,
     supervisorPaths,
     terminateExactSupervisor,
 } from "../runtime/index.mjs";
@@ -34,6 +36,58 @@ afterEach(() => {
     for (const root of roots.splice(0)) {
         fs.rmSync(root, { recursive: true, force: true });
     }
+});
+
+describe("H7 supervisor status-write failure matrix", () => {
+    it.each([
+        "after_owner_status_write",
+        "after_status_write",
+    ])("recovers after a crash at %s without a stale write or atomic temporary", async (point) => {
+        const root = makeRoot(`status-fault-${point}`);
+        const config = normalizeSupervisorConfig(rawConfig(root));
+        let injected = false;
+
+        await expect(runSupervisor(config, {
+            pid: 8801,
+            idFactory: () => "status-fault-owner",
+            isPidAlive: () => false,
+            statusFaultInjector(observedPoint, details) {
+                if (!injected
+                    && observedPoint === point
+                    && details.state === "starting") {
+                    injected = true;
+                    throw new Error(`injected ${point}`);
+                }
+            },
+            spawnRunner() {
+                throw new Error("runner must not launch before starting status is durable");
+            },
+        })).rejects.toThrow(`injected ${point}`);
+        expect(injected).toBe(true);
+        expect(fs.existsSync(config.paths.lockPath)).toBe(false);
+        expect(fs.readdirSync(config.paths.directory)
+            .filter((name) => name.endsWith(".tmp"))).toEqual([]);
+
+        const recovered = await runSupervisor(config, {
+            pid: 8802,
+            idFactory: () => "status-fault-replacement",
+            isPidAlive: () => false,
+            spawnRunner: childResultSpawner([{
+                envelope: successfulOutcome("non_result", "STATUS_RECOVERED"),
+            }]),
+        });
+        expect(recovered).toMatchObject({
+            kind: "NON_RESULT",
+            nonResultCode: "STATUS_RECOVERED",
+            status: {
+                supervisorGeneration: 2,
+                state: "non_result",
+                terminal_available: false,
+            },
+        });
+        expect(fs.readdirSync(config.paths.directory)
+            .filter((name) => name.endsWith(".tmp"))).toEqual([]);
+    });
 });
 
 function rawConfig(root, overrides = {}) {
@@ -153,6 +207,7 @@ function writeRuntimeOwnerMarker(root, {
     investigationId = "supervised-investigation",
     supervisorGeneration,
     supervisorNonce,
+    runnerIncarnation = `runner-${supervisorGeneration}`,
     runnerEpochId = "runner-epoch",
     pid,
 } = {}) {
@@ -163,6 +218,7 @@ function writeRuntimeOwnerMarker(root, {
         investigationId,
         supervisorGeneration,
         supervisorNonce,
+        runnerIncarnation,
         runnerEpochId,
         pid,
         root,
@@ -358,6 +414,73 @@ describe("Crucible supervisor", () => {
             supervisorGeneration: 1,
         });
         expect(fs.existsSync(config.paths.lockPath)).toBe(false);
+    });
+
+    it("reaps the crashed runner incarnation before launching its replacement", async () => {
+        const root = makeRoot("restart-reap");
+        const config = normalizeSupervisorConfig(rawConfig(root));
+        const incarnations = ["crashed-incarnation", "replacement-incarnation"];
+        let crashedRoot = null;
+        const result = await runSupervisor(config, {
+            pid: 304,
+            idFactory: () => "restart-reap-supervisor",
+            runnerIncarnationFactory: () => incarnations.shift(),
+            isPidAlive: () => false,
+            sleep: async () => {},
+            spawnRunner: async (launchConfig, context) => {
+                const child = new EventEmitter();
+                child.pid = 5400 + context.launchNumber;
+                if (context.launchNumber === 1) {
+                    crashedRoot = path.join(
+                        config.runner.options.tempRoot,
+                        "run-g1-crashed",
+                    );
+                    writeRuntimeOwnerMarker(crashedRoot, {
+                        supervisorGeneration: context.supervisorGeneration,
+                        supervisorNonce: context.supervisorNonce,
+                        runnerIncarnation: context.runnerIncarnation,
+                        pid: child.pid,
+                    });
+                    fs.mkdirSync(
+                        path.join(crashedRoot, ".crucible-stage-abrupt"),
+                    );
+                    fs.writeFileSync(
+                        path.join(
+                            crashedRoot,
+                            ".crucible-stage-abrupt",
+                            "node.exe",
+                        ),
+                        "debris",
+                    );
+                } else {
+                    expect(fs.existsSync(crashedRoot)).toBe(false);
+                }
+                setImmediate(() => {
+                    fs.writeFileSync(
+                        launchConfig.paths.childResultPath,
+                        `${JSON.stringify(
+                            context.launchNumber === 1
+                                ? failedOutcome("TRANSIENT", true)
+                                : successfulOutcome(
+                                    "non_result",
+                                    "RESTART_REAPED",
+                                ),
+                        )}\n`,
+                    );
+                    child.emit("close", context.launchNumber === 1 ? 75 : 0, null);
+                });
+                return {
+                    child,
+                    resultPath: launchConfig.paths.childResultPath,
+                };
+            },
+        });
+
+        expect(result).toMatchObject({
+            kind: "NON_RESULT",
+            nonResultCode: "RESTART_REAPED",
+        });
+        expect(fs.existsSync(crashedRoot)).toBe(false);
     });
 
     it("persists a unique incarnation before each launch and rotates it before restart", async () => {
@@ -638,6 +761,62 @@ describe("Crucible supervisor", () => {
         ]);
     });
 
+    it("persists supervisor non-results through current generation/incarnation/lease authority", async () => {
+        const root = makeRoot("fenced-supervisor-non-result");
+        const config = normalizeSupervisorConfig(rawConfig(root));
+        const result = await runSupervisor(config, {
+            pid: 406,
+            idFactory: () => "fenced-non-result-owner",
+            operationalWriterIdFactory: () => "fenced-writer",
+            isPidAlive: () => false,
+            spawnRunner: childResultSpawner([{
+                code: 1,
+                envelope: failedOutcome("FATAL_FENCED_RUNNER", false),
+            }]),
+        });
+        expect(result.kind).toBe("FAILED");
+
+        const repository = openRepository({
+            file: path.join(config.runner.stateDir, "events.sqlite"),
+        });
+        try {
+            const authority = repository.getSupervisorAuthority(
+                config.runner.investigationId,
+            );
+            const lease = repository.getActiveLease(config.runner.investigationId);
+            expect(authority).toMatchObject({
+                supervisorGeneration: 1,
+                supervisorNonce: "fenced-non-result-owner",
+                currentRunnerIncarnation:
+                    "supervisor-operational-g1-fenced-writer",
+            });
+            expect(lease).toMatchObject({
+                supervisorGeneration: 1,
+                runnerIncarnation: authority.currentRunnerIncarnation,
+                releasedAt: null,
+            });
+            const adapter = createDomainRepositoryAdapter({
+                repository,
+                investigationId: config.runner.investigationId,
+            });
+            expect(adapter.latestOperationalNonResult()).toMatchObject({
+                kind: "runtime:non_result",
+                payload: {
+                    code: "FATAL_FENCED_RUNNER",
+                    details: expect.objectContaining({
+                        supervisorGeneration: 1,
+                        operationalWriterIncarnation:
+                            authority.currentRunnerIncarnation,
+                        leaseId: lease.leaseId,
+                        fencingToken: lease.fencingToken,
+                    }),
+                },
+            });
+        } finally {
+            repository.close();
+        }
+    });
+
     it("keeps every supervisor file opaque and deletes the consumed child outcome", async () => {
         const root = makeRoot("opaque-files");
         const config = normalizeSupervisorConfig(rawConfig(root));
@@ -758,6 +937,210 @@ describe("Crucible supervisor", () => {
         });
         expect(result.action).toBe("started");
         expect(result.pid).toBe(999);
+    });
+
+    it("acknowledges only matching live config/deadline and repository authority", async () => {
+        const root = makeRoot("ensure-acknowledged");
+        const config = normalizeSupervisorConfig({
+            ...rawConfig(root),
+            runner: {
+                ...rawConfig(root).runner,
+                deadline: Date.parse("2030-01-01T00:10:00.000Z"),
+            },
+        });
+        const now = Date.parse("2030-01-01T00:00:00.000Z");
+        fs.mkdirSync(config.runner.stateDir, { recursive: true });
+        const repository = openRepository({
+            file: path.join(config.runner.stateDir, "events.sqlite"),
+        });
+        repository.ensureInvestigation({
+            investigationId: config.runner.investigationId,
+        });
+        repository.claimSupervisorGeneration({
+            investigationId: config.runner.investigationId,
+            supervisorGeneration: 3,
+            supervisorNonce: "ack-owner",
+        });
+        repository.issueRunnerIncarnation({
+            investigationId: config.runner.investigationId,
+            supervisorGeneration: 3,
+            supervisorNonce: "ack-owner",
+            runnerIncarnation: "ack-runner",
+        });
+        repository.acquireLease({
+            investigationId: config.runner.investigationId,
+            leaseId: "ack-lease",
+            owner: "ack-runner-owner",
+            supervisorGeneration: 3,
+            runnerIncarnation: "ack-runner",
+        });
+        repository.close();
+        fs.mkdirSync(config.paths.directory, { recursive: true });
+        fs.writeFileSync(config.paths.lockPath, JSON.stringify({
+            pid: 4321,
+            nonce: "ack-owner",
+            startedAt: new Date(now).toISOString(),
+            supervisorGeneration: 3,
+        }));
+        fs.writeFileSync(config.paths.statusPath, JSON.stringify({
+            version: 4,
+            investigationId: config.runner.investigationId,
+            supervisorEpochId: config.supervisorEpochId,
+            configFingerprint: supervisorConfigFingerprint(config),
+            deadlineMs: config.runner.deadlineMs,
+            pid: 4321,
+            nonce: "ack-owner",
+            supervisorGeneration: 3,
+            startedAt: new Date(now).toISOString(),
+            heartbeatAt: new Date(now).toISOString(),
+            state: "running",
+            restartCount: 0,
+            childPid: 4322,
+            runnerIncarnation: "ack-runner",
+            statusRevision: 2,
+            terminal_available: false,
+            non_result_code: null,
+        }));
+
+        await expect(ensureSupervisor(config, {
+            requireAcknowledgement: true,
+            acknowledgementTimeoutMs: 100,
+            acknowledgementPollMs: 1,
+            clock: { now: () => now },
+            isPidAlive: (pid) => pid === 4321,
+        })).resolves.toMatchObject({
+            action: "already-running",
+            acknowledged: true,
+            acknowledgement: {
+                supervisorGeneration: 3,
+                runnerIncarnation: "ack-runner",
+                leaseId: "ack-lease",
+                configFingerprint: supervisorConfigFingerprint(config),
+                deadlineMs: config.runner.deadlineMs,
+            },
+        });
+
+        const mismatchedStatus = JSON.parse(
+            fs.readFileSync(config.paths.statusPath, "utf8"),
+        );
+        mismatchedStatus.deadlineMs += 1;
+        fs.writeFileSync(config.paths.statusPath, JSON.stringify(mismatchedStatus));
+        await expect(ensureSupervisor(config, {
+            requireAcknowledgement: true,
+            acknowledgementTimeoutMs: 100,
+            acknowledgementPollMs: 1,
+            clock: { now: () => now },
+            isPidAlive: (pid) => pid === 4321,
+        })).rejects.toThrow(
+            "does not match the requested configuration or deadline",
+        );
+    });
+
+    it("rejects an exiting stale supervisor as a start acknowledgement", async () => {
+        const root = makeRoot("ensure-stale-exit");
+        const config = normalizeSupervisorConfig(rawConfig(root));
+        const now = Date.now();
+        fs.mkdirSync(config.paths.directory, { recursive: true });
+        fs.writeFileSync(config.paths.lockPath, JSON.stringify({
+            pid: 5432,
+            nonce: "exiting-owner",
+            startedAt: new Date(now).toISOString(),
+            supervisorGeneration: 1,
+        }));
+        fs.writeFileSync(config.paths.statusPath, JSON.stringify({
+            version: 4,
+            investigationId: config.runner.investigationId,
+            supervisorEpochId: config.supervisorEpochId,
+            configFingerprint: supervisorConfigFingerprint(config),
+            deadlineMs: config.runner.deadlineMs,
+            pid: 5432,
+            nonce: "exiting-owner",
+            supervisorGeneration: 1,
+            startedAt: new Date(now).toISOString(),
+            heartbeatAt: new Date(now).toISOString(),
+            state: "non_result",
+            restartCount: 0,
+            childPid: null,
+            runnerIncarnation: "exiting-runner",
+            statusRevision: 4,
+            terminal_available: false,
+            non_result_code: "OLD_DEADLINE",
+        }));
+
+        await expect(ensureSupervisor(config, {
+            requireAcknowledgement: true,
+            resetOperationalState: true,
+            acknowledgementTimeoutMs: 100,
+            acknowledgementPollMs: 1,
+            clock: { now: () => now },
+            isPidAlive: (pid) => pid === 5432,
+        })).rejects.toThrow(
+            "An exiting or completed supervisor cannot acknowledge a new start",
+        );
+    });
+
+    it("does not accept a PID-reused final status from the previous generation", async () => {
+        const root = makeRoot("ensure-reused-final-status");
+        const config = normalizeSupervisorConfig(rawConfig(root));
+        const now = Date.now();
+        fs.mkdirSync(config.runner.stateDir, { recursive: true });
+        const repository = openRepository({
+            file: path.join(config.runner.stateDir, "events.sqlite"),
+        });
+        repository.ensureInvestigation({
+            investigationId: config.runner.investigationId,
+        });
+        repository.claimSupervisorGeneration({
+            investigationId: config.runner.investigationId,
+            supervisorGeneration: 1,
+            supervisorNonce: "previous-owner",
+        });
+        repository.issueRunnerIncarnation({
+            investigationId: config.runner.investigationId,
+            supervisorGeneration: 1,
+            supervisorNonce: "previous-owner",
+            runnerIncarnation: "previous-runner",
+        });
+        repository.acquireLease({
+            investigationId: config.runner.investigationId,
+            leaseId: "previous-lease",
+            owner: "previous-runner-owner",
+            supervisorGeneration: 1,
+            runnerIncarnation: "previous-runner",
+        });
+        repository.close();
+        fs.mkdirSync(config.paths.directory, { recursive: true });
+        fs.writeFileSync(config.paths.statusPath, JSON.stringify({
+            version: 4,
+            investigationId: config.runner.investigationId,
+            supervisorEpochId: config.supervisorEpochId,
+            configFingerprint: supervisorConfigFingerprint(config),
+            deadlineMs: config.runner.deadlineMs,
+            pid: 6543,
+            nonce: "previous-owner",
+            supervisorGeneration: 1,
+            startedAt: new Date(now).toISOString(),
+            heartbeatAt: new Date(now).toISOString(),
+            state: "non_result",
+            restartCount: 0,
+            childPid: null,
+            runnerIncarnation: "previous-runner",
+            statusRevision: 5,
+            terminal_available: false,
+            non_result_code: "OLD_FAILURE",
+        }));
+
+        await expect(ensureSupervisor(config, {
+            requireAcknowledgement: true,
+            resetOperationalState: true,
+            acknowledgementTimeoutMs: 20,
+            acknowledgementPollMs: 1,
+            clock: { now: () => now },
+            isPidAlive: () => false,
+            spawnProcess: () => ({ pid: 6543, unref() {} }),
+        })).rejects.toThrow(
+            "did not publish a matching generation/incarnation/config/deadline acknowledgement",
+        );
     });
 
     it("reclaims a malformed legacy lock only after stale mtime and no matching heartbeat", () => {
@@ -1128,7 +1511,7 @@ describe("Crucible supervisor", () => {
         expect(fs.existsSync(config.paths.lockPath)).toBe(false);
     });
 
-    it("scavenges only dead older-generation runtime debris", () => {
+    it("scavenges only dead older-generation runtime debris", async () => {
         const root = makeRoot("startup-scavenge");
         const tempRoot = path.join(root, "state", "runtime-temp");
         const supervisorDirectory = path.join(root, "state", "supervisor");
@@ -1195,7 +1578,7 @@ describe("Crucible supervisor", () => {
             nonce: "current-owner",
         }));
 
-        const result = scavengeStaleGenerationOwnedPaths({
+        const result = await scavengeStaleGenerationOwnedPaths({
             tempRoot,
             supervisorDirectory,
             investigationId: "supervised-investigation",
@@ -1219,6 +1602,63 @@ describe("Crucible supervisor", () => {
             "atomic_temp",
             "runtime_temp_root",
         ]);
+    });
+
+    it("scavenges a dead abandoned runner incarnation in the current generation", async () => {
+        const root = makeRoot("current-generation-scavenge");
+        const tempRoot = path.join(root, "state", "runtime-temp");
+        const supervisorDirectory = path.join(root, "state", "supervisor");
+        fs.mkdirSync(tempRoot, { recursive: true });
+        fs.mkdirSync(supervisorDirectory, { recursive: true });
+        writeGenerationRecord(supervisorDirectory, 4, "current-owner", 904);
+
+        const abandoned = path.join(tempRoot, "run-g4-abandoned");
+        writeRuntimeOwnerMarker(abandoned, {
+            supervisorGeneration: 4,
+            supervisorNonce: "current-owner",
+            runnerIncarnation: "abandoned-runner",
+            pid: 301,
+        });
+        fs.mkdirSync(path.join(abandoned, ".crucible-stage-abrupt"));
+        fs.writeFileSync(
+            path.join(abandoned, ".crucible-stage-abrupt", "node.exe"),
+            "debris",
+        );
+
+        const active = path.join(tempRoot, "run-g4-active");
+        writeRuntimeOwnerMarker(active, {
+            supervisorGeneration: 4,
+            supervisorNonce: "current-owner",
+            runnerIncarnation: "active-runner",
+            pid: 302,
+        });
+
+        const result = await scavengeStaleGenerationOwnedPaths({
+            tempRoot,
+            supervisorDirectory,
+            investigationId: "supervised-investigation",
+            currentGeneration: 4,
+            currentNonce: "current-owner",
+            currentPid: 904,
+            abandonedRunners: [{
+                runnerIncarnation: "abandoned-runner",
+                pid: 999,
+            }],
+            isPidAlive: () => false,
+            now: Date.now(),
+            minimumAgeMs: 0,
+        });
+
+        expect(fs.existsSync(abandoned)).toBe(false);
+        expect(fs.existsSync(active)).toBe(true);
+        expect(result.removed).toEqual([{
+            path: abandoned,
+            kind: "runtime_temp_root",
+        }]);
+        expect(result.preserved).toContainEqual({
+            path: active,
+            reason: "current_generation",
+        });
     });
 
     it("does not write through a junction outside the assigned state root", () => {

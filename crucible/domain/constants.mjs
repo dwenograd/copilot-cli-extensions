@@ -1,5 +1,48 @@
 export const DOMAIN_VERSION = 3;
 
+export const CONTRACT_LIMITS = Object.freeze({
+    objectiveCharacters: 2048,
+    objectiveBytes: 2048,
+    acceptancePredicateBytes: 4096,
+    acceptancePredicateDepth: 16,
+    acceptancePredicateNodes: 128,
+    acceptancePredicateChildren: 32,
+    acceptancePathSegments: 16,
+    acceptancePathSegmentCharacters: 128,
+    acceptanceValueDepth: 8,
+    acceptanceValueNodes: 128,
+    acceptanceValueArrayItems: 32,
+    acceptanceValueObjectProperties: 32,
+    acceptanceValueStringCharacters: 1024,
+    acceptanceValueStringBytes: 2048,
+    metrics: 12,
+    validationCases: 64,
+    workerModels: 8,
+    candidatesPerRound: 8,
+    maxRounds: 64,
+    maxEvaluations: 512,
+    boundedCandidateIds: 512,
+});
+
+export const SEARCH_POLICY_LIMITS = Object.freeze({
+    plateauWindow: CONTRACT_LIMITS.maxRounds,
+    minRoundsBeforePlateau: CONTRACT_LIMITS.maxRounds,
+    mandatoryEscapeRounds: CONTRACT_LIMITS.maxRounds,
+    archiveCaps: Object.freeze({
+        accepted: 32,
+        nearMisses: 32,
+        rejected: 32,
+        invalidMetrics: 32,
+        mechanismGroups: 32,
+        lessonGroups: 32,
+        duplicateIndex: 256,
+    }),
+    promptCaps: Object.freeze({
+        parentEvidenceIds: 4,
+        promptContextRefs: 12,
+    }),
+});
+
 export const HYPOTHESIS_TOPOLOGIES = Object.freeze([
     "finite_enumerable",
     "bounded_parameterized",
@@ -78,11 +121,16 @@ export const DEFAULT_SEARCH_POLICY = Object.freeze({
 
 export const ANNOTATION_LIMITS = Object.freeze({
     mechanismLength: 256,
+    mechanismBytes: 256,
     hypothesisLength: 2048,
+    hypothesisBytes: 4096,
     expectedEffectCount: 16,
     expectedEffectLength: 512,
-    citedEvidenceCount: 64,
-    findingLength: 2048,
+    expectedEffectBytes: 512,
+    citedEvidenceCount: SEARCH_POLICY_LIMITS.promptCaps.promptContextRefs,
+    findingLength: 1024,
+    findingBytes: 1024,
+    totalBytes: 16 * 1024,
 });
 
 export const EVENT_TYPES = Object.freeze({

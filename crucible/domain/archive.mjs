@@ -21,11 +21,72 @@ function evidenceOrder(left, right) {
     return leftId < rightId ? -1 : leftId > rightId ? 1 : 0;
 }
 
+// Exact IEEE-754 parts keep epsilon bucket ordering finite and stable across runtimes.
+function finiteDoubleParts(value) {
+    if (value === 0) {
+        return { coefficient: 0n, exponent: 0 };
+    }
+    const view = new DataView(new ArrayBuffer(8));
+    view.setFloat64(0, value, false);
+    const high = view.getUint32(0, false);
+    const low = view.getUint32(4, false);
+    const exponentBits = (high >>> 20) & 0x7ff;
+    const fraction = (BigInt(high & 0x000fffff) << 32n) | BigInt(low);
+    const magnitude = exponentBits === 0
+        ? fraction
+        : (1n << 52n) | fraction;
+    return {
+        coefficient: (high & 0x80000000) === 0 ? magnitude : -magnitude,
+        exponent: exponentBits === 0 ? -1074 : exponentBits - 1023 - 52,
+    };
+}
+
+function epsilonBucket(value, epsilon) {
+    const valueParts = finiteDoubleParts(value);
+    if (valueParts.coefficient === 0n) {
+        return 0n;
+    }
+    const epsilonParts = finiteDoubleParts(epsilon);
+    let numerator = valueParts.coefficient;
+    let denominator = epsilonParts.coefficient;
+    const exponentDifference = valueParts.exponent - epsilonParts.exponent;
+    if (exponentDifference > 0) {
+        numerator <<= BigInt(exponentDifference);
+    } else if (exponentDifference < 0) {
+        denominator <<= BigInt(-exponentDifference);
+    }
+
+    const negative = numerator < 0n;
+    const magnitude = negative ? -numerator : numerator;
+    let quotient = magnitude / denominator;
+    const doubledRemainder = (magnitude % denominator) << 1n;
+    if ((!negative && doubledRemainder >= denominator)
+        || (negative && doubledRemainder > denominator)) {
+        quotient += 1n;
+    }
+    return negative ? -quotient : quotient;
+}
+
+function compareMetricValues(left, right, epsilon) {
+    if (left === right) {
+        return 0;
+    }
+    if (epsilon > 0) {
+        const leftBucket = epsilonBucket(left, epsilon);
+        const rightBucket = epsilonBucket(right, epsilon);
+        if (leftBucket === rightBucket) {
+            return 0;
+        }
+        return leftBucket < rightBucket ? -1 : 1;
+    }
+    return left < right ? -1 : 1;
+}
+
 export function compareCandidateEvidence(metrics, left, right) {
     for (const metric of metrics) {
         const epsilon = metric.epsilon > 0 ? metric.epsilon : 0;
-        let leftValue = left.metrics?.[metric.key];
-        let rightValue = right.metrics?.[metric.key];
+        const leftValue = left.metrics?.[metric.key];
+        const rightValue = right.metrics?.[metric.key];
         const leftValid = typeof leftValue === "number" && Number.isFinite(leftValue);
         const rightValid = typeof rightValue === "number" && Number.isFinite(rightValue);
         if (leftValid !== rightValid) {
@@ -34,16 +95,13 @@ export function compareCandidateEvidence(metrics, left, right) {
         if (!leftValid) {
             continue;
         }
-        if (epsilon > 0) {
-            leftValue = Math.round(leftValue / epsilon);
-            rightValue = Math.round(rightValue / epsilon);
-        }
-        if (leftValue === rightValue) {
+        const comparison = compareMetricValues(leftValue, rightValue, epsilon);
+        if (comparison === 0) {
             continue;
         }
         return metric.direction === "min"
-            ? leftValue - rightValue
-            : rightValue - leftValue;
+            ? comparison
+            : -comparison;
     }
     return evidenceOrder(left, right);
 }

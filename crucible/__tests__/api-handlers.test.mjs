@@ -192,7 +192,18 @@ function makeDeps(env, overrides = {}) {
         ensureSupervisor: (input, opts) => {
             calls.ensure.push({ input, opts });
             persistSupervisorConfig(input);
-            return { action: "started", pid: 4242, statusPath: "status" };
+            return {
+                action: "started",
+                pid: 4242,
+                statusPath: "status",
+                acknowledged: true,
+                acknowledgement: {
+                    supervisorGeneration: 1,
+                    runnerIncarnation: "fixture-runner-incarnation",
+                    configFingerprint: "sha256:fixture-supervisor-config",
+                    deadlineMs: input.runner.deadlineMs,
+                },
+            };
         },
         readStatus,
         requestStop,
@@ -399,6 +410,8 @@ function seedMeasurementReceipt({
     parsed,
     stdoutHash,
     stderrHash,
+    stdoutBytes,
+    stderrBytes,
 }) {
     const executableHash = hashCanonical(
         { harness: "executable" },
@@ -434,6 +447,19 @@ function seedMeasurementReceipt({
             role: "support",
             sha256: dependencyHash,
         }],
+        launchFileBindings: [{
+            path: "C:\\stage\\candidate.bin",
+            role: "candidate",
+            sha256: snapshotHash,
+            identity: {
+                dev: "1",
+                ino: "1",
+                size: "1",
+                mode: "33188",
+                mtimeNs: "1",
+                ctimeNs: "1",
+            },
+        }],
         argvHash: hashCanonical(
             { observationId, subjectId, argv: true },
             "sha256:crucible-measurement-argv-v1",
@@ -443,6 +469,9 @@ function seedMeasurementReceipt({
             "sha256:crucible-measurement-env-v1",
         ),
         candidateSnapshotHash: snapshotHash,
+        stagedCandidateSnapshotHash: snapshotHash,
+        stagedCandidateSnapshotClosureHash: closureHash,
+        stagedCandidateSnapshotIdentitySummary: identity,
         candidateSnapshotPreClosureHash: closureHash,
         candidateSnapshotPostClosureHash: closureHash,
         candidateSnapshotIdentitySummary: { pre: identity, post: identity },
@@ -455,6 +484,24 @@ function seedMeasurementReceipt({
         },
         stdoutHash,
         stderrHash,
+        outputCapture: {
+            stdout: {
+                capBytes: 1024 * 1024,
+                totalObservedBytes: stdoutBytes,
+                retainedBytes: stdoutBytes,
+                overflowed: false,
+                truncated: false,
+            },
+            stderr: {
+                capBytes: 256 * 1024,
+                totalObservedBytes: stderrBytes,
+                retainedBytes: stderrBytes,
+                overflowed: false,
+                truncated: false,
+            },
+            overflowed: false,
+            truncated: false,
+        },
         parserVersion: aggregate.contract.parserVersion,
         sandbox: null,
         attemptId: `attempt-${observationId}-${subjectId}`,
@@ -567,6 +614,8 @@ function seedReceipt(adapter, store, aggregate, reserved, observationId, purpose
             parsed,
             stdoutHash,
             stderrHash,
+            stdoutBytes: stdoutBytes.length,
+            stderrBytes: stderrBytes.length,
         });
         const receiptArtifact = persistSeedBytes(
             adapter,
@@ -610,6 +659,12 @@ function seedReceipt(adapter, store, aggregate, reserved, observationId, purpose
             snapshot,
             snapshotExecutionHash: hashCanonical(
                 {
+                    stagedCandidateSnapshotHash:
+                        fullReceipt.stagedCandidateSnapshotHash,
+                    stagedCandidateSnapshotClosureHash:
+                        fullReceipt.stagedCandidateSnapshotClosureHash,
+                    stagedCandidateSnapshotIdentitySummary:
+                        fullReceipt.stagedCandidateSnapshotIdentitySummary,
                     candidateSnapshotPreClosureHash:
                         fullReceipt.candidateSnapshotPreClosureHash,
                     candidateSnapshotPostClosureHash:
@@ -1122,12 +1177,26 @@ function terminalArtifactClasses(stateRoot, investigationId) {
     };
 }
 
-function corruptCasArtifact(stateRoot, investigationId, artifact, mode) {
+function corruptCasArtifact(
+    stateRoot,
+    investigationId,
+    artifact,
+    mode,
+    replacementArtifact = null,
+) {
     const paths = resolveInvestigationPaths(stateRoot, investigationId);
     const store = openArtifactStoreReadOnly({ root: paths.artifactRoot });
     const objectPath = store.objectPath(artifact.objectId);
     if (mode === "missing") {
         fs.rmSync(objectPath);
+        return;
+    }
+    if (mode === "substitute") {
+        if (replacementArtifact === null
+            || replacementArtifact.objectId === artifact.objectId) {
+            throw new Error("substitution requires a different artifact object");
+        }
+        fs.writeFileSync(objectPath, store.readObject(replacementArtifact.objectId));
         return;
     }
     const original = fs.readFileSync(objectPath);
@@ -1582,20 +1651,19 @@ describe("crucible_start", () => {
         expect(calls.ensure).toHaveLength(1);
     });
 
-    it("compensates a failed supervisor resume back to a durable retryable pause", () => {
+    it("compensates a failed asynchronous supervisor acknowledgement to a durable pause", async () => {
         const workspace = makeWorkspace("resume-supervisor-failure");
         const { deps } = makeDeps(workspace.env);
         const started = startInvestigation(startArgs(workspace.projectDir), deps);
         persistPauseForStarted(workspace, started);
         stopInvestigation({ investigation_id: started.investigation_id }, deps);
         const workingEnsure = deps.ensureSupervisor;
-        deps.ensureSupervisor = () => {
-            throw new Error("injected resume launch failure");
-        };
+        deps.ensureSupervisor = () =>
+            Promise.reject(new Error("injected resume acknowledgement failure"));
 
-        expect(() => startInvestigation({
+        await expect(Promise.resolve(startInvestigation({
             investigation_id: started.investigation_id,
-        }, deps)).toThrow(StartFailedError);
+        }, deps))).rejects.toBeInstanceOf(StartFailedError);
 
         const compensated = replayAggregate(workspace.stateRoot, started.investigation_id);
         expect(compensated.pause).not.toBeNull();
@@ -1896,21 +1964,29 @@ describe("crucible_status", () => {
             },
         });
         const status = statusInvestigation({ investigation_id: "verified-inv" }, deps);
-        expect(status.terminal_available).toBe(true);
+        expect(status).toEqual({
+            is_result: false,
+            investigation_id: "verified-inv",
+            terminal_available: true,
+        });
         expect(ensureCalls).toHaveLength(0);
-        expect(status.supervisor_health.ensure_action).toBeNull();
     });
 
-    it("redacts terminal decision, winner, and evidence data from status", () => {
+    it("uses the exact terminal status key allowlist before result verification", () => {
         const workspace = makeWorkspace("status-redaction");
         seedVerifiedResult(workspace.stateRoot, "verified-inv");
         const { deps } = makeDeps(workspace.env, { readStatus: () => null });
         const status = statusInvestigation({ investigation_id: "verified-inv" }, deps);
-        expect(status.terminal_available).toBe(true);
-        expect(status).not.toHaveProperty("terminal");
-        expect(status).not.toHaveProperty("terminal_decision");
-        expect(status.next_recommendation).toBeNull();
-        expect(status).not.toHaveProperty("event_head");
+        expect(Object.keys(status).sort()).toEqual([
+            "investigation_id",
+            "is_result",
+            "terminal_available",
+        ]);
+        expect(status).toEqual({
+            is_result: false,
+            investigation_id: "verified-inv",
+            terminal_available: true,
+        });
         const serialized = JSON.stringify(status);
         expect(serialized).not.toContain("VERIFIED_RESULT");
         expect(serialized).not.toContain("TARGET_UNREACHABLE");
@@ -1938,6 +2014,23 @@ describe("crucible_status", () => {
             non_result_code: "DEADLINE_EXCEEDED",
         });
         expect(status.note).not.toContain("In progress");
+    });
+
+    it("describes a persisted domain non-result without calling it in progress", () => {
+        const workspace = makeWorkspace("status-domain-non-result");
+        seedCertifiedNonResult(workspace.stateRoot, "certified-non-result-inv");
+        const { deps } = makeDeps(workspace.env, { readStatus: () => null });
+        const status = statusInvestigation({
+            investigation_id: "certified-non-result-inv",
+        }, deps);
+        expect(status).toMatchObject({
+            is_result: false,
+            terminal_available: false,
+            non_result: true,
+            non_result_code: "IMPOSSIBILITY_CERTIFICATE_INCONCLUSIVE",
+        });
+        expect(status.note).toContain("persisted non-result");
+        expect(status.note).not.toContain("in progress");
     });
 
     it("fails clearly for an unknown investigation", () => {
@@ -2156,7 +2249,7 @@ describe("crucible_result", () => {
         "snapshot manifest",
         "snapshot object",
     ]) {
-        for (const mode of ["missing", "corrupt"]) {
+        for (const mode of ["missing", "corrupt", "substitute"]) {
             it(`refuses a terminal result when the ${artifactClass} artifact is ${mode}`, () => {
                 const workspace = makeWorkspace(`result-${artifactClass}-${mode}`);
                 seedVerifiedResult(workspace.stateRoot, "verified-inv");
@@ -2165,11 +2258,15 @@ describe("crucible_result", () => {
                     "verified-inv",
                 );
                 expect(artifacts[artifactClass]).toBeTruthy();
+                const replacement = Object.values(artifacts).find((artifact) =>
+                    artifact?.objectId !== undefined
+                    && artifact.objectId !== artifacts[artifactClass].objectId);
                 corruptCasArtifact(
                     workspace.stateRoot,
                     "verified-inv",
                     artifacts[artifactClass],
                     mode,
+                    replacement,
                 );
                 const { deps } = makeDeps(workspace.env);
                 expectIntegrityBlocked(resultInvestigation({
@@ -2179,7 +2276,7 @@ describe("crucible_result", () => {
         }
     }
 
-    for (const mode of ["missing", "corrupt"]) {
+    for (const mode of ["missing", "corrupt", "substitute"]) {
         it(`refuses a certified terminal result when the impossibility certificate is ${mode}`, () => {
             const workspace = makeWorkspace(`result-certificate-${mode}`);
             seedCertifiedTargetUnreachable(
@@ -2190,11 +2287,15 @@ describe("crucible_result", () => {
                 workspace.stateRoot,
                 "certified-unreach-inv",
             );
+            const replacement = Object.values(artifacts).find((artifact) =>
+                artifact?.objectId !== undefined
+                && artifact.objectId !== artifacts["impossibility certificate"].objectId);
             corruptCasArtifact(
                 workspace.stateRoot,
                 "certified-unreach-inv",
                 artifacts["impossibility certificate"],
                 mode,
+                replacement,
             );
             const { deps } = makeDeps(workspace.env);
             expectIntegrityBlocked(resultInvestigation({
@@ -2259,8 +2360,20 @@ describe("crucible_result", () => {
         expect(fs.existsSync(paths.artifactRoot)).toBe(false);
     });
 
-    it("verifies inline artifact checksums and refuses same-size byte corruption", () => {
-        const workspace = makeWorkspace("result-inline-corruption");
+    it.each([
+        ["delete", (bytes) => Buffer.alloc(0), 0],
+        ["corrupt", (bytes) => {
+            const corrupted = Buffer.from(bytes);
+            corrupted[0] ^= 0xff;
+            return corrupted;
+        }, null],
+        ["substitute", (bytes) => Buffer.alloc(bytes.length, 0x5a), null],
+    ])("verifies inline artifact checksums and refuses %s", (
+        mode,
+        mutate,
+        explicitSize,
+    ) => {
+        const workspace = makeWorkspace(`result-inline-${mode}`);
         seedVerifiedResult(workspace.stateRoot, "verified-inv");
         const { artifacts } = terminalArtifactClasses(
             workspace.stateRoot,
@@ -2289,13 +2402,18 @@ describe("crucible_result", () => {
             investigation_id: "verified-inv",
         }, deps).is_result).toBe(true);
 
-        const corrupted = Buffer.from(bytes);
-        corrupted[0] ^= 0xff;
+        const mutated = mutate(bytes);
         const corruptDb = new DatabaseSync(paths.eventsDbPath);
         try {
-            corruptDb.prepare(
-                "UPDATE artifacts SET inline_blob = ? WHERE artifact_id = ?",
-            ).run(corrupted, proposal.artifactId);
+            corruptDb.prepare(`
+                UPDATE artifacts
+                SET inline_blob = ?,
+                    size_bytes = ?
+                WHERE artifact_id = ?`).run(
+                mutated,
+                explicitSize ?? mutated.length,
+                proposal.artifactId,
+            );
         } finally {
             corruptDb.close();
         }
@@ -2344,11 +2462,10 @@ describe("crucible_result", () => {
         const status = statusInvestigation({
             investigation_id: "verified-inv",
         }, deps);
-        expect(status).toMatchObject({
+        expect(status).toEqual({
             is_result: false,
-            integrity_blocked: false,
+            investigation_id: "verified-inv",
             terminal_available: true,
-            status: "terminal",
         });
         expect(JSON.stringify(status)).not.toContain("VERIFIED_RESULT");
         expect(status).not.toHaveProperty("decision");

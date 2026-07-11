@@ -16,8 +16,9 @@
 //
 //   * Every write goes through a unique staging file and a durable private
 //     installation journal. An object is not reported durable until its bytes,
-//     parent directory, and installed-state marker have all crossed an fsync
-//     barrier. A later trusted reconciliation advances installed -> referenced.
+//     parent/ancestor directories, and installed-state marker have all crossed
+//     fsync barriers. A later trusted reconciliation advances installed ->
+//     referenced.
 //
 //   * Ingesting a directory produces an immutable canonical snapshot: a sorted,
 //     symlink-free, traversal-checked recursive walk whose per-file hashes are
@@ -40,7 +41,8 @@ import { createHash, randomBytes } from "node:crypto";
 
 import { CruciblePersistenceError, InvalidArgumentError } from "./errors.mjs";
 import { assertLocalDatabasePath } from "./paths.mjs";
-import { canonicalize } from "./canonical.mjs";
+import { canonicalize, normalizeCreatedAt } from "./canonical.mjs";
+import { DatabaseSync } from "./sqlite.mjs";
 
 // --- constants ------------------------------------------------------------
 
@@ -92,7 +94,10 @@ const STATE_MARKER_KEYS = Object.freeze([
 const TRANSACTION_RE = /^[0-9a-z]+-[0-9a-z]+-[0-9a-f]{24}$/u;
 const JOURNAL_FILE_RE = /^([0-9a-z]+-[0-9a-z]+-[0-9a-f]{24})\.json$/u;
 const STATE_MARKER_FILE_RE = /^([0-9a-f]{64})\.(installed|referenced)\.json$/u;
-const DIRECTORY_BARRIER_FILE = ".crucible-dirsync";
+const COORDINATION_DB_FILE = "coordination.sqlite";
+const COORDINATION_SCHEMA_VERSION = 1;
+const COORDINATION_BUSY_TIMEOUT_MS = 5000;
+const LEGACY_DIRECTORY_BARRIER_FILE = ".crucible-dirsync";
 
 const DEFAULT_LIMITS = Object.freeze({
     maxFiles: 100_000,
@@ -507,6 +512,24 @@ function validateStagingRecord(value, options = {}) {
         throw new JournalCorruptError("installation staging record has an invalid schema", {
             fileName,
         });
+    }
+    let normalizedCreatedAt;
+    try {
+        normalizedCreatedAt = normalizeCreatedAt(
+            value.createdAt,
+            "installation.createdAt",
+        );
+    } catch (err) {
+        throw new JournalCorruptError("installation staging record createdAt is invalid", {
+            fileName,
+            cause: err.message,
+        });
+    }
+    if (normalizedCreatedAt !== value.createdAt) {
+        throw new JournalCorruptError(
+            "installation staging record createdAt is not canonical UTC ISO-8601",
+            { fileName, createdAt: value.createdAt, normalizedCreatedAt },
+        );
     }
     let parsed;
     try {
@@ -1011,6 +1034,7 @@ export class ArtifactStore {
     #journalRoot;
     #installationsRoot;
     #quarantineRoot;
+    #coordinationFile;
     #limits;
     #now;
     #readOnly;
@@ -1024,6 +1048,7 @@ export class ArtifactStore {
         this.#journalRoot = path.join(this.#metadataRoot, "journal");
         this.#installationsRoot = path.join(this.#metadataRoot, "installations", ALGO);
         this.#quarantineRoot = path.join(this.#metadataRoot, "quarantine");
+        this.#coordinationFile = path.join(this.#metadataRoot, COORDINATION_DB_FILE);
         this.#limits = limits;
         this.#now = now;
         this.#readOnly = readOnly;
@@ -1098,12 +1123,9 @@ export class ArtifactStore {
             this.#installationsRoot,
             this.#quarantineRoot,
         ]) {
-            try {
-                fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-            } catch (err) {
-                throw asIoError("failed to create artifact store layout", err, { path: dir });
-            }
+            this.#ensureDirectoryDurable(dir, "artifact store layout");
         }
+        this.#initializeCoordination();
     }
 
     // --- object addressing -------------------------------------------------
@@ -1206,50 +1228,117 @@ export class ArtifactStore {
         this.#closeFd(fd, `failed to close ${purpose} after fsync`, { path: filePath, purpose });
     }
 
-    #fsyncWindowsDirectoryBarrier(dirPath, purpose) {
-        const barrierPath = path.join(dirPath, DIRECTORY_BARRIER_FILE);
-        let fd;
-        try {
+    #ensureDirectoryDurable(dirPath, purpose) {
+        const resolved = path.resolve(dirPath);
+        const missing = [];
+        let current = resolved;
+        for (;;) {
+            let stat;
             try {
-                fd = fs.openSync(barrierPath, "r+");
+                stat = fs.lstatSync(current);
             } catch (err) {
                 if (!err || err.code !== "ENOENT") {
-                    throw err;
+                    throw asIoError(`failed to inspect ${purpose} directory`, err, {
+                        path: current,
+                        purpose,
+                    });
                 }
-                try {
-                    fd = fs.openSync(barrierPath, "wx+", 0o600);
-                } catch (createErr) {
-                    if (!createErr || createErr.code !== "EEXIST") {
-                        throw createErr;
-                    }
-                    fd = fs.openSync(barrierPath, "r+");
+                missing.push(current);
+                const parent = path.dirname(current);
+                if (parent === current) {
+                    throw new UnsafePathError(`cannot create ${purpose} above a missing filesystem root`, {
+                        path: resolved,
+                    });
                 }
+                current = parent;
+                continue;
             }
-            const bytes = randomBytes(8);
-            let offset = 0;
-            while (offset < bytes.length) {
-                offset += fs.writeSync(fd, bytes, offset, bytes.length - offset, offset);
+            if (stat.isSymbolicLink() || !stat.isDirectory()) {
+                throw new UnsafePathError(`${purpose} path component is not a real directory`, {
+                    path: current,
+                });
             }
-            this.#fsyncFd(fd, `directory barrier (${purpose})`, barrierPath);
-        } catch (err) {
-            if (fd !== undefined) {
+            break;
+        }
+
+        for (const candidate of missing.reverse()) {
+            const parent = path.dirname(candidate);
+            try {
+                fs.mkdirSync(candidate, { recursive: false, mode: 0o700 });
                 try {
-                    fs.closeSync(fd);
+                    fs.chmodSync(candidate, 0o700);
                 } catch {
-                    // Preserve the durability failure.
+                    // Windows applies the available subset; durability remains mandatory.
+                }
+            } catch (err) {
+                if (!err || err.code !== "EEXIST") {
+                    throw asIoError(`failed to create ${purpose} directory`, err, {
+                        path: candidate,
+                        purpose,
+                    });
+                }
+                const raced = fs.lstatSync(candidate);
+                if (raced.isSymbolicLink() || !raced.isDirectory()) {
+                    throw new UnsafePathError(`${purpose} directory was replaced during creation`, {
+                        path: candidate,
+                    });
                 }
             }
-            throw asIoError("failed to flush Windows directory barrier", err, {
-                path: dirPath,
-                barrierPath,
+            this.#fsyncDirectory(parent, `${purpose} parent`);
+        }
+        return resolved;
+    }
+
+    #fsyncDirectoryChain(startDir, stopDir, purpose) {
+        const start = path.resolve(startDir);
+        const stop = path.resolve(stopDir);
+        if (!isInsideDir(start, stop)) {
+            throw new UnsafePathError("directory durability fence escaped its trusted root", {
+                start,
+                stop,
                 purpose,
             });
         }
-        this.#closeFd(fd, "failed to close Windows directory barrier", {
-            path: dirPath,
-            barrierPath,
-            purpose,
-        });
+        let current = start;
+        let depth = 0;
+        for (;;) {
+            this.#fsyncDirectory(
+                current,
+                depth === 0 ? purpose : `${purpose} ancestor`,
+            );
+            if (sameCanonicalPath(current, stop)) {
+                break;
+            }
+            const parent = path.dirname(current);
+            if (parent === current) {
+                throw new UnsafePathError("directory durability fence reached a filesystem root early", {
+                    start,
+                    stop,
+                    purpose,
+                });
+            }
+            current = parent;
+            depth += 1;
+        }
+    }
+
+    #fsyncDirectoryAndAncestors(dirPath, purpose) {
+        const resolved = path.resolve(dirPath);
+        if (!isInsideDir(resolved, this.#root)) {
+            throw new UnsafePathError("directory durability fence escaped the artifact store", {
+                path: resolved,
+                root: this.#root,
+                purpose,
+            });
+        }
+        this.#fsyncDirectory(resolved, purpose);
+        if (!sameCanonicalPath(resolved, this.#root)) {
+            this.#fsyncDirectoryChain(
+                path.dirname(resolved),
+                this.#root,
+                `${purpose} ancestor`,
+            );
+        }
     }
 
     #fsyncDirectory(dirPath, purpose) {
@@ -1257,7 +1346,7 @@ export class ArtifactStore {
         let failure = null;
         try {
             this.#inject("before-directory-fsync", { purpose, path: dirPath });
-            fd = fs.openSync(dirPath, "r");
+            fd = fs.openSync(dirPath, process.platform === "win32" ? "r+" : "r");
             fs.fsyncSync(fd);
         } catch (err) {
             failure = err;
@@ -1272,21 +1361,231 @@ export class ArtifactStore {
             }
         }
         if (failure !== null) {
-            // Node's Windows backend cannot FlushFileBuffers on a directory
-            // handle (EPERM). A private, rewritten+fsync'd barrier file in that
-            // directory provides the available ordered durability barrier.
-            if (process.platform === "win32"
-                && failure.code === "EPERM"
-                && failure.syscall === "fsync") {
-                this.#fsyncWindowsDirectoryBarrier(dirPath, purpose);
-            } else {
-                throw asIoError(`failed to fsync directory for ${purpose}`, failure, {
-                    path: dirPath,
-                    purpose,
-                });
-            }
+            throw asIoError(`failed to fsync directory for ${purpose}`, failure, {
+                path: dirPath,
+                purpose,
+            });
         }
         this.#inject("after-directory-fsync", { purpose, path: dirPath });
+    }
+
+    #openCoordinationDatabase({ readOnly = false } = {}) {
+        let db;
+        try {
+            db = new DatabaseSync(this.#coordinationFile, { readOnly });
+            db.exec(`PRAGMA busy_timeout = ${COORDINATION_BUSY_TIMEOUT_MS};`);
+            if (readOnly) {
+                db.exec("PRAGMA query_only = ON;");
+            } else {
+                const journal = db.prepare("PRAGMA journal_mode = DELETE;").get();
+                if (String(journal?.journal_mode ?? "").toLowerCase() !== "delete") {
+                    throw new Error("failed to enable DELETE journal mode");
+                }
+                db.exec("PRAGMA synchronous = FULL;");
+            }
+            return db;
+        } catch (err) {
+            try {
+                db?.close();
+            } catch {
+                // Preserve the coordination-open failure.
+            }
+            throw asIoError("failed to open CAS reconciliation coordination database", err, {
+                path: this.#coordinationFile,
+            });
+        }
+    }
+
+    #readCoordinationGeneration(db) {
+        const row = db.prepare(
+            "SELECT generation FROM cas_reconciliation_state WHERE singleton = 1",
+        ).get();
+        const generation = Number(row?.generation);
+        if (!Number.isSafeInteger(generation) || generation < 0) {
+            throw new JournalCorruptError("CAS reconciliation generation is invalid", {
+                path: this.#coordinationFile,
+                generation: row?.generation ?? null,
+            });
+        }
+        return generation;
+    }
+
+    #initializeCoordination() {
+        const db = this.#openCoordinationDatabase();
+        let began = false;
+        let committed = false;
+        try {
+            db.exec("BEGIN IMMEDIATE;");
+            began = true;
+            const initialVersion = Number(
+                db.prepare("PRAGMA user_version;").get()?.user_version,
+            );
+            if (initialVersion !== 0 && initialVersion !== COORDINATION_SCHEMA_VERSION) {
+                throw new JournalCorruptError("CAS coordination schema version is invalid", {
+                    expected: COORDINATION_SCHEMA_VERSION,
+                    actual: initialVersion,
+                });
+            }
+            db.exec(`
+                CREATE TABLE IF NOT EXISTS cas_reconciliation_state (
+                    singleton  INTEGER PRIMARY KEY CHECK (singleton = 1),
+                    generation INTEGER NOT NULL CHECK (generation >= 0)
+                );
+                INSERT OR IGNORE INTO cas_reconciliation_state(singleton, generation)
+                VALUES(1, 0);
+            `);
+            if (initialVersion === 0) {
+                db.exec(`PRAGMA user_version = ${COORDINATION_SCHEMA_VERSION};`);
+            }
+            const version = Number(db.prepare("PRAGMA user_version;").get()?.user_version);
+            if (version !== COORDINATION_SCHEMA_VERSION) {
+                throw new JournalCorruptError("CAS coordination schema version is invalid", {
+                    expected: COORDINATION_SCHEMA_VERSION,
+                    actual: version,
+                });
+            }
+            const columns = db.prepare(
+                "PRAGMA table_info('cas_reconciliation_state');",
+            ).all().map((row) => ({
+                name: String(row.name),
+                type: String(row.type).toUpperCase(),
+                notNull: Number(row.notnull),
+                primaryKey: Number(row.pk),
+            }));
+            if (canonicalize(columns) !== canonicalize([
+                { name: "singleton", type: "INTEGER", notNull: 0, primaryKey: 1 },
+                { name: "generation", type: "INTEGER", notNull: 1, primaryKey: 0 },
+            ])) {
+                throw new JournalCorruptError("CAS coordination table schema is invalid", {
+                    columns,
+                });
+            }
+            const integrityRows = db.prepare("PRAGMA integrity_check;").all();
+            if (integrityRows.length !== 1
+                || String(Object.values(integrityRows[0] ?? {})[0] ?? "") !== "ok") {
+                throw new JournalCorruptError("CAS coordination database failed integrity_check", {
+                    rows: integrityRows,
+                });
+            }
+            this.#readCoordinationGeneration(db);
+            db.exec("COMMIT;");
+            began = false;
+            committed = true;
+        } catch (err) {
+            if (began) {
+                try {
+                    db.exec("ROLLBACK;");
+                } catch {
+                    // Preserve the initialization failure.
+                }
+            }
+            throw err;
+        } finally {
+            try {
+                db.close();
+            } catch (err) {
+                if (committed) {
+                    throw asIoError(
+                        "failed to close CAS reconciliation coordination database",
+                        err,
+                        { path: this.#coordinationFile },
+                    );
+                }
+            }
+        }
+        this.#fsyncFilePath(this.#coordinationFile, "CAS reconciliation coordination database");
+        this.#fsyncDirectoryChain(
+            this.#metadataRoot,
+            this.#root,
+            "CAS reconciliation coordination database parent",
+        );
+    }
+
+    #coordinationGeneration() {
+        const db = this.#openCoordinationDatabase({ readOnly: true });
+        try {
+            return this.#readCoordinationGeneration(db);
+        } finally {
+            db.close();
+        }
+    }
+
+    #withCoordinationTransaction(work) {
+        const db = this.#openCoordinationDatabase();
+        let began = false;
+        let changed = false;
+        let generation;
+        let result;
+        let committed = false;
+        try {
+            db.exec("BEGIN IMMEDIATE;");
+            began = true;
+            generation = this.#readCoordinationGeneration(db);
+            let nextGeneration = generation;
+            result = work({
+                generation,
+                bumpGeneration() {
+                    if (nextGeneration >= Number.MAX_SAFE_INTEGER) {
+                        throw new JournalCorruptError(
+                            "CAS reconciliation generation exhausted the safe integer range",
+                        );
+                    }
+                    nextGeneration += 1;
+                    changed = true;
+                    return nextGeneration;
+                },
+            });
+            if (changed) {
+                db.prepare(`
+                    UPDATE cas_reconciliation_state
+                    SET generation = ?
+                    WHERE singleton = 1
+                `).run(nextGeneration);
+            }
+            db.exec("COMMIT;");
+            began = false;
+            committed = true;
+        } catch (err) {
+            if (began) {
+                try {
+                    db.exec("ROLLBACK;");
+                } catch (rollbackErr) {
+                    if (err && typeof err === "object") {
+                        err.rollbackError = rollbackErr;
+                    }
+                }
+            }
+            if (err instanceof CruciblePersistenceError) {
+                throw err;
+            }
+            throw asIoError("CAS reconciliation transaction failed", err, {
+                path: this.#coordinationFile,
+            });
+        } finally {
+            try {
+                db.close();
+            } catch (err) {
+                if (committed) {
+                    throw asIoError(
+                        "failed to close CAS reconciliation coordination database",
+                        err,
+                        { path: this.#coordinationFile },
+                    );
+                }
+            }
+        }
+        if (changed) {
+            this.#fsyncFilePath(
+                this.#coordinationFile,
+                "CAS reconciliation coordination database",
+            );
+            this.#fsyncDirectoryChain(
+                this.#metadataRoot,
+                this.#root,
+                "CAS reconciliation coordination database parent",
+            );
+        }
+        return { result, generation, changed };
     }
 
     #unlinkPath(filePath, action) {
@@ -1301,14 +1600,10 @@ export class ArtifactStore {
         }
     }
 
-    #writeImmutableRecord(finalPath, value, purpose, syncAncestor = null) {
+    #writeImmutableRecord(finalPath, value, purpose, _syncAncestor = null) {
         const bytes = Buffer.from(canonicalize(value), "utf8");
         const parent = path.dirname(finalPath);
-        try {
-            fs.mkdirSync(parent, { recursive: true, mode: 0o700 });
-        } catch (err) {
-            throw asIoError(`failed to create ${purpose} directory`, err, { path: parent });
-        }
+        this.#ensureDirectoryDurable(parent, purpose);
 
         const verifyExisting = () => {
             let existing;
@@ -1327,10 +1622,7 @@ export class ArtifactStore {
         if (fs.existsSync(finalPath)) {
             verifyExisting();
             this.#fsyncFilePath(finalPath, purpose);
-            this.#fsyncDirectory(parent, `${purpose} parent`);
-            if (syncAncestor !== null) {
-                this.#fsyncDirectory(syncAncestor, `${purpose} ancestor`);
-            }
+            this.#fsyncDirectoryAndAncestors(parent, `${purpose} parent`);
             return true;
         }
 
@@ -1392,13 +1684,10 @@ export class ArtifactStore {
             verifyExisting();
         }
         this.#fsyncFilePath(finalPath, purpose);
-        this.#fsyncDirectory(parent, `${purpose} parent`);
-        if (syncAncestor !== null) {
-            this.#fsyncDirectory(syncAncestor, `${purpose} ancestor`);
-        }
+        this.#fsyncDirectoryAndAncestors(parent, `${purpose} parent`);
         const removedTemp = this.#unlinkPath(tempPath, `failed to remove ${purpose} temporary file`);
         if (removedTemp) {
-            this.#fsyncDirectory(parent, `${purpose} temporary cleanup`);
+            this.#fsyncDirectoryAndAncestors(parent, `${purpose} temporary cleanup`);
         }
         return existed;
     }
@@ -1413,7 +1702,10 @@ export class ArtifactStore {
             staging: path.basename(staged.stagingPath),
             object: objectIdFor(staged.hash),
             size: staged.size,
-            createdAt: String(this.#now()),
+            createdAt: normalizeCreatedAt(
+                this.#now(),
+                "installation.createdAt",
+            ),
         }, { limits: this.#limits });
         this.#writeImmutableRecord(
             this.#journalPath(record.transaction),
@@ -1448,7 +1740,7 @@ export class ArtifactStore {
             transaction: staged.transaction,
             object: objectIdFor(staged.hash),
         });
-        this.#fsyncDirectory(this.#stagingRoot, "staging entry");
+        this.#fsyncDirectoryAndAncestors(this.#stagingRoot, "staging entry");
         this.#inject("stage-directory-durable", {
             transaction: staged.transaction,
             object: objectIdFor(staged.hash),
@@ -1605,11 +1897,7 @@ export class ArtifactStore {
 
     #installObjectEntry(record, sourcePath) {
         const dir = path.join(this.#objectsRoot, record.hash.slice(0, 2));
-        try {
-            fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-        } catch (err) {
-            throw asIoError("failed to create object prefix directory", err, { path: dir });
-        }
+        this.#ensureDirectoryDurable(dir, "object prefix");
         const dest = path.join(dir, record.hash);
         let existed = false;
         let method = "link";
@@ -1728,7 +2016,7 @@ export class ArtifactStore {
             dest,
         });
         this.#fsyncDirectory(dir, "object parent");
-        this.#fsyncDirectory(this.#objectsRoot, "object prefix parent");
+        this.#fsyncDirectoryAndAncestors(this.#objectsRoot, "object prefix parent");
         this.#inject("object-directory-durable", {
             transaction: record.transaction,
             object: record.object,
@@ -1747,10 +2035,10 @@ export class ArtifactStore {
             "failed to remove completed installation candidate",
         ) || objectDirChanged;
         if (stagingRemoved) {
-            this.#fsyncDirectory(this.#stagingRoot, "staging cleanup");
+            this.#fsyncDirectoryAndAncestors(this.#stagingRoot, "staging cleanup");
         }
         if (objectDirChanged) {
-            this.#fsyncDirectory(
+            this.#fsyncDirectoryAndAncestors(
                 path.join(this.#objectsRoot, record.hash.slice(0, 2)),
                 "installation candidate cleanup",
             );
@@ -1760,7 +2048,10 @@ export class ArtifactStore {
             "failed to remove completed installation journal",
         );
         if (journalRemoved) {
-            this.#fsyncDirectory(this.#journalRoot, "installation journal cleanup");
+            this.#fsyncDirectoryAndAncestors(
+                this.#journalRoot,
+                "installation journal cleanup",
+            );
         }
         this.#inject("transaction-cleaned", {
             transaction: record.transaction,
@@ -2484,7 +2775,7 @@ export class ArtifactStore {
             throw err;
         }
         for (const f of files) {
-            if (!f.isFile() || f.name === DIRECTORY_BARRIER_FILE) {
+            if (!f.isFile() || f.name === LEGACY_DIRECTORY_BARRIER_FILE) {
                 continue;
             }
             const abs = path.join(this.#stagingRoot, f.name);
@@ -2514,7 +2805,7 @@ export class ArtifactStore {
             throw asIoError("failed to enumerate installation journal", err, { path: this.#journalRoot });
         }
         for (const file of files) {
-            if (!file.isFile() || file.name === DIRECTORY_BARRIER_FILE) {
+            if (!file.isFile() || file.name === LEGACY_DIRECTORY_BARRIER_FILE) {
                 continue;
             }
             const filePath = path.join(this.#journalRoot, file.name);
@@ -2584,7 +2875,7 @@ export class ArtifactStore {
             const files = fs.readdirSync(prefixDir, { withFileTypes: true })
                 .sort((a, b) => a.name.localeCompare(b.name));
             for (const file of files) {
-                if (!file.isFile() || file.name === DIRECTORY_BARRIER_FILE) {
+                if (!file.isFile() || file.name === LEGACY_DIRECTORY_BARRIER_FILE) {
                     continue;
                 }
                 const filePath = path.join(prefixDir, file.name);
@@ -2714,7 +3005,10 @@ export class ArtifactStore {
                 }
             }
             this.#fsyncFilePath(quarantinePath, "quarantined corrupt object");
-            this.#fsyncDirectory(this.#quarantineRoot, "corrupt-object quarantine");
+            this.#fsyncDirectoryAndAncestors(
+                this.#quarantineRoot,
+                "corrupt-object quarantine",
+            );
         }
         const after = this.#hashExisting(dest);
         if (after === null) {
@@ -2729,7 +3023,7 @@ export class ArtifactStore {
         }
         const removed = this.#unlinkPath(dest, "failed to remove quarantined corrupt object slot");
         if (removed) {
-            this.#fsyncDirectory(path.dirname(dest), "corrupt object removal");
+            this.#fsyncDirectoryAndAncestors(path.dirname(dest), "corrupt object removal");
         }
         return quarantinePath;
     }
@@ -2764,7 +3058,10 @@ export class ArtifactStore {
                         "failed to remove recovered corrupt-object quarantine",
                     );
                     if (removed) {
-                        this.#fsyncDirectory(this.#quarantineRoot, "recovered quarantine cleanup");
+                        this.#fsyncDirectoryAndAncestors(
+                            this.#quarantineRoot,
+                            "recovered quarantine cleanup",
+                        );
                     }
                 }
             } else if (!dryRun) {
@@ -2829,7 +3126,10 @@ export class ArtifactStore {
     #removeObjectDurably(objectPath, purpose) {
         const removed = this.#unlinkPath(objectPath, `failed to remove ${purpose}`);
         if (removed) {
-            this.#fsyncDirectory(path.dirname(objectPath), `${purpose} parent`);
+            this.#fsyncDirectoryAndAncestors(
+                path.dirname(objectPath),
+                `${purpose} parent`,
+            );
         }
         return removed;
     }
@@ -2837,9 +3137,93 @@ export class ArtifactStore {
     #removeMarkerDurably(markerEntry, purpose) {
         const removed = this.#unlinkPath(markerEntry.path, `failed to remove ${purpose}`);
         if (removed) {
-            this.#fsyncDirectory(path.dirname(markerEntry.path), `${purpose} parent`);
+            this.#fsyncDirectoryAndAncestors(
+                path.dirname(markerEntry.path),
+                `${purpose} parent`,
+            );
         }
         return removed;
+    }
+
+    #markObjectReferenced(id, expectedSize, dryRun) {
+        if (dryRun) {
+            const markerScan = this.#scanStateMarkers();
+            return {
+                marked: this.#ensureReferencedState(id, expectedSize, markerScan, true),
+                probe: this.verifyObject(id),
+                markerScan,
+            };
+        }
+        return this.#withCoordinationTransaction(({ bumpGeneration }) => {
+            const probe = this.verifyObject(id);
+            const markerScan = this.#scanStateMarkers();
+            const prefix = parseObjectId(id).hex.slice(0, 2);
+            if (!probe.ok
+                || markerScan.protectedIds.has(id)
+                || markerScan.protectedPrefixes.has(prefix)) {
+                return { marked: false, probe, markerScan };
+            }
+            const marked = this.#ensureReferencedState(id, probe.size, markerScan, false);
+            if (marked) {
+                bumpGeneration();
+            }
+            return { marked, probe, markerScan };
+        }).result;
+    }
+
+    #removeObjectIfStillUnreferenced({
+        id,
+        objectPath = null,
+        installedMarker = false,
+        purpose,
+        observedGeneration,
+    }) {
+        this.#inject("before-reconcile-object-delete", {
+            object: id,
+            path: objectPath,
+            installedMarker,
+            observedGeneration,
+        });
+        return this.#withCoordinationTransaction(({ generation, bumpGeneration }) => {
+            const markerScan = this.#scanStateMarkers();
+            const prefix = parseObjectId(id).hex.slice(0, 2);
+            if (markerScan.referenced.has(id)
+                || markerScan.protectedIds.has(id)
+                || markerScan.protectedPrefixes.has(prefix)) {
+                return {
+                    removedObject: false,
+                    removedMarker: false,
+                    protected: true,
+                    generationChanged: generation !== observedGeneration,
+                    generation,
+                };
+            }
+
+            let removedObject = false;
+            if (objectPath !== null) {
+                removedObject = this.#removeObjectDurably(objectPath, purpose);
+            }
+            let removedMarker = false;
+            if (installedMarker) {
+                const currentInstalled = markerScan.installed.get(id);
+                if (currentInstalled !== undefined) {
+                    removedMarker = this.#removeMarkerDurably(
+                        currentInstalled,
+                        "durable unreferenced installed marker",
+                    );
+                }
+            }
+            if (removedObject || removedMarker) {
+                bumpGeneration();
+            }
+            return {
+                removedObject,
+                removedMarker,
+                protected: false,
+                generationChanged: generation !== observedGeneration,
+                generation,
+            };
+        }).result;
     }
 
     // Reconcile the store against trusted caller references plus the private,
@@ -2900,7 +3284,10 @@ export class ArtifactStore {
                         "failed to remove corrupt installation journal entry",
                     );
                     if (removed) {
-                        this.#fsyncDirectory(this.#journalRoot, "corrupt journal cleanup");
+                        this.#fsyncDirectoryAndAncestors(
+                            this.#journalRoot,
+                            "corrupt journal cleanup",
+                        );
                     }
                 }
                 installationReport.removedJournalEntries.push(corrupt.name);
@@ -2961,11 +3348,20 @@ export class ArtifactStore {
         for (const id of refSet) {
             const r = this.verifyObject(id);
             if (r.ok) {
-                referencedReport.ok.push(id);
                 if (!markerScan.protectedIds.has(id)
                     && !markerScan.protectedPrefixes.has(parseObjectId(id).hex.slice(0, 2))) {
                     try {
-                        if (this.#ensureReferencedState(id, r.size, markerScan, dryRun)) {
+                        const marked = this.#markObjectReferenced(id, r.size, dryRun);
+                        if (!marked.probe.ok) {
+                            if (marked.probe.reason === "missing") {
+                                referencedReport.missing.push(id);
+                            } else {
+                                referencedReport.corrupt.push(id);
+                            }
+                            continue;
+                        }
+                        referencedReport.ok.push(id);
+                        if (marked.marked) {
                             installationReport.markedReferenced.push(id);
                         }
                     } catch (err) {
@@ -2979,6 +3375,8 @@ export class ArtifactStore {
                             message: err.message,
                         });
                     }
+                } else {
+                    referencedReport.ok.push(id);
                 }
             } else if (r.reason === "missing") {
                 if (!referencedReport.missing.includes(id)) {
@@ -2997,6 +3395,7 @@ export class ArtifactStore {
                 installationReport.persistentReferenced.push(id);
             }
         }
+        let sweepGeneration = this.#coordinationGeneration();
 
         // Sweep durable unreferenced objects according to installed markers.
         // A referenced marker is monotonic and permanently protects its object.
@@ -3024,16 +3423,36 @@ export class ArtifactStore {
             }
             const age = now - (obj?.mtimeMs ?? installedEntry.mtimeMs);
             if (age >= olderThanMs) {
+                let removal = {
+                    removedObject: obj !== undefined,
+                    removedMarker: true,
+                    protected: false,
+                    generation: sweepGeneration,
+                };
                 if (!dryRun) {
-                    if (obj !== undefined) {
-                        this.#removeObjectDurably(obj.path, "durable unreferenced object");
+                    removal = this.#removeObjectIfStillUnreferenced({
+                        id,
+                        objectPath: obj?.path ?? null,
+                        installedMarker: true,
+                        purpose: "durable unreferenced object",
+                        observedGeneration: sweepGeneration,
+                    });
+                    sweepGeneration = removal.generation;
+                    if (removal.protected) {
+                        refSet.add(id);
+                        installationReport.persistentReferenced.push(id);
+                        installationReport.durableOrphans =
+                            installationReport.durableOrphans.filter((value) => value !== id);
+                        keptOrphans.push(id);
+                        continue;
                     }
-                    this.#removeMarkerDurably(installedEntry, "durable unreferenced installed marker");
                 }
-                if (obj !== undefined) {
+                if (obj !== undefined && removal.removedObject) {
                     removedObjects.push(id);
                 }
-                installationReport.removedMarkers.push(id);
+                if (removal.removedMarker) {
+                    installationReport.removedMarkers.push(id);
+                }
             } else {
                 keptOrphans.push(id);
             }
@@ -3053,10 +3472,34 @@ export class ArtifactStore {
             installationReport.unjournaledOrphans.push(obj.id);
             const age = now - obj.mtimeMs;
             if (age >= olderThanMs) {
+                let removal = {
+                    removedObject: true,
+                    protected: false,
+                    generation: sweepGeneration,
+                };
                 if (!dryRun) {
-                    this.#removeObjectDurably(obj.path, "unjournalled orphan object");
+                    removal = this.#removeObjectIfStillUnreferenced({
+                        id: obj.id,
+                        objectPath: obj.path,
+                        installedMarker: false,
+                        purpose: "unjournalled orphan object",
+                        observedGeneration: sweepGeneration,
+                    });
+                    sweepGeneration = removal.generation;
+                    if (removal.protected) {
+                        refSet.add(obj.id);
+                        installationReport.persistentReferenced.push(obj.id);
+                        installationReport.unjournaledOrphans =
+                            installationReport.unjournaledOrphans.filter(
+                                (value) => value !== obj.id,
+                            );
+                        keptOrphans.push(obj.id);
+                        continue;
+                    }
                 }
-                removedObjects.push(obj.id);
+                if (removal.removedObject) {
+                    removedObjects.push(obj.id);
+                }
             } else {
                 keptOrphans.push(obj.id);
             }
@@ -3079,7 +3522,10 @@ export class ArtifactStore {
                 if (!dryRun) {
                     const removed = this.#unlinkPath(s.path, "failed to remove stale staging file");
                     if (removed) {
-                        this.#fsyncDirectory(this.#stagingRoot, "stale staging cleanup");
+                        this.#fsyncDirectoryAndAncestors(
+                            this.#stagingRoot,
+                            "stale staging cleanup",
+                        );
                     }
                 }
                 removedStaging.push(s.name);
@@ -3094,7 +3540,10 @@ export class ArtifactStore {
                         "failed to remove stale journal temporary file",
                     );
                     if (removed) {
-                        this.#fsyncDirectory(this.#journalRoot, "journal temporary cleanup");
+                        this.#fsyncDirectoryAndAncestors(
+                            this.#journalRoot,
+                            "journal temporary cleanup",
+                        );
                     }
                 }
                 installationReport.removedJournalEntries.push(temp.name);
@@ -3110,7 +3559,10 @@ export class ArtifactStore {
                         "failed to remove stale installation-marker temporary file",
                     );
                     if (removed) {
-                        this.#fsyncDirectory(path.dirname(temp.path), "installation-marker temporary cleanup");
+                        this.#fsyncDirectoryAndAncestors(
+                            path.dirname(temp.path),
+                            "installation-marker temporary cleanup",
+                        );
                     }
                 }
                 installationReport.removedMetadataTemps.push(temp.name);
@@ -3140,7 +3592,7 @@ export class ArtifactStore {
             }
         }
         for (const file of quarantineFiles.sort((a, b) => a.name.localeCompare(b.name))) {
-            if (!file.isFile() || file.name === DIRECTORY_BARRIER_FILE) {
+            if (!file.isFile() || file.name === LEGACY_DIRECTORY_BARRIER_FILE) {
                 continue;
             }
             const filePath = path.join(this.#quarantineRoot, file.name);
@@ -3149,7 +3601,10 @@ export class ArtifactStore {
                 if (!dryRun) {
                     const removed = this.#unlinkPath(filePath, "failed to remove stale corrupt-object quarantine");
                     if (removed) {
-                        this.#fsyncDirectory(this.#quarantineRoot, "stale quarantine cleanup");
+                        this.#fsyncDirectoryAndAncestors(
+                            this.#quarantineRoot,
+                            "stale quarantine cleanup",
+                        );
                     }
                 }
                 installationReport.removedQuarantine.push(file.name);

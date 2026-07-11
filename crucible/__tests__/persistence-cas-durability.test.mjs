@@ -144,6 +144,49 @@ describe("CAS durable installation lifecycle", () => {
         expect(fs.existsSync(markerPath(meta.hash, "installed"))).toBe(false);
     });
 
+    it("rechecks the reference generation before deleting a raced object", () => {
+        const writer = openArtifactStore({ root });
+        const meta = writer.putBytes(Buffer.from("newly-referenced-race"));
+        const old = new Date(Date.now() - 2 * 60 * 60 * 1000);
+        fs.utimesSync(meta.path, old, old);
+
+        let raced = false;
+        const sweeper = openArtifactStore({
+            root,
+            faultInjector(event) {
+                if (!raced
+                    && event.point === "before-reconcile-object-delete"
+                    && event.object === meta.id) {
+                    raced = true;
+                    openArtifactStore({ root }).reconcile({
+                        referenced: [meta.id],
+                        olderThanMs: 0,
+                        now: Date.now(),
+                    });
+                }
+            },
+        });
+        const report = sweeper.reconcile({
+            referenced: [],
+            olderThanMs: 60 * 60 * 1000,
+            now: Date.now(),
+        });
+
+        expect(raced).toBe(true);
+        expect(report.removedObjects).not.toContain(meta.id);
+        expect(report.installations.persistentReferenced).toContain(meta.id);
+        expect(fs.existsSync(meta.path)).toBe(true);
+        expect(fs.existsSync(markerPath(meta.hash, "referenced"))).toBe(true);
+    });
+
+    it("rejects a non-string installation clock before journaling it", () => {
+        const badClock = openArtifactStore({ root, now: () => 123 });
+        const { hash } = objectIdentity(Buffer.from("bad-installation-clock"));
+        const err = catchErr(() => badClock.putBytes(Buffer.from("bad-installation-clock")));
+        expect(err.code).toBe("CRUCIBLE_PERSIST_INVALID_ARGUMENT");
+        expect(fs.existsSync(markerPath(hash, "installed"))).toBe(false);
+    });
+
     it("removes an aged corrupt journal without trusting its staged path", () => {
         const bytes = Buffer.from("corrupt-journal");
         const crashing = openArtifactStore({
@@ -198,6 +241,12 @@ describe("fsync failure propagation", () => {
             (event) => event.purpose === "installed installation marker parent",
             true,
         ],
+        [
+            "installed marker ancestor directory",
+            "before-directory-fsync",
+            (event) => event.purpose === "installed installation marker parent ancestor",
+            true,
+        ],
     ])("propagates an unexpected %s fsync failure and never returns durable", (
         _label,
         point,
@@ -232,6 +281,26 @@ describe("fsync failure propagation", () => {
         } else {
             expect(recovered.hasObject(id)).toBe(false);
         }
+    });
+
+    it("does not treat an unsupported Windows directory fsync as durable", () => {
+        if (process.platform !== "win32") {
+            return;
+        }
+        const bytes = Buffer.from("unsupported-windows-directory-fsync");
+        const { hash } = objectIdentity(bytes);
+        const store = openArtifactStore({
+            root,
+            faultInjector: throwOnceAt(
+                "before-directory-fsync",
+                (event) => event.purpose === "installed installation marker parent",
+                fault("EPERM", "directory fsync unsupported"),
+            ),
+        });
+
+        const err = catchErr(() => store.putBytes(bytes));
+        expect(err.code).toBe(ARTIFACT_STORE_ERROR_CODES.IO_ERROR);
+        expect(fs.existsSync(markerPath(hash, "referenced"))).toBe(false);
     });
 });
 

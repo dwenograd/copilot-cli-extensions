@@ -451,13 +451,26 @@ describe("opaque SandboxLaunchCapability", () => {
         );
 
         const result = await runFixture(executor, fixture);
-        expect(result.receipt.sandbox).toEqual({
+        expect(result.receipt.sandbox).toMatchObject({
             sandboxId: "receipt-capability",
             environmentHash: POLICY_DIGEST,
             providerId: "receipt-provider",
             providerVersion: "v9.4",
             policyId: "fixture-policy-v1",
             policyDigest: POLICY_DIGEST,
+            policyIdentity: {
+                providerId: "receipt-provider",
+                providerVersion: "v9.4",
+                policyId: "fixture-policy-v1",
+            },
+            policy: {
+                version: 1,
+                identity: {
+                    providerId: "receipt-provider",
+                    providerVersion: "v9.4",
+                    policyId: "fixture-policy-v1",
+                },
+            },
             capabilityId: "receipt-capability",
             launchPath: "sandbox-capability",
             capabilityLaunchUsed: true,

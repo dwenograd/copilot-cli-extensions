@@ -18,6 +18,25 @@ import { CanonicalPayloadError, InvalidArgumentError } from "./errors.mjs";
 
 // The prev_hash of the first event in every investigation.
 export const GENESIS_PREV_HASH = "0".repeat(64);
+const ISO_TIMESTAMP_RE =
+    /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/u;
+
+export function normalizeCreatedAt(value, field = "createdAt") {
+    if (typeof value !== "string" || !ISO_TIMESTAMP_RE.test(value)) {
+        throw new InvalidArgumentError(
+            `${field} must be an ISO-8601 timestamp string with an explicit timezone`,
+            { field, valueType: typeof value },
+        );
+    }
+    const parsed = new Date(value);
+    if (!Number.isFinite(parsed.valueOf())) {
+        throw new InvalidArgumentError(`${field} must be a valid ISO-8601 timestamp`, {
+            field,
+            value,
+        });
+    }
+    return parsed.toISOString();
+}
 
 // Deterministic JSON: object keys sorted recursively; undefined rejected (JSON
 // cannot represent it and it would make the hash ambiguous).
@@ -113,6 +132,7 @@ export function computeEventHash({
     if (typeof payloadCanonical !== "string") {
         throw new InvalidArgumentError("payloadCanonical must be a string");
     }
+    const normalizedCreatedAt = normalizeCreatedAt(createdAt, "createdAt");
     const header = canonicalize({
         version: 2,
         investigationId,
@@ -123,7 +143,7 @@ export function computeEventHash({
         terminalKind,
         attemptId,
         evidenceKind,
-        createdAt,
+        createdAt: normalizedCreatedAt,
     });
     return createHash("sha256")
         .update("crucible-event:v2\0")
@@ -150,6 +170,7 @@ export function computeLegacyEventHash({
     if (typeof payloadCanonical !== "string") {
         throw new InvalidArgumentError("payloadCanonical must be a string");
     }
+    const normalizedCreatedAt = normalizeCreatedAt(createdAt, "createdAt");
     const envelope = canonicalize({
         version: 1,
         investigationId,
@@ -161,7 +182,7 @@ export function computeLegacyEventHash({
         terminalKind,
         attemptId,
         evidenceKind,
-        createdAt,
+        createdAt: normalizedCreatedAt,
     });
     return createHash("sha256").update("crucible-event:").update(envelope).digest("hex");
 }

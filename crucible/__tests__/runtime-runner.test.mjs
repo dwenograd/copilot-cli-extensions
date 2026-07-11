@@ -1,5 +1,10 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { spawn as childSpawn } from "node:child_process";
+import {
+    execFileSync,
+    spawn as childSpawn,
+} from "node:child_process";
+import { EventEmitter } from "node:events";
+import { PassThrough } from "node:stream";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -7,6 +12,7 @@ import { fileURLToPath } from "node:url";
 import {
     DEFAULT_SEARCH_POLICY,
     ESCAPE_SEARCH_OPERATORS,
+    EVENT_TYPES,
     artifactRefsFromProvenance,
     createInvestigationContract,
     harnessCandidateEvidenceItems,
@@ -15,21 +21,25 @@ import {
 import {
     PARSER_VERSION,
     buildFrozenHarnessIdentity,
+    createDefaultProcessAdapter,
     createSandboxProvider,
     loadHarnessAllowlist,
     verifyHarnessPreflight,
 } from "../measurement/index.mjs";
 import {
+    CasConflictError,
     ERROR_CODES as PERSISTENCE_ERROR_CODES,
     openArtifactStore,
     openRepository,
 } from "../persistence/index.mjs";
+import { DatabaseSync } from "../persistence/sqlite.mjs";
 import {
     InjectedCrashError,
     READ_PARENT_ARTIFACT_TOOL_NAME,
     RUNTIME_ERROR_CODES,
     SUBMIT_CANDIDATE_TOOL_NAME,
     createDomainRepositoryAdapter,
+    deriveRunnerExecutionLimits,
     requestStop,
     runAutonomousInvestigation,
 } from "../runtime/index.mjs";
@@ -42,6 +52,80 @@ import {
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const roots = [];
+const WINDOWS_POWERSHELL = path.join(
+    process.env.SystemRoot ?? "C:\\Windows",
+    "System32",
+    "WindowsPowerShell",
+    "v1.0",
+    "powershell.exe",
+);
+
+function exactWindowsProcessesForPaths(paths) {
+    if (process.platform !== "win32" || paths.length === 0) return [];
+    const script = `
+        $needles = @((ConvertFrom-Json $env:CRUCIBLE_EXACT_PROCESS_PATHS))
+        $rows = @(
+            Get-CimInstance Win32_Process | Where-Object {
+                $executable = [string]$_.ExecutablePath
+                $commandLine = [string]$_.CommandLine
+                $matched = $false
+                foreach ($needle in $needles) {
+                    if ([string]::Equals(
+                            $executable,
+                            [string]$needle,
+                            [StringComparison]::OrdinalIgnoreCase
+                        ) -or (
+                            -not [string]::IsNullOrEmpty($commandLine) -and
+                            $commandLine.IndexOf(
+                                [string]$needle,
+                                [StringComparison]::OrdinalIgnoreCase
+                            ) -ge 0
+                        )) {
+                        $matched = $true
+                        break
+                    }
+                }
+                $matched
+            } | Select-Object ProcessId,ParentProcessId,ExecutablePath,CommandLine
+        )
+        if ($rows.Count -eq 0) {
+            [Console]::Out.Write("[]")
+        } else {
+            [Console]::Out.Write((ConvertTo-Json -InputObject @($rows) -Compress))
+        }
+    `;
+    const output = execFileSync(
+        WINDOWS_POWERSHELL,
+        [
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            script,
+        ],
+        {
+            encoding: "utf8",
+            env: {
+                ...process.env,
+                CRUCIBLE_EXACT_PROCESS_PATHS: JSON.stringify(paths),
+            },
+            windowsHide: true,
+            maxBuffer: 4 * 1024 * 1024,
+        },
+    );
+    const parsed = JSON.parse(output || "[]");
+    return Array.isArray(parsed) ? parsed : [parsed];
+}
+
+async function waitForNoExactWindowsProcess(paths, timeoutMs = 5_000) {
+    const deadline = Date.now() + timeoutMs;
+    let remaining = exactWindowsProcessesForPaths(paths);
+    while (remaining.length > 0 && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        remaining = exactWindowsProcessesForPaths(paths);
+    }
+    return remaining;
+}
 
 function makeRoot(label) {
     const root = fs.mkdtempSync(path.join(HERE, `.runtime-runner-${label}-`));
@@ -160,11 +244,48 @@ function runnerSandboxIdentity() {
     return {
         required: true,
         primitive: "fixture-containment",
+        providerId: "runner-fixture-containment",
+        providerVersion: "v1",
         policyId: "runner-fixture-policy",
         helperSourceHash:
             `sha256:runner-fixture-helper-source-v1:${"a".repeat(64)}`,
         helperBinaryHash:
             `sha256:crucible-measurement-file-v1:${"b".repeat(64)}`,
+        launcherId: "runner-fixture-launcher-v1",
+        launcherBinaryHash:
+            `sha256:runner-fixture-launcher-binary-v1:${"c".repeat(64)}`,
+        launcherScriptHash:
+            `sha256:runner-fixture-launcher-script-v1:${"d".repeat(64)}`,
+        securityContext: {
+            appContainer: true,
+            lowIntegrity: true,
+            capabilities: [],
+            loopbackExemptionRejected: true,
+        },
+        network: {
+            mode: "deny-by-default",
+            enforcement: "fixture zero-capability boundary",
+        },
+        filesystem: {
+            stagedHarness: "exact-manifest-read-execute",
+            immutableCandidate: "private-staged-copy-read-only",
+            outputTemp: "provider-owned",
+            aclJournalRestored: true,
+            exactLaunchClosure: true,
+            hostWriteDenied: true,
+        },
+        job: {
+            killOnJobClose: true,
+            descendantsContained: true,
+            uiRestrictions: true,
+            activeProcessLimit: 8,
+            processMemoryBytes: 512 * 1024 * 1024,
+            jobMemoryBytes: 768 * 1024 * 1024,
+            cpuRatePercent: 50,
+            cpuTimeMs: 30_000,
+            wallTimeMs: 120_000,
+            terminationGraceMs: 5_000,
+        },
     };
 }
 
@@ -229,10 +350,56 @@ class FakeWorkerPool {
     }
 }
 
+function createControllableHarnessAdapter() {
+    let nextPid = 7600;
+    const children = new Map();
+    return {
+        spawn(_executable, _argv, options) {
+            const child = new EventEmitter();
+            child.pid = ++nextPid;
+            child.stdout = new PassThrough();
+            child.stderr = new PassThrough();
+            const state = { child, terminated: false, closed: false };
+            children.set(child.pid, state);
+            setImmediate(() => {
+                if (state.terminated || state.closed) return;
+                const candidatePath = options.env.CANDIDATE_SNAPSHOT_PATH;
+                const score = Number(
+                    fs.readFileSync(path.join(candidatePath, "score.txt"), "utf8").trim(),
+                );
+                child.stdout.end(Buffer.from(JSON.stringify({
+                    pass: Number.isFinite(score) && score >= 90,
+                    metrics: { score },
+                }), "utf8"));
+                child.stderr.end();
+                state.closed = true;
+                children.delete(child.pid);
+                child.emit("close", 0, null);
+            });
+            return child;
+        },
+        terminateTree(pid) {
+            const state = children.get(pid);
+            if (state === undefined || state.closed) return false;
+            state.terminated = true;
+            state.child.stdout.end();
+            state.child.stderr.end();
+            setImmediate(() => {
+                if (state.closed) return;
+                state.closed = true;
+                children.delete(pid);
+                state.child.emit("close", null, "SIGKILL");
+            });
+            return true;
+        },
+    };
+}
+
 function setupInvestigation(label, contractOptions = {}, {
     countHarnessCalls = false,
     impossibilityResult = null,
     executesCandidateCode = false,
+    spawnLingeringCandidateProcess = false,
 } = {}) {
     const root = makeRoot(label);
     const stateDir = path.join(root, "state");
@@ -250,21 +417,40 @@ function setupInvestigation(label, contractOptions = {}, {
         searchSpaceExhausted: false,
     };
     const scriptPath = writeHarnessScript(root, "score-harness", `
-        ${countHarnessCall}
-        const candidatePath = process.argv[2];
-        const impossibilityRequest = path.join(
-            candidatePath,
-            "crucible-impossibility-request.json",
-        );
-        if (fs.existsSync(impossibilityRequest)) {
-            process.stdout.write(JSON.stringify(${JSON.stringify(certificateResult)}));
+        if (process.argv[2] === "--crucible-owned-linger") {
+            setInterval(() => {}, 1000);
         } else {
-            const raw = fs.readFileSync(path.join(candidatePath, "score.txt"), "utf8").trim();
-            const score = Number(raw);
-            process.stdout.write(JSON.stringify({
-                pass: Number.isFinite(score) && score >= 90,
-                metrics: raw === "omit" ? {} : { score }
-            }));
+            ${countHarnessCall}
+            const candidatePath = process.argv[2];
+            const impossibilityRequest = path.join(
+                candidatePath,
+                "crucible-impossibility-request.json",
+            );
+            if (fs.existsSync(impossibilityRequest)) {
+                process.stdout.write(JSON.stringify(${JSON.stringify(certificateResult)}));
+            } else {
+                const raw = fs.readFileSync(path.join(candidatePath, "score.txt"), "utf8").trim();
+                const score = Number(raw);
+                ${spawnLingeringCandidateProcess ? `
+                if (score === 95) {
+                    const { spawn } = await import("node:child_process");
+                    const lingering = spawn(
+                        process.execPath,
+                        [process.argv[1], "--crucible-owned-linger"],
+                        {
+                            detached: true,
+                            stdio: "ignore",
+                            windowsHide: true,
+                        },
+                    );
+                    lingering.unref();
+                }
+                ` : ""}
+                process.stdout.write(JSON.stringify({
+                    pass: Number.isFinite(score) && score >= 90,
+                    metrics: raw === "omit" ? {} : { score }
+                }));
+            }
         }
     `);
     const allowlistPath = writeRuntimeAllowlist(root, "score-harness", scriptPath, {
@@ -548,7 +734,7 @@ describe("Crucible autonomous runner", () => {
             row.kind === "runtime:measurement" && row.payload.purpose === "candidate");
         expect(candidateMeasurements).toHaveLength(4);
         const persistedReceipt = candidateMeasurements[0].payload.receipt;
-        expect(persistedReceipt.version).toBe(3);
+        expect(persistedReceipt.version).toBe(5);
         expect(persistedReceipt.candidateSnapshotPreClosureHash).toMatch(
             /^sha256:crucible-measurement-snapshot-closure-v1:[a-f0-9]{64}$/,
         );
@@ -573,6 +759,126 @@ describe("Crucible autonomous runner", () => {
         expect(fs.readdirSync(tempRoot)).toEqual([]);
     }, 60_000);
 
+    it("enforces per-attempt CAS bytes before artifact growth", async () => {
+        const setup = setupInvestigation("cas-attempt-budget", {
+            candidatesPerRound: 1,
+            maxRounds: 1,
+            searchPolicy: { stopOnFirstAccept: true },
+        });
+        const inventory = () => {
+            const files = [];
+            const walk = (directory) => {
+                for (const dirent of fs.readdirSync(directory, {
+                    withFileTypes: true,
+                })) {
+                    const absolute = path.join(directory, dirent.name);
+                    if (dirent.isDirectory()) walk(absolute);
+                    else if (dirent.isFile()) {
+                        files.push({
+                            path: path.relative(setup.artifactRoot, absolute),
+                            size: fs.statSync(absolute).size,
+                        });
+                    }
+                }
+            };
+            walk(setup.artifactRoot);
+            return files.sort((left, right) =>
+                left.path.localeCompare(right.path));
+        };
+        const before = inventory();
+        let outcome;
+        try {
+            outcome = await runAutonomousInvestigation(
+                setup.config,
+                runnerDependencies(new FakeWorkerPool([95]), {
+                    byteBudgets: {
+                        perAttemptCasBytes: 512,
+                        perInvestigationCasBytes: 1024,
+                    },
+                }),
+            );
+        } catch (error) {
+            outcome = error;
+        }
+        expect(outcome?.message ?? outcome?.reason).toMatch(
+            /validation measurements failed/i,
+        );
+        expect(inventory()).toEqual(before);
+    }, 30_000);
+
+    it("seeds the investigation CAS budget from durable prior artifacts", async () => {
+        const setup = setupInvestigation("cas-investigation-budget", {
+            candidatesPerRound: 1,
+            maxRounds: 1,
+            searchPolicy: { stopOnFirstAccept: true },
+        });
+        const store = openArtifactStore({ root: setup.artifactRoot });
+        const stored = store.putBytes(Buffer.alloc(2048, 0x61), {
+            contentType: "application/octet-stream",
+        });
+        const repository = openRepository({
+            file: path.join(setup.stateDir, "events.sqlite"),
+        });
+        repository.registerExternalArtifact({
+            investigationId: "runtime-investigation",
+            artifactId: "seeded-cas-budget-artifact",
+            algo: "sha256",
+            hash: stored.id.slice("sha256:".length),
+            sizeBytes: stored.size,
+            contentType: "application/octet-stream",
+        });
+        repository.markArtifactDurable("seeded-cas-budget-artifact");
+        repository.referenceArtifact({
+            investigationId: "runtime-investigation",
+            artifactId: "seeded-cas-budget-artifact",
+        });
+        repository.close();
+
+        let error;
+        try {
+            await runAutonomousInvestigation(
+                setup.config,
+                runnerDependencies(new FakeWorkerPool([95]), {
+                    byteBudgets: {
+                        perAttemptCasBytes: 1024,
+                        perInvestigationCasBytes: 1024,
+                    },
+                }),
+            );
+        } catch (caught) {
+            error = caught;
+        }
+        expect([
+            error?.message,
+            error?.cause?.message,
+        ].filter(Boolean).join(" ")).toMatch(
+            /Persisted investigation artifacts already exceed/i,
+        );
+    }, 30_000);
+
+    it("raises a too-small configured loop cap to the frozen-contract budget", async () => {
+        const setup = setupInvestigation("derived-loop-budget", {
+            candidatesPerRound: 2,
+            maxRounds: 2,
+        });
+        setup.config.options.maxLoopIterations = 1;
+        const limits = deriveRunnerExecutionLimits(setup.contract);
+        expect(limits.maxLoopIterations).toBeGreaterThan(1);
+
+        const pool = new FakeWorkerPool([95, 80, 96, 70]);
+        const result = await runAutonomousInvestigation(
+            setup.config,
+            runnerDependencies(pool),
+        );
+        expect(result).toMatchObject({
+            kind: "TERMINAL",
+            decision: "VERIFIED_RESULT",
+        });
+        const replayed = replaySetup(setup);
+        expect(replayed.adapter.latestOperationalNonResult()).toBeNull();
+        replayed.repository.close();
+    }, 60_000);
+
     it.each([
         [
             "allowlist file",
@@ -595,6 +901,24 @@ describe("Crucible autonomous runner", () => {
             (setup) => {
                 const allowlist = JSON.parse(fs.readFileSync(setup.allowlistPath, "utf8"));
                 allowlist.entries["score-harness"].executableSha256 = "0".repeat(64);
+                fs.writeFileSync(setup.allowlistPath, JSON.stringify(allowlist));
+            },
+        ],
+        [
+            "harness executable path",
+            (setup) => {
+                const allowlist = JSON.parse(fs.readFileSync(setup.allowlistPath, "utf8"));
+                allowlist.entries["score-harness"].executable = setup.scriptPath;
+                allowlist.entries["score-harness"].executableSha256 =
+                    sha256HexOfFile(setup.scriptPath);
+                fs.writeFileSync(setup.allowlistPath, JSON.stringify(allowlist));
+            },
+        ],
+        [
+            "harness argv template",
+            (setup) => {
+                const allowlist = JSON.parse(fs.readFileSync(setup.allowlistPath, "utf8"));
+                allowlist.entries["score-harness"].argvTemplate.push("--mutated");
                 fs.writeFileSync(setup.allowlistPath, JSON.stringify(allowlist));
             },
         ],
@@ -660,8 +984,12 @@ describe("Crucible autonomous runner", () => {
                 return mutated
                     ? {
                         ...identity,
-                        helperBinaryHash:
-                            `sha256:crucible-measurement-file-v1:${"f".repeat(64)}`,
+                        providerVersion: "v2",
+                        job: {
+                            ...identity.job,
+                            activeProcessLimit:
+                                identity.job.activeProcessLimit + 1,
+                        },
                     }
                     : identity;
             },
@@ -871,7 +1199,49 @@ describe("Crucible autonomous runner", () => {
         const replayed = replaySetup(setup);
         expect(replayed.aggregate.terminal).toBeNull();
         expect(harnessCandidateEvidenceItems(replayed.aggregate)).toHaveLength(0);
+        const operationalNonResult = replayed.adapter.latestOperationalNonResult();
+        expect(operationalNonResult).toMatchObject({
+            payload: { code: "DEADLINE_EXCEEDED" },
+        });
+        replayed.adapter.recordOperationalRecovery({
+            attemptId: "later-deadline-recovery",
+            previousSeq: operationalNonResult.seq,
+            policy: "later_deadline",
+            reason: "Explicit test recovery supplied a later deadline.",
+            details: {
+                previousDeadline: deadline,
+                requestedDeadline: clock.now() + 60_000,
+            },
+        });
+        if (replayed.aggregate.pause !== null) {
+            replayed.adapter.resumeInvestigation();
+        }
+        expect(replayed.adapter.replay().aggregate.pause).toBeNull();
+        expect(replayed.adapter.latestOperationalNonResult()).toBeNull();
         replayed.repository.close();
+
+        const recoveryPool = new FakeWorkerPool([95]);
+        const recovered = await runAutonomousInvestigation({
+            ...setup.config,
+            deadline: clock.now() + 60_000,
+        }, runnerDependencies(recoveryPool, { clock }));
+        expect(recovered).toMatchObject({
+            kind: "TERMINAL",
+            decision: "VERIFIED_RESULT",
+        });
+        expect(recoveryPool.calls).toHaveLength(1);
+        const recoveredReplay = replaySetup(setup);
+        expect(recoveredReplay.adapter.latestOperationalNonResult()).toBeNull();
+        expect(recoveredReplay.aggregate.terminal).not.toBeNull();
+        expect(recoveredReplay.aggregate.pause).toBeNull();
+        expect(recoveredReplay.aggregate.pauseHistory).toHaveLength(1);
+        expect(harnessCallCount(setup)).toBe(3);
+        const deadlineFailures = recoveredReplay.adapter.listOperationalEvidence()
+            .filter((row) =>
+                row.kind === "runtime:effect_failure"
+                && row.payload?.classification === "deadline_expired");
+        expect(deadlineFailures).toHaveLength(1);
+        recoveredReplay.repository.close();
     }, 60_000);
 
     it("rejects candidate measurement facts completed after the deadline", async () => {
@@ -1718,6 +2088,45 @@ describe("Crucible autonomous runner", () => {
         replayed.repository.close();
     }, 60_000);
 
+    it("keeps a durable pause authoritative when in-flight cleanup fails", async () => {
+        const setup = setupInvestigation("pause-cleanup-barrier", {
+            maxRounds: 1,
+        });
+        const pool = new FakeWorkerPool([50]);
+        pool.close = async () => {
+            throw new Error("injected worker cleanup failure");
+        };
+        let requested = false;
+        const result = await runAutonomousInvestigation(
+            setup.config,
+            runnerDependencies(pool, {
+                faultInjector(point) {
+                    if (!requested && point === "after_proposal_response") {
+                        requested = true;
+                        requestStop({
+                            stateDir: setup.stateDir,
+                            investigationId: "runtime-investigation",
+                            reason: "Pause while the admitted command drains.",
+                            requestId: "pause-during-proposal",
+                        });
+                    }
+                },
+            }),
+        );
+        expect(requested).toBe(true);
+        expect(result).toMatchObject({
+            kind: "PAUSE",
+            code: "INVESTIGATION_PAUSED",
+            cleanupWarning: {
+                message: "injected worker cleanup failure",
+            },
+        });
+        const replayed = replaySetup(setup);
+        expect(replayed.aggregate.pause).not.toBeNull();
+        expect(replayed.adapter.latestOperationalNonResult()).toBeNull();
+        replayed.repository.close();
+    }, 60_000);
+
     it.each([
         ["after_reservation", 0],
         ["after_dispatch", 1],
@@ -2050,4 +2459,540 @@ describe("Crucible autonomous runner", () => {
         replayedA.repository.close();
         replayedB.repository.close();
     }, 120_000);
+});
+
+describe("H7 systematic runtime failure matrix", () => {
+    const recoverableBoundaries = [
+        {
+            label: "domain reservation",
+            point: "after_reservation",
+            matches: (details) => details.commandId === "cmd-000002",
+        },
+        {
+            label: "domain dispatch",
+            point: "after_dispatch",
+            matches: (details) => details.commandId === "cmd-000002",
+        },
+        {
+            label: "proposal effect reservation",
+            point: "after_effect_reservation",
+            matches: (details) => details.command?.kind === "sdk-proposal",
+        },
+        {
+            label: "proposal artifacts installed",
+            point: "after_effect_artifact_persistence",
+            matches: (details) => details.command?.kind === "sdk-proposal",
+        },
+        {
+            label: "proposal effect committed",
+            point: "after_effect_commit",
+            matches: (details) => details.command?.kind === "sdk-proposal",
+        },
+        {
+            label: "candidate snapshot referenced",
+            point: "after_candidate_snapshot",
+            matches: (details) => details.commandId === "cmd-000002",
+        },
+        {
+            label: "measurement artifacts installed",
+            point: "after_effect_artifact_persistence",
+            matches: (details) => details.command?.kind === "candidate-measurement",
+        },
+        {
+            label: "measurement effect committed",
+            point: "after_effect_commit",
+            matches: (details) => details.command?.kind === "candidate-measurement",
+        },
+        {
+            label: "observation transaction",
+            point: "after_domain_observation",
+            matches: (details) => details.commandId === "cmd-000002",
+        },
+        {
+            label: "evidence transaction",
+            point: "after_evidence_commit",
+            matches: (details) => details.commandId === "cmd-000002",
+        },
+        {
+            label: "terminal transaction",
+            point: "after_terminal_append",
+            matches: () => true,
+        },
+    ];
+
+    it.each(recoverableBoundaries)(
+        "recovers deterministically after $label without duplicate effects, evidence, or terminal",
+        async ({ label, point, matches }) => {
+            const setup = setupInvestigation(
+                `h7-recover-${label.replaceAll(" ", "-")}`,
+                { maxRounds: 1 },
+                { countHarnessCalls: true },
+            );
+            const firstPool = new FakeWorkerPool([95]);
+            let injected = false;
+            await expect(runAutonomousInvestigation(
+                setup.config,
+                runnerDependencies(firstPool, {
+                    faultInjector(observedPoint, details) {
+                        if (!injected && observedPoint === point && matches(details)) {
+                            injected = true;
+                            throw new InjectedCrashError(point);
+                        }
+                    },
+                }),
+            )).rejects.toMatchObject({
+                code: RUNTIME_ERROR_CODES.INJECTED_CRASH,
+            });
+            expect(injected).toBe(true);
+            expect(fs.readdirSync(path.join(setup.stateDir, "runtime-temp"))).toEqual([]);
+
+            const recoveredPool = new FakeWorkerPool([95]);
+            const result = await runAutonomousInvestigation(
+                setup.config,
+                runnerDependencies(recoveredPool),
+            );
+            expect(result).toMatchObject({
+                kind: "TERMINAL",
+                decision: "VERIFIED_RESULT",
+                tempRootCleaned: true,
+            });
+            expect(firstPool.calls.length + recoveredPool.calls.length).toBe(1);
+            expect(harnessCallCount(setup)).toBe(3);
+
+            const replayed = replaySetup(setup);
+            const operational = replayed.adapter.listOperationalEvidence();
+            expect(operational.filter((row) =>
+                row.kind === "runtime:model_proposal")).toHaveLength(1);
+            expect(operational.filter((row) =>
+                row.kind === "runtime:candidate_snapshot")).toHaveLength(1);
+            expect(operational.filter((row) =>
+                row.kind === "runtime:measurement"
+                && row.payload.purpose === "candidate")).toHaveLength(1);
+            expect(harnessCandidateEvidenceItems(replayed.aggregate)).toHaveLength(1);
+            expect(replayed.repository.listEvents("runtime-investigation")
+                .filter((event) => event.isTerminal)).toHaveLength(1);
+            const refs = replayed.repository.listArtifactRefs("runtime-investigation");
+            expect(new Set(refs.map((ref) => `${ref.seq}:${ref.artifactId}`)).size)
+                .toBe(refs.length);
+            replayed.repository.close();
+            expect(fs.readdirSync(path.join(setup.stateDir, "runtime-temp"))).toEqual([]);
+        },
+        120_000,
+    );
+
+    it.runIf(process.platform === "win32")(
+        "owns the exact harness process tree through committed-effect recovery and parent failure",
+        async () => {
+            const setup = setupInvestigation(
+                "h7-committed-effect-process-ownership",
+                { maxRounds: 1 },
+                {
+                    countHarnessCalls: true,
+                    spawnLingeringCandidateProcess: true,
+                },
+            );
+            let capturedLaunch = null;
+            let injected = false;
+            let exactPaths = [];
+            const processOwners = [];
+            const makeProcessOwner = () => {
+                const owned = createDefaultProcessAdapter();
+                const state = { closeCalls: 0 };
+                processOwners.push(state);
+                return {
+                    spawn: (...args) => owned.spawn(...args),
+                    terminateTree: (...args) => owned.terminateTree(...args),
+                    async close(options) {
+                        state.closeCalls += 1;
+                        return owned.close(options);
+                    },
+                };
+            };
+            try {
+                await expect(runAutonomousInvestigation(
+                    setup.config,
+                    runnerDependencies(new FakeWorkerPool([95]), {
+                        processAdapter: makeProcessOwner(),
+                        faultInjector(point, details) {
+                            if (point === "after_harness_staging") {
+                                const scorePath = path.join(
+                                    details.candidateRoot,
+                                    "score.txt",
+                                );
+                                if (fs.existsSync(scorePath)
+                                    && fs.readFileSync(scorePath, "utf8").trim()
+                                        === "95") {
+                                    capturedLaunch = {
+                                        stageRoot: details.stageRoot,
+                                        executable: details.executable,
+                                        dependencies: [...details.dependencies],
+                                    };
+                                }
+                            }
+                            if (!injected
+                                && point === "after_effect_commit"
+                                && details.command?.kind
+                                    === "candidate-measurement") {
+                                injected = true;
+                                throw new InjectedCrashError(point);
+                            }
+                        },
+                    }),
+                )).rejects.toMatchObject({
+                    code: RUNTIME_ERROR_CODES.INJECTED_CRASH,
+                });
+                expect(injected).toBe(true);
+                expect(processOwners[0].closeCalls).toBe(1);
+                expect(capturedLaunch).not.toBeNull();
+                exactPaths = [
+                    capturedLaunch.executable,
+                    ...capturedLaunch.dependencies,
+                ];
+                expect(
+                    await waitForNoExactWindowsProcess(exactPaths),
+                ).toEqual([]);
+                expect(fs.existsSync(capturedLaunch.stageRoot)).toBe(false);
+                expect(
+                    fs.readdirSync(path.join(setup.stateDir, "runtime-temp")),
+                ).toEqual([]);
+
+                const recovered = await runAutonomousInvestigation(
+                    setup.config,
+                    runnerDependencies(new FakeWorkerPool([]), {
+                        processAdapter: makeProcessOwner(),
+                    }),
+                );
+                expect(recovered).toMatchObject({
+                    kind: "TERMINAL",
+                    decision: "VERIFIED_RESULT",
+                    tempRootCleaned: true,
+                });
+                expect(harnessCallCount(setup)).toBe(3);
+                expect(processOwners[1].closeCalls).toBe(1);
+                expect(
+                    await waitForNoExactWindowsProcess(exactPaths),
+                ).toEqual([]);
+                expect(fs.existsSync(capturedLaunch.stageRoot)).toBe(false);
+                expect(
+                    fs.readdirSync(path.join(setup.stateDir, "runtime-temp")),
+                ).toEqual([]);
+            } finally {
+                for (const processRecord of exactWindowsProcessesForPaths(
+                    exactPaths,
+                )) {
+                    try {
+                        process.kill(Number(processRecord.ProcessId), "SIGKILL");
+                    } catch {
+                        // Exact-path cleanup only; the process may already be gone.
+                    }
+                }
+            }
+        },
+        120_000,
+    );
+
+    it.each([
+        {
+            label: "proposal dispatch",
+            point: "after_effect_dispatch",
+            matches: (details) => details.command?.kind === "sdk-proposal",
+        },
+        {
+            label: "proposal response",
+            point: "after_proposal_response",
+            matches: (details) => details.command?.kind === "sdk-proposal",
+        },
+        {
+            label: "harness launch",
+            point: "after_harness_launch",
+            matches: (_details, occurrence) => occurrence === 3,
+        },
+        {
+            label: "harness exit",
+            point: "after_harness_exit",
+            matches: (_details, occurrence) => occurrence === 3,
+        },
+        {
+            label: "receipt persistence",
+            point: "after_measurement_receipt_persistence",
+            matches: (details) => details.purpose === "candidate",
+        },
+    ])(
+        "blocks automatic replay after an uncertain $label instead of duplicating the effect",
+        async ({ label, point, matches }) => {
+            const setup = setupInvestigation(
+                `h7-uncertain-${label.replaceAll(" ", "-")}`,
+                { maxRounds: 1 },
+                { countHarnessCalls: true },
+            );
+            const firstPool = new FakeWorkerPool([95]);
+            let injected = false;
+            let pointOccurrences = 0;
+            const processAdapter = point === "after_harness_launch"
+                ? createControllableHarnessAdapter()
+                : undefined;
+            let crashError = null;
+            try {
+                await runAutonomousInvestigation(
+                    setup.config,
+                    runnerDependencies(firstPool, {
+                        ...(processAdapter === undefined ? {} : { processAdapter }),
+                        faultInjector(observedPoint, details) {
+                            if (observedPoint === point) {
+                                pointOccurrences += 1;
+                            }
+                            if (!injected
+                                && observedPoint === point
+                                && matches(details, pointOccurrences)) {
+                                injected = true;
+                                throw new InjectedCrashError(point);
+                            }
+                        },
+                    }),
+                );
+            } catch (error) {
+                crashError = error;
+            }
+            expect(
+                crashError,
+                `${label} returned ${crashError?.code ?? "no error"} at ${
+                    crashError?.path ?? "unknown path"
+                }`,
+            ).toMatchObject({
+                code: RUNTIME_ERROR_CODES.INJECTED_CRASH,
+            });
+            expect(injected).toBe(true);
+            const callsBeforeRecovery = firstPool.calls.length;
+            const harnessBeforeRecovery = harnessCallCount(setup);
+
+            const recoveryPool = new FakeWorkerPool([95]);
+            const result = await runAutonomousInvestigation(
+                setup.config,
+                runnerDependencies(recoveryPool),
+            );
+            expect(result).toMatchObject({
+                kind: "NON_RESULT",
+                code: RUNTIME_ERROR_CODES.UNCERTAIN_EXTERNAL_EFFECT,
+                persisted: true,
+            });
+            expect(firstPool.calls).toHaveLength(callsBeforeRecovery);
+            expect(recoveryPool.calls).toHaveLength(0);
+            expect(harnessCallCount(setup)).toBe(harnessBeforeRecovery);
+
+            const replayed = replaySetup(setup);
+            expect(replayed.aggregate.terminal).toBeNull();
+            expect(harnessCandidateEvidenceItems(replayed.aggregate)).toHaveLength(0);
+            expect(replayed.adapter.latestOperationalNonResult()).toMatchObject({
+                payload: {
+                    code: RUNTIME_ERROR_CODES.UNCERTAIN_EXTERNAL_EFFECT,
+                    details: {
+                        resetRequired: true,
+                    },
+                },
+            });
+            replayed.repository.close();
+            expect(fs.readdirSync(path.join(setup.stateDir, "runtime-temp"))).toEqual([]);
+        },
+        120_000,
+    );
+
+    it("rechecks the absolute deadline before a CAS retry can append evidence", async () => {
+        const setup = setupInvestigation(
+            "h7-deadline-cas-retry",
+            { maxRounds: 1 },
+            { countHarnessCalls: true },
+        );
+        const clock = mutableClock();
+        const deadline = clock.now() + 30_000;
+        let evidenceAttempts = 0;
+        let injected = false;
+        const repositoryFactory = (options) => {
+            const repository = openRepository(options);
+            return new Proxy(repository, {
+                get(target, property) {
+                    if (property === "appendEventsWithAttemptTransition") {
+                        return (input) => {
+                            const type = input.events?.[0]?.payload?.domainEvent?.type;
+                            if (type === EVENT_TYPES.EVIDENCE_COMMITTED) {
+                                evidenceAttempts += 1;
+                                if (!injected && evidenceAttempts === 2) {
+                                    injected = true;
+                                    clock.advance(30_001);
+                                    throw new CasConflictError("injected CAS retry");
+                                }
+                            }
+                            return target.appendEventsWithAttemptTransition(input);
+                        };
+                    }
+                    const value = Reflect.get(target, property, target);
+                    return typeof value === "function" ? value.bind(target) : value;
+                },
+            });
+        };
+
+        const result = await runAutonomousInvestigation({
+            ...setup.config,
+            deadline,
+        }, runnerDependencies(new FakeWorkerPool([95]), {
+            clock,
+            repositoryFactory,
+        }));
+        expect(injected).toBe(true);
+        expect(result).toMatchObject({
+            kind: "NON_RESULT",
+            code: "DEADLINE_EXCEEDED",
+            terminalEmitted: false,
+        });
+        const replayed = replaySetup(setup);
+        expect(replayed.aggregate.terminal).toBeNull();
+        expect(harnessCandidateEvidenceItems(replayed.aggregate)).toHaveLength(0);
+        expect(Object.values(replayed.aggregate.observations)
+            .some((observation) => observation.purpose === "candidate")).toBe(true);
+        replayed.repository.close();
+    }, 120_000);
+
+    it("fails closed for every persisted recovery artifact mutation without rerunning effects", async () => {
+        const setup = setupInvestigation(
+            "h7-recovery-artifact-base",
+            { maxRounds: 1 },
+            { countHarnessCalls: true },
+        );
+        let injected = false;
+        await expect(runAutonomousInvestigation(
+            setup.config,
+            runnerDependencies(new FakeWorkerPool([95]), {
+                faultInjector(point, details) {
+                    if (!injected
+                        && point === "after_effect_artifact_persistence"
+                        && details.command?.kind === "candidate-measurement") {
+                        injected = true;
+                        throw new InjectedCrashError(point);
+                    }
+                },
+            }),
+        )).rejects.toMatchObject({
+            code: RUNTIME_ERROR_CODES.INJECTED_CRASH,
+        });
+
+        const persisted = replaySetup(setup);
+        const db = new DatabaseSync(path.join(setup.stateDir, "events.sqlite"), {
+            readOnly: true,
+        });
+        let capsuleRows;
+        try {
+            capsuleRows = db.prepare(`
+                SELECT artifact_id, hash_value
+                FROM artifacts
+                WHERE investigation_id = ?
+                  AND content_type = ?
+                ORDER BY artifact_id ASC`).all(
+                "runtime-investigation",
+                "application/vnd.crucible.effect-recovery+json",
+            );
+        } finally {
+            db.close();
+        }
+        const store = openArtifactStore({ root: setup.artifactRoot });
+        const capsules = capsuleRows.map((row) => ({
+            artifactId: row.artifact_id,
+            objectId: `sha256:${row.hash_value}`,
+            value: JSON.parse(store.readObject(`sha256:${row.hash_value}`).toString("utf8")),
+        }));
+        const measurementCapsule = capsules.find((item) =>
+            item.value.command.kind === "candidate-measurement");
+        expect(measurementCapsule).toBeTruthy();
+        const measurement = measurementCapsule.value.evidence.find((item) =>
+            item.kind === "runtime:measurement").payload;
+        const artifacts = {
+            capsule: {
+                artifactId: measurementCapsule.artifactId,
+                objectId: measurementCapsule.objectId,
+            },
+            receipt: measurement.measurementProvenance.receiptArtifact,
+            stdout: measurement.measurementProvenance.rawStdoutArtifact,
+            stderr: measurement.measurementProvenance.rawStderrArtifact,
+            manifest: measurement.measurementProvenance.snapshot.manifestArtifact,
+            object: measurement.measurementProvenance.snapshot.objectArtifacts[0],
+        };
+        persisted.repository.close();
+        const baselineHarnessCalls = harnessCallCount(setup);
+
+        for (const [artifactClass, artifact] of Object.entries(artifacts)) {
+            for (const mode of ["missing", "corrupt", "substitute"]) {
+                const branch = clonePersistedSetup(
+                    setup,
+                    `h7-recovery-${artifactClass}-${mode}`,
+                );
+                const branchStore = openArtifactStore({ root: branch.artifactRoot });
+                const objectPath = branchStore.objectPath(artifact.objectId);
+                if (mode === "missing") {
+                    fs.rmSync(objectPath, { force: true });
+                } else if (mode === "substitute") {
+                    const replacement = Object.values(artifacts)
+                        .find((candidate) => candidate.objectId !== artifact.objectId);
+                    const replacementBytes = branchStore.readObject(replacement.objectId);
+                    fs.writeFileSync(objectPath, replacementBytes);
+                } else {
+                    const original = fs.readFileSync(objectPath);
+                    const mutated = original.length === 0
+                        ? Buffer.from([1])
+                        : Buffer.concat([
+                            Buffer.from([original[0] ^ 0xff]),
+                            original.subarray(1),
+                        ]);
+                    fs.writeFileSync(objectPath, mutated);
+                }
+
+                let recoveryError = null;
+                try {
+                    await runAutonomousInvestigation(
+                        branch.config,
+                        runnerDependencies(new FakeWorkerPool([])),
+                    );
+                } catch (error) {
+                    recoveryError = error;
+                }
+                expect(
+                    recoveryError,
+                    `${artifactClass}:${mode} unexpectedly produced a terminal result`,
+                ).toMatchObject({
+                    code: RUNTIME_ERROR_CODES.INTEGRITY_FAILURE,
+                });
+                expect(harnessCallCount(setup)).toBe(baselineHarnessCalls);
+                const branchReplay = replaySetup(branch);
+                expect(branchReplay.aggregate.terminal).toBeNull();
+                expect(harnessCandidateEvidenceItems(branchReplay.aggregate)).toHaveLength(0);
+                branchReplay.repository.close();
+            }
+        }
+
+        const inlineBranch = clonePersistedSetup(setup, "h7-recovery-inline-substitute");
+        const inlineStore = openArtifactStore({ root: inlineBranch.artifactRoot });
+        const receiptBytes = inlineStore.readObject(artifacts.receipt.objectId);
+        const inlineDb = new DatabaseSync(path.join(inlineBranch.stateDir, "events.sqlite"));
+        try {
+            inlineDb.prepare(`
+                UPDATE artifacts
+                SET storage = 'inline',
+                    inline_blob = ?,
+                    hash_algo = NULL,
+                    hash_value = NULL,
+                    durable = 1,
+                    size_bytes = ?
+                WHERE artifact_id = ?`).run(
+                Buffer.alloc(receiptBytes.length, 0x5a),
+                receiptBytes.length,
+                artifacts.receipt.artifactId,
+            );
+        } finally {
+            inlineDb.close();
+        }
+        await expect(runAutonomousInvestigation(
+            inlineBranch.config,
+            runnerDependencies(new FakeWorkerPool([])),
+        )).rejects.toMatchObject({
+            code: RUNTIME_ERROR_CODES.INTEGRITY_FAILURE,
+        });
+        expect(harnessCallCount(setup)).toBe(baselineHarnessCalls);
+    }, 300_000);
 });

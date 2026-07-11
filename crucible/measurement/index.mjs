@@ -78,4 +78,8 @@ export {
     probeWindowsSandboxAvailability,
 } from "./windows-sandbox-provider.mjs";
 
-export { createMeasurementExecutor, toFileUrl } from "./executor.mjs";
+export {
+    DEFAULT_MEASUREMENT_BYTE_BUDGETS,
+    createMeasurementExecutor,
+    toFileUrl,
+} from "./executor.mjs";

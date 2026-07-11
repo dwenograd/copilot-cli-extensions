@@ -458,18 +458,42 @@ describe("canonical schema fingerprint and database integrity", () => {
             .toBe(ERROR_CODES.DATABASE_INTEGRITY_VIOLATION);
     });
 
-    it("fails closed on an injected non-ok quick_check response", () => {
+    it("fails closed on an injected non-ok integrity_check response", () => {
         const raw = new DatabaseSync(repo.databaseFile, { readOnly: true });
         try {
             const err = catchCode(() => verifyDatabaseIntegrity(raw, {
                 adapter: {
-                    quickCheck: () => [{ quick_check: "database disk image is malformed" }],
+                    integrityCheck: () => [{
+                        integrity_check: "database disk image is malformed",
+                    }],
                 },
             }));
             expect(err.code).toBe(ERROR_CODES.DATABASE_INTEGRITY_VIOLATION);
-            expect(err.details.check).toBe("quick_check");
+            expect(err.details.check).toBe("integrity_check");
         } finally {
             raw.close();
+        }
+    });
+
+    it("re-runs integrity_check when closing an investigation result", () => {
+        const file = path.join(dir, "closure-integrity.sqlite");
+        let healthy = true;
+        const guarded = openRepository({
+            file,
+            integrityCheckAdapter: {
+                integrityCheck: () => healthy
+                    ? [{ integrity_check: "ok" }]
+                    : [{ integrity_check: "row 7 missing from index" }],
+            },
+        });
+        try {
+            guarded.ensureInvestigation({ investigationId: "closure-inv" });
+            healthy = false;
+            const err = catchCode(() => guarded.verifyInvestigation("closure-inv"));
+            expect(err.code).toBe(ERROR_CODES.DATABASE_INTEGRITY_VIOLATION);
+            expect(err.details.check).toBe("integrity_check");
+        } finally {
+            guarded.close();
         }
     });
 });

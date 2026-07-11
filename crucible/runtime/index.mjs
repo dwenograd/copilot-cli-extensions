@@ -17,10 +17,13 @@ export {
     coerceSupervisorConfig,
     loadSupervisorConfig,
     supervisorPaths,
+    supervisorConfigDocument,
+    supervisorConfigFingerprint,
 } from "./config.mjs";
 
 export {
     STRICT_ISO_TIMESTAMP_PATTERN_SOURCE,
+    deriveRunnerExecutionLimits,
     normalizeStartDeadline,
     validateSupervisorTimingConstraints,
 } from "./config-validation.mjs";
@@ -28,6 +31,8 @@ export {
 export {
     SUBMIT_CANDIDATE_TOOL_NAME,
     READ_PARENT_ARTIFACT_TOOL_NAME,
+    MAX_PROPOSAL_PROMPT_BYTES,
+    MAX_TRUSTED_OPERATOR_CONTEXT_BYTES,
     DEFAULT_CANDIDATE_LIMITS,
     DEFAULT_PARENT_READ_LIMITS,
     SdkWorkerPool,
@@ -73,6 +78,7 @@ export {
     readStatus,
     requestStop,
     ensureSupervisor,
+    waitForSupervisorAcknowledgement,
     terminateSupervisor,
     validateSupervisorAdmission,
 } from "./extension-adapter.mjs";

@@ -1,12 +1,18 @@
 import fs from "node:fs";
 import path from "node:path";
-import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 
 import { createDefaultProcessAdapter } from "../measurement/windows-adapter.mjs";
 import { openRepository } from "../persistence/index.mjs";
-import { coerceSupervisorConfig, supervisorPaths } from "./config.mjs";
-import { createDomainRepositoryAdapter } from "./domain-adapter.mjs";
+import {
+    coerceSupervisorConfig,
+    supervisorConfigFingerprint,
+    supervisorPaths,
+} from "./config.mjs";
+import {
+    createDomainRepositoryAdapter,
+    formatAttemptCommand,
+} from "./domain-adapter.mjs";
 import { normalizeRunnerOutcomeEnvelope } from "./outcome.mjs";
 import {
     CrucibleRuntimeError,
@@ -173,13 +179,14 @@ function readKnownGenerationOwners(supervisorDirectory, investigationId) {
     return owners;
 }
 
-export function scavengeStaleGenerationOwnedPaths({
+export async function scavengeStaleGenerationOwnedPaths({
     tempRoot,
     supervisorDirectory,
     investigationId,
     currentGeneration,
     currentNonce,
     currentPid,
+    abandonedRunners = [],
     referencedPaths = [],
     isPidAlive = isExactPidAlive,
     now = Date.now(),
@@ -196,10 +203,24 @@ export function scavengeStaleGenerationOwnedPaths({
         || currentNonce.length === 0
         || !Number.isSafeInteger(currentPid)
         || currentPid < 1
+        || !Array.isArray(abandonedRunners)
         || !Array.isArray(referencedPaths)
         || !Number.isSafeInteger(minimumAgeMs)
         || minimumAgeMs < 0) {
         throw new RuntimeConfigError("Invalid startup scavenging configuration");
+    }
+    const abandonedOwners = new Set();
+    for (const runner of abandonedRunners) {
+        if (!isPlainObject(runner)
+            || typeof runner.runnerIncarnation !== "string"
+            || runner.runnerIncarnation.length === 0
+            || (runner.pid !== undefined
+                && (!Number.isSafeInteger(runner.pid) || runner.pid < 1))) {
+            throw new RuntimeConfigError(
+                "Invalid abandoned runner scavenging authority",
+            );
+        }
+        abandonedOwners.add(runner.runnerIncarnation);
     }
     const references = referencedPaths
         .filter((value) => typeof value === "string" && path.isAbsolute(value))
@@ -226,6 +247,11 @@ export function scavengeStaleGenerationOwnedPaths({
                 continue;
             }
             const ageMs = safeAgeMs(markerPath, now);
+            const abandonedCurrentRunner =
+                marker?.supervisorGeneration === currentGeneration
+                && marker?.supervisorNonce === currentNonce
+                && typeof marker?.runnerIncarnation === "string"
+                && abandonedOwners.has(marker.runnerIncarnation);
             if (!validRuntimeOwnerMarker(marker, candidate, investigationId)) {
                 preserved.push({ path: candidate, reason: "owner_invalid" });
             } else if (!knownGenerationOwners.has(generationOwnerKey(
@@ -233,9 +259,9 @@ export function scavengeStaleGenerationOwnedPaths({
                 marker.supervisorNonce,
             ))) {
                 preserved.push({ path: candidate, reason: "generation_unproven" });
-            } else if (marker.supervisorGeneration >= currentGeneration
+            } else if (marker.supervisorGeneration > currentGeneration
                 || (marker.supervisorGeneration === currentGeneration
-                    && marker.supervisorNonce === currentNonce)
+                    && !abandonedCurrentRunner)
                 || marker.pid === currentPid) {
                 preserved.push({ path: candidate, reason: "current_generation" });
             } else if (!Number.isFinite(ageMs) || ageMs < minimumAgeMs) {
@@ -1008,14 +1034,25 @@ function defaultSpawnRunner(config, context) {
         }`,
     });
     context.assertOwnership("runner process launch");
-    const child = spawn(
+    const processAdapter = context.processAdapter
+        ?? createDefaultProcessAdapter();
+    const remaining = remainingDeadlineMs(config.runner.deadlineMs);
+    const child = processAdapter.spawn(
         process.execPath,
         [config.runnerCliPath, "--config", config.paths.childConfigPath],
         {
             cwd: config.runner.stateDir,
-            shell: false,
-            windowsHide: true,
             stdio: ["ignore", "ignore", "ignore"],
+            env: process.env,
+            executesCandidateCode: false,
+            launchPath: "host-process-adapter",
+            timeoutMs: Number.isFinite(remaining)
+                ? Math.max(1, Math.min(remaining, 0x7fffffff))
+                : 0x7fffffff,
+            ownerRoot: path.join(
+                config.runner.options.tempRoot,
+                ".supervisor-process-owners",
+            ),
         },
     );
     return { child, resultPath: config.paths.childResultPath };
@@ -1045,44 +1082,107 @@ function classifySuccessfulResult(envelope) {
     }
 }
 
-function persistSupervisorNonResult(config, lock, dependencies, input, assertOwnership) {
-    const fencedInput = {
-        ...input,
-        supervisorGeneration: lock.supervisorGeneration,
-        supervisorNonce: lock.nonce,
-        details: {
-            ...(isPlainObject(input.details) ? input.details : { value: input.details ?? null }),
+function persistSupervisorNonResult(
+    config,
+    lock,
+    repository,
+    dependencies,
+    input,
+    assertOwnership,
+) {
+    const failedRunnerIncarnation = input.runnerIncarnation ?? null;
+    const writerToken = requireString(
+        (dependencies.operationalWriterIdFactory ?? (() => randomUUID()))({
+            investigationId: config.runner.investigationId,
             supervisorGeneration: lock.supervisorGeneration,
             supervisorNonce: lock.nonce,
-        },
+            failedRunnerIncarnation,
+            code: input.code,
+            restartCount: input.restartCount ?? 0,
+        }),
+        "operational writer id",
+        { max: 128 },
+    );
+    const writerIncarnation =
+        `supervisor-operational-g${lock.supervisorGeneration}-${writerToken}`
+            .replace(/[^A-Za-z0-9._@-]/gu, "-")
+            .slice(0, 256);
+    const identity = sha256Hex(Buffer.from(JSON.stringify({
+        investigationId: config.runner.investigationId,
+        supervisorGeneration: lock.supervisorGeneration,
+        supervisorNonce: lock.nonce,
+        writerIncarnation,
+        failedRunnerIncarnation,
+        code: input.code,
+        restartCount: input.restartCount ?? 0,
+    }), "utf8")).slice(0, 40);
+
+    assertOwnership("operational non-result incarnation issue");
+    repository.issueRunnerIncarnation({
+        investigationId: config.runner.investigationId,
+        supervisorGeneration: lock.supervisorGeneration,
+        supervisorNonce: lock.nonce,
+        runnerIncarnation: writerIncarnation,
+    });
+    assertOwnership("operational non-result lease acquisition");
+    const adapter = createDomainRepositoryAdapter({
+        repository,
+        investigationId: config.runner.investigationId,
+    });
+    const { lease } = adapter.acquireRunnerLease({
+        leaseId: `supervisor-operational-lease-${identity}`,
+        owner: `supervisor-operational-g${lock.supervisorGeneration}`,
+        supervisorGeneration: lock.supervisorGeneration,
+        runnerIncarnation: writerIncarnation,
+    });
+    const command = formatAttemptCommand("operational-non-result", {
+        source: "supervisor",
+        code: input.code,
+        restartCount: input.restartCount ?? 0,
+        identity,
+    });
+    const attemptId = `supervisor-operational-${identity}`;
+    adapter.reserveAttempt({ attemptId, command, lease });
+    adapter.dispatchAttempt(attemptId, lease);
+    adapter.observeAttempt(attemptId, lease);
+    const details = {
+        ...(isPlainObject(input.details) ? input.details : { value: input.details ?? null }),
+        supervisorGeneration: lock.supervisorGeneration,
+        supervisorNonce: lock.nonce,
+        failedRunnerIncarnation,
+        operationalWriterIncarnation: writerIncarnation,
+        leaseId: lease.leaseId,
+        fencingToken: lease.fencingToken,
     };
-    assertOwnership("operational non-result write");
-    if (typeof dependencies.recordOperationalNonResult === "function") {
-        return dependencies.recordOperationalNonResult(fencedInput);
-    }
-    const eventsFile = path.join(config.runner.stateDir, "events.sqlite");
-    if (!fs.existsSync(eventsFile)) {
-        return null;
-    }
-    assertOwnership("operational non-result repository open");
-    const repository = openRepository({ file: eventsFile });
-    try {
-        assertOwnership("operational non-result append");
-        const adapter = createDomainRepositoryAdapter({
-            repository,
-            investigationId: config.runner.investigationId,
-        });
-        return adapter.recordOperationalNonResult({
-            attemptId: `supervisor-g${lock.supervisorGeneration}-${lock.nonce}-${input.code}-${input.restartCount ?? 0}`
-                .replace(/[^A-Za-z0-9._@-]/gu, "-")
-                .slice(0, 256),
-            code: fencedInput.code,
-            reason: fencedInput.reason,
-            details: fencedInput.details,
-        });
-    } finally {
-        repository.close();
-    }
+    assertOwnership("operational non-result fenced append");
+    const persisted = adapter.ingestOperationalEvidenceBatchFenced([{
+        attemptId,
+        evidenceKind: `non-result:${input.code}`,
+        kind: "runtime:non_result",
+        payload: {
+            code: input.code,
+            reason: input.reason,
+            details,
+        },
+    }], {
+        attemptId,
+        command,
+        lease,
+        fromState: "observed",
+        toState: "committed",
+    });
+    const result = Object.freeze({
+        persisted,
+        runnerIncarnation: writerIncarnation,
+        lease,
+        supervisorGeneration: lock.supervisorGeneration,
+        supervisorNonce: lock.nonce,
+        code: input.code,
+        reason: input.reason,
+        details,
+    });
+    dependencies.recordOperationalNonResult?.(result);
+    return result;
 }
 
 function readMatchingStopRequest(file, lock, assertOwnership) {
@@ -1110,14 +1210,35 @@ export async function runSupervisor(input, dependencies = {}) {
     const config = coerceSupervisorConfig(input, {
         env: dependencies.env ?? process.env,
     });
+    const configFingerprint = supervisorConfigFingerprint(config);
     const clock = dependencies.clock ?? defaultClock();
     const timers = dependencies.timers ?? globalThis;
     const sleep = dependencies.sleep ?? ((milliseconds) => delay(milliseconds, timers));
-    const spawnRunner = dependencies.spawnRunner ?? defaultSpawnRunner;
     const processTreeAdapter = dependencies.processTreeAdapter ?? createDefaultProcessAdapter();
+    const spawnRunner = dependencies.spawnRunner
+        ?? ((runnerConfig, context) => defaultSpawnRunner(runnerConfig, {
+            ...context,
+            processAdapter: processTreeAdapter,
+        }));
     const shutdownPolicy = normalizeShutdownPolicy(dependencies.shutdownPolicy);
     const shutdownTimers = dependencies.shutdownTimers ?? globalThis;
     const signalSource = dependencies.signalSource ?? process;
+    const statusFaultInjector = dependencies.statusFaultInjector ?? null;
+    if (statusFaultInjector !== null && typeof statusFaultInjector !== "function") {
+        throw new RuntimeConfigError("statusFaultInjector must be a function or null");
+    }
+    const injectStatusFault = (point, details) => {
+        if (statusFaultInjector === null) return;
+        const result = statusFaultInjector(point, details);
+        if (result !== null
+            && typeof result === "object"
+            && typeof result.then === "function") {
+            throw new RuntimeConfigError(
+                "statusFaultInjector must be synchronous",
+                { point },
+            );
+        }
+    };
     const lock = acquireSupervisorLock(config, {
         ...dependencies,
         clock,
@@ -1161,6 +1282,57 @@ export async function runSupervisor(input, dependencies = {}) {
     let scavenging = null;
 
     const assertOwnership = (action) => assertSupervisorOwnership(lock, action);
+    const scavengeRuntime = dependencies.scavengeRuntime
+        ?? scavengeStaleGenerationOwnedPaths;
+    const scavengingReferences = [
+        config.runner.stateDir,
+        config.runner.artifactRoot,
+        config.runner.allowlistPath,
+        config.runner.sdkPath,
+        config.runner.cliPath,
+        ...Object.values(config.paths),
+        ...Object.values(scopedPaths),
+    ];
+    const scavengeOwnedPaths = (abandonedRunners = []) => scavengeRuntime({
+        tempRoot: config.runner.options.tempRoot,
+        supervisorDirectory: config.paths.directory,
+        investigationId: config.runner.investigationId,
+        currentGeneration: lock.supervisorGeneration,
+        currentNonce: lock.nonce,
+        currentPid: lock.pid,
+        abandonedRunners,
+        referencedPaths: scavengingReferences,
+        isPidAlive: dependencies.isPidAlive ?? isExactPidAlive,
+        now: clock.now(),
+        minimumAgeMs: dependencies.scavengeMinimumAgeMs ?? 0,
+    });
+    const reapRunnerOwnedPaths = async (runnerIncarnation, runnerPid) => {
+        if (typeof runnerIncarnation !== "string"
+            || runnerIncarnation.length === 0) {
+            return null;
+        }
+        return scavengeOwnedPaths([{
+            runnerIncarnation,
+            ...(Number.isSafeInteger(runnerPid) && runnerPid > 0
+                ? { pid: runnerPid }
+                : {}),
+        }]);
+    };
+    const recordSupervisorNonResult = (input) => {
+        const persisted = persistSupervisorNonResult(
+            config,
+            lock,
+            authorityHandle.repository,
+            dependencies,
+            {
+                ...input,
+                runnerIncarnation: currentRunnerIncarnation,
+            },
+            assertOwnership,
+        );
+        currentRunnerIncarnation = persisted.runnerIncarnation;
+        return persisted;
+    };
 
     const requestShutdown = (request) => {
         if (shutdownRequest !== null) return;
@@ -1196,9 +1368,11 @@ export async function runSupervisor(input, dependencies = {}) {
             ? extra.non_result_code
             : null;
         const nextStatus = {
-            version: 3,
+            version: 4,
             investigationId: config.runner.investigationId,
             supervisorEpochId: config.supervisorEpochId,
+            configFingerprint,
+            deadlineMs: config.runner.deadlineMs,
             pid: lock.pid,
             nonce: lock.nonce,
             supervisorGeneration: lock.supervisorGeneration,
@@ -1215,9 +1389,19 @@ export async function runSupervisor(input, dependencies = {}) {
         atomicWriteJson(ownedConfig.paths.statusPath, nextStatus, {
             token: `status:${lock.supervisorGeneration}:${lock.nonce}:${nextStatus.statusRevision}`,
         });
+        injectStatusFault("after_owner_status_write", {
+            state,
+            statusRevision: nextStatus.statusRevision,
+            path: ownedConfig.paths.statusPath,
+        });
         assertOwnership(`${state} shared status write`);
         atomicWriteJson(config.paths.statusPath, nextStatus, {
             token: `shared-status:${lock.supervisorGeneration}:${lock.nonce}:${nextStatus.statusRevision}`,
+        });
+        injectStatusFault("after_status_write", {
+            state,
+            statusRevision: nextStatus.statusRevision,
+            path: config.paths.statusPath,
         });
         statusRevision = nextStatus.statusRevision;
         status = nextStatus;
@@ -1384,28 +1568,7 @@ export async function runSupervisor(input, dependencies = {}) {
     };
 
     try {
-        const scavengeRuntime = dependencies.scavengeRuntime
-            ?? scavengeStaleGenerationOwnedPaths;
-        scavenging = scavengeRuntime({
-            tempRoot: config.runner.options.tempRoot,
-            supervisorDirectory: config.paths.directory,
-            investigationId: config.runner.investigationId,
-            currentGeneration: lock.supervisorGeneration,
-            currentNonce: lock.nonce,
-            currentPid: lock.pid,
-            referencedPaths: [
-                config.runner.stateDir,
-                config.runner.artifactRoot,
-                config.runner.allowlistPath,
-                config.runner.sdkPath,
-                config.runner.cliPath,
-                ...Object.values(config.paths),
-                ...Object.values(scopedPaths),
-            ],
-            isPidAlive: dependencies.isPidAlive ?? isExactPidAlive,
-            now: clock.now(),
-            minimumAgeMs: dependencies.scavengeMinimumAgeMs ?? 0,
-        });
+        scavenging = await scavengeOwnedPaths();
         for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"]) {
             const handler = () => requestShutdown({ kind: "signal", signal });
             signalHandlers.set(signal, handler);
@@ -1544,8 +1707,14 @@ export async function runSupervisor(input, dependencies = {}) {
                     shutdownPromise.then((request) => ({ kind: "shutdown", request })),
                 ]);
                 if (completed.kind === "shutdown") {
+                    const exitedRunnerPid = currentChildPid;
+                    const exitedRunnerIncarnation = currentRunnerIncarnation;
                     const exit = await terminateCurrentChild();
                     stopHeartbeat();
+                    await reapRunnerOwnedPaths(
+                        exitedRunnerIncarnation,
+                        exitedRunnerPid,
+                    );
                     if (completed.request.kind === "ownership_lost") {
                         return {
                             kind: "STOPPED",
@@ -1559,11 +1728,17 @@ export async function runSupervisor(input, dependencies = {}) {
                     return { kind: "STOPPED", status };
                 }
                 const exit = completed.exit;
+                const exitedRunnerPid = currentChildPid;
+                const exitedRunnerIncarnation = currentRunnerIncarnation;
                 currentChild = null;
                 currentChildWait = null;
                 currentChildPid = null;
                 stopHeartbeat();
                 assertOwnership("runner result processing");
+                await reapRunnerOwnedPaths(
+                    exitedRunnerIncarnation,
+                    exitedRunnerPid,
+                );
 
                 let envelope = null;
                 let envelopeError = null;
@@ -1583,12 +1758,12 @@ export async function runSupervisor(input, dependencies = {}) {
                     const finalState = classifySuccessfulResult(envelope);
                     if (finalState === null) {
                         const reason = "Runner returned an unsupported result kind";
-                        persistSupervisorNonResult(config, lock, dependencies, {
+                        recordSupervisorNonResult({
                             code: RUNTIME_ERROR_CODES.RESULT_MISSING,
                             reason,
                             restartCount,
                             details: { exit, recoverable: false },
-                        }, assertOwnership);
+                        });
                         writeStatus("failed", {
                             non_result_code: RUNTIME_ERROR_CODES.RESULT_MISSING,
                         });
@@ -1632,12 +1807,12 @@ export async function runSupervisor(input, dependencies = {}) {
                     recoverable,
                 };
                 if (!recoverable) {
-                    persistSupervisorNonResult(config, lock, dependencies, {
+                    recordSupervisorNonResult({
                         code: lastError.code ?? RUNTIME_ERROR_CODES.RUNTIME_FAILURE,
                         reason: lastError.message ?? "Runner failed without a recoverable outcome.",
                         restartCount,
                         details: { exit, recoverable: false },
-                    }, assertOwnership);
+                    });
                     writeStatus("failed", { non_result_code: lastError.code });
                     return { kind: "FAILED", status, error: lastError };
                 }
@@ -1656,12 +1831,12 @@ export async function runSupervisor(input, dependencies = {}) {
                     windowMs: config.circuitWindowMs,
                     maxRestarts: config.maxRestarts,
                 };
-                persistSupervisorNonResult(config, lock, dependencies, {
+                recordSupervisorNonResult({
                     code: RUNTIME_ERROR_CODES.CIRCUIT_OPEN,
                     reason,
                     restartCount,
                     details: { circuit, recoverable: false },
-                }, assertOwnership);
+                });
                 writeStatus("circuit_open", {
                     non_result_code: RUNTIME_ERROR_CODES.CIRCUIT_OPEN,
                 });
@@ -1711,7 +1886,13 @@ export async function runSupervisor(input, dependencies = {}) {
             throw error;
         }
         requestOwnershipLoss(error?.details?.action ?? "supervisor action", error);
+        const exitedRunnerPid = currentChildPid;
+        const exitedRunnerIncarnation = currentRunnerIncarnation;
         const exit = await terminateCurrentChild();
+        await reapRunnerOwnedPaths(
+            exitedRunnerIncarnation,
+            exitedRunnerPid,
+        );
         return {
             kind: "STOPPED",
             status,
@@ -1732,11 +1913,25 @@ export async function runSupervisor(input, dependencies = {}) {
                 signalSource.removeListener?.(signal, handler);
             }
         }
-        await terminateCurrentChild();
+        const exitedRunnerPid = currentChildPid;
+        const exitedRunnerIncarnation = currentRunnerIncarnation;
         try {
-            closeSupervisorAuthorityRepository(authorityHandle);
+            await terminateCurrentChild();
+            await reapRunnerOwnedPaths(
+                exitedRunnerIncarnation,
+                exitedRunnerPid,
+            );
+            if (typeof processTreeAdapter.close === "function") {
+                await processTreeAdapter.close({
+                    timeoutMs: shutdownPolicy.finalMs,
+                });
+            }
         } finally {
-            releaseSupervisorLock(lock);
+            try {
+                closeSupervisorAuthorityRepository(authorityHandle);
+            } finally {
+                releaseSupervisorLock(lock);
+            }
         }
     }
 }

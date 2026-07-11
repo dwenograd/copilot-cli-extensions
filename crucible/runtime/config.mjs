@@ -1,9 +1,14 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { assertLocalDatabasePath } from "../persistence/index.mjs";
+import {
+    assertLocalDatabasePath,
+    canonicalize,
+    sha256Hex,
+} from "../persistence/index.mjs";
 import { RuntimeConfigError } from "./errors.mjs";
 import { validateSupervisorTimingConstraints } from "./config-validation.mjs";
+import { MAX_TRUSTED_OPERATOR_CONTEXT_BYTES } from "./worker-pool.mjs";
 import {
     assertPathInside,
     isPathInside,
@@ -86,6 +91,25 @@ function optionalPositiveInteger(value, field, fallback, maximum = Number.MAX_SA
     return value === undefined
         ? fallback
         : requirePositiveInteger(value, field, maximum);
+}
+
+function normalizeTrustedOperatorContext(value) {
+    const normalized = requireString(
+        value,
+        "options.workerAdditionalContext",
+        {
+            max: MAX_TRUSTED_OPERATOR_CONTEXT_BYTES,
+            allowLineBreaks: true,
+        },
+    );
+    const bytes = Buffer.byteLength(normalized, "utf8");
+    if (bytes > MAX_TRUSTED_OPERATOR_CONTEXT_BYTES) {
+        throw new RuntimeConfigError(
+            `options.workerAdditionalContext must not exceed ${MAX_TRUSTED_OPERATOR_CONTEXT_BYTES} UTF-8 bytes`,
+            { bytes, maximumBytes: MAX_TRUSTED_OPERATOR_CONTEXT_BYTES },
+        );
+    }
+    return normalized;
 }
 
 function requireNonNegativeInteger(value, field, maximum = Number.MAX_SAFE_INTEGER) {
@@ -285,10 +309,7 @@ export function normalizeRunnerConfig(input, { env = process.env } = {}) {
             workerAdditionalContext: options.workerAdditionalContext === undefined
                 || options.workerAdditionalContext === null
                 ? null
-                : requireString(options.workerAdditionalContext, "options.workerAdditionalContext", {
-                    max: 64 * 1024,
-                    allowLineBreaks: true,
-                }),
+                : normalizeTrustedOperatorContext(options.workerAdditionalContext),
             tempRoot,
             ...(supervisorAuthority === null
                 ? {}
@@ -314,6 +335,38 @@ export function supervisorPaths(stateDir, investigationId) {
         childResultPath: path.join(directory, `${token}.runner-result.json`),
         stopRequestPath: path.join(directory, `${token}.stop-request.json`),
     });
+}
+
+export function supervisorConfigDocument(input, options = {}) {
+    const config = coerceSupervisorConfig(input, options);
+    return {
+        runner: {
+            investigationId: config.runner.investigationId,
+            stateDir: config.runner.stateDir,
+            artifactRoot: config.runner.artifactRoot,
+            allowlistPath: config.runner.allowlistPath,
+            copilotSdkPath: config.runner.sdkPath,
+            copilotCliPath: config.runner.cliPath,
+            runnerEpochId: config.runner.runnerEpochId,
+            deadline: config.runner.deadlineMs,
+            options: config.runner.options,
+        },
+        runnerCliPath: config.runnerCliPath,
+        supervisorEpochId: config.supervisorEpochId,
+        maxRestarts: config.maxRestarts,
+        baseBackoffMs: config.baseBackoffMs,
+        maxBackoffMs: config.maxBackoffMs,
+        heartbeatIntervalMs: config.heartbeatIntervalMs,
+        staleLockMs: config.staleLockMs,
+        circuitWindowMs: config.circuitWindowMs,
+    };
+}
+
+export function supervisorConfigFingerprint(input, options = {}) {
+    const document = supervisorConfigDocument(input, options);
+    return `sha256:crucible-supervisor-config-v1:${
+        sha256Hex(Buffer.from(canonicalize(document), "utf8"))
+    }`;
 }
 
 export function normalizeSupervisorConfig(input, options = {}) {

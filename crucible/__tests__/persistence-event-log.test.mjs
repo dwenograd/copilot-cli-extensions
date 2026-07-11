@@ -102,6 +102,54 @@ describe("append-only hash-chained event log", () => {
         }));
         expect(err.code).toBe(ERROR_CODES.INVALID_ARGUMENT);
     });
+
+    it("rejects non-string createdAt values before hashing or SQLite binding", () => {
+        for (const createdAt of [123, new Date("2026-01-01T00:00:00.000Z"), null]) {
+            const err = catchCode(() => repo.appendEvents({
+                investigationId: "inv-1",
+                expectedHead: null,
+                events: [{ kind: "bad-time", payload: {}, createdAt }],
+            }));
+            expect(err.code).toBe(ERROR_CODES.INVALID_ARGUMENT);
+            expect(repo.countEvents("inv-1")).toBe(0);
+        }
+        expect(() => computeEventHash({
+            investigationId: "inv-1",
+            seq: 1,
+            prevHash: "0".repeat(64),
+            kind: "bad-time",
+            payloadCanonical: "{}",
+            createdAt: 123,
+        })).toThrow(expect.objectContaining({ code: ERROR_CODES.INVALID_ARGUMENT }));
+    });
+
+    it("normalizes a valid zoned createdAt string before hashing and insertion", () => {
+        const appended = repo.appendEvents({
+            investigationId: "inv-1",
+            expectedHead: null,
+            events: [{
+                kind: "normalized-time",
+                payload: {},
+                createdAt: "2026-01-01T01:00:00+01:00",
+            }],
+        }).events[0];
+        expect(appended.createdAt).toBe("2026-01-01T00:00:00.000Z");
+        expect(repo.getEvent("inv-1", 1).createdAt).toBe(appended.createdAt);
+        expect(repo.verifyInvestigation("inv-1").ok).toBe(true);
+    });
+
+    it("rejects a non-string repository clock before any row is inserted", () => {
+        const file = path.join(dir, "bad-clock.sqlite");
+        const badClock = openRepository({ file, now: () => 123 });
+        try {
+            const err = catchCode(() =>
+                badClock.ensureInvestigation({ investigationId: "clock-inv" }));
+            expect(err.code).toBe(ERROR_CODES.INVALID_ARGUMENT);
+            expect(badClock.getInvestigation("clock-inv")).toBeNull();
+        } finally {
+            badClock.close();
+        }
+    });
 });
 
 describe("idempotent commutative evidence ingestion", () => {

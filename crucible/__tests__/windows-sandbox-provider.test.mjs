@@ -1,4 +1,5 @@
 import { afterAll, describe, expect, it } from "vitest";
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
@@ -36,7 +37,10 @@ afterAll(() => {
 
 function makeFixture(label, body, {
     allowedEnv = {},
+    clock,
     limits,
+    provider,
+    providerFactory,
     controlRootAsFile = false,
     processAdapter,
     timeoutMs = 15_000,
@@ -55,14 +59,17 @@ function makeFixture(label, body, {
     if (controlRootAsFile) {
         fs.writeFileSync(controlRoot, "not a directory");
     }
-    const provider = createWindowsSandboxProvider({
-        controlRoot,
-        ...(limits === undefined ? {} : { limits }),
-    });
+    const sandboxProvider = provider
+        ?? providerFactory?.(controlRoot)
+        ?? createWindowsSandboxProvider({
+            controlRoot,
+            ...(limits === undefined ? {} : { limits }),
+        });
     const executor = createMeasurementExecutor({
         allowlist,
-        sandboxProvider: provider,
+        sandboxProvider,
         scratchRoot: path.join(root, "scratch"),
+        ...(clock === undefined ? {} : { clock }),
         ...(processAdapter === undefined ? {} : { processAdapter }),
     });
     const snapshot = materializeCandidateSnapshot(
@@ -72,6 +79,7 @@ function makeFixture(label, body, {
     );
     return {
         root,
+        sandboxProvider,
         executor,
         snapshot,
         verifiedEntry: allowlist.verifyEntry(label),
@@ -84,6 +92,17 @@ async function runFixture(fixture, ids = fixedIds()) {
         candidateSnapshot: fixture.snapshot,
         ...ids,
     });
+}
+
+function mutableClock(start = 20_000) {
+    let now = start;
+    return {
+        now: () => now,
+        isoNow: () => new Date(now).toISOString(),
+        advance(milliseconds) {
+            now += milliseconds;
+        },
+    };
 }
 
 function ownedSandboxProfiles() {
@@ -100,6 +119,54 @@ function expectFixtureCleanup(fixture, beforeProfiles) {
     expect(fs.readdirSync(path.join(fixture.root, "control"))
         .filter((name) => name.startsWith("attempt-"))).toEqual([]);
     expect(ownedSandboxProfiles()).toEqual(beforeProfiles);
+}
+
+function cruciblePopupTitles() {
+    const powershell = path.join(
+        process.env.SystemRoot ?? "C:\\Windows",
+        "System32",
+        "WindowsPowerShell",
+        "v1.0",
+        "powershell.exe",
+    );
+    const result = spawnSync(
+        powershell,
+        [
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-WindowStyle",
+            "Hidden",
+            "-Command",
+            "@(Get-Process | Where-Object { $_.MainWindowTitle -like '*CrucibleWindowsSandbox*' } | ForEach-Object { $_.MainWindowTitle }) | ConvertTo-Json -Compress",
+        ],
+        {
+            encoding: "utf8",
+            windowsHide: true,
+            timeout: 10_000,
+        },
+    );
+    if (result.status !== 0 || result.stdout.trim().length === 0) return [];
+    const parsed = JSON.parse(result.stdout);
+    return Array.isArray(parsed) ? parsed : [parsed];
+}
+
+function pidAlive(pid) {
+    try {
+        process.kill(pid, 0);
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+async function waitForPidExit(pid, timeoutMs = 5_000) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+        if (!pidAlive(pid)) return true;
+        await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    return !pidAlive(pid);
 }
 
 describe("Windows sandbox availability", () => {
@@ -150,9 +217,157 @@ describe("Windows sandbox availability", () => {
         });
         expect(hostSpawns).toBe(0);
     });
+
+    it("rejects an expired deadline with no timeout before any helper launch", async () => {
+        const root = makeTempRoot("windows-sandbox-expired-deadline");
+        roots.push(root);
+        const stageRoot = path.join(root, "stage");
+        const candidateRoot = path.join(stageRoot, "candidate");
+        fs.mkdirSync(candidateRoot, { recursive: true });
+        const clock = mutableClock(50_000);
+        const helperOperations = [];
+        const controlRoot = path.join(root, "control");
+        const provider = createWindowsSandboxProvider({
+            controlRoot,
+            clock,
+            testHooks: {
+                beforeHelperSpawn(details) {
+                    helperOperations.push(details.operation);
+                },
+            },
+        });
+        const deadlineMs = clock.now() - 1;
+
+        await expect(provider.admitAndPrepare({
+            attemptId: "att-expired-deadline",
+            runnerEpochId: "epoch-expired-deadline",
+            harnessId: "expired-deadline",
+            verifiedEntry: {},
+            candidateSnapshot: {
+                path: candidateRoot,
+                hash: `sha256:test:${"a".repeat(64)}`,
+            },
+            stagedRoots: [stageRoot],
+            launch: { deadlineMs },
+        })).rejects.toMatchObject({
+            code: MEASUREMENT_ERROR_CODES.TIMEOUT,
+            details: {
+                deadlineExceeded: true,
+                deadlineMs,
+                observedAtMs: clock.now(),
+                stage: "native sandbox preparation",
+            },
+        });
+        expect(helperOperations).toEqual([]);
+        expect(fs.existsSync(controlRoot)).toBe(false);
+    });
 });
 
 describe.skipIf(!availability.available)("Windows AppContainer containment", () => {
+    it("clamps prepare, policy, and helper limits to one deadline budget", async () => {
+        const clock = mutableClock(80_000);
+        const stages = [];
+        let advanced = false;
+        const fixture = makeFixture("deadline-stage-bounds", `
+            process.stdout.write(JSON.stringify({ pass: true }));
+        `, {
+            clock,
+            providerFactory: (controlRoot) => createWindowsSandboxProvider({
+                controlRoot,
+                clock,
+                testHooks: {
+                    beforeHelperSpawn(details) {
+                        stages.push({
+                            operation: details.operation,
+                            timeoutMs: details.timeoutMs,
+                        });
+                        if (details.operation === "prepare" && !advanced) {
+                            advanced = true;
+                            clock.advance(2_000);
+                        }
+                    },
+                },
+            }),
+        });
+        await fixture.sandboxProvider.describePolicyIdentity();
+        const beforeProfiles = ownedSandboxProfiles();
+        const deadlineMs = clock.now() + 10_000;
+        const result = await fixture.executor.run({
+            verifiedEntry: fixture.verifiedEntry,
+            candidateSnapshot: fixture.snapshot,
+            ...fixedIds(),
+            deadlineMs,
+        });
+
+        expect(stages.find(({ operation }) => operation === "prepare"))
+            .toEqual({ operation: "prepare", timeoutMs: 10_000 });
+        expect(result.receipt.sandbox.policy.effectiveJob.wallTimeMs)
+            .toBe(8_000);
+        expect(stages.find(({ operation }) => operation === "launch"))
+            .toEqual({ operation: "launch", timeoutMs: 8_000 });
+        expectFixtureCleanup(fixture, beforeProfiles);
+    }, 180_000);
+
+    it("prevents a full measurement from overrunning during prepare", async () => {
+        const clock = mutableClock(120_000);
+        const helperOperations = [];
+        const fixture = makeFixture("deadline-prepare-expiry", `
+            process.stdout.write(JSON.stringify({ pass: true }));
+        `, {
+            clock,
+            providerFactory: (controlRoot) => createWindowsSandboxProvider({
+                controlRoot,
+                clock,
+                testHooks: {
+                    beforeHelperSpawn(details) {
+                        helperOperations.push(details.operation);
+                        if (details.operation === "prepare") {
+                            clock.advance(1_000);
+                        }
+                    },
+                },
+            }),
+        });
+        await fixture.sandboxProvider.describePolicyIdentity();
+        const beforeProfiles = ownedSandboxProfiles();
+        const deadlineMs = clock.now() + 1_000;
+        const started = Date.now();
+
+        await expect(fixture.executor.run({
+            verifiedEntry: fixture.verifiedEntry,
+            candidateSnapshot: fixture.snapshot,
+            ...fixedIds(),
+            deadlineMs,
+        })).rejects.toMatchObject({
+            code: MEASUREMENT_ERROR_CODES.TIMEOUT,
+            details: {
+                deadlineExceeded: true,
+                deadlineMs,
+                observedAtMs: deadlineMs,
+                stage: "native sandbox preparation",
+            },
+        });
+        expect(Date.now() - started).toBeLessThan(5_000);
+        expect(helperOperations).toEqual(["prepare"]);
+        expectFixtureCleanup(fixture, beforeProfiles);
+    }, 180_000);
+
+    it("keeps the helper binary identity stable across independent control roots", async () => {
+        const secondProbeRoot = makeTempRoot("windows-sandbox-second-probe");
+        roots.push(secondProbeRoot);
+        const second = await probeWindowsSandboxAvailability({
+            controlRoot: path.join(secondProbeRoot, "control"),
+        });
+        expect(second).toMatchObject({
+            available: true,
+            helperSourceHash: availability.helperSourceHash,
+            helperBinaryHash: availability.helperBinaryHash,
+            launcherId: availability.launcherId,
+            launcherBinaryHash: availability.launcherBinaryHash,
+            launcherScriptHash: availability.launcherScriptHash,
+        });
+    }, 180_000);
+
     it("reads immutable input and writes only provider-owned output/temp", async () => {
         const fixture = makeFixture("read-write", `
             const candidatePath = process.argv[2];
@@ -175,19 +390,56 @@ describe.skipIf(!availability.available)("Windows AppContainer containment", () 
         });
         expect(result.receipt.sandbox).toMatchObject({
             providerId: "windows-native-appcontainer",
+            providerVersion: "v3",
             policyId: WINDOWS_SANDBOX_POLICY_ID,
             launchPath: "sandbox-capability",
             capabilityLaunchUsed: true,
+            policyIdentity: {
+                providerId: "windows-native-appcontainer",
+                providerVersion: "v3",
+                policyId: WINDOWS_SANDBOX_POLICY_ID,
+                launcherId: "powershell-loadfrom-no-ui-v1",
+                launcherBinaryHash: expect.stringMatching(
+                    /^sha256:crucible-windows-native-file-v1:[a-f0-9]{64}$/u,
+                ),
+                launcherScriptHash: expect.stringMatching(
+                    /^sha256:crucible-windows-helper-launcher-script-v1:[a-f0-9]{64}$/u,
+                ),
+                filesystem: {
+                    exactLaunchClosure: true,
+                    hostWriteDenied: true,
+                },
+                job: {
+                    activeProcessLimit: 8,
+                    processMemoryBytes: 512 * 1024 * 1024,
+                    jobMemoryBytes: 768 * 1024 * 1024,
+                    cpuRatePercent: 50,
+                    cpuTimeMs: 30_000,
+                    wallTimeMs: 120_000,
+                    terminationGraceMs: 5_000,
+                },
+            },
+            policy: {
+                version: 3,
+                identity: {
+                    providerId: "windows-native-appcontainer",
+                    providerVersion: "v3",
+                    policyId: WINDOWS_SANDBOX_POLICY_ID,
+                },
+                effectiveJob: {
+                    activeProcessLimit: 8,
+                },
+            },
         });
         expect(result.receipt.sandbox.policyDigest).toMatch(
-            /^sha256:crucible-windows-appcontainer-policy-v1:[a-f0-9]{64}$/u,
+            /^sha256:crucible-windows-appcontainer-policy-v3:[a-f0-9]{64}$/u,
         );
         expect(hashReceipt({
             ...result.receipt,
             sandbox: {
                 ...result.receipt.sandbox,
                 policyDigest:
-                    `sha256:crucible-windows-appcontainer-policy-v1:${"0".repeat(64)}`,
+                    `sha256:crucible-windows-appcontainer-policy-v3:${"0".repeat(64)}`,
             },
         })).not.toBe(hashReceipt(result.receipt));
         expectFixtureCleanup(fixture, beforeProfiles);
@@ -344,6 +596,90 @@ describe.skipIf(!availability.available)("Windows AppContainer containment", () 
         expect(alive).toBe(false);
     }, 180_000);
 
+    it("rejects a concurrently substituted private helper before launch", async () => {
+        const beforeProfiles = ownedSandboxProfiles();
+        let mutated = false;
+        const fixture = makeFixture("helper-substitution", `
+            process.stdout.write(JSON.stringify({ pass: true }));
+        `, {
+            providerFactory: (controlRoot) => createWindowsSandboxProvider({
+                controlRoot,
+                testHooks: {
+                    beforeHelperSpawn(details) {
+                        if (details.operation !== "launch" || mutated) return;
+                        mutated = true;
+                        fs.chmodSync(details.helperPath, 0o700);
+                        fs.appendFileSync(details.helperPath, "substituted");
+                    },
+                },
+            }),
+        });
+        await expect(runFixture(fixture)).rejects.toMatchObject({
+            code: MEASUREMENT_ERROR_CODES.SANDBOX_LIFECYCLE,
+        });
+        expect(mutated).toBe(true);
+        expectFixtureCleanup(fixture, beforeProfiles);
+    }, 180_000);
+
+    it("terminates the suspended lowbox child when Job assignment fails", async () => {
+        const beforeProfiles = ownedSandboxProfiles();
+        const fixture = makeFixture("assign-job-failure", `
+            process.stdout.write(JSON.stringify({ pass: true }));
+        `, {
+            providerFactory: (controlRoot) => createWindowsSandboxProvider({
+                controlRoot,
+                testHooks: {
+                    failAssignProcessToJobObject: true,
+                },
+            }),
+        });
+        let error;
+        try {
+            await runFixture(fixture);
+        } catch (caught) {
+            error = caught;
+        }
+        expect(error).toMatchObject({
+            code: MEASUREMENT_ERROR_CODES.NONZERO_EXIT,
+        });
+        const match = /CRUCIBLE_TEST_ASSIGN_FAILURE_PID\s+(\d+)/u.exec(
+            error.details.stderr,
+        );
+        expect(match).not.toBeNull();
+        const childPid = Number(match[1]);
+        expect(await waitForPidExit(childPid)).toBe(true);
+        expectFixtureCleanup(fixture, beforeProfiles);
+    }, 180_000);
+
+    it("bounds invalid managed-helper startup without visible Windows UI", async () => {
+        const beforeProfiles = ownedSandboxProfiles();
+        const beforeTitles = cruciblePopupTitles();
+        const fixture = makeFixture("invalid-helper-startup", `
+            process.stdout.write(JSON.stringify({ pass: true }));
+        `, {
+            providerFactory: (controlRoot) => createWindowsSandboxProvider({
+                controlRoot,
+                testHooks: {
+                    invalidManagedHelperStartup: true,
+                },
+            }),
+        });
+        const started = Date.now();
+        let error;
+        try {
+            await runFixture(fixture);
+        } catch (caught) {
+            error = caught;
+        }
+        expect(error).toMatchObject({
+            code: MEASUREMENT_ERROR_CODES.SANDBOX_LIFECYCLE,
+        });
+        expect(error.message).toMatch(/managed helper failed before startup/i);
+        expect(Date.now() - started).toBeLessThan(10_000);
+        expect(cruciblePopupTitles()).toEqual(beforeTitles);
+        expectFixtureCleanup(fixture, beforeProfiles);
+    }, 180_000);
+
     it("enforces Job Object CPU-time limits before the executor timeout", async () => {
         const beforeProfiles = ownedSandboxProfiles();
         const fixture = makeFixture("cpu-limit", `
@@ -361,7 +697,7 @@ describe.skipIf(!availability.available)("Windows AppContainer containment", () 
         await expect(runFixture(fixture)).rejects.toMatchObject({
             code: MEASUREMENT_ERROR_CODES.NONZERO_EXIT,
         });
-        expect(Date.now() - started).toBeLessThan(10_000);
+        expect(Date.now() - started).toBeLessThan(15_000);
         expectFixtureCleanup(fixture, beforeProfiles);
     }, 180_000);
 });

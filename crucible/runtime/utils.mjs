@@ -161,6 +161,10 @@ export function assertPathInside(candidate, root, field = "path") {
 
 export function atomicWriteJson(file, value, options = {}) {
     const directory = ensureDirectory(path.dirname(file));
+    const faultInjector = options.faultInjector ?? null;
+    if (faultInjector !== null && typeof faultInjector !== "function") {
+        throw new RuntimeConfigError("atomicWriteJson faultInjector must be a function or null");
+    }
     const token = sha256Hex(
         Buffer.from(String(options.token ?? randomBytes(12).toString("hex")), "utf8"),
     ).slice(0, 24);
@@ -171,35 +175,72 @@ export function atomicWriteJson(file, value, options = {}) {
     );
     const bytes = Buffer.from(`${JSON.stringify(value, null, 2)}\n`, "utf8");
     let fd;
+    let published = false;
+    const inject = (point, details = {}) => {
+        if (faultInjector !== null) {
+            faultInjector({
+                point,
+                file,
+                temporary,
+                directory,
+                ...details,
+            });
+        }
+    };
     try {
         fd = fs.openSync(temporary, "wx", 0o600);
+        inject("after-open");
         let offset = 0;
         while (offset < bytes.length) {
             offset += fs.writeSync(fd, bytes, offset, bytes.length - offset);
         }
+        inject("after-write", { bytes: bytes.length });
+        inject("before-file-fsync");
         fs.fsyncSync(fd);
-    } finally {
-        if (fd !== undefined) {
-            fs.closeSync(fd);
-        }
-    }
-    try {
+        inject("after-file-fsync");
+        fs.closeSync(fd);
+        fd = undefined;
+        inject("before-rename");
         fs.renameSync(temporary, file);
+        published = true;
+        inject("after-rename");
+
+        let directoryFd;
+        try {
+            inject("before-directory-fsync");
+            directoryFd = fs.openSync(directory, "r");
+            fs.fsyncSync(directoryFd);
+            inject("after-directory-fsync");
+        } catch (error) {
+            const unsupportedOnWindows = process.platform === "win32"
+                && ["EACCES", "EBADF", "EINVAL", "ENOTSUP", "EPERM"]
+                    .includes(error?.code);
+            if (!unsupportedOnWindows) {
+                throw error;
+            }
+        } finally {
+            if (directoryFd !== undefined) {
+                fs.closeSync(directoryFd);
+            }
+        }
+        return file;
     } catch (error) {
-        fs.rmSync(temporary, { force: true });
+        if (fd !== undefined) {
+            try {
+                fs.closeSync(fd);
+            } catch {
+                // Preserve the primary persistence failure.
+            }
+        }
+        if (!published) {
+            fs.rmSync(temporary, {
+                force: true,
+                maxRetries: 10,
+                retryDelay: 25,
+            });
+        }
         throw error;
     }
-    try {
-        const directoryFd = fs.openSync(directory, "r");
-        try {
-            fs.fsyncSync(directoryFd);
-        } finally {
-            fs.closeSync(directoryFd);
-        }
-    } catch {
-        // Directory fsync is not uniformly supported on Windows.
-    }
-    return file;
 }
 
 export function readJsonFile(file, field = "JSON file", { maxBytes = 4 * 1024 * 1024 } = {}) {
@@ -278,7 +319,12 @@ export function removeTreeInside(target, root) {
             { target: resolved, root: path.resolve(root) },
         );
     }
-    fs.rmSync(resolved, { recursive: true, force: true });
+    fs.rmSync(resolved, {
+        recursive: true,
+        force: true,
+        maxRetries: 10,
+        retryDelay: 25,
+    });
 }
 
 export function parseDeadline(value, field = "deadline") {

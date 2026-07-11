@@ -45,6 +45,25 @@ hashes, event hashes, or closures, and the supervisor deletes each outcome file
 immediately after consuming it. Full terminal repository/domain/artifact
 verification is performed only by `crucible_result`.
 
+### Admission and runtime limits
+
+New contracts are bounded before any investigation state is created: objective
+text is limited to 2 KiB/2048 characters; the normalized acceptance predicate
+to 4 KiB, depth 16, 128 nodes, and 32 children per boolean node; ranking metrics
+to 12; validation cases to 64; rounds to 64; and candidates to 8 per round
+(512 evaluations total). Bounded candidate-id sets are likewise capped at 512.
+Archive cohorts are capped at 32 entries (duplicate index: 256), with at most
+12 prompt references and four parents.
+
+Preflight serializes the worst-case irreducible prompt core against the frozen
+16 KiB context cap. Runtime construction rechecks the final canonical byte
+length and fails rather than returning an oversized fallback. Candidate
+annotations and trusted operator context have independent UTF-8 bounds, and the
+final proposal prompt is capped at 32 KiB. Runner loop, external-effect, and
+supervisor restart budgets are derived from the frozen rounds, candidates,
+validation effects, and a safety margin; a smaller configured loop value cannot
+turn a legal contract into repeated child crashes.
+
 ## Harness allowlist
 
 The allowlist defaults to:
@@ -62,7 +81,10 @@ Every new contract freezes the canonical allowlist-entry hash, raw allowlist
 file hash/version, executable and dependency hashes, argv-template hash,
 allowed-environment hash, trusted parser version/source hashes,
 `executesCandidateCode`, and the required sandbox policy identity/digest. The
-allowlist entry hash is also part of the deterministic investigation identity.
+policy identity is explicit: provider id/version, helper hashes, AppContainer,
+network/filesystem enforcement fields, and every configured Job Object resource
+limit are contract-pinned rather than hidden behind the digest. The allowlist
+entry hash is also part of the deterministic investigation identity.
 The runner re-verifies the exact frozen identity before every measurement.
 Replacing an entry under the same id, or changing the allowlist, executable,
 dependency, environment policy, parser, or sandbox policy, therefore fails an
@@ -128,6 +150,21 @@ Validation runs use the same `pass` field against frozen accept/reject cases.
 Optional fields are `validationCases`, `searchSpaceExhausted`, and
 `impossibilityCertificateHash`.
 
+Stdout and stderr are counted by total bytes observed, independently of the
+bytes retained under each allowlist cap. Exactly reaching a cap is valid, but
+any later non-empty chunk is overflow, including a later chunk after an
+otherwise valid JSON prefix. Overflow is rejected before parsing. Measurement
+receipt v5 records each stream's cap, total observed bytes, retained bytes,
+overflow/truncation state, the private staged candidate identity, every
+identity-pinned launch file, and the full enforced sandbox policy/Job limits;
+an overflow failure receipt has `parsed: null`.
+
+Each attempt and investigation also has cumulative output, receipt, and CAS byte
+budgets. Output is charged while chunks stream in, before retention, UTF-8
+decoding, or JSON parsing. Receipt and CAS budgets are checked before artifacts
+are handed to durable storage, preventing repeated bounded attempts from
+creating unbounded artifact growth.
+
 For `hypothesisTopology: "certified_impossibility"`, the same allowlisted
 harness must also support verifier mode. After validation and every frozen
 search slot complete without an accepted candidate, the kernel reserves a
@@ -168,9 +205,26 @@ Every executable and declared dependency is reverified, copied into a private
 per-attempt staging directory, rehashed, and executed only from staged bytes.
 Static script/file arguments must be declared dependencies.
 
+On Windows, even trusted host-side harnesses are launched suspended through a
+native kill-on-close Job Object owner before they are resumed. The owner
+contains descendants, watches the runner PID, kills the whole job when the
+harness root exits or the runner dies, and is closed again during runner
+cleanup. The supervisor applies the same ownership boundary to runner
+processes and scavenges dead runner-incarnation temp roots before restart.
+
 Harnesses with `"executesCandidateCode": true` fail closed unless a real
 sandbox provider admits the run. Working-directory isolation, environment
 filtering, timeouts, and process-tree termination are not treated as a sandbox.
+The Windows provider copies harness and candidate bytes into one private stage,
+rejects unlisted paths, denies host writes, and holds native read locks on the
+helper, executable, dependencies, and candidate files through `CreateProcess`
+and child exit. Any post-create failure terminates the still-suspended lowbox
+process before handles are closed. The managed helper itself is loaded through a
+hash-pinned, hidden, noninteractive PowerShell host rather than launched as an
+untrusted PE path; startup exceptions are acknowledged over redirected pipes,
+bounded, and returned as typed failures. The helper sets process/thread error
+mode plus WER no-UI flags before creating any child, so unattended failures
+cannot display loader, crash, or Windows Error Reporting dialogs.
 
 ## Configuring a harness (operator CLI)
 
@@ -354,9 +408,15 @@ artifact store. Domain decisions are replayable from an append-only hash chain.
 Domain observation/evidence appends atomically validate the current lease,
 fencing token, and attempt transition in the same SQLite transaction. External
 effects also carry a lease-independent logical effect key; recovery verifies and
-reuses committed proposal/measurement artifacts while conservatively rerunning
-uncertain dispatched work. Terminal decisions are unique database-constrained
-events. `crucible_result` reports only persisted terminal
+reuses committed proposal/measurement artifacts and durable recovery capsules.
+If a runner dies after dispatch but before any outcome capsule is durable,
+automatic replay stops with `CRUCIBLE_RUNTIME_UNCERTAIN_EXTERNAL_EFFECT` rather
+than risking a duplicate external call; an explicit failed-state reset is
+required before retrying. Process ownership is independent of effect
+commitment: parent failure closes the effect Job Object, and recovery removes
+the abandoned incarnation's private runtime root before another runner starts.
+Terminal decisions are unique database-constrained events. `crucible_result`
+reports only persisted terminal
 events and never recomputes policy; every terminal decision carries the evidence
 closure the kernel sealed when it fired. Deadlines, pauses, failures, and budget
 exhaustion remain explicit non-results.

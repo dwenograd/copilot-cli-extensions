@@ -17,7 +17,7 @@ import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 
 import { assertLocalDatabasePath } from "../persistence/index.mjs";
-import { DOMAIN_VERSION } from "../domain/index.mjs";
+import { CONTRACT_LIMITS, DOMAIN_VERSION } from "../domain/index.mjs";
 import { EnvironmentError } from "./errors.mjs";
 
 // Fixed contract defaults the tool surface does not expose as arguments. These
@@ -30,7 +30,6 @@ const DEFAULT_ROOT_DIRNAME = "Crucible";
 const DEFAULT_ALLOWLIST_FILENAME = "harnesses.json";
 const DEFAULT_INVESTIGATIONS_DIRNAME = "investigations";
 const IDENTIFIER_RE = /^[A-Za-z0-9][A-Za-z0-9._@-]{0,127}$/u;
-const MAX_OBJECTIVE_CHARACTERS = 4096;
 const PREFLIGHT_WORKSPACES = new WeakSet();
 
 function hasText(value) {
@@ -147,10 +146,16 @@ export function canonicalObjective(objective) {
     if (normalized.length === 0) {
         throw new EnvironmentError("objective must be a non-empty string", { field: "objective" });
     }
-    if (normalized.length > MAX_OBJECTIVE_CHARACTERS) {
+    const bytes = Buffer.byteLength(normalized, "utf8");
+    if (normalized.length > CONTRACT_LIMITS.objectiveCharacters
+        || bytes > CONTRACT_LIMITS.objectiveBytes) {
         throw new EnvironmentError(
-            `objective must be at most ${MAX_OBJECTIVE_CHARACTERS} characters`,
-            { field: "objective", length: normalized.length },
+            `objective must be at most ${CONTRACT_LIMITS.objectiveCharacters} characters and ${CONTRACT_LIMITS.objectiveBytes} UTF-8 bytes`,
+            {
+                field: "objective",
+                length: normalized.length,
+                bytes,
+            },
         );
     }
     return normalized;
@@ -316,6 +321,7 @@ export function buildSupervisorConfigInput({
     cliPath,
     deadlineIso,
     runnerEpochId = deriveRunnerEpochId(investigationId),
+    executionLimits = null,
 }) {
     return {
         runner: {
@@ -327,6 +333,16 @@ export function buildSupervisorConfigInput({
             copilotCliPath: cliPath,
             runnerEpochId,
             ...(hasText(deadlineIso) ? { deadline: deadlineIso } : {}),
+            ...(executionLimits === null
+                ? {}
+                : {
+                    options: {
+                        maxLoopIterations: executionLimits.maxLoopIterations,
+                    },
+                }),
         },
+        ...(executionLimits === null
+            ? {}
+            : { maxRestarts: executionLimits.maxRestarts }),
     };
 }

@@ -22,6 +22,9 @@
 // wrapping `priorWork` in nonce-delimited untrusted-data framing.
 
 import {
+    ANNOTATION_LIMITS,
+    CONTRACT_LIMITS,
+    SEARCH_POLICY_LIMITS,
     canonicalJson,
     hashCanonical,
     immutableCanonical,
@@ -61,12 +64,83 @@ function stringOrNull(value) {
     return typeof value === "string" && value.length > 0 ? value : null;
 }
 
+function boundedStringOrNull(value, field, maximumCharacters, maximumBytes) {
+    const normalized = stringOrNull(value);
+    if (normalized === null) {
+        return null;
+    }
+    const bytes = Buffer.byteLength(normalized, "utf8");
+    if (normalized.length > maximumCharacters || bytes > maximumBytes) {
+        throw new RuntimeConfigError(`${field} exceeds its prompt-context bound`, {
+            field,
+            characters: normalized.length,
+            bytes,
+            maximumCharacters,
+            maximumBytes,
+        });
+    }
+    return normalized;
+}
+
 function integerOrNull(value) {
     return Number.isSafeInteger(value) ? value : null;
 }
 
 function byteLength(value) {
     return Buffer.byteLength(canonicalJson(value), "utf8");
+}
+
+function assertArrayBound(value, maximum, field) {
+    const list = asArray(value);
+    if (list.length > maximum) {
+        throw new RuntimeConfigError(`${field} exceeds its prompt-context item bound`, {
+            field,
+            count: list.length,
+            maximum,
+        });
+    }
+    return list;
+}
+
+function archiveCap(contract, key) {
+    const configured = contract.searchPolicy?.archiveCaps?.[key];
+    return Number.isSafeInteger(configured)
+        ? Math.min(configured, SEARCH_POLICY_LIMITS.archiveCaps[key])
+        : SEARCH_POLICY_LIMITS.archiveCaps[key];
+}
+
+function promptCap(contract, key) {
+    const configured = contract.searchPolicy?.promptCaps?.[key];
+    return Number.isSafeInteger(configured)
+        ? Math.min(configured, SEARCH_POLICY_LIMITS.promptCaps[key])
+        : SEARCH_POLICY_LIMITS.promptCaps[key];
+}
+
+function assertArchiveBounds(contract, archive) {
+    for (const key of ["accepted", "nearMisses", "rejected", "invalidMetrics"]) {
+        assertArrayBound(archive[key], archiveCap(contract, key), `archive.${key}`);
+    }
+    assertArrayBound(
+        archive.mechanismGroups,
+        archiveCap(contract, "mechanismGroups"),
+        "archive.mechanismGroups",
+    );
+    assertArrayBound(
+        archive.lessonGroups,
+        archiveCap(contract, "lessonGroups"),
+        "archive.lessonGroups",
+    );
+    const duplicateIndex = archive.duplicateIndex;
+    if (duplicateIndex !== undefined
+        && duplicateIndex !== null
+        && (typeof duplicateIndex !== "object"
+            || Array.isArray(duplicateIndex)
+            || Object.keys(duplicateIndex).length
+                > archiveCap(contract, "duplicateIndex"))) {
+        throw new RuntimeConfigError("archive.duplicateIndex exceeds its prompt-context bound", {
+            maximum: archiveCap(contract, "duplicateIndex"),
+        });
+    }
 }
 
 function normalizeByteCap(byteCap) {
@@ -116,8 +190,18 @@ function summarizeCandidate(evidence, keys) {
         round: integerOrNull(evidence.round),
         slotIndex: integerOrNull(evidence.slotIndex),
         metrics: selectMetricValues(evidence.metrics, keys),
-        mechanism: stringOrNull(annotations.mechanism),
-        finding: stringOrNull(annotations.finding),
+        mechanism: boundedStringOrNull(
+            annotations.mechanism,
+            "evidence.annotations.mechanism",
+            ANNOTATION_LIMITS.mechanismLength,
+            ANNOTATION_LIMITS.mechanismBytes,
+        ),
+        finding: boundedStringOrNull(
+            annotations.finding,
+            "evidence.annotations.finding",
+            ANNOTATION_LIMITS.findingLength,
+            ANNOTATION_LIMITS.findingBytes,
+        ),
         artifactHash: stringOrNull(evidence.receipt?.candidateArtifactHash),
     };
 }
@@ -178,7 +262,12 @@ function buildDeltas(metrics, incumbent, candidateSummaries) {
 function buildLessons(lessonGroups) {
     return asArray(lessonGroups)
         .map((group) => {
-            const finding = stringOrNull(group?.finding);
+            const finding = boundedStringOrNull(
+                group?.finding,
+                "archive.lessonGroups.finding",
+                ANNOTATION_LIMITS.findingLength,
+                ANNOTATION_LIMITS.findingBytes,
+            );
             if (finding === null) {
                 return null;
             }
@@ -253,6 +342,16 @@ function normalizeAssignment(slot) {
             slotIndex: slot.slotIndex ?? null,
         });
     }
+    const parentEvidenceIds = assertArrayBound(
+        slot.parentEvidenceIds,
+        SEARCH_POLICY_LIMITS.promptCaps.parentEvidenceIds,
+        "slot.parentEvidenceIds",
+    ).filter((id) => typeof id === "string" && id.length > 0);
+    const promptContextRefs = assertArrayBound(
+        slot.promptContextRefs,
+        SEARCH_POLICY_LIMITS.promptCaps.promptContextRefs,
+        "slot.promptContextRefs",
+    ).filter((id) => typeof id === "string" && id.length > 0);
     const assignment = {
         operator: stringOrNull(slot.operator) ?? "fresh",
         round,
@@ -260,12 +359,8 @@ function normalizeAssignment(slot) {
         candidateId: stringOrNull(slot.candidateId),
         model: stringOrNull(slot.model),
         seed: integerOrNull(slot.seed),
-        parentEvidenceIds: asArray(slot.parentEvidenceIds).filter(
-            (id) => typeof id === "string" && id.length > 0,
-        ),
-        promptContextRefs: asArray(slot.promptContextRefs).filter(
-            (id) => typeof id === "string" && id.length > 0,
-        ),
+        parentEvidenceIds,
+        promptContextRefs,
     };
     if (stringOrNull(slot.boundedCandidateId) !== null) {
         assignment.boundedCandidateId = slot.boundedCandidateId;
@@ -299,8 +394,11 @@ function enforceByteCap(body, byteCap, initialOmissions = {}) {
             }
         }
         if (!dropped) {
-            // Only irreducible trusted core remains; stop rather than loop.
-            break;
+            const coreBytes = byteLength({ ...body, omissions });
+            throw new RuntimeConfigError(
+                "Irreducible prompt context exceeds the frozen byte cap",
+                { coreBytes, byteCap },
+            );
         }
     }
     return omissions;
@@ -311,12 +409,30 @@ export function buildPromptContext(input = {}) {
     const contract = requirePlainObject(input.contract ?? {}, "contract");
     const archive = requirePlainObject(input.archive ?? {}, "archive");
     const byteCap = normalizeByteCap(input.byteCap);
+    assertArchiveBounds(contract, archive);
 
-    const objective = stringOrNull(contract.objective);
+    const objective = boundedStringOrNull(
+        contract.objective,
+        "contract.objective",
+        CONTRACT_LIMITS.objectiveCharacters,
+        CONTRACT_LIMITS.objectiveBytes,
+    );
     if (objective === null) {
         throw new RuntimeConfigError("contract.objective must be a non-empty string");
     }
-    const metrics = asArray(contract.metrics)
+    const predicate = contract.acceptancePredicate ?? { kind: "harness_pass" };
+    const predicateBytes = byteLength(predicate);
+    if (predicateBytes > CONTRACT_LIMITS.acceptancePredicateBytes) {
+        throw new RuntimeConfigError("contract.acceptancePredicate exceeds its byte bound", {
+            predicateBytes,
+            maximumBytes: CONTRACT_LIMITS.acceptancePredicateBytes,
+        });
+    }
+    const metrics = assertArrayBound(
+        contract.metrics,
+        CONTRACT_LIMITS.metrics,
+        "contract.metrics",
+    )
         .filter((metric) => metric && typeof metric.key === "string")
         .map((metric) => ({
             key: metric.key,
@@ -326,6 +442,15 @@ export function buildPromptContext(input = {}) {
     const keys = metricKeys(metrics);
 
     const assignment = normalizeAssignment(input.slot);
+    if (assignment.parentEvidenceIds.length > promptCap(contract, "parentEvidenceIds")
+        || assignment.promptContextRefs.length > promptCap(contract, "promptContextRefs")) {
+        throw new RuntimeConfigError("slot prompt references exceed the frozen contract caps", {
+            parentEvidenceIds: assignment.parentEvidenceIds.length,
+            promptContextRefs: assignment.promptContextRefs.length,
+            parentEvidenceIdCap: promptCap(contract, "parentEvidenceIds"),
+            promptContextRefCap: promptCap(contract, "promptContextRefs"),
+        });
+    }
     const visibleEvidenceIds = new Set(assignment.promptContextRefs);
     const visibleEvidence = (evidence) =>
         evidence !== null
@@ -390,7 +515,7 @@ export function buildPromptContext(input = {}) {
     const body = {
         version: PROMPT_CONTEXT_VERSION,
         objective,
-        predicate: contract.acceptancePredicate ?? { kind: "harness_pass" },
+        predicate,
         metrics,
         assignment,
         plateau: plateauNotice(input.plateau ?? null),
@@ -407,6 +532,13 @@ export function buildPromptContext(input = {}) {
 
     const omissions = enforceByteCap(body, byteCap, initialOmissions);
     const context = immutableCanonical({ ...body, omissions });
+    const serializedBytes = byteLength(context);
+    if (serializedBytes > byteCap) {
+        throw new RuntimeConfigError("Prompt context exceeds the frozen byte cap", {
+            serializedBytes,
+            byteCap,
+        });
+    }
     const hash = hashCanonical(context, PROMPT_CONTEXT_HASH_ALGORITHM);
     return { context, hash };
 }
@@ -430,9 +562,44 @@ export function assertPromptContractCoreFits(
         "candidate-r999999-s007-retry-999",
     );
     const model = longest(workerModels, "worker");
+    const makeIdentifier = (prefix, index) => {
+        const base = `${prefix}-${String(index).padStart(3, "0")}-`;
+        return base.padEnd(128, String(index % 10));
+    };
+    const promptContextRefs = Array.from(
+        { length: promptCap(contract, "promptContextRefs") },
+        (_unused, index) => makeIdentifier("evidence", index),
+    );
+    const parentEvidenceIds = promptContextRefs.slice(
+        0,
+        promptCap(contract, "parentEvidenceIds"),
+    );
+    const incumbent = promptContextRefs.length === 0
+        ? null
+        : {
+            evidenceId: promptContextRefs[0],
+            outcomeClass: "accepted",
+            round: Number.isSafeInteger(contract.maxRounds) ? contract.maxRounds : 1,
+            slotIndex: Number.isSafeInteger(contract.candidatesPerRound)
+                ? Math.max(0, contract.candidatesPerRound - 1)
+                : 0,
+            metrics: Object.fromEntries(asArray(contract.metrics).map((metric) => [
+                metric.key,
+                Number.MAX_SAFE_INTEGER,
+            ])),
+            annotations: {
+                mechanism: "m".repeat(ANNOTATION_LIMITS.mechanismBytes),
+                finding: "f".repeat(ANNOTATION_LIMITS.findingBytes),
+            },
+            receipt: {
+                candidateArtifactHash: `sha256:${"f".repeat(64)}`,
+            },
+        };
     const { context } = buildPromptContext({
         contract,
-        archive: {},
+        archive: incumbent === null
+            ? {}
+            : { incumbent, accepted: [incumbent] },
         slot: {
             operator: "adversarial",
             round: Number.isSafeInteger(contract.maxRounds) ? contract.maxRounds : 1,
@@ -442,8 +609,8 @@ export function assertPromptContractCoreFits(
             candidateId,
             model,
             seed: 0x7fffffff,
-            parentEvidenceIds: [],
-            promptContextRefs: [],
+            parentEvidenceIds,
+            promptContextRefs,
             ...(boundedCandidateIds.length === 0 ? {} : { boundedCandidateId: candidateId }),
         },
         plateau: {

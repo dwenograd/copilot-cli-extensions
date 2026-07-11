@@ -193,6 +193,31 @@ describe("canonical export", () => {
         expect(stageEntries("export")).toEqual([]);
     });
 
+    it.each([
+        "before-stage-file-open",
+        "after-source-copy",
+        "before-database-backup",
+        "before-publish",
+    ])("cleans every private stage after an injected export failure at %s", (point) => {
+        const destDir = path.join(base, `bundle-fault-${point}`);
+        let injected = false;
+        expect(() => exportBundle({
+            store,
+            dbFile: repo.databaseFile,
+            destDir,
+            investigationId: "inv-1",
+            faultInjector(event) {
+                if (!injected && event.point === point) {
+                    injected = true;
+                    throw new Error(`injected ${point}`);
+                }
+            },
+        })).toThrow(`injected ${point}`);
+        expect(injected).toBe(true);
+        expect(fs.existsSync(destDir)).toBe(false);
+        expect(stageEntries("export")).toEqual([]);
+    });
+
     it("refuses a non-empty destination", () => {
         const destDir = path.join(base, "occupied");
         fs.mkdirSync(destDir);
@@ -204,6 +229,20 @@ describe("canonical export", () => {
             investigationId: "inv-1",
         }));
         expect(err.code).toBe(BUNDLE_ERROR_CODES.DESTINATION_EXISTS);
+    });
+
+    it("rejects a non-string bundle clock before publication", () => {
+        const destDir = path.join(base, "bad-bundle-clock");
+        const err = catchErr(() => exportBundle({
+            store,
+            dbFile: repo.databaseFile,
+            destDir,
+            investigationId: "inv-1",
+            now: () => 123,
+        }));
+        expect(err.code).toBe("CRUCIBLE_PERSIST_INVALID_ARGUMENT");
+        expect(fs.existsSync(destDir)).toBe(false);
+        expect(stageEntries("export")).toEqual([]);
     });
 });
 
@@ -297,6 +336,49 @@ describe("authenticated import and round trip", () => {
             },
         });
         expect(imported.trustLevel).toBe("authenticated");
+    });
+
+    it("re-verifies staged bytes after caller-owned authentication", () => {
+        const { destDir } = doExport();
+        const dest = path.join(base, "signature-mutation");
+        let stagingDir;
+        const err = catchErr(() => importBundle({
+            bundleDir: destDir,
+            destDir: dest,
+            expectedSignature: Buffer.from("signed"),
+            hooks: {
+                beforePublish(event) {
+                    stagingDir = event.stagingDir;
+                },
+            },
+            verifySignature() {
+                fs.appendFileSync(path.join(stagingDir, "manifest.json"), " ");
+                return true;
+            },
+        }));
+        expect(err.code).toBe(BUNDLE_ERROR_CODES.TAMPER_DETECTED);
+        expect(fs.existsSync(dest)).toBe(false);
+        expect(stageEntries("import")).toEqual([]);
+    });
+
+    it("authenticates the final staged digest after a before-publish mutation", () => {
+        const { destDir, res } = doExport();
+        const dest = path.join(base, "digest-mutation");
+        const err = catchErr(() => importBundle({
+            bundleDir: destDir,
+            destDir: dest,
+            expectedDigest: res.digest,
+            hooks: {
+                beforePublish(event) {
+                    rewriteManifest(event.stagingDir, (manifest) => {
+                        manifest.metadata = { mutatedAfterInitialCopy: true };
+                    });
+                },
+            },
+        }));
+        expect(err.code).toBe(BUNDLE_ERROR_CODES.AUTHENTICATION_FAILED);
+        expect(fs.existsSync(dest)).toBe(false);
+        expect(stageEntries("import")).toEqual([]);
     });
 });
 
@@ -459,6 +541,58 @@ describe("source mutation and filesystem races", () => {
         expect(fs.existsSync(path.join(outside, "database.sqlite"))).toBe(false);
         expect(fs.existsSync(dest)).toBe(false);
         expect(stageEntries("import")).toEqual([]);
+    });
+
+    it("rejects a database-backup junction swap before VACUUM can write outside", () => {
+        const outside = path.join(base, "backup-outside");
+        fs.mkdirSync(outside);
+        const dest = path.join(base, "junction-export");
+        let injected = false;
+        const err = catchErr(() => exportBundle({
+            store,
+            dbFile: repo.databaseFile,
+            destDir: dest,
+            investigationId: "inv-1",
+            hooks: {
+                beforeDatabaseBackup(event) {
+                    injected = true;
+                    const dbDir = path.dirname(event.stagedPath);
+                    fs.rmdirSync(dbDir);
+                    fs.symlinkSync(outside, dbDir, "junction");
+                },
+            },
+        }));
+        expect(injected).toBe(true);
+        expect(err.code).toBe(BUNDLE_ERROR_CODES.UNSAFE_PATH);
+        expect(fs.existsSync(path.join(outside, "database.sqlite"))).toBe(false);
+        expect(fs.existsSync(dest)).toBe(false);
+        expect(stageEntries("export")).toEqual([]);
+    });
+
+    it("fails closed when a publication ancestor directory cannot be fsynced", () => {
+        const dest = path.join(base, "unsupported-dirsync");
+        let injected = false;
+        const err = catchErr(() => exportBundle({
+            store,
+            dbFile: repo.databaseFile,
+            destDir: dest,
+            investigationId: "inv-1",
+            faultInjector(event) {
+                if (!injected
+                    && event.point === "before-directory-fsync"
+                    && event.purpose === "bundle publication parent") {
+                    injected = true;
+                    throw Object.assign(new Error("directory fsync unsupported"), {
+                        code: "EPERM",
+                        syscall: "fsync",
+                    });
+                }
+            },
+        }));
+        expect(injected).toBe(true);
+        expect(err.code).toBe(BUNDLE_ERROR_CODES.IO_ERROR);
+        expect(fs.existsSync(dest)).toBe(false);
+        expect(stageEntries("export")).toEqual([]);
     });
 
     it("cleans partial staging after an injected copy failure", () => {

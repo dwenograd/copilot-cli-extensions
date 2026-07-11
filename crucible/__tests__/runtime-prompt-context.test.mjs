@@ -5,10 +5,17 @@ import {
     PROMPT_CONTEXT_HASH_ALGORITHM,
     READ_PARENT_ARTIFACT_TOOL_NAME,
     SUBMIT_CANDIDATE_TOOL_NAME,
+    RuntimeConfigError,
+    assertPromptContractCoreFits,
     buildPromptContext,
     buildProposalPrompt,
 } from "../runtime/index.mjs";
-import { canonicalJson } from "../domain/index.mjs";
+import {
+    ANNOTATION_LIMITS,
+    CONTRACT_LIMITS,
+    SEARCH_POLICY_LIMITS,
+    canonicalJson,
+} from "../domain/index.mjs";
 
 const SEARCH_OPERATORS = [
     "fresh",
@@ -262,9 +269,8 @@ describe("Crucible prompt context", () => {
         const promptContextRefs = [
             "ev-inc",
             "ev-elite",
-            ...archive.nearMisses.map((item) => item.evidenceId),
-            ...archive.rejected.map((item) => item.evidenceId),
-            ...archive.invalidMetrics.map((item) => item.evidenceId),
+            ...archive.nearMisses.slice(0, 8).map((item) => item.evidenceId),
+            ...archive.rejected.slice(0, 2).map((item) => item.evidenceId),
         ];
         const input = {
             slot: baseSlot({ promptContextRefs }),
@@ -333,6 +339,78 @@ describe("Crucible prompt context", () => {
             deltas: 0,
             duplicateHashes: 0,
         });
+    });
+
+    it("throws instead of returning an oversized irreducible context", () => {
+        expect(() => buildPromptContext({
+            slot: baseSlot({ promptContextRefs: [], parentEvidenceIds: [] }),
+            contract: {
+                ...CONTRACT,
+                objective: "o".repeat(CONTRACT_LIMITS.objectiveBytes),
+            },
+            archive: {},
+            byteCap: 2048,
+        })).toThrow(RuntimeConfigError);
+    });
+
+    it("rejects oversized archive buckets and incumbent annotations", () => {
+        expect(() => buildPromptContext({
+            slot: baseSlot(),
+            contract: CONTRACT,
+            archive: {
+                ...baseArchive(),
+                accepted: Array.from(
+                    { length: SEARCH_POLICY_LIMITS.archiveCaps.accepted + 1 },
+                    (_unused, index) => evidence({
+                        id: `ev-${index}`,
+                        outcomeClass: "accepted",
+                        score: index,
+                    }),
+                ),
+            },
+        })).toThrow(RuntimeConfigError);
+        expect(() => buildPromptContext({
+            slot: baseSlot({ promptContextRefs: ["ev-inc"] }),
+            contract: CONTRACT,
+            archive: {
+                ...baseArchive(),
+                incumbent: evidence({
+                    id: "ev-inc",
+                    outcomeClass: "accepted",
+                    score: 95,
+                    finding: "f".repeat(ANNOTATION_LIMITS.findingBytes + 1),
+                }),
+            },
+        })).toThrow(RuntimeConfigError);
+    });
+
+    it("proves the maximum legal trusted core fits the frozen default cap", () => {
+        const metrics = Array.from(
+            { length: CONTRACT_LIMITS.metrics },
+            (_unused, index) => ({
+                key: `metric-${index}-`.padEnd(128, String(index % 10)),
+                direction: index % 2 === 0 ? "max" : "min",
+                epsilon: Number.MAX_SAFE_INTEGER,
+            }),
+        );
+        const result = assertPromptContractCoreFits({
+            objective: "o".repeat(CONTRACT_LIMITS.objectiveBytes),
+            acceptancePredicate: {
+                kind: "field_equals",
+                path: ["payload"],
+                value: Array.from({ length: 4 }, () => "p".repeat(900)),
+            },
+            metrics,
+            workerModels: ["worker-model".padEnd(128, "w")],
+            candidatesPerRound: CONTRACT_LIMITS.candidatesPerRound,
+            maxRounds: CONTRACT_LIMITS.maxRounds,
+            searchPolicy: {
+                promptCaps: SEARCH_POLICY_LIMITS.promptCaps,
+                archiveCaps: SEARCH_POLICY_LIMITS.archiveCaps,
+                mandatoryEscapeRounds: CONTRACT_LIMITS.maxRounds,
+            },
+        });
+        expect(result.coreBytes).toBeLessThanOrEqual(DEFAULT_PROMPT_CONTEXT_BYTE_CAP);
     });
 });
 
