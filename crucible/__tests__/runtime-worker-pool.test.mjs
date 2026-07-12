@@ -12,7 +12,7 @@ import {
     validateCandidateSubmission,
     validateWorkerProposal,
 } from "../runtime/index.mjs";
-import { hashCanonical } from "../domain/index.mjs";
+import { hashCanonical, normalizeHypotheses } from "../domain/index.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const roots = [];
@@ -58,6 +58,30 @@ function validPayload(candidateId, challenge = "challenge-1", annotationOverride
         candidateId,
         annotations: validAnnotations(annotationOverrides),
         files: [{ path: "score.txt", content: "95\n" }],
+    };
+}
+
+const HYPOTHESIS_OBSERVABLES = [
+    { key: "score", kind: "numeric", minimum: 0, maximum: 100 },
+    { key: "outcome", kind: "categorical", values: ["accepted", "rejected"] },
+];
+
+const REQUIRED_HYPOTHESIS_POLICY = {
+    required: true,
+    maxPredictions: 4,
+};
+
+function thresholdHypotheses(value = 90) {
+    return {
+        predictions: [{
+            id: "score-threshold",
+            kind: "threshold",
+            observable: "score",
+            operator: ">=",
+            value,
+            refutation: { kind: "threshold", operator: "<", value },
+            requiredForResult: true,
+        }],
     };
 }
 
@@ -576,6 +600,62 @@ describe("Crucible SDK worker pool", () => {
             });
         });
 
+        it("seals required typed predictions against an injected observable registry", () => {
+            const submission = validateCandidateSubmission({
+                ...validPayload("candidate-a"),
+                annotations: {
+                    mechanism: "raise the score",
+                    hypothesis: "explanatory prose only",
+                    hypotheses: thresholdHypotheses(),
+                },
+            }, {
+                ...options,
+                observableRegistry: HYPOTHESIS_OBSERVABLES,
+                hypothesisPolicy: REQUIRED_HYPOTHESIS_POLICY,
+            });
+            expect(submission.annotations.hypothesis).toBe("explanatory prose only");
+            expect(submission.annotations.hypotheses).toMatchObject({
+                version: "crucible-preregistered-hypotheses-v4",
+                predictions: [{
+                    id: "score-threshold",
+                    kind: "threshold",
+                    requiredForResult: true,
+                }],
+            });
+            expect(submission.annotations.hypotheses.identity).toMatch(
+                /^sha256:crucible-preregistered-hypotheses-v4:[a-f0-9]{64}$/,
+            );
+            expect(Object.isFrozen(submission.annotations.hypotheses)).toBe(true);
+        });
+
+        it("rejects missing required predictions and unknown observables", () => {
+            const hypothesisOptions = {
+                ...options,
+                observableRegistry: HYPOTHESIS_OBSERVABLES,
+                hypothesisPolicy: REQUIRED_HYPOTHESIS_POLICY,
+            };
+            expect(() => validateCandidateSubmission(
+                validPayload("candidate-a"),
+                hypothesisOptions,
+            )).toThrow(expect.objectContaining({
+                code: RUNTIME_ERROR_CODES.WORKER_INVALID_CANDIDATE,
+            }));
+            expect(() => validateCandidateSubmission({
+                ...validPayload("candidate-a"),
+                annotations: {
+                    mechanism: "predict an unknown metric",
+                    hypotheses: {
+                        predictions: [{
+                            ...thresholdHypotheses().predictions[0],
+                            observable: "unregistered",
+                        }],
+                    },
+                },
+            }, hypothesisOptions)).toThrow(expect.objectContaining({
+                code: RUNTIME_ERROR_CODES.WORKER_INVALID_CANDIDATE,
+            }));
+        });
+
         it("rejects citations outside the visible evidence set", () => {
             expect(() => validateCandidateSubmission({
                 ...validPayload("candidate-a"),
@@ -640,6 +720,67 @@ describe("Crucible SDK worker pool", () => {
                 visibleEvidenceIds: ["ev-1", "ev-2"],
                 promptContextHash: contextHash,
             })).toEqual(proposal);
+            await pool.close();
+        });
+
+        it("binds sealed hypotheses into annotation and proposal payload hashes", async () => {
+            const root = makeRoot("hypothesis-identity");
+            const client = driverClient(async (config) => {
+                const submitTool = config.tools[0];
+                expect(submitTool.parameters.properties.annotations.required)
+                    .toContain("hypotheses");
+                await submitTool.handler({
+                    ...validPayload("candidate-a"),
+                    annotations: {
+                        mechanism: "preregister score",
+                        hypotheses: thresholdHypotheses(),
+                    },
+                }, { sessionId: config.sessionId, toolName: submitTool.name });
+            });
+            const pool = createSdkWorkerPool({
+                client,
+                baseDirectory: path.join(root, "sdk"),
+                workingDirectory: path.join(root, "work"),
+            });
+            const hypothesisRequest = {
+                ...request("candidate-a"),
+                observableRegistry: HYPOTHESIS_OBSERVABLES,
+                hypothesisPolicy: REQUIRED_HYPOTHESIS_POLICY,
+            };
+            const proposal = await pool.propose(hypothesisRequest);
+            expect(proposal.identity.annotationsHash).toBe(
+                hashCanonical(
+                    proposal.annotations,
+                    "sha256:crucible-runtime-candidate-annotations-v1",
+                ),
+            );
+            expect(proposal.identity.payloadHash).toBe(
+                hashCanonical(
+                    {
+                        candidateId: proposal.candidateId,
+                        annotations: proposal.annotations,
+                        files: proposal.files,
+                    },
+                    "sha256:crucible-runtime-candidate-payload-v1",
+                ),
+            );
+            expect(() => {
+                proposal.annotations.hypotheses.predictions[0].value = 95;
+            }).toThrow(TypeError);
+
+            const changed = structuredClone(proposal);
+            changed.annotations.hypotheses = normalizeHypotheses(
+                thresholdHypotheses(95),
+                {
+                    observableRegistry: HYPOTHESIS_OBSERVABLES,
+                    hypothesisPolicy: REQUIRED_HYPOTHESIS_POLICY,
+                },
+            );
+            expect(() => validateWorkerProposal(changed, hypothesisRequest))
+                .toThrow(expect.objectContaining({
+                    code: RUNTIME_ERROR_CODES.WORKER_PROTOCOL,
+                    details: expect.objectContaining({ field: "annotationsHash" }),
+                }));
             await pool.close();
         });
 

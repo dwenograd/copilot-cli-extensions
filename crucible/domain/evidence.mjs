@@ -680,6 +680,13 @@ export function deriveEvidencePayload(aggregate, observation, evidenceId) {
         promptContextRefs: candidateEvidence ? command.promptContextRefs : [],
         seed: candidateEvidence ? command.seed : null,
         boundedCandidateId: candidateEvidence ? (command.boundedCandidateId ?? null) : null,
+        ...(candidateEvidence && command?.enumerand !== undefined
+            ? {
+                enumerandOrdinal: command.enumerand.ordinal,
+                enumerandHash: command.enumerand.enumerandHash,
+                enumerandManifestRoot: command.enumerand.manifestRoot,
+            }
+            : {}),
         metrics,
         rankable,
         outcomeClass,

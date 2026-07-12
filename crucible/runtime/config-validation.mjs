@@ -149,18 +149,52 @@ export function deriveRunnerExecutionLimits(contract) {
             { maxRounds, candidatesPerRound },
         );
     }
-    const candidateEvaluations = maxRounds * candidatesPerRound;
-    if (!Number.isSafeInteger(candidateEvaluations)) {
+    const searchCapacity = maxRounds * candidatesPerRound;
+    if (!Number.isSafeInteger(searchCapacity)) {
         throw new RuntimeConfigError("contract candidate evaluation capacity is not a safe integer");
+    }
+    const candidateEvaluations = Array.isArray(contract.enumerandManifest?.entries)
+        ? contract.enumerandManifest.entries.length
+        : searchCapacity;
+    if (!Number.isSafeInteger(candidateEvaluations)
+        || candidateEvaluations < 1
+        || candidateEvaluations > searchCapacity) {
+        throw new RuntimeConfigError(
+            "contract enumerand/search capacity is impossible",
+            { candidateEvaluations, searchCapacity },
+        );
     }
     const validationEffects = Array.isArray(contract.validationCases)
         ? contract.validationCases.length
         : 0;
     const impossibilityEffects =
         contract.hypothesisTopology === "certified_impossibility" ? 1 : 0;
-    const expectedExternalEffects = validationEffects
-        + (candidateEvaluations * 2)
-        + impossibilityEffects;
+    const statisticalPolicy = contract.statisticalPolicy;
+    const evaluationBudget = statisticalPolicy?.evaluationBudget;
+    const byteBudgets = statisticalPolicy?.resourceBudget;
+    if (evaluationBudget === null
+        || typeof evaluationBudget !== "object"
+        || !Number.isSafeInteger(evaluationBudget.maxTotalEvaluations)
+        || evaluationBudget.maxTotalEvaluations
+            < validationEffects + candidateEvaluations + impossibilityEffects) {
+        throw new RuntimeConfigError(
+            "frozen statistical evaluation budget cannot cover runtime execution",
+            {
+                evaluationBudget: evaluationBudget ?? null,
+                validationEffects,
+                candidateEvaluations,
+                impossibilityEffects,
+            },
+        );
+    }
+    if (byteBudgets === null || typeof byteBudgets !== "object") {
+        throw new RuntimeConfigError(
+            "frozen statistical resource budget is required",
+        );
+    }
+    const proposalEffects = candidateEvaluations;
+    const expectedExternalEffects = evaluationBudget.maxTotalEvaluations
+        + proposalEffects;
     const effectSafetyMargin = Math.max(
         RUNNER_BUDGET_MINIMUM_SAFETY_MARGIN,
         Math.ceil(expectedExternalEffects / 4),
@@ -174,8 +208,12 @@ export function deriveRunnerExecutionLimits(contract) {
     const maxLoopIterations = expectedKernelIterations
         + maxExternalEffects
         + RUNNER_BUDGET_MINIMUM_SAFETY_MARGIN;
-    if (!Number.isSafeInteger(maxLoopIterations)) {
-        throw new RuntimeConfigError("derived runner loop budget is not a safe integer");
+    if (!Number.isSafeInteger(maxLoopIterations)
+        || maxLoopIterations > 1_000_000) {
+        throw new RuntimeConfigError(
+            "derived runner loop budget is not a supported safe integer",
+            { maxLoopIterations, maximum: 1_000_000 },
+        );
     }
     const maxRestarts = Math.min(
         12,
@@ -188,5 +226,6 @@ export function deriveRunnerExecutionLimits(contract) {
         maxLoopIterations,
         maxRestarts,
         safetyMargin: effectSafetyMargin,
+        byteBudgets: Object.freeze({ ...byteBudgets }),
     });
 }

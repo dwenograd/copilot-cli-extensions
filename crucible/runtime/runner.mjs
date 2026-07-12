@@ -33,6 +33,7 @@ import {
 import {
     PARSER_VERSION,
     RECEIPT_VERSION,
+    SANDBOX_POLICY_IDENTITY_HASH_ALGORITHM,
     STREAM_HASH_ALGORITHM,
     DEFAULT_MEASUREMENT_BYTE_BUDGETS,
     createMeasurementExecutor,
@@ -42,7 +43,6 @@ import {
     hashReceipt,
     loadHarnessAllowlist,
     sha256Bytes,
-    verifyFrozenHarnessIdentity,
 } from "../measurement/index.mjs";
 import { MEASUREMENT_LIFECYCLE_ADAPTER } from "../measurement/private-adapters.mjs";
 import { normalizeRunnerConfig } from "./config.mjs";
@@ -61,8 +61,14 @@ import {
     createBoundedParentReadAuthority,
     createSdkWorkerPool,
     normalizeParentReadLimits,
+    validateCandidateSubmission,
     validateWorkerProposal,
 } from "./worker-pool.mjs";
+import {
+    assertBoundedEnumerandRequest,
+    assertFiniteEnumerandSnapshot,
+    resolveCommandEnumerand,
+} from "./enumerand-execution.mjs";
 import { buildPromptContext } from "./prompt-context.mjs";
 import {
     RUNTIME_TEMP_OWNER_MARKER,
@@ -134,6 +140,32 @@ function normalizeRuntimeByteBudgets(value = {}) {
         );
     }
     return Object.freeze(normalized);
+}
+
+function runtimeSandboxIdentity(value) {
+    if (value === null || typeof value !== "object" || Array.isArray(value)) {
+        return value;
+    }
+    if (typeof value.policyDigest === "string") {
+        return Object.freeze({ ...value });
+    }
+    const source = value.policyIdentity !== null
+        && typeof value.policyIdentity === "object"
+        && !Array.isArray(value.policyIdentity)
+        ? value.policyIdentity
+        : value;
+    const policyIdentity = Object.fromEntries(
+        Object.entries(source).filter(([key]) =>
+            !["available", "policyDigest", "policyIdentity", "required"].includes(key)),
+    );
+    return Object.freeze({
+        ...value,
+        policyIdentity: Object.freeze(policyIdentity),
+        policyDigest: hashCanonical(
+            policyIdentity,
+            SANDBOX_POLICY_IDENTITY_HASH_ALGORITHM,
+        ),
+    });
 }
 
 function compareStable(left, right) {
@@ -359,6 +391,7 @@ export class AutonomousRunner {
     #capturedOutputs = new Map();
     #recoveredDeadlineStopRequestSeqs = new Set();
     #byteBudgets;
+    #byteBudgetOverride;
     #investigationByteUsage = {
         casBytes: 0,
         outputBytes: 0,
@@ -373,9 +406,8 @@ export class AutonomousRunner {
     constructor(config, dependencies = {}) {
         this.#config = normalizeRunnerConfig(config, { env: dependencies.env ?? process.env });
         this.#dependencies = dependencies;
-        this.#byteBudgets = normalizeRuntimeByteBudgets(
-            dependencies.byteBudgets,
-        );
+        this.#byteBudgets = null;
+        this.#byteBudgetOverride = dependencies.byteBudgets ?? null;
         this.#parentReadLimits = normalizeParentReadLimits(
             dependencies.parentReadLimits ?? {},
         );
@@ -543,6 +575,27 @@ export class AutonomousRunner {
         }
         this.#contract = opened.aggregate.contract;
         this.#executionLimits = deriveRunnerExecutionLimits(this.#contract);
+        const frozenByteBudgets = normalizeRuntimeByteBudgets(
+            this.#executionLimits.byteBudgets,
+        );
+        if (this.#byteBudgetOverride === null) {
+            this.#byteBudgets = frozenByteBudgets;
+        } else {
+            const override = normalizeRuntimeByteBudgets(this.#byteBudgetOverride);
+            for (const [key, value] of Object.entries(override)) {
+                if (value > frozenByteBudgets[key]) {
+                    throw new RuntimeConfigError(
+                        `byteBudgets.${key} cannot exceed the frozen statistical resource budget`,
+                        {
+                            key,
+                            configured: value,
+                            frozen: frozenByteBudgets[key],
+                        },
+                    );
+                }
+            }
+            this.#byteBudgets = override;
+        }
         const operationalNonResult = this.#adapter.latestOperationalNonResult();
         this.#recoveredDeadlineStopRequestSeqs =
             this.#loadRecoveredDeadlineStopRequestSeqs();
@@ -627,7 +680,10 @@ export class AutonomousRunner {
                 ),
             });
         this.#sandboxProvider = sandboxProvider;
-        if (this.#contract.harnessIdentity.sandbox.required) {
+        const suiteRequiresSandbox = Object.values(
+            this.#contract.harnessSuite.roles,
+        ).some((role) => role.sandboxIdentity.required);
+        if (suiteRequiresSandbox) {
             if (sandboxProvider === null) {
                 throw new CrucibleRuntimeError(
                     RUNTIME_ERROR_CODES.HARNESS_CONFIGURATION_INVALID,
@@ -643,9 +699,11 @@ export class AutonomousRunner {
                     "Sandbox provider did not attest its frozen policy identity",
                 );
             }
-            this.#sandboxIdentity = sandboxIdentity;
+            this.#sandboxIdentity = runtimeSandboxIdentity(sandboxIdentity);
         }
-        this.#validateHarnessContract(this.#contract);
+        for (const role of Object.keys(this.#contract.harnessSuite.roles)) {
+            this.#validateHarnessContract(this.#contract, role);
+        }
         this.#recordCapabilityEpoch(opened.aggregate);
         this.#executor = this.#dependencies.executor
             ?? (this.#dependencies.executorFactory ?? createMeasurementExecutor)({
@@ -732,12 +790,18 @@ export class AutonomousRunner {
         }
         const capabilities = [
             "crucible-autonomous-runtime",
-            `harness:${aggregate.contract.harnessId}`,
+            `harness-suite:${aggregate.contract.harnessSuiteIdentity}`,
             `parser:${aggregate.contract.parserVersion}`,
             `allowlist:${this.#allowlist.contentHash}`,
             ...(aggregate.contract.hypothesisTopology === "certified_impossibility"
-                ? [`impossibility-verifier:${aggregate.contract.harnessId}`]
+                ? [
+                    `impossibility-verifier:${
+                        aggregate.contract.harnessSuite.roles.impossibility_verifier.harnessId
+                    }`,
+                ]
                 : []),
+            ...Object.entries(aggregate.contract.harnessSuite.roles)
+                .map(([role, spec]) => `harness-role:${role}:${spec.harnessId}`),
             ...aggregate.contract.workerModels.map((model) => `model:${model}`),
         ].sort();
         const existing = aggregate.capabilityEpochs[this.#config.runnerEpochId];
@@ -764,29 +828,70 @@ export class AutonomousRunner {
         );
     }
 
-    #validateHarnessContract(contract) {
-        if (contract.parserVersion !== PARSER_VERSION) {
+    #validateHarnessContract(contract, role = "search") {
+        const frozenRole = contract.harnessSuite?.roles?.[role];
+        if (frozenRole === undefined) {
+            throw new CrucibleRuntimeError(
+                RUNTIME_ERROR_CODES.HARNESS_CONFIGURATION_INVALID,
+                `Frozen HarnessSuiteV4 role ${JSON.stringify(role)} is unavailable`,
+                { role },
+            );
+        }
+        if (frozenRole.parser.version !== PARSER_VERSION) {
             throw new CrucibleRuntimeError(
                 RUNTIME_ERROR_CODES.HARNESS_CONFIGURATION_INVALID,
                 "Frozen contract parserVersion does not match the trusted measurement parser",
-                { contract: contract.parserVersion, runtime: PARSER_VERSION },
+                {
+                    role,
+                    contract: frozenRole.parser.version,
+                    runtime: PARSER_VERSION,
+                },
             );
         }
         try {
-            return verifyFrozenHarnessIdentity(
-                this.#allowlist,
-                contract.harnessIdentity,
-                {
-                    validationCases: contract.validationCases,
-                    sandbox: this.#sandboxIdentity,
-                },
-            ).verification;
+            const currentSuite = this.#allowlist.getSuite(contract.harnessSuite.id);
+            const currentIdentity = this.#allowlist.getSuiteIdentity(
+                contract.harnessSuite.id,
+            );
+            if (currentIdentity !== contract.harnessSuiteIdentity
+                || !canonicalEqual(currentSuite, contract.harnessSuite)) {
+                throw new RuntimeIntegrityError(
+                    "Configured HarnessSuiteV4 no longer matches the frozen contract",
+                    {
+                        expectedIdentity: contract.harnessSuiteIdentity,
+                        actualIdentity: currentIdentity,
+                    },
+                );
+            }
+            if (frozenRole.sandboxIdentity.required) {
+                if (this.#sandboxIdentity?.policyDigest
+                    !== frozenRole.sandboxIdentity.policyDigest) {
+                    throw new RuntimeIntegrityError(
+                        "Current sandbox policy does not match the frozen harness role",
+                        {
+                            role,
+                            expected: frozenRole.sandboxIdentity.policyDigest,
+                            actual: this.#sandboxIdentity?.policyDigest ?? null,
+                        },
+                    );
+                }
+            }
+            const verifiedEntry = this.#allowlist.verifyEntry(frozenRole.harnessId);
+            if (verifiedEntry.entryHash !== frozenRole.harnessEntryHash
+                || verifiedEntry.executableHash !== frozenRole.executableHash) {
+                throw new RuntimeIntegrityError(
+                    "Verified harness role bytes do not match HarnessSuiteV4",
+                    { role, harnessId: frozenRole.harnessId },
+                );
+            }
+            return { verifiedEntry, role: frozenRole };
         } catch (error) {
             throw new CrucibleRuntimeError(
                 RUNTIME_ERROR_CODES.HARNESS_CONFIGURATION_INVALID,
-                `Frozen harness identity no longer matches runtime inputs: ${error?.message ?? String(error)}`,
+                `Frozen harness suite no longer matches runtime inputs: ${error?.message ?? String(error)}`,
                 {
-                    harnessId: contract.harnessId,
+                    role,
+                    harnessId: frozenRole.harnessId,
                     cause: error?.code ?? null,
                 },
                 { cause: error },
@@ -794,8 +899,9 @@ export class AutonomousRunner {
         }
     }
 
-    async #verifiedHarnessForMeasurement() {
-        if (this.#contract.harnessIdentity.sandbox.required) {
+    async #verifiedHarnessForMeasurement(role = "search") {
+        const roleSpec = this.#contract.harnessSuite.roles[role];
+        if (roleSpec?.sandboxIdentity.required) {
             const describePolicy = this.#dependencies.describeSandboxProviderPolicy
                 ?? describeSandboxProviderPolicy;
             const current = await describePolicy(this.#sandboxProvider);
@@ -805,9 +911,9 @@ export class AutonomousRunner {
                     "Sandbox provider stopped attesting its frozen policy identity",
                 );
             }
-            this.#sandboxIdentity = current;
+            this.#sandboxIdentity = runtimeSandboxIdentity(current);
         }
-        return this.#validateHarnessContract(this.#contract).verifiedEntry;
+        return this.#validateHarnessContract(this.#contract, role).verifiedEntry;
     }
 
     #idFactory() {
@@ -1216,9 +1322,15 @@ export class AutonomousRunner {
     async #runHarnessMeasurement(input) {
         let measurement;
         try {
-            const verifiedEntry = await this.#verifiedHarnessForMeasurement();
+            const {
+                harnessRole = "search",
+                ...measurementInput
+            } = input;
+            const verifiedEntry = await this.#verifiedHarnessForMeasurement(
+                harnessRole,
+            );
             measurement = await this.#executor.run({
-                ...input,
+                ...measurementInput,
                 verifiedEntry,
                 deadlineMs: this.#config.deadlineMs,
             });
@@ -1282,8 +1394,15 @@ export class AutonomousRunner {
             }
             if (recommendation.event !== null) {
                 try {
+                    const finalNonResult =
+                        recommendation.kind === "NON_RESULT"
+                        && recommendation.event.type === EVENT_TYPES.NON_RESULT_RECORDED;
                     if (recommendation.kind === "TERMINAL") {
                         await this.#fault("before_terminal_append", {
+                            recommendation,
+                        });
+                    } else if (finalNonResult) {
+                        await this.#fault("before_non_result_append", {
                             recommendation,
                         });
                     }
@@ -1302,6 +1421,12 @@ export class AutonomousRunner {
                     }
                     if (recommendation.kind === "TERMINAL") {
                         await this.#fault("after_terminal_append", {
+                            type: appended.domainEvent?.type ?? null,
+                            seq: appended.repositoryEvent?.seq ?? null,
+                            eventHash: appended.repositoryEvent?.eventHash ?? null,
+                        });
+                    } else if (finalNonResult) {
+                        await this.#fault("after_non_result_append", {
                             type: appended.domainEvent?.type ?? null,
                             seq: appended.repositoryEvent?.seq ?? null,
                             eventHash: appended.repositoryEvent?.eventHash ?? null,
@@ -2225,6 +2350,9 @@ export class AutonomousRunner {
             || payload.operator !== assignment.operator
             || payload.seed !== assignment.seed
             || payload.promptContextHash !== request.promptContextHash
+            || (request.enumerandBindingHash !== undefined
+                && payload.enumerandBindingHash
+                    !== request.enumerandBindingHash)
             || !canonicalEqual(payload.parentEvidenceIds, assignment.parentEvidenceIds)
             || !canonicalEqual(payload.promptContextRefs, assignment.promptContextRefs)) {
             throw new RuntimeIntegrityError(
@@ -2291,6 +2419,13 @@ export class AutonomousRunner {
         candidateId,
         snapshotId,
     }) {
+        const harnessRole = purpose === "validation"
+            ? "calibration"
+            : purpose === "impossibility"
+                ? "impossibility_verifier"
+                : "search";
+        const expectedParserVersion =
+            aggregate.contract.harnessSuite.roles[harnessRole].parser.version;
         const event = this.#requireRecoveredEffectEvent(
             committed,
             "runtime:measurement",
@@ -2310,7 +2445,7 @@ export class AutonomousRunner {
                 payload.receipt,
                 candidateArtifactHash,
             )
-            || payload.receipt?.parserVersion !== aggregate.contract.parserVersion
+            || payload.receipt?.parserVersion !== expectedParserVersion
             || payload.stdoutHash !== payload.receipt?.stdoutHash
             || payload.stderrHash !== payload.receipt?.stderrHash
             || hashReceipt(payload.receipt) !== payload.receiptHash) {
@@ -2328,6 +2463,7 @@ export class AutonomousRunner {
         }
         const verifiedEntry = this.#validateHarnessContract(
             aggregate.contract,
+            harnessRole,
         ).verifiedEntry;
         const expectedDependencies = verifiedEntry.dependencies
             .map((dependency) => ({
@@ -2644,6 +2780,7 @@ export class AutonomousRunner {
                     command,
                     async (attemptId) => {
                         return this.#runHarnessMeasurement({
+                            harnessRole: "calibration",
                             candidateSnapshot: materialized.candidateSnapshot,
                             attemptId,
                             runnerEpochId: this.#config.runnerEpochId,
@@ -2992,6 +3129,7 @@ export class AutonomousRunner {
                 },
                 async (attemptId) => {
                     const executed = await this.#runHarnessMeasurement({
+                        harnessRole: "impossibility_verifier",
                         candidateSnapshot: materialized.candidateSnapshot,
                         attemptId,
                         runnerEpochId: this.#config.runnerEpochId,
@@ -3074,105 +3212,140 @@ export class AutonomousRunner {
     }
 
     async #runSearchCandidateCommand(aggregate, commandId, mainAttemptId, command) {
-        const workerPool = this.#getWorkerPool(aggregate);
-        const request = this.#buildSearchRequest(
-            aggregate,
-            commandId,
+        const enumerandPlan = resolveCommandEnumerand(
+            aggregate.contract,
             command,
         );
-        this.#parentReadController.register(request);
-
+        const finiteEnumerand = enumerandPlan?.execution?.kind
+            === "staged_snapshot";
+        const boundedEnumerand = enumerandPlan?.execution?.kind
+            === "bounded_parameter_generation";
+        let request;
         let proposalEffect;
-        try {
-            proposalEffect = await this.#executeEffect(
-                {
-                    kind: "sdk-proposal",
-                    commandId,
-                    round: command.round,
-                    slotIndex: command.slotIndex,
-                    model: command.model,
-                    operator: command.operator,
-                    sessionId: request.sessionId,
-                    candidateId: command.candidateId,
-                    seed: command.seed,
-                },
-                async (attemptId) => {
-                    const proposal = validateWorkerProposal(
-                        await workerPool.propose(request),
-                        request,
-                        { limits: this.#config.options.candidateLimits },
-                    );
-                    if (proposal.candidateId !== command.candidateId) {
-                        throw new CrucibleRuntimeError(
-                            RUNTIME_ERROR_CODES.WORKER_INVALID_CANDIDATE,
-                            "Worker proposal did not preserve the kernel-assigned candidate id",
-                            {
-                                assignedCandidateId: command.candidateId,
-                                proposedCandidateId: proposal.candidateId,
-                            },
-                        );
-                    }
-                    await this.#fault("after_proposal_response", {
-                        attemptId,
-                        command: {
-                            kind: "sdk-proposal",
-                            commandId,
-                            round: command.round,
-                            slotIndex: command.slotIndex,
-                            candidateId: command.candidateId,
-                            model: command.model,
-                        },
-                    });
-                    return proposal;
-                },
-                async (proposal, attemptId, logicalEffectKey) => {
-                    const artifact = this.#persistJsonArtifact({
-                        attemptId,
-                        kind: `proposal-${proposal.candidateId}`,
-                        value: {
-                            assignment: request.promptContext.assignment,
-                            promptContext: request.promptContext,
-                            promptContextHash: request.promptContextHash,
-                            proposal,
-                        },
-                        contentType: "application/vnd.crucible.candidate-proposal+json",
-                    });
-                    this.#ingestOperationalEvidence({
-                        attemptId,
-                        evidenceKind: `proposal:${proposal.candidateId}`,
-                        kind: "runtime:model_proposal",
-                        payload: {
-                            commandId,
-                            logicalEffectKey,
-                            round: command.round,
-                            slotIndex: command.slotIndex,
-                            candidateId: proposal.candidateId,
-                            model: command.model,
-                            operator: command.operator,
-                            parentEvidenceIds: command.parentEvidenceIds,
-                            promptContextRefs: command.promptContextRefs,
-                            seed: command.seed,
-                            identity: proposal.identity ?? null,
-                            promptContextHash: request.promptContextHash,
-                            artifactId: artifact.artifactId,
-                        },
-                    });
-                    return {
-                        proposalArtifact: artifact,
-                        promptContextHash: request.promptContextHash,
-                    };
-                },
-                async (committed, logicalEffectKey) =>
-                    this.#recoverProposalEffect({
-                        committed,
-                        logicalEffectKey,
-                        request,
-                        commandId,
-                        assignment: command,
-                    }),
+        if (finiteEnumerand) {
+            proposalEffect = this.#prepareFiniteEnumerandProposal({
+                aggregate,
+                commandId,
+                attemptId: mainAttemptId,
+                command,
+                enumerandPlan,
+            });
+            request = proposalEffect.request;
+        } else if (boundedEnumerand) {
+            proposalEffect = await this.#prepareBoundedEnumerandProposal({
+                aggregate,
+                commandId,
+                attemptId: mainAttemptId,
+                command,
+                enumerandPlan,
+            });
+            request = proposalEffect.request;
+        } else {
+            const workerPool = this.#getWorkerPool(aggregate);
+            request = this.#buildSearchRequest(
+                aggregate,
+                commandId,
+                command,
+                enumerandPlan,
             );
-        } finally {
-            this.#parentReadController.unregister(request.sessionId);
+            this.#parentReadController.register(request);
+            try {
+                proposalEffect = await this.#executeEffect(
+                    {
+                        kind: "sdk-proposal",
+                        commandId,
+                        round: command.round,
+                        slotIndex: command.slotIndex,
+                        model: command.model,
+                        operator: command.operator,
+                        sessionId: request.sessionId,
+                        candidateId: command.candidateId,
+                        seed: command.seed,
+                    },
+                    async (attemptId) => {
+                        const proposal = validateWorkerProposal(
+                            await workerPool.propose(request),
+                            request,
+                            { limits: this.#config.options.candidateLimits },
+                        );
+                        if (proposal.candidateId !== command.candidateId) {
+                            throw new CrucibleRuntimeError(
+                                RUNTIME_ERROR_CODES.WORKER_INVALID_CANDIDATE,
+                                "Worker proposal did not preserve the kernel-assigned candidate id",
+                                {
+                                    assignedCandidateId: command.candidateId,
+                                    proposedCandidateId: proposal.candidateId,
+                                },
+                            );
+                        }
+                        await this.#fault("after_proposal_response", {
+                            attemptId,
+                            command: {
+                                kind: "sdk-proposal",
+                                commandId,
+                                round: command.round,
+                                slotIndex: command.slotIndex,
+                                candidateId: command.candidateId,
+                                model: command.model,
+                            },
+                        });
+                        return proposal;
+                    },
+                    async (proposal, attemptId, logicalEffectKey) => {
+                        const artifact = this.#persistJsonArtifact({
+                            attemptId,
+                            kind: `proposal-${proposal.candidateId}`,
+                            value: {
+                                assignment: request.promptContext.assignment,
+                                promptContext: request.promptContext,
+                                promptContextHash: request.promptContextHash,
+                                proposal,
+                            },
+                            contentType: "application/vnd.crucible.candidate-proposal+json",
+                        });
+                        this.#ingestOperationalEvidence({
+                            attemptId,
+                            evidenceKind: `proposal:${proposal.candidateId}`,
+                            kind: "runtime:model_proposal",
+                            payload: {
+                                commandId,
+                                logicalEffectKey,
+                                round: command.round,
+                                slotIndex: command.slotIndex,
+                                candidateId: proposal.candidateId,
+                                model: command.model,
+                                operator: command.operator,
+                                parentEvidenceIds: command.parentEvidenceIds,
+                                promptContextRefs: command.promptContextRefs,
+                                seed: command.seed,
+                                identity: proposal.identity ?? null,
+                                promptContextHash: request.promptContextHash,
+                                artifactId: artifact.artifactId,
+                                ...(enumerandPlan === null
+                                    ? {}
+                                    : {
+                                        enumerandBindingHash:
+                                            enumerandPlan.bindingHash,
+                                    }),
+                            },
+                        });
+                        return {
+                            proposalArtifact: artifact,
+                            promptContextHash: request.promptContextHash,
+                        };
+                    },
+                    async (committed, logicalEffectKey) =>
+                        this.#recoverProposalEffect({
+                            committed,
+                            logicalEffectKey,
+                            request,
+                            commandId,
+                            assignment: command,
+                        }),
+                );
+            } finally {
+                this.#parentReadController.unregister(request.sessionId);
+            }
         }
 
         const proposal = proposalEffect.result;
@@ -3186,15 +3359,26 @@ export class AutonomousRunner {
             );
         }
         const annotations = proposal.annotations;
-        const persistedSnapshot = this.#loadPersistedCandidateSnapshot({
-            commandId,
-            command,
-            proposal,
-        });
-        const snapshot = persistedSnapshot === null
-            ? this.#ingestCandidate(proposal, mainAttemptId)
-            : { snapshot: persistedSnapshot.snapshotId };
+        const persistedSnapshot = finiteEnumerand
+            ? null
+            : this.#loadPersistedCandidateSnapshot({
+                commandId,
+                command,
+                proposal,
+            });
+        const snapshot = finiteEnumerand
+            ? { snapshot: enumerandPlan.execution.artifactSnapshotHash }
+            : persistedSnapshot === null
+                ? this.#ingestCandidate(proposal, mainAttemptId)
+                : { snapshot: persistedSnapshot.snapshotId };
         const candidateArtifactHash = measurementSnapshotHash(snapshot.snapshot);
+        if (finiteEnumerand) {
+            assertFiniteEnumerandSnapshot(
+                enumerandPlan,
+                snapshot.snapshot,
+                candidateArtifactHash,
+            );
+        }
         this.#persistCandidateSnapshot({
             attemptId: mainAttemptId,
             commandId,
@@ -3257,6 +3441,7 @@ export class AutonomousRunner {
                     },
                     async (attemptId) => {
                         return this.#runHarnessMeasurement({
+                            harnessRole: "search",
                             candidateSnapshot: materialized.candidateSnapshot,
                             attemptId,
                             runnerEpochId: this.#config.runnerEpochId,
@@ -3345,7 +3530,360 @@ export class AutonomousRunner {
         };
     }
 
-    #buildSearchRequest(aggregate, commandId, command) {
+    #prepareFiniteEnumerandProposal({
+        aggregate,
+        commandId,
+        attemptId,
+        command,
+        enumerandPlan,
+    }) {
+        const archive = buildCandidateArchive(aggregate);
+        const { context: promptContext, hash: promptContextHash } = buildPromptContext({
+            contract: aggregate.contract,
+            archive,
+            plateau: detectPlateau(aggregate),
+            slot: command,
+        });
+        const proposal = immutableCanonical({
+            candidateId: command.candidateId,
+            annotations: {
+                mechanism:
+                    `Frozen finite enumerand ordinal ${enumerandPlan.binding.ordinal} `
+                    + "evaluated directly from its staged snapshot.",
+                hypothesis: null,
+                expectedEffects: [],
+                citedEvidenceIds: [],
+                finding: null,
+                ...(command.hypotheses === undefined
+                    ? {}
+                    : { hypotheses: command.hypotheses }),
+            },
+            files: [],
+            identity: {
+                source: "frozen_enumerand_manifest",
+                enumerandBindingHash: enumerandPlan.bindingHash,
+            },
+        });
+        const existing = this.#adapter.listOperationalEvidence().filter((event) =>
+            event.kind === "runtime:enumerand_selection"
+            && event.payload?.commandId === commandId
+            && event.payload?.candidateId === command.candidateId);
+        if (existing.length > 1) {
+            throw new RuntimeIntegrityError(
+                "More than one finite-enumerand selection exists for one command",
+                { commandId, candidateId: command.candidateId },
+            );
+        }
+        if (existing.length === 1) {
+            const payload = existing[0].payload;
+            if (payload.enumerandBindingHash !== enumerandPlan.bindingHash
+                || payload.snapshotId
+                    !== enumerandPlan.execution.artifactSnapshotHash
+                || payload.promptContextHash !== promptContextHash) {
+                throw new RuntimeIntegrityError(
+                    "Persisted finite-enumerand selection does not match the frozen command",
+                    { commandId, candidateId: command.candidateId },
+                );
+            }
+            const value = this.#readRegisteredJsonArtifact(
+                payload.artifactId,
+                "Persisted finite-enumerand selection",
+            );
+            if (!canonicalEqual(value.assignment, promptContext.assignment)
+                || !canonicalEqual(value.promptContext, promptContext)
+                || value.promptContextHash !== promptContextHash
+                || !canonicalEqual(value.enumerand, enumerandPlan.binding)
+                || !canonicalEqual(value.proposal, proposal)) {
+                throw new RuntimeIntegrityError(
+                    "Persisted finite-enumerand selection artifact is inconsistent",
+                    { commandId, artifactId: payload.artifactId },
+                );
+            }
+            return {
+                request: {
+                    promptContext,
+                    promptContextHash,
+                },
+                result: proposal,
+                persisted: {
+                    proposalArtifact: this.#registeredArtifactRef(
+                        payload.artifactId,
+                        "Persisted finite-enumerand selection",
+                    ).artifact,
+                    promptContextHash,
+                },
+            };
+        }
+        const artifact = this.#persistJsonArtifact({
+            attemptId,
+            kind: `enumerand-selection-${command.candidateId}`,
+            value: {
+                assignment: promptContext.assignment,
+                promptContext,
+                promptContextHash,
+                enumerand: enumerandPlan.binding,
+                proposal,
+            },
+            contentType: "application/vnd.crucible.enumerand-selection+json",
+        });
+        this.#ingestOperationalEvidence({
+            attemptId,
+            evidenceKind: `enumerand-selection:${command.candidateId}`,
+            kind: "runtime:enumerand_selection",
+            payload: {
+                commandId,
+                round: command.round,
+                slotIndex: command.slotIndex,
+                candidateId: command.candidateId,
+                enumerandOrdinal: enumerandPlan.binding.ordinal,
+                enumerandHash: enumerandPlan.binding.enumerandHash,
+                enumerandManifestRoot: enumerandPlan.binding.manifestRoot,
+                enumerandBindingHash: enumerandPlan.bindingHash,
+                snapshotId: enumerandPlan.execution.artifactSnapshotHash,
+                promptContextHash,
+                artifactId: artifact.artifactId,
+            },
+        });
+        return {
+            request: {
+                promptContext,
+                promptContextHash,
+            },
+            result: proposal,
+            persisted: {
+                proposalArtifact: artifact,
+                promptContextHash,
+            },
+        };
+    }
+
+    async #prepareBoundedEnumerandProposal({
+        aggregate,
+        commandId,
+        attemptId,
+        command,
+        enumerandPlan,
+    }) {
+        const archive = buildCandidateArchive(aggregate);
+        const { context: promptContext, hash: promptContextHash } = buildPromptContext({
+            contract: aggregate.contract,
+            archive,
+            plateau: detectPlateau(aggregate),
+            slot: command,
+        });
+        const generationRequest = immutableCanonical({
+            candidateId: command.candidateId,
+            commandId,
+            round: command.round,
+            slotIndex: command.slotIndex,
+            enumerandBinding: enumerandPlan.binding,
+            enumerandBindingHash: enumerandPlan.bindingHash,
+            parameterTuple: enumerandPlan.execution.parameterTuple,
+            parameterTupleHash: enumerandPlan.execution.parameterTupleHash,
+            promptContext,
+            promptContextHash,
+        });
+        const challengeNonce = stableHex({
+            investigationId: this.#config.investigationId,
+            contractHash: aggregate.contractHash,
+            commandId,
+            enumerandBindingHash: enumerandPlan.bindingHash,
+        });
+        const candidateOptions = {
+            challengeNonce,
+            allowedCandidateIds: [command.candidateId],
+            visibleEvidenceIds: command.promptContextRefs,
+            observableRegistry: aggregate.contract.observableRegistry ?? [],
+            hypothesisPolicy: aggregate.contract.hypothesisPolicy ?? {},
+            assignedParentEvidenceIds: command.parentEvidenceIds,
+            enumerandBinding: enumerandPlan.binding,
+            trustedParameterizedGenerator: true,
+            limits: this.#config.options.candidateLimits,
+        };
+        const existing = this.#adapter.listOperationalEvidence().filter((event) =>
+            event.kind === "runtime:enumerand_generation"
+            && event.payload?.commandId === commandId
+            && event.payload?.candidateId === command.candidateId);
+        if (existing.length > 1) {
+            throw new RuntimeIntegrityError(
+                "More than one parameterized-enumerand generation exists for one command",
+                { commandId, candidateId: command.candidateId },
+            );
+        }
+        if (existing.length === 1) {
+            const payload = existing[0].payload;
+            if (payload.enumerandBindingHash !== enumerandPlan.bindingHash
+                || payload.parameterTupleHash
+                    !== enumerandPlan.execution.parameterTupleHash
+                || payload.promptContextHash !== promptContextHash) {
+                throw new RuntimeIntegrityError(
+                    "Persisted parameterized generation does not match the frozen tuple",
+                    { commandId, candidateId: command.candidateId },
+                );
+            }
+            const value = this.#readRegisteredJsonArtifact(
+                payload.artifactId,
+                "Persisted parameterized-enumerand generation",
+            );
+            if (!canonicalEqual(value.assignment, promptContext.assignment)
+                || !canonicalEqual(value.promptContext, promptContext)
+                || value.promptContextHash !== promptContextHash
+                || !canonicalEqual(value.generationRequest, generationRequest)) {
+                throw new RuntimeIntegrityError(
+                    "Persisted parameterized generation artifact is inconsistent",
+                    { commandId, artifactId: payload.artifactId },
+                );
+            }
+            const persistedProposal = value.proposal;
+            if (persistedProposal?.identity?.source
+                    !== "trusted_parameterized_generator"
+                || persistedProposal.identity.enumerandBindingHash
+                    !== enumerandPlan.bindingHash) {
+                throw new RuntimeIntegrityError(
+                    "Persisted parameterized proposal identity is invalid",
+                    { commandId, artifactId: payload.artifactId },
+                );
+            }
+            const candidate = validateCandidateSubmission({
+                challenge: challengeNonce,
+                candidateId: persistedProposal.candidateId,
+                annotations: persistedProposal.annotations,
+                files: persistedProposal.files,
+            }, candidateOptions);
+            const expectedProposal = immutableCanonical({
+                ...candidate,
+                identity: {
+                    source: "trusted_parameterized_generator",
+                    enumerandBindingHash: enumerandPlan.bindingHash,
+                    generatedPayloadHash: hashCanonical(
+                        candidate,
+                        "sha256:crucible-parameterized-candidate-v1",
+                    ),
+                },
+            });
+            if (!canonicalEqual(persistedProposal, expectedProposal)) {
+                throw new RuntimeIntegrityError(
+                    "Persisted parameterized proposal payload is invalid",
+                    { commandId, artifactId: payload.artifactId },
+                );
+            }
+            return {
+                request: {
+                    promptContext,
+                    promptContextHash,
+                },
+                result: expectedProposal,
+                persisted: {
+                    proposalArtifact: this.#registeredArtifactRef(
+                        payload.artifactId,
+                        "Persisted parameterized-enumerand generation",
+                    ).artifact,
+                    promptContextHash,
+                },
+            };
+        }
+        const generator = this.#dependencies.parameterizedCandidateGenerator;
+        if (typeof generator !== "function") {
+            throw new RuntimeConfigError(
+                "bounded_parameterized enumerands require a trusted parameterizedCandidateGenerator",
+                {
+                    ordinal: enumerandPlan.binding.ordinal,
+                    enumerandHash: enumerandPlan.binding.enumerandHash,
+                },
+            );
+        }
+        const generated = await generator(generationRequest);
+        if (generated === null
+            || typeof generated !== "object"
+            || Array.isArray(generated)) {
+            throw new RuntimeIntegrityError(
+                "Trusted parameterized candidate generator returned a non-object",
+            );
+        }
+        const keys = Object.keys(generated).sort();
+        const expectedKeys = [
+            "annotations",
+            "candidateId",
+            "enumerandBindingHash",
+            "files",
+        ];
+        if (keys.length !== expectedKeys.length
+            || keys.some((key, index) => key !== expectedKeys[index])) {
+            throw new RuntimeIntegrityError(
+                "Parameterized generator output must contain exactly candidateId, annotations, files, and enumerandBindingHash",
+                { keys },
+            );
+        }
+        if (generated.enumerandBindingHash !== enumerandPlan.bindingHash) {
+            throw new RuntimeIntegrityError(
+                "Parameterized generator output is bound to a different enumerand",
+                {
+                    expected: enumerandPlan.bindingHash,
+                    actual: generated.enumerandBindingHash ?? null,
+                },
+            );
+        }
+        const candidate = validateCandidateSubmission({
+            challenge: challengeNonce,
+            candidateId: generated.candidateId,
+            annotations: generated.annotations,
+            files: generated.files,
+        }, candidateOptions);
+        const proposal = immutableCanonical({
+            ...candidate,
+            identity: {
+                source: "trusted_parameterized_generator",
+                enumerandBindingHash: enumerandPlan.bindingHash,
+                generatedPayloadHash: hashCanonical(
+                    candidate,
+                    "sha256:crucible-parameterized-candidate-v1",
+                ),
+            },
+        });
+        const artifact = this.#persistJsonArtifact({
+            attemptId,
+            kind: `enumerand-generation-${command.candidateId}`,
+            value: {
+                assignment: promptContext.assignment,
+                promptContext,
+                promptContextHash,
+                generationRequest,
+                proposal,
+            },
+            contentType: "application/vnd.crucible.enumerand-generation+json",
+        });
+        this.#ingestOperationalEvidence({
+            attemptId,
+            evidenceKind: `enumerand-generation:${command.candidateId}`,
+            kind: "runtime:enumerand_generation",
+            payload: {
+                commandId,
+                round: command.round,
+                slotIndex: command.slotIndex,
+                candidateId: command.candidateId,
+                enumerandOrdinal: enumerandPlan.binding.ordinal,
+                enumerandHash: enumerandPlan.binding.enumerandHash,
+                enumerandManifestRoot: enumerandPlan.binding.manifestRoot,
+                enumerandBindingHash: enumerandPlan.bindingHash,
+                parameterTupleHash: enumerandPlan.execution.parameterTupleHash,
+                promptContextHash,
+                artifactId: artifact.artifactId,
+            },
+        });
+        return {
+            request: {
+                promptContext,
+                promptContextHash,
+            },
+            result: proposal,
+            persisted: {
+                proposalArtifact: artifact,
+                promptContextHash,
+            },
+        };
+    }
+
+    #buildSearchRequest(aggregate, commandId, command, enumerandPlan = null) {
         const contract = aggregate.contract;
         const archive = buildCandidateArchive(aggregate);
         const promptRefSet = new Set(command.promptContextRefs);
@@ -3412,8 +3950,12 @@ export class AutonomousRunner {
             parentReadToolAvailable: parents.length > 0,
             parentReadLimits,
             trustedOperatorContext: this.#config.options.workerAdditionalContext,
+            observableRegistry: contract.observableRegistry,
+            hypothesisPolicy: contract.hypothesisPolicy,
+            assignedParentEvidenceIds: command.parentEvidenceIds,
+            enumerandBinding: enumerandPlan?.binding ?? null,
         });
-        return Object.freeze({
+        const request = Object.freeze({
             candidateId: command.candidateId,
             round: command.round,
             slotIndex: command.slotIndex,
@@ -3422,6 +3964,11 @@ export class AutonomousRunner {
             parentEvidenceIds: Object.freeze([...command.parentEvidenceIds]),
             promptContextRefs: Object.freeze([...command.promptContextRefs]),
             visibleEvidenceIds: Object.freeze([...command.promptContextRefs]),
+            observableRegistry: contract.observableRegistry,
+            hypothesisPolicy: contract.hypothesisPolicy,
+            assignedParentEvidenceIds: Object.freeze([
+                ...command.parentEvidenceIds,
+            ]),
             seed: command.seed,
             boundedCandidateId: command.boundedCandidateId ?? null,
             promptContext,
@@ -3436,9 +3983,19 @@ export class AutonomousRunner {
             sessionId,
             challengeNonce,
             allowedCandidateIds: Object.freeze([command.candidateId]),
+            ...(enumerandPlan === null
+                ? {}
+                : {
+                    enumerandBinding: enumerandPlan.binding,
+                    enumerandBindingHash: enumerandPlan.bindingHash,
+                }),
             prompt,
             parentReadAuthority: this.#parentReadController.authority,
         });
+        if (enumerandPlan?.execution?.kind === "bounded_parameter_generation") {
+            assertBoundedEnumerandRequest(enumerandPlan, request);
+        }
+        return request;
     }
 
     #persistCandidateSnapshot({
@@ -3464,6 +4021,11 @@ export class AutonomousRunner {
                 || payload.slotIndex !== command.slotIndex
                 || payload.snapshotId !== snapshotId
                 || payload.candidateArtifactHash !== candidateArtifactHash
+                || (command.enumerand !== undefined
+                    && (payload.enumerandOrdinal !== command.enumerand.ordinal
+                        || payload.enumerandHash !== command.enumerand.enumerandHash
+                        || payload.enumerandManifestRoot
+                            !== command.enumerand.manifestRoot))
                 || payload.artifactId
                     !== payload.snapshotProvenance?.manifestArtifact?.artifactId) {
                 throw new RuntimeIntegrityError(
@@ -3493,6 +4055,13 @@ export class AutonomousRunner {
                 candidateId: command.candidateId,
                 snapshotId,
                 candidateArtifactHash,
+                ...(command.enumerand === undefined
+                    ? {}
+                    : {
+                        enumerandOrdinal: command.enumerand.ordinal,
+                        enumerandHash: command.enumerand.enumerandHash,
+                        enumerandManifestRoot: command.enumerand.manifestRoot,
+                    }),
                 artifactId: snapshotProvenance.manifestArtifact.artifactId,
                 snapshotProvenance,
             },
@@ -3520,6 +4089,11 @@ export class AutonomousRunner {
             || typeof payload.snapshotId !== "string"
             || payload.candidateArtifactHash
                 !== measurementSnapshotHash(payload.snapshotId)
+            || (command.enumerand !== undefined
+                && (payload.enumerandOrdinal !== command.enumerand.ordinal
+                    || payload.enumerandHash !== command.enumerand.enumerandHash
+                    || payload.enumerandManifestRoot
+                        !== command.enumerand.manifestRoot))
             || payload.artifactId
                 !== payload.snapshotProvenance?.manifestArtifact?.artifactId) {
             throw new RuntimeIntegrityError(
@@ -3583,6 +4157,7 @@ export class AutonomousRunner {
 
         const verifiedEntry = this.#validateHarnessContract(
             aggregate.contract,
+            "search",
         ).verifiedEntry;
         const expectedDependencies = verifiedEntry.dependencies
             .map((dependency) => ({
@@ -3607,7 +4182,8 @@ export class AutonomousRunner {
                 || payload.receipt.allowlistFileHash !== verifiedEntry.allowlistFileHash
                 || payload.receipt.harnessEntryHash !== verifiedEntry.entryHash
                 || payload.receipt.executableHash !== verifiedEntry.executableHash
-                || payload.receipt.parserVersion !== aggregate.contract.parserVersion
+                || payload.receipt.parserVersion
+                    !== aggregate.contract.harnessSuite.roles.search.parser.version
                 || !receiptHasVerifiedSnapshotBytes(
                     payload.receipt,
                     candidateArtifactHash,

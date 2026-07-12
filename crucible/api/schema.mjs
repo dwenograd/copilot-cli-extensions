@@ -13,9 +13,17 @@
 import {
     CONTRACT_LIMITS,
     DEFAULT_SEARCH_POLICY,
+    GOAL_MODES,
     HYPOTHESIS_TOPOLOGIES,
+    MISSINGNESS_MODES,
     SEARCH_POLICY_LIMITS,
+    STATISTICAL_METRIC_DIRECTIONS,
+    STATISTICAL_POLICY_VERSION,
 } from "../domain/constants.mjs";
+import {
+    HYPOTHESIS_LIMITS,
+    PREDICTION_KINDS,
+} from "../domain/hypotheses.mjs";
 import { STRICT_ISO_TIMESTAMP_PATTERN_SOURCE } from "../runtime/config-validation.mjs";
 import { SchemaValidationError } from "./errors.mjs";
 
@@ -453,10 +461,6 @@ function discriminatedObjectUnion({
 // --- the four public tool specs -------------------------------------------
 
 const searchPolicyShape = object({
-    stopOnFirstAccept: boolean({
-        description: "If true, the first accepted candidate terminates immediately.",
-        default: DEFAULT_SEARCH_POLICY.stopOnFirstAccept,
-    }),
     plateauWindow: integer({
         description: "Consecutive completed non-improving rounds required to detect a plateau.",
         minimum: 1,
@@ -551,70 +555,366 @@ const searchPolicyField = makeField({
 
 const investigationIdField = identifier({
     description:
-        "The investigationId returned by crucible_start. Deterministic slug + SHA-256 suffix; resolves to local state under the Crucible state root.",
+        "The investigationId returned by crucible_start. Deterministic v4-namespaced slug + SHA-256 suffix; resolves to local state under the Crucible state root.",
 });
-
-const validationCaseShape = object({
-    id: lowerIdentifier({ description: "Stable lowercase id for this validation case." }),
-    expectation: enumField(["accept", "reject"], {
-        description: "Whether the harness must accept or reject this case.",
-    }),
-    path: string({
-        description: "Local directory path (inside project_dir) staged immutably during preflight; only its content hash enters the contract.",
-        maxLength: 32767,
-    }),
-});
-
-const validationCasesArray = array(validationCaseShape, {
+const experimentIdField = lowerIdentifier({
     description:
-        "At least one accept and one reject case. Paths are snapshot-staged in an isolated preflight store; symlinks/traversal are refused.",
-    minItems: 2,
-    maxItems: CONTRACT_LIMITS.validationCases,
-    uniqueBy: "id",
+        "An operator-preapproved experiment id from the local Crucible experiment registry.",
 });
 
-const validationCasesField = makeField({
+function jsonValueField({ description, arrayOnly = false } = {}) {
+    return makeField({
+        jsonSchema: commonOptions(arrayOnly ? { type: "array" } : {}, { description }),
+        parse(value, pathLabel) {
+            if (arrayOnly && !Array.isArray(value)) {
+                fail(pathLabel, "must be an array");
+            }
+            let encoded;
+            try {
+                encoded = JSON.stringify(value);
+            } catch {
+                fail(pathLabel, "must be JSON-serializable");
+            }
+            if (encoded === undefined) {
+                fail(pathLabel, "must be a JSON value");
+            }
+            return structuredClone(value);
+        },
+    });
+}
+
+function taggedHashField({ description } = {}) {
+    return string({
+        description,
+        maxLength: 256,
+        pattern: "^sha256:[a-z0-9][a-z0-9._-]*:[a-f0-9]{64}$",
+    });
+}
+
+function snapshotHashField({ description } = {}) {
+    return string({
+        description,
+        maxLength: 71,
+        pattern: "^sha256:[a-f0-9]{64}$",
+    });
+}
+
+function discriminatedField(discriminant, alternatives, description) {
+    const byValue = new Map(alternatives.map((item) => [item.value, item.shape]));
+    const jsonSchema = {
+        oneOf: alternatives.map((item) => item.shape.jsonSchema),
+        ...(description === undefined ? {} : { description }),
+    };
+    return makeField({
+        jsonSchema,
+        parse(value, pathLabel) {
+            if (!isPlainObject(value)) {
+                fail(pathLabel, "must be a JSON object");
+            }
+            const selected = byValue.get(value[discriminant]);
+            if (selected === undefined) {
+                fail(
+                    `${pathLabel}.${discriminant}`,
+                    `must be one of ${[...byValue.keys()].join(", ")}`,
+                );
+            }
+            return selected.parse(value, pathLabel);
+        },
+    });
+}
+
+const categoricalValueField = makeField({
     jsonSchema: {
-        ...validationCasesArray.jsonSchema,
-        allOf: [
-            {
-                contains: {
-                    type: "object",
-                    properties: { expectation: { const: "accept" } },
-                    required: ["expectation"],
-                },
-            },
-            {
-                contains: {
-                    type: "object",
-                    properties: { expectation: { const: "reject" } },
-                    required: ["expectation"],
-                },
-            },
+        oneOf: [
+            { type: "string", minLength: 1, maxLength: HYPOTHESIS_LIMITS.categoryCharacters },
+            { type: "boolean" },
         ],
     },
     parse(value, pathLabel) {
-        const parsed = validationCasesArray.parse(value, pathLabel);
-        const expectations = new Set(parsed.map((item) => item.expectation));
-        if (!expectations.has("accept") || !expectations.has("reject")) {
-            fail(pathLabel, "must contain at least one accept and one reject case");
+        if (typeof value === "boolean") return value;
+        if (typeof value !== "string"
+            || value.length < 1
+            || value.length > HYPOTHESIS_LIMITS.categoryCharacters) {
+            fail(pathLabel, "must be a bounded string or boolean");
         }
-        return parsed;
+        return value;
     },
 });
 
-const newInvestigationStartShape = object({
+const observableRegistryItem = discriminatedField("kind", [
+    {
+        value: "numeric",
+        shape: object({
+            key: identifier(),
+            kind: enumField(["numeric"]),
+            minimum: number(),
+            maximum: number(),
+        }),
+    },
+    {
+        value: "categorical",
+        shape: object({
+            key: identifier(),
+            kind: enumField(["categorical"]),
+            values: array(categoricalValueField, {
+                minItems: 1,
+                maxItems: HYPOTHESIS_LIMITS.maxCategoriesPerObservable,
+                uniqueItems: true,
+            }),
+        }),
+    },
+], "Frozen observables available to preregistered worker predictions.");
+
+const observableRegistryField = array(observableRegistryItem, {
+    minItems: 1,
+    maxItems: HYPOTHESIS_LIMITS.maxObservableRegistryEntries,
+    uniqueBy: "key",
+});
+
+const hypothesisPolicyField = object({
+    required: boolean(),
+    maxPredictions: integer({
+        minimum: 1,
+        maximum: HYPOTHESIS_LIMITS.maxPredictions,
+    }),
+    allowedKinds: array(enumField(PREDICTION_KINDS), {
+        minItems: 1,
+        maxItems: PREDICTION_KINDS.length,
+        uniqueItems: true,
+    }),
+    allowRequiredForResult: boolean(),
+});
+
+const finiteEnumerandEntry = object({
+    id: identifier(),
+    ordinal: integer({
+        minimum: 0,
+        maximum: CONTRACT_LIMITS.boundedCandidateIds - 1,
+    }),
+    artifactSnapshotHash: snapshotHashField({
+        description:
+            "Snapshot already present in the durable operator case/enumerand store; preflight verifies and stages it.",
+    }),
+    hypotheses: rawObject({
+        description:
+            "Optional operator-frozen typed hypotheses for this enumerand. Required on every enumerand when hypothesis_policy.required is true.",
+        optional: true,
+        maxBytes: HYPOTHESIS_LIMITS.hypothesesBytes,
+    }),
+});
+
+const boundedEnumerandEntry = object({
+    id: identifier(),
+    ordinal: integer({
+        minimum: 0,
+        maximum: CONTRACT_LIMITS.boundedCandidateIds - 1,
+    }),
+    parameterTuple: jsonValueField({
+        description: "Canonical finite parameter tuple for this enumerand.",
+        arrayOnly: true,
+    }),
+    hypotheses: rawObject({
+        description:
+            "Optional operator-frozen typed hypotheses for this enumerand. Required on every enumerand when hypothesis_policy.required is true.",
+        optional: true,
+        maxBytes: HYPOTHESIS_LIMITS.hypothesesBytes,
+    }),
+});
+
+const manifestControlField = discriminatedField("kind", [
+    {
+        value: "enumerand",
+        shape: object({
+            kind: enumField(["enumerand"]),
+            ordinal: integer({
+                minimum: 0,
+                maximum: CONTRACT_LIMITS.boundedCandidateIds - 1,
+            }),
+        }),
+    },
+    {
+        value: "snapshot",
+        shape: object({
+            kind: enumField(["snapshot"]),
+            snapshotHash: snapshotHashField(),
+        }),
+    },
+], "A frozen enumerand or durable operator-owned snapshot control.");
+
+const finiteEnumerandManifestShape = object({
+    topology: enumField(["finite_enumerable"]),
+    entries: array(finiteEnumerandEntry, {
+        minItems: 1,
+        maxItems: CONTRACT_LIMITS.boundedCandidateIds,
+        uniqueBy: "id",
+    }),
+    control: manifestControlField,
+});
+
+const boundedEnumerandManifestShape = object({
+    topology: enumField(["bounded_parameterized"]),
+    entries: array(boundedEnumerandEntry, {
+        minItems: 1,
+        maxItems: CONTRACT_LIMITS.boundedCandidateIds,
+        uniqueBy: "id",
+    }),
+    control: manifestControlField,
+});
+
+const enumerandManifestField = discriminatedField("topology", [
+    { value: "finite_enumerable", shape: finiteEnumerandManifestShape },
+    { value: "bounded_parameterized", shape: boundedEnumerandManifestShape },
+], "Complete immutable enumerand manifest. Labels-only candidate-id lists are forbidden.");
+const optionalEnumerandManifestField = makeField({
+    ...enumerandManifestField,
+    optional: true,
+});
+
+const statisticalMetricShape = object({
+    key: identifier(),
+    minimum: number(),
+    maximum: number(),
+    estimand: string({ maxLength: 256, maxBytes: 512 }),
+    unit: string({ maxLength: 128, maxBytes: 256 }),
+    direction: enumField(STATISTICAL_METRIC_DIRECTIONS),
+    acceptanceThreshold: number(),
+    practicalEquivalenceDelta: number({ minimum: Number.MIN_VALUE }),
+    family: identifier(),
+});
+
+const familyAllocationShape = object({
+    family: identifier(),
+    alpha: number({ minimum: Number.MIN_VALUE, maximum: 1 }),
+});
+
+const controlToleranceShape = object({
+    metric: identifier(),
+    absolute: number({ minimum: 0 }),
+    relative: number({ minimum: 0, maximum: 1 }),
+});
+
+const statisticalControlField = discriminatedField("kind", [
+    {
+        value: "enumerand",
+        shape: object({
+            kind: enumField(["enumerand"]),
+            tolerances: array(controlToleranceShape, {
+                minItems: 1,
+                maxItems: CONTRACT_LIMITS.metrics,
+                uniqueBy: "metric",
+            }),
+        }),
+    },
+    {
+        value: "snapshot",
+        shape: object({
+            kind: enumField(["snapshot"]),
+            identity: snapshotHashField(),
+            tolerances: array(controlToleranceShape, {
+                minItems: 1,
+                maxItems: CONTRACT_LIMITS.metrics,
+                uniqueBy: "metric",
+            }),
+        }),
+    },
+], "Control identity and per-metric drift tolerances.");
+
+const statisticalPolicyField = object({
+    version: enumField([STATISTICAL_POLICY_VERSION]),
+    goalMode: enumField(GOAL_MODES),
+    metrics: array(statisticalMetricShape, {
+        minItems: 1,
+        maxItems: CONTRACT_LIMITS.metrics,
+        uniqueBy: "key",
+    }),
+    investigationAlpha: number({
+        minimum: Number.MIN_VALUE,
+        maximum: 1 - Number.EPSILON,
+    }),
+    familyAllocations: array(familyAllocationShape, {
+        minItems: 1,
+        maxItems: CONTRACT_LIMITS.statisticalFamilies,
+        uniqueBy: "family",
+    }),
+    minBlocks: integer({ minimum: 1, maximum: CONTRACT_LIMITS.maxBlocks }),
+    maxBlocks: integer({ minimum: 1, maximum: CONTRACT_LIMITS.maxBlocks }),
+    control: statisticalControlField,
+    missingness: object({
+        mode: enumField(MISSINGNESS_MODES),
+        maxMissingPerBlock: integer({
+            minimum: 0,
+            maximum: CONTRACT_LIMITS.maxStatisticalEvaluations,
+        }),
+        maxMissingFraction: number({ minimum: 0, maximum: 1 }),
+    }),
+    deterministicBlockSeed: string({ maxLength: 256, maxBytes: 512 }),
+    maxConfirmations: integer({
+        minimum: 1,
+        maximum: CONTRACT_LIMITS.maxConfirmations,
+    }),
+    evaluationBudget: object({
+        maxCandidateEvaluations: integer({
+            minimum: 1,
+            maximum: CONTRACT_LIMITS.maxStatisticalEvaluations,
+        }),
+        maxControlEvaluations: integer({
+            minimum: 1,
+            maximum: CONTRACT_LIMITS.maxStatisticalEvaluations,
+        }),
+        maxTotalEvaluations: integer({
+            minimum: 1,
+            maximum: CONTRACT_LIMITS.maxStatisticalEvaluations,
+        }),
+    }),
+    resourceBudget: object({
+        perAttemptOutputBytes: integer({
+            minimum: 1,
+            maximum: CONTRACT_LIMITS.maxResourceBytes,
+        }),
+        perInvestigationOutputBytes: integer({
+            minimum: 1,
+            maximum: CONTRACT_LIMITS.maxResourceBytes,
+        }),
+        perAttemptReceiptBytes: integer({
+            minimum: 1,
+            maximum: CONTRACT_LIMITS.maxResourceBytes,
+        }),
+        perInvestigationReceiptBytes: integer({
+            minimum: 1,
+            maximum: CONTRACT_LIMITS.maxResourceBytes,
+        }),
+        perAttemptCasBytes: integer({
+            minimum: 1,
+            maximum: CONTRACT_LIMITS.maxResourceBytes,
+        }),
+        perInvestigationCasBytes: integer({
+            minimum: 1,
+            maximum: CONTRACT_LIMITS.maxResourceBytes,
+        }),
+    }),
+});
+
+const operatorExperimentConfigShape = object({
+        experiment_id: experimentIdField,
         objective: string({
             description: "The falsifiable objective under investigation. Part of the deterministic investigationId.",
             maxLength: MAX_OBJECTIVE_CHARACTERS,
             maxBytes: MAX_OBJECTIVE_BYTES,
         }),
         project_dir: string({
-            description: "Absolute local project directory. Validation-case paths must resolve inside it. Part of the deterministic investigationId.",
+            description: "Absolute local project directory identifying the investigation scope. Part of the deterministic investigationId.",
             maxLength: 32767,
         }),
-        harness_id: lowerIdentifier({
-            description: "Id of an operator-owned harness allowlist entry (the terminal measurement authority). Must already exist in the allowlist; never a path or command.",
+        harness_suite_id: lowerIdentifier({
+            description:
+                "Id of an operator-owned durable HarnessSuiteV4. Preflight freezes its complete suite identity and role corpus.",
+        }),
+        harness_suite_identity: string({
+            description:
+                "Optional expected HarnessSuiteV4 identity. Configuration fails if the allowlisted suite does not match it.",
+            maxLength: 256,
+            pattern: "^sha256:crucible-harness-suite-v4:[a-f0-9]{64}$",
+            optional: true,
         }),
         acceptance_predicate: rawObject({
             description: "Acceptance-predicate grammar object (harness_pass / metric_compare / field_equals / all / any / not ...). Validated by the domain contract.",
@@ -622,28 +922,12 @@ const newInvestigationStartShape = object({
         }),
         hypothesis_topology: enumField(HYPOTHESIS_TOPOLOGIES, {
             description:
-                "Search topology. finite_enumerable/bounded_parameterized require bounded_candidate_ids. open_generative can never emit TARGET_UNREACHABLE. certified_impossibility runs the same allowlisted harness in verifier mode only after validation and every frozen search slot complete without an accepted candidate; the harness must recognize crucible-impossibility-request.json and return a certificate verdict.",
+                "Search topology. Finite/bounded starts require enumerand_manifest. Open generative is non-exhaustible. Certified impossibility additionally requires the suite verifier role.",
         }),
-        validation_cases: validationCasesField,
-        metrics: array(
-            object({
-                key: identifier({ description: "Metric key as emitted by the harness." }),
-                direction: enumField(["min", "max"], {
-                    description: "min = lower is better; max = higher is better.",
-                }),
-                epsilon: number({
-                    description: "Optional non-negative tie tolerance.",
-                    minimum: 0,
-                    optional: true,
-                }),
-            }),
-            {
-                description: "Ranking metrics the harness emits. Order = priority.",
-                maxItems: CONTRACT_LIMITS.metrics,
-                uniqueBy: "key",
-                default: [],
-            },
-        ),
+        enumerand_manifest: optionalEnumerandManifestField,
+        observable_registry: observableRegistryField,
+        hypothesis_policy: hypothesisPolicyField,
+        statistical_policy: statisticalPolicyField,
         worker_models: array(
             identifier({ description: "A proposer/worker model id." }),
             {
@@ -665,23 +949,6 @@ const newInvestigationStartShape = object({
             maximum: CONTRACT_LIMITS.maxRounds,
         }),
         search_policy: searchPolicyField,
-        bounded_candidate_ids: array(
-            identifier({ description: "A declared candidate id for a finite/bounded search space." }),
-            {
-                description: "Required exhaustive candidate id set for finite_enumerable / bounded_parameterized topologies.",
-                minItems: 1,
-                maxItems: CONTRACT_LIMITS.boundedCandidateIds,
-                uniqueItems: true,
-                optional: true,
-            },
-        ),
-        deadline_iso: string({
-            description: "Optional wall-clock ISO-8601 deadline for the run.",
-            maxLength: 64,
-            pattern: STRICT_ISO_TIMESTAMP_PATTERN_SOURCE,
-            format: "date-time",
-            optional: true,
-        }),
     });
 
 const BOUNDED_HYPOTHESIS_TOPOLOGIES = Object.freeze([
@@ -695,36 +962,78 @@ const boundedTopologySchemaRule = Object.freeze({
         },
         required: ["hypothesis_topology"],
     },
-    then: { required: ["bounded_candidate_ids"] },
-    else: { not: { required: ["bounded_candidate_ids"] } },
+    then: { required: ["enumerand_manifest"] },
+    else: { not: { required: ["enumerand_manifest"] } },
 });
-const newInvestigationStartSchema = Object.freeze({
-    ...newInvestigationStartShape.jsonSchema,
+const operatorExperimentConfigSchema = Object.freeze({
+    ...operatorExperimentConfigShape.jsonSchema,
     allOf: [boundedTopologySchemaRule],
 });
-const newInvestigationStartArgs = Object.freeze({
-    ...newInvestigationStartShape,
-    jsonSchema: newInvestigationStartSchema,
-    toJsonSchema: () => structuredClone(newInvestigationStartSchema),
+export const operatorExperimentConfigSpec = Object.freeze({
+    name: "configure_experiment",
+    description:
+        "Strict operator-only authoring schema for a preapproved Crucible v4 experiment.",
+    parameters: structuredClone(operatorExperimentConfigSchema),
+    parse(rawArgs) {
+        return operatorExperimentConfigArgs.parse(rawArgs);
+    },
+});
+const operatorExperimentConfigArgs = Object.freeze({
+    ...operatorExperimentConfigShape,
+    jsonSchema: operatorExperimentConfigSchema,
+    toJsonSchema: () => structuredClone(operatorExperimentConfigSchema),
     parse(rawArgs, pathLabel = "args") {
-        const parsed = newInvestigationStartShape.parse(rawArgs, pathLabel);
-        const requiresBoundedIds = BOUNDED_HYPOTHESIS_TOPOLOGIES.includes(
+        const parsed = operatorExperimentConfigShape.parse(rawArgs, pathLabel);
+        const requiresManifest = BOUNDED_HYPOTHESIS_TOPOLOGIES.includes(
             parsed.hypothesis_topology,
         );
-        if (requiresBoundedIds && parsed.bounded_candidate_ids === undefined) {
+        if (requiresManifest && parsed.enumerand_manifest === undefined) {
             fail(
-                `${pathLabel}.bounded_candidate_ids`,
+                `${pathLabel}.enumerand_manifest`,
                 "is required for finite_enumerable and bounded_parameterized topologies",
             );
         }
-        if (!requiresBoundedIds && parsed.bounded_candidate_ids !== undefined) {
+        if (!requiresManifest && parsed.enumerand_manifest !== undefined) {
             fail(
-                `${pathLabel}.bounded_candidate_ids`,
+                `${pathLabel}.enumerand_manifest`,
                 "is only valid for finite_enumerable and bounded_parameterized topologies",
+            );
+        }
+        if (parsed.enumerand_manifest !== undefined
+            && parsed.enumerand_manifest.topology !== parsed.hypothesis_topology) {
+            fail(
+                `${pathLabel}.enumerand_manifest.topology`,
+                "must match hypothesis_topology",
+            );
+        }
+        if (parsed.statistical_policy.control.kind === "enumerand"
+            && parsed.enumerand_manifest?.control.kind !== "enumerand") {
+            fail(
+                `${pathLabel}.statistical_policy.control.kind`,
+                "enumerand control requires an enumerand manifest control",
+            );
+        }
+        if (!requiresManifest
+            && parsed.statistical_policy.control.kind !== "snapshot") {
+            fail(
+                `${pathLabel}.statistical_policy.control.kind`,
+                "non-enumerated investigations require a snapshot control",
             );
         }
         return parsed;
     },
+});
+
+const newInvestigationStartArgs = object({
+    experiment_id: experimentIdField,
+    deadline_iso: string({
+        description:
+            "Optional wall-clock ISO-8601 operational deadline for this run. It does not alter the preapproved experiment contract.",
+        maxLength: 64,
+        pattern: STRICT_ISO_TIMESTAMP_PATTERN_SOURCE,
+        format: "date-time",
+        optional: true,
+    }),
 });
 
 const reattachStartArgs = object({
@@ -749,27 +1058,27 @@ const crucibleStartArgs = discriminatedObjectUnion({
     absent: newInvestigationStartArgs,
     present: reattachStartArgs,
     description:
-        "Exactly one form is accepted: a complete new-investigation contract, or an investigation_id reattach with only an optional later deadline/reset policy.",
+        "Exactly one form is accepted: an operator-preapproved experiment_id, or an investigation_id reattach with only an optional later deadline/reset policy.",
 });
 
 export const crucibleStartSpec = defineTool({
     name: "crucible_start",
     description:
-        "Start a new persistent Crucible investigation, or reattach/resume one by investigation_id using its persisted contract/config/snapshots. All admission and harness checks complete before durable mutation. This is NOT a result — poll crucible_status and only crucible_result may emit a terminal decision.",
+        "Start a new persistent Crucible investigation from an existing operator-preapproved experiment_id, or reattach/resume one by investigation_id using its persisted contract/config/snapshots. Models cannot author acceptance, topology, enumerands, hypotheses, or statistics through this tool. All admission checks complete before durable mutation. This is NOT a result — poll crucible_status and only crucible_result may emit a terminal decision.",
     args: crucibleStartArgs,
 });
 
 export const crucibleStatusSpec = defineTool({
     name: "crucible_status",
     description:
-        "Read-only progress for a Crucible investigation. Replays and integrity-checks domain plus operational evidence, exposes only terminal_available for terminal state (never the decision/winner/evidence), and restarts a missing supervisor only when no terminal or non-result blocks recovery. Never a result.",
+        "Read-only progress for a Crucible investigation. V3/non-v4 state is reported as legacy_incompatible and restart-required without kernel replay. V4 state is replayed and integrity-checked; terminal state exposes only terminal_available. Never a result.",
     args: object({ investigation_id: investigationIdField }),
 });
 
 export const crucibleStopSpec = defineTool({
     name: "crucible_stop",
     description:
-        "Request a PAUSE through the runtime. Reports resumable:true only after the kernel-owned pause transition is durably persisted; terminal/non-result calls remain non-resumable. It never manufactures a terminal decision.",
+        "Request a Crucible PAUSE through the runtime. Reports resumable:true only after the kernel-owned pause transition is durably persisted; terminal/non-result calls remain non-resumable. It never manufactures a terminal decision.",
     args: object({
         investigation_id: investigationIdField,
         reason: string({
@@ -783,15 +1092,24 @@ export const crucibleStopSpec = defineTool({
 export const crucibleResultSpec = defineTool({
     name: "crucible_result",
     description:
-        "The ONLY tool that may emit a terminal Crucible result. Replays and verifies repository/domain integrity. If a VERIFIED_RESULT or TARGET_UNREACHABLE decision is persisted it returns is_result:true with the exact terminal decision and hashes behind a prominent banner. For every other state it returns is_result:false and 'NOT A RESULT — DO NOT REPORT AS COMPLETE' with no winner payload. It never recomputes scoring or policy.",
+        "The ONLY tool that may emit a terminal Crucible result. Replays and verifies compatible v4 state, artifact integrity, and frozen scientific readiness/confirmation closure; legacy, synthetic, search-only, or scientifically incomplete terminals return is_result:false with no winner/evidence/hash payload.",
     args: object({ investigation_id: investigationIdField }),
 });
 
-export const TOOL_SPECS = Object.freeze([
-    crucibleStartSpec,
-    crucibleStatusSpec,
-    crucibleStopSpec,
-    crucibleResultSpec,
+export const PUBLIC_TOOL_NAMES = Object.freeze([
+    "crucible_start",
+    "crucible_status",
+    "crucible_stop",
+    "crucible_result",
 ]);
 
-export const PUBLIC_TOOL_NAMES = Object.freeze(TOOL_SPECS.map((spec) => spec.name));
+const TOOL_SPEC_BY_NAME = Object.freeze({
+    crucible_start: crucibleStartSpec,
+    crucible_status: crucibleStatusSpec,
+    crucible_stop: crucibleStopSpec,
+    crucible_result: crucibleResultSpec,
+});
+
+export const TOOL_SPECS = Object.freeze(
+    PUBLIC_TOOL_NAMES.map((name) => TOOL_SPEC_BY_NAME[name]),
+);

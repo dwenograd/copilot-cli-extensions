@@ -1,0 +1,288 @@
+{
+  "schemaVersion": 1,
+  "fixtureVersion": 1,
+  "suite": "crucible-v3-science-baseline",
+  "domainVersion": 3,
+  "phase": "phase-0-characterization-only",
+  "caseCount": 10,
+  "cases": [
+    {
+      "id": "null-noise-lucky-verification",
+      "characterization": "One threshold-crossing sample from a declared null stream reaches VERIFIED_RESULT.",
+      "expectedToChangeInV4": true,
+      "notDesiredBehavior": true,
+      "oracle": {
+        "firstThresholdCrossing": 4,
+        "thresholdCrossingCount": 1,
+        "familyFalsePositiveProbability": 0.276202279408,
+        "scientificVerdict": "not_verified",
+        "reason": "All observations are sampled from a declared null/no-effect stream."
+      },
+      "observedV3": {
+        "seed": 464367618,
+        "observationCountBeforeVerification": 5,
+        "acceptedObservationIndex": 4,
+        "acceptedScore": 0.981062,
+        "decision": "VERIFIED_RESULT",
+        "basisKind": "first_passing_candidate",
+        "replicationCount": 1
+      }
+    },
+    {
+      "id": "known-effect-and-equal-tie",
+      "characterization": "A known effect is selected, while exact equal candidates are silently ordered by commit sequence.",
+      "expectedToChangeInV4": true,
+      "notDesiredBehavior": true,
+      "oracle": {
+        "trueEffectWinnerId": "effect-high",
+        "trueEffectWinnerScore": 0.91,
+        "equalCandidatesAreTied": true,
+        "tiedCandidateIds": [
+          "tie-first",
+          "tie-second"
+        ]
+      },
+      "observedV3": {
+        "trueEffectWinnerId": "effect-high",
+        "trueEffectWinnerScore": 0.91,
+        "tieComparisonSign": -1,
+        "tieWinnerId": "tie-first",
+        "tieSurfaced": false,
+        "tieBreakBasis": "committed_event_order"
+      }
+    },
+    {
+      "id": "drift-correlated-blocks",
+      "characterization": "Raw late-block scores are accepted without block or correlation adjustment.",
+      "expectedToChangeInV4": true,
+      "notDesiredBehavior": true,
+      "oracle": {
+        "withinBlockDifferences": [
+          0,
+          0,
+          0
+        ],
+        "maxAbsoluteWithinBlockDifference": 0,
+        "rawDriftAcceptedIds": [
+          "block-3-a",
+          "block-3-b"
+        ],
+        "scientificVerdict": "no_candidate_effect"
+      },
+      "observedV3": {
+        "acceptedIds": [
+          "block-3-a",
+          "block-3-b"
+        ],
+        "winnerId": "block-3-a",
+        "winnerScore": 88,
+        "blockRelabelingChangesOutcome": false,
+        "blockAdjustmentApplied": false
+      }
+    },
+    {
+      "id": "harness-pass-predicate-disagreement",
+      "characterization": "The acceptance predicate remains authoritative when parsed harness pass disagrees.",
+      "expectedToChangeInV4": true,
+      "notDesiredBehavior": true,
+      "oracle": {
+        "cases": [
+          {
+            "id": "harness-pass-predicate-fail",
+            "harnessPass": true,
+            "predicateSatisfied": false
+          },
+          {
+            "id": "harness-fail-predicate-pass",
+            "harnessPass": false,
+            "predicateSatisfied": true
+          }
+        ],
+        "disagreementCount": 2
+      },
+      "observedV3": {
+        "cases": [
+          {
+            "id": "harness-pass-predicate-fail",
+            "harnessPass": true,
+            "acceptanceSatisfied": false,
+            "outcomeClass": "rejected"
+          },
+          {
+            "id": "harness-fail-predicate-pass",
+            "harnessPass": false,
+            "acceptanceSatisfied": true,
+            "outcomeClass": "accepted"
+          }
+        ],
+        "acceptanceAuthority": "acceptance_predicate"
+      }
+    },
+    {
+      "id": "true-and-false-typed-predictions",
+      "characterization": "Structured supported/refuted predictions do not affect outcome or ranking.",
+      "expectedToChangeInV4": true,
+      "notDesiredBehavior": true,
+      "oracle": {
+        "predictionTruth": {
+          "prediction-refuted": false,
+          "prediction-supported": true
+        },
+        "supportedIds": [
+          "prediction-supported"
+        ],
+        "refutedIds": [
+          "prediction-refuted"
+        ]
+      },
+      "observedV3": {
+        "outcomes": {
+          "prediction-refuted": "accepted",
+          "prediction-supported": "accepted"
+        },
+        "predictionChangesOutcome": false,
+        "winnerId": "prediction-refuted",
+        "predictionsScored": false
+      }
+    },
+    {
+      "id": "discovery-overfit-heldout-challenge",
+      "characterization": "Discovery winner is verified despite failing held-out and challenge observations.",
+      "expectedToChangeInV4": true,
+      "notDesiredBehavior": true,
+      "oracle": {
+        "discoveryWinner": "overfit",
+        "confirmedIds": [
+          "generalizer"
+        ],
+        "confirmationWinner": "generalizer",
+        "scientificVerdict": "confirmation_required"
+      },
+      "observedV3": {
+        "decision": "VERIFIED_RESULT",
+        "basisKind": "rounds_exhausted_with_incumbent",
+        "winnerId": "overfit",
+        "heldOutConsulted": false,
+        "challengeConsulted": false
+      }
+    },
+    {
+      "id": "bounded-ids-duplicate-and-mutated-enumerand",
+      "characterization": "IDs are unique, but enumerand content is not contract-bound and a retry can mutate content under one ID.",
+      "expectedToChangeInV4": true,
+      "notDesiredBehavior": true,
+      "oracle": {
+        "duplicateIdsUnique": false,
+        "duplicateIdsShouldBeRejected": true,
+        "enumerandContentChanged": true,
+        "contentMutationShouldChangeIdentity": true
+      },
+      "observedV3": {
+        "duplicateIdsRejected": true,
+        "duplicateErrorCode": "INVALID_CONTRACT",
+        "duplicateErrorMentionsUnique": true,
+        "mutatedContentsChangeContractHash": false,
+        "enumerandContentsFrozenInContract": false,
+        "retryCandidateId": "enum-a",
+        "retryReplacementOrdinal": 1,
+        "replacementCandidateId": "enum-a",
+        "replacementArtifactChanged": true
+      }
+    },
+    {
+      "id": "invalid-self-generated-disagreeing-impossibility",
+      "characterization": "A self-certified proof and latest surviving disagreeing attempt can establish unreachability without consensus.",
+      "expectedToChangeInV4": true,
+      "notDesiredBehavior": true,
+      "oracle": {
+        "selfGeneratedIsIndependent": false,
+        "invalidFactsShouldProveUnreachable": false,
+        "disagreeingAttemptsShouldProveUnreachable": false
+      },
+      "observedV3": {
+        "rawCandidateClaimRecommendation": {
+          "kind": "COMMAND",
+          "commandKind": "verify_impossibility"
+        },
+        "selfCertifiedVerdict": "target_unreachable",
+        "selfCertifiedDecision": "TARGET_UNREACHABLE",
+        "generatorEqualsVerifier": true,
+        "independentVerifierRequired": false,
+        "invalidVerdict": "invalid",
+        "invalidRecommendation": {
+          "kind": "NON_RESULT",
+          "code": "IMPOSSIBILITY_CERTIFICATE_INCONCLUSIVE"
+        },
+        "disagreeingVerdicts": [
+          "not_proven",
+          "target_unreachable"
+        ],
+        "secondAttemptOrdinal": 2,
+        "disagreeingFinalDecision": "TARGET_UNREACHABLE",
+        "consensusRequired": false
+      }
+    },
+    {
+      "id": "reboot-rollover-resource-contention-metadata",
+      "characterization": "Reboot recovery, event-log rollover, and resource contention remain unbound fixture metadata.",
+      "expectedToChangeInV4": true,
+      "notDesiredBehavior": true,
+      "oracle": {
+        "rebootRecoveryFieldsRequired": [
+          "bootId",
+          "recoveredFromEventHash",
+          "recoveryAttemptOrdinal"
+        ],
+        "rolloverFieldsRequired": [
+          "segmentId",
+          "previousSegmentRoot",
+          "rolloverReason"
+        ],
+        "resourceContentionFieldsRequired": [
+          "leaseId",
+          "resourceId",
+          "waitOrdinal"
+        ]
+      },
+      "observedV3": {
+        "lifecycleMetadataChangesContractHash": false,
+        "normalizedContractFieldsPresent": {
+          "rebootRecovery": false,
+          "rollover": false,
+          "resourceContention": false
+        },
+        "resumePayloadKeys": [
+          "pausedSeq",
+          "sourceStopRequestSeq"
+        ],
+        "rebootRecoveryBound": false,
+        "eventLogRolloverBound": false,
+        "resourceContentionBound": false
+      }
+    },
+    {
+      "id": "prior-optimization-reconstruction",
+      "characterization": "Reconstructed deterministic optimization baseline reaches 86.7% of the known optimum.",
+      "expectedToChangeInV4": false,
+      "notDesiredBehavior": false,
+      "oracle": {
+        "winnerId": "opt-best",
+        "score": 86.7,
+        "percentOfKnownOptimum": 86.7,
+        "improvementPercent": 11.2,
+        "exactImprovementPercent": 11.153846153846
+      },
+      "observedV3": {
+        "seed": 8675309,
+        "reconstructionStatus": "aggregate-only",
+        "sourceNote": "The surviving science-audit baseline records +11.2% and 86.7% of a known optimum; the raw prior trace is not present locally.",
+        "winnerId": "opt-best",
+        "winnerScore": 86.7,
+        "knownOptimum": 100,
+        "percentOfKnownOptimum": 86.7,
+        "rawMetricImprovement": 8.7,
+        "relativeImprovementPercent": 11.153846153846
+      }
+    }
+  ]
+}

@@ -43,7 +43,7 @@ const FAILED_ACKNOWLEDGEMENT_STATES = new Set([
     "stopped",
 ]);
 
-function resolveNodeExecutable(env, explicitPath) {
+export function resolveNodeExecutable(env, explicitPath) {
     if (typeof explicitPath === "string" && path.isAbsolute(explicitPath)) {
         return explicitPath;
     }

@@ -1,4 +1,4 @@
-export const DOMAIN_VERSION = 3;
+export const DOMAIN_VERSION = 4;
 
 export const CONTRACT_LIMITS = Object.freeze({
     objectiveCharacters: 2048,
@@ -22,6 +22,11 @@ export const CONTRACT_LIMITS = Object.freeze({
     maxRounds: 64,
     maxEvaluations: 512,
     boundedCandidateIds: 512,
+    statisticalFamilies: 32,
+    maxBlocks: 4096,
+    maxConfirmations: 64,
+    maxStatisticalEvaluations: 100000,
+    maxResourceBytes: 4 * 1024 * 1024 * 1024,
 });
 
 export const SEARCH_POLICY_LIMITS = Object.freeze({
@@ -49,6 +54,28 @@ export const HYPOTHESIS_TOPOLOGIES = Object.freeze([
     "open_generative",
     "certified_impossibility",
 ]);
+
+export const STATISTICAL_POLICY_VERSION = "crucible-statistical-policy-v4";
+export const STATISTICAL_POLICY_HASH_ALGORITHM =
+    "sha256:crucible-statistical-policy-v4";
+export const GOAL_MODES = Object.freeze(["satisfice", "optimize"]);
+export const STATISTICAL_METRIC_DIRECTIONS = Object.freeze(["min", "max"]);
+export const MISSINGNESS_MODES = Object.freeze(["fail_closed", "bounded"]);
+export const SCIENTIFIC_TERMINAL_POLICY_VERSION =
+    "crucible-scientific-terminal-readiness-v1";
+export const DEFAULT_SCIENTIFIC_TERMINAL_POLICY = Object.freeze({
+    version: SCIENTIFIC_TERMINAL_POLICY_VERSION,
+    verifiedResult: Object.freeze({
+        confirmationRequired: true,
+        challengeRequired: true,
+    }),
+    targetUnreachable: Object.freeze({
+        independentVerifierRequired: true,
+    }),
+    hypotheses: Object.freeze({
+        requiredForResultMustBeSupported: true,
+    }),
+});
 
 export const IMPOSSIBILITY_REQUEST_VERSION = "crucible-impossibility-request-v1";
 export const IMPOSSIBILITY_CERTIFICATE_VERSION = "crucible-impossibility-certificate-v1";
@@ -90,7 +117,6 @@ export const ESCAPE_SEARCH_OPERATORS = Object.freeze([
 ]);
 
 export const DEFAULT_SEARCH_POLICY = Object.freeze({
-    stopOnFirstAccept: false,
     plateauWindow: 3,
     minRoundsBeforePlateau: 3,
     plateauMinImprovement: 0,
@@ -216,6 +242,8 @@ export const EVIDENCE_PURPOSES = Object.freeze([
 export const NON_RESULT_CODES = Object.freeze({
     BUDGET_EXHAUSTED_INCONCLUSIVE: "BUDGET_EXHAUSTED_INCONCLUSIVE",
     IMPOSSIBILITY_CERTIFICATE_INCONCLUSIVE: "IMPOSSIBILITY_CERTIFICATE_INCONCLUSIVE",
+    INDEPENDENT_VERIFICATION_REQUIRED: "INDEPENDENT_VERIFICATION_REQUIRED",
+    SCIENTIFIC_CONFIRMATION_REQUIRED: "SCIENTIFIC_CONFIRMATION_REQUIRED",
     VALIDATION_INCONCLUSIVE: "VALIDATION_INCONCLUSIVE",
     INVESTIGATION_PAUSED: "INVESTIGATION_PAUSED",
 });

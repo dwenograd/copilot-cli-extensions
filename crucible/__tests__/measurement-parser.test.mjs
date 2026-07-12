@@ -34,6 +34,14 @@ describe("parseHarnessResult", () => {
             validationCases: { "case-a": true, "case-b": false },
             searchSpaceExhausted: true,
             impossibilityCertificateHash: certificate,
+            role: null,
+            phase: null,
+            replicateIndex: null,
+            blockIndex: null,
+            deterministicSeed: null,
+            subjectId: null,
+            environmentIdentity: null,
+            suiteIdentity: null,
             parserVersion: PARSER_VERSION,
         });
         expect(Object.isFrozen(result)).toBe(true);
@@ -55,6 +63,14 @@ describe("parseHarnessResult", () => {
             validationCases: null,
             searchSpaceExhausted: null,
             impossibilityCertificateHash: null,
+            role: null,
+            phase: null,
+            replicateIndex: null,
+            blockIndex: null,
+            deterministicSeed: null,
+            subjectId: null,
+            environmentIdentity: null,
+            suiteIdentity: null,
             parserVersion: PARSER_VERSION,
         });
     });
@@ -150,5 +166,59 @@ describe("parseHarnessResult", () => {
     it("rejects non-string input with INVALID_ARGUMENT", () => {
         expect(parseError(Buffer.from('{"pass":true}')).code)
             .toBe(MEASUREMENT_ERROR_CODES.INVALID_ARGUMENT);
+    });
+
+    it("binds suite role metadata and rejects mismatched or role-inappropriate fields", () => {
+        const binding = {
+            role: "confirmation",
+            phase: "confirmation",
+            replicateIndex: 2,
+            blockIndex: 5,
+            deterministicSeed: "seed-confirm-2",
+            subjectId: "candidate-7",
+            environmentIdentity:
+                `sha256:crucible-harness-environment-v4:${"a".repeat(64)}`,
+            suiteIdentity:
+                `sha256:crucible-harness-suite-v4:${"b".repeat(64)}`,
+        };
+        const parsed = parseHarnessResult(JSON.stringify({
+            pass: true,
+            metrics: { score: 4 },
+            ...binding,
+        }), { expectedBinding: binding });
+        expect(parsed).toMatchObject(binding);
+
+        expect(() => parseHarnessResult(JSON.stringify({
+            pass: true,
+            ...binding,
+            subjectId: "candidate-8",
+        }), { expectedBinding: binding })).toThrow(expect.objectContaining({
+            code: MEASUREMENT_ERROR_CODES.PARSE_SCHEMA,
+        }));
+
+        expect(parseError(JSON.stringify({
+            pass: true,
+            role: "search",
+            phase: "search",
+            replicateIndex: 0,
+            blockIndex: 1,
+            deterministicSeed: "seed",
+            subjectId: "candidate-1",
+            environmentIdentity: binding.environmentIdentity,
+            suiteIdentity: binding.suiteIdentity,
+        })).code).toBe(MEASUREMENT_ERROR_CODES.PARSE_SCHEMA);
+
+        expect(parseError(JSON.stringify({
+            pass: false,
+            searchSpaceExhausted: true,
+            role: "challenge",
+            phase: "challenge",
+            replicateIndex: 0,
+            blockIndex: 0,
+            deterministicSeed: "seed",
+            subjectId: "candidate-1",
+            environmentIdentity: binding.environmentIdentity,
+            suiteIdentity: binding.suiteIdentity,
+        })).code).toBe(MEASUREMENT_ERROR_CODES.PARSE_SCHEMA);
     });
 });

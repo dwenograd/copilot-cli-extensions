@@ -22,6 +22,11 @@ export const API_ERROR_CODES = Object.freeze({
     START_FAILED: "CRUCIBLE_API_START_FAILED",
     INVESTIGATION_NOT_RESUMABLE: "CRUCIBLE_API_INVESTIGATION_NOT_RESUMABLE",
     OPERATIONAL_RESET_REQUIRED: "CRUCIBLE_API_OPERATIONAL_RESET_REQUIRED",
+    LEGACY_INCOMPATIBLE: "CRUCIBLE_API_LEGACY_INCOMPATIBLE",
+    EXPERIMENT_REGISTRY_INVALID: "CRUCIBLE_API_EXPERIMENT_REGISTRY_INVALID",
+    EXPERIMENT_NOT_FOUND: "CRUCIBLE_API_EXPERIMENT_NOT_FOUND",
+    EXPERIMENT_AUTHORITY_MISMATCH:
+        "CRUCIBLE_API_EXPERIMENT_AUTHORITY_MISMATCH",
 });
 
 export class CrucibleApiError extends Error {
@@ -114,5 +119,43 @@ export class OperationalResetRequiredError extends CrucibleApiError {
     constructor(message, details = null) {
         super(API_ERROR_CODES.OPERATIONAL_RESET_REQUIRED, message, details);
         this.name = "OperationalResetRequiredError";
+    }
+}
+
+export class LegacyIncompatibleApiError extends CrucibleApiError {
+    constructor(message, details = null) {
+        super(API_ERROR_CODES.LEGACY_INCOMPATIBLE, message, {
+            compatibility: "legacy_incompatible",
+            legacyIncompatible: true,
+            restartRequired: true,
+            requiredAction: "start_new_investigation",
+            ...details,
+        });
+        this.name = "LegacyIncompatibleApiError";
+    }
+}
+
+export class ExperimentRegistryApiError extends CrucibleApiError {
+    constructor(message, details = null, options = {}) {
+        super(API_ERROR_CODES.EXPERIMENT_REGISTRY_INVALID, message, details, options);
+        this.name = "ExperimentRegistryApiError";
+    }
+}
+
+export class ExperimentNotFoundApiError extends CrucibleApiError {
+    constructor(message, details = null, options = {}) {
+        super(API_ERROR_CODES.EXPERIMENT_NOT_FOUND, message, details, options);
+        this.name = "ExperimentNotFoundApiError";
+    }
+}
+
+export class ExperimentAuthorityMismatchApiError extends CrucibleApiError {
+    constructor(message, details = null, options = {}) {
+        super(API_ERROR_CODES.EXPERIMENT_AUTHORITY_MISMATCH, message, {
+            restartRequired: true,
+            requiredAction: "start_new_investigation",
+            ...details,
+        }, options);
+        this.name = "ExperimentAuthorityMismatchApiError";
     }
 }

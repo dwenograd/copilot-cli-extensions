@@ -46,12 +46,42 @@ export {
 export {
     PARSER_MAX_INPUT_BYTES,
     PARSER_VERSION,
+    normalizeHarnessResultBinding,
     parseHarnessResult,
 } from "./parser.mjs";
 
 export {
+    HARNESS_SUITE_V4_CASE_MANIFEST_ALGORITHM,
+    HARNESS_SUITE_V4_CONFIG_ALGORITHM,
+    HARNESS_SUITE_V4_CORPUS_ALGORITHM,
+    HARNESS_SUITE_V4_ENVIRONMENT_ALGORITHM,
+    HARNESS_SUITE_V4_HIDDEN_CASE_ROLES,
+    HARNESS_SUITE_V4_IDENTITY_ALGORITHM,
+    HARNESS_SUITE_V4_KIND,
+    HARNESS_SUITE_V4_OBSERVABLE_SCHEMA_ALGORITHM,
+    HARNESS_SUITE_V4_OPTIONAL_ROLES,
+    HARNESS_SUITE_V4_REQUIRED_ROLES,
+    HARNESS_SUITE_V4_ROLES,
+    HARNESS_SUITE_V4_VERSION,
+    HarnessSuiteV4Error,
+    computeHarnessSuiteV4Identity,
+    hashHarnessEnvironmentV4,
+    hashHarnessObservableSchemaV4,
+    hashHarnessRoleConfigV4,
+    harnessSuiteV4Identity,
+    identifyHarnessSuiteV4,
+    normalizeHarnessRoleConfigV4,
+    normalizeHarnessSuiteV4,
+    projectHarnessSuiteV4ForWorker,
+    validateHarnessSuiteV4,
+    validateHarnessSuiteV4CaseClaims,
+} from "./harness-suite.mjs";
+
+export {
     ARGV_HASH_ALGORITHM,
     ENV_HASH_ALGORITHM,
+    HARNESS_SUITE_RECEIPT_DETERMINISM_KEYS,
+    HARNESS_SUITE_RECEIPT_VERSION,
     RECEIPT_DETERMINISM_KEYS,
     RECEIPT_HASH_ALGORITHM,
     RECEIPT_VERSION,

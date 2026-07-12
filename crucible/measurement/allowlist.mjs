@@ -45,6 +45,11 @@ import {
     verifyLocalRegularFile,
 } from "./fs-verify.mjs";
 import { PARSER_VERSION } from "./parser.mjs";
+import {
+    computeHarnessSuiteV4Identity,
+    hashHarnessRoleConfigV4,
+    normalizeHarnessSuiteV4,
+} from "./harness-suite.mjs";
 
 // Algorithm tag for canonical-JSON hashes of allowlist entries. Kept distinct
 // from the generic domain canonical hash so an entry hash cannot be silently
@@ -122,7 +127,11 @@ const ENTRY_ALLOWED_KEYS = new Set([
 ]);
 
 const DEPENDENCY_ALLOWED_KEYS = new Set(["path", "sha256", "role"]);
-const VALIDATION_CASE_ALLOWED_KEYS = new Set(["snapshotHash", "description"]);
+const VALIDATION_CASE_ALLOWED_KEYS = new Set([
+    "snapshotHash",
+    "expectation",
+    "description",
+]);
 
 function invalid(message, details) {
     throw new AllowlistInvalidError(message, details);
@@ -378,8 +387,22 @@ function normalizeValidationCases(validationCases, entryId) {
             );
         }
         const snapshotHash = snapshotHashRaw;
+        let expectation = null;
+        if (spec.expectation !== undefined && spec.expectation !== null) {
+            expectation = requireString(
+                spec.expectation,
+                `entries.${entryId}.validationCases[${key}].expectation`,
+                { maxLength: 16 },
+            );
+            if (expectation !== "accept" && expectation !== "reject") {
+                invalid(
+                    `entries.${entryId}.validationCases[${key}].expectation must be "accept" or "reject"`,
+                );
+            }
+        }
         out[key] = Object.freeze({
             snapshotHash,
+            expectation,
             description: spec.description === undefined
                 ? null
                 : requireString(spec.description, `entries.${entryId}.validationCases[${key}].description`, { maxLength: 4096 }),
@@ -451,7 +474,137 @@ function normalizeEntry(entryId, raw) {
     return { entry: canonical, entryHash };
 }
 
-const ALLOWLIST_ALLOWED_KEYS = new Set(["version", "entries", "description"]);
+function roleConfigFromEntry(entry) {
+    return {
+        argvTemplate: [...entry.argvTemplate],
+        cwd: entry.cwd,
+        allowedEnv: { ...entry.allowedEnv },
+        timeoutMs: entry.timeoutMs,
+        maxStdoutBytes: entry.maxStdoutBytes,
+        maxStderrBytes: entry.maxStderrBytes,
+        executesCandidateCode: entry.executesCandidateCode,
+    };
+}
+
+function taggedFileHash(hex) {
+    return `${FILE_HASH_ALGORITHM}:${hex}`;
+}
+
+function expectedSuiteParserIdentity() {
+    const parserPath = fileURLToPath(new URL("./parser.mjs", import.meta.url));
+    return Object.freeze({
+        version: PARSER_VERSION,
+        versionHash: hashCanonical(
+            { parserVersion: PARSER_VERSION },
+            PARSER_VERSION_HASH_ALGORITHM,
+        ),
+        sourceHash: sha256File(parserPath, PARSER_SOURCE_HASH_ALGORITHM),
+    });
+}
+
+function normalizeHarnessSuites(rawSuites, entries, entryHashes) {
+    if (rawSuites === undefined || rawSuites === null) {
+        return { suites: {}, identities: {} };
+    }
+    requireObject(rawSuites, "allowlist.suites");
+    const suiteIds = Object.keys(rawSuites).sort();
+    if (suiteIds.length > 256) {
+        invalid("allowlist.suites has too many suites (max 256)");
+    }
+    const parser = expectedSuiteParserIdentity();
+    const suites = {};
+    const identities = {};
+    for (const suiteId of suiteIds) {
+        if (!SAFE_ID.test(suiteId)) {
+            invalid(`allowlist.suites key ${JSON.stringify(suiteId)} is not a safe id`);
+        }
+        let suite;
+        try {
+            suite = normalizeHarnessSuiteV4(rawSuites[suiteId]);
+        } catch (error) {
+            invalid(`allowlist.suites.${suiteId} is not a valid HarnessSuiteV4: ${error?.message ?? String(error)}`, {
+                cause: error?.code ?? null,
+                details: error?.details ?? null,
+            });
+        }
+        if (suite.id !== suiteId) {
+            invalid(`allowlist.suites.${suiteId}.id must equal its keyed id`);
+        }
+        const shared = new Map(
+            suite.sharedPlatformDependencies.map((dependency) => [
+                `${dependency.role}\0${dependency.sha256}`,
+                dependency,
+            ]),
+        );
+        for (const [role, roleIdentity] of Object.entries(suite.roles)) {
+            const entry = entries[roleIdentity.harnessId];
+            if (entry === undefined) {
+                invalid(`allowlist.suites.${suiteId}.roles.${role} references missing harness entry ${JSON.stringify(roleIdentity.harnessId)}`);
+            }
+            if (roleIdentity.harnessEntryHash
+                !== entryHashes[roleIdentity.harnessId]) {
+                invalid(`allowlist.suites.${suiteId}.roles.${role}.harnessEntryHash does not match the referenced entry`);
+            }
+            if (roleIdentity.executableHash
+                !== taggedFileHash(entry.executableSha256)) {
+                invalid(`allowlist.suites.${suiteId}.roles.${role}.executableHash does not match the referenced entry`);
+            }
+            if (!canonicalEqual(roleIdentity.parser, parser)) {
+                invalid(`allowlist.suites.${suiteId}.roles.${role}.parser does not match the trusted parser identity`);
+            }
+            const configHash = hashHarnessRoleConfigV4(
+                roleConfigFromEntry(entry),
+            );
+            if (roleIdentity.configHash !== configHash) {
+                invalid(`allowlist.suites.${suiteId}.roles.${role}.configHash does not match the referenced entry`);
+            }
+            const dependencies = entry.dependencies.map((dependency) => {
+                const sha256 = taggedFileHash(dependency.sha256);
+                return {
+                    role: dependency.role,
+                    sha256,
+                    kind: shared.has(`${dependency.role}\0${sha256}`)
+                        ? "platform"
+                        : "application",
+                };
+            }).sort((left, right) =>
+                `${left.kind}\0${left.role}\0${left.sha256}`.localeCompare(
+                    `${right.kind}\0${right.role}\0${right.sha256}`,
+                ));
+            if (!canonicalEqual(roleIdentity.dependencies, dependencies)) {
+                invalid(`allowlist.suites.${suiteId}.roles.${role}.dependencies do not match the referenced entry`);
+            }
+            if (roleIdentity.sandboxIdentity.required
+                !== entry.executesCandidateCode) {
+                invalid(`allowlist.suites.${suiteId}.roles.${role}.sandboxIdentity.required does not match executesCandidateCode`);
+            }
+            for (const caseRef of roleIdentity.caseManifest) {
+                const pinned = entry.validationCases?.[caseRef.id];
+                const corpusCase = suite.operatorCorpus.cases[caseRef.id];
+                if (pinned === undefined
+                    || pinned.expectation === null
+                    || pinned.snapshotHash !== caseRef.snapshotHash
+                    || corpusCase?.snapshotHash !== pinned.snapshotHash
+                    || corpusCase?.expectation !== pinned.expectation) {
+                    invalid(`allowlist.suites.${suiteId}.roles.${role}.caseManifest does not match the operator-owned entry corpus`, {
+                        caseId: caseRef.id,
+                        harnessId: roleIdentity.harnessId,
+                    });
+                }
+            }
+        }
+        suites[suiteId] = suite;
+        identities[suiteId] = computeHarnessSuiteV4Identity(suite);
+    }
+    return { suites, identities };
+}
+
+const ALLOWLIST_ALLOWED_KEYS = new Set([
+    "version",
+    "entries",
+    "suites",
+    "description",
+]);
 
 function parseAllowlistJson(rawText, allowlistPath) {
     if (rawText.length > MAX_ALLOWLIST_BYTES) {
@@ -517,6 +670,10 @@ export function loadHarnessAllowlist(allowlistPath) {
         entries[id] = entry;
         entryHashes[id] = entryHash;
     }
+    const {
+        suites,
+        identities: suiteIdentities,
+    } = normalizeHarnessSuites(parsed.suites, entries, entryHashes);
 
     // Snapshot the allowlist file's own hash and content-hash. The file hash
     // is over the raw bytes-on-disk (so a tampered file after load is
@@ -526,7 +683,10 @@ export function loadHarnessAllowlist(allowlistPath) {
     const allowlistFile = verifyAndHashFile(resolvedAllowlistPath, sha256HexOfString(rawText), {
         label: "allowlist",
     });
-    const contentHash = hashCanonical(entries, ALLOWLIST_HASH_ALGORITHM);
+    const contentHash = hashCanonical(
+        { entries, suites },
+        ALLOWLIST_HASH_ALGORITHM,
+    );
 
     const state = Object.freeze({
         version: 1,
@@ -536,6 +696,8 @@ export function loadHarnessAllowlist(allowlistPath) {
         loadedAt: new Date().toISOString(),
         entries: immutableCanonical(entries),
         entryHashes: immutableCanonical(entryHashes),
+        suites: immutableCanonical(suites),
+        suiteIdentities: immutableCanonical(suiteIdentities),
     });
 
     const allowlist = Object.freeze({
@@ -546,6 +708,7 @@ export function loadHarnessAllowlist(allowlistPath) {
         loadedAt: state.loadedAt,
 
         listEntryIds: () => Object.keys(state.entries),
+        listSuiteIds: () => Object.keys(state.suites),
 
         getEntry(id) {
             if (typeof id !== "string" || !Object.hasOwn(state.entries, id)) {
@@ -565,6 +728,27 @@ export function loadHarnessAllowlist(allowlistPath) {
                 );
             }
             return state.entryHashes[id];
+        },
+
+        getSuite(id) {
+            if (typeof id !== "string" || !Object.hasOwn(state.suites, id)) {
+                throw new MeasurementError(
+                    MEASUREMENT_ERROR_CODES.ALLOWLIST_ENTRY_NOT_FOUND,
+                    `no allowlist suite ${JSON.stringify(id)}`,
+                );
+            }
+            return state.suites[id];
+        },
+
+        getSuiteIdentity(id) {
+            if (typeof id !== "string"
+                || !Object.hasOwn(state.suiteIdentities, id)) {
+                throw new MeasurementError(
+                    MEASUREMENT_ERROR_CODES.ALLOWLIST_ENTRY_NOT_FOUND,
+                    `no allowlist suite ${JSON.stringify(id)}`,
+                );
+            }
+            return state.suiteIdentities[id];
         },
 
         // Re-verify the allowlist file on disk against the hash captured at
@@ -668,6 +852,31 @@ export function validateHarnessValidationCases(entry, validationCases) {
                     allowlistedSnapshotHash: pinned.snapshotHash,
                 },
             );
+        }
+        if (pinned.expectation !== null) {
+            const requestedExpectation = validationCase?.expectation;
+            if (requestedExpectation !== "accept"
+                && requestedExpectation !== "reject") {
+                invalid(
+                    `requested validation case ${JSON.stringify(caseId)} must carry its operator-owned expectation`,
+                    {
+                        harnessId: entry.id,
+                        caseId,
+                        operatorExpectation: pinned.expectation,
+                    },
+                );
+            }
+            if (requestedExpectation !== pinned.expectation) {
+                invalid(
+                    `requested validation case ${JSON.stringify(caseId)} cannot relabel the operator-owned expectation`,
+                    {
+                        harnessId: entry.id,
+                        caseId,
+                        requestedExpectation,
+                        operatorExpectation: pinned.expectation,
+                    },
+                );
+            }
         }
     }
     return true;

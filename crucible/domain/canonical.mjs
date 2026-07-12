@@ -3,8 +3,8 @@ import { CanonicalizationError } from "./errors.mjs";
 
 export const CANONICAL_JSON_VERSION = "crucible-canonical-json-v1";
 export const CANONICAL_HASH_ALGORITHM = "sha256:crucible-canonical-json-v1";
-export const EVENT_HASH_ALGORITHM = "sha256:crucible-event-v1";
-export const CONTRACT_HASH_ALGORITHM = "sha256:crucible-contract-v1";
+export const EVENT_HASH_ALGORITHM = "sha256:crucible-event-v4";
+export const CONTRACT_HASH_ALGORITHM = "sha256:crucible-contract-v4";
 
 function fail(path, reason) {
     throw new CanonicalizationError(`Cannot canonicalize ${path}: ${reason}`, {

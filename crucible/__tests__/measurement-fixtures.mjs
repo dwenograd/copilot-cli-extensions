@@ -64,7 +64,16 @@ export function makeTempRoot(label) {
 }
 
 export function rmTempRoot(root) {
-    if (root) fs.rmSync(root, { recursive: true, force: true });
+    if (!root) return;
+    fs.rmSync(root, {
+        recursive: true,
+        force: true,
+        maxRetries: 40,
+        retryDelay: 50,
+    });
+    if (fs.existsSync(root)) {
+        throw new Error(`measurement test root survived cleanup: ${root}`);
+    }
 }
 
 // Write a tiny .mjs script that behaves as a Crucible harness. `body` is a

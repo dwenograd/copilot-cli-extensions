@@ -9,6 +9,10 @@ import {
     ESCAPE_SEARCH_OPERATORS,
     SEARCH_OPERATORS,
 } from "./constants.mjs";
+import {
+    enumerandBinding,
+    normalizeEnumerandManifest,
+} from "./enumerands.mjs";
 
 function candidateEvidence(aggregate, { includeInvalidated = false } = {}) {
     return aggregate.evidenceOrder
@@ -20,6 +24,24 @@ function candidateEvidence(aggregate, { includeInvalidated = false } = {}) {
 }
 
 function expectedSlotsForRound(contract, round) {
+    if (contract.enumerandManifest !== undefined) {
+        const manifest = normalizeEnumerandManifest(
+            contract.enumerandManifest,
+            {
+                topology: contract.hypothesisTopology,
+                observableRegistry: contract.observableRegistry,
+                hypothesisPolicy: contract.hypothesisPolicy,
+            },
+        );
+        const offset = (round - 1) * contract.candidatesPerRound;
+        return Math.max(
+            0,
+            Math.min(
+                contract.candidatesPerRound,
+                manifest.entries.length - offset,
+            ),
+        );
+    }
     if (contract.boundedCandidateIds === undefined) {
         return contract.candidatesPerRound;
     }
@@ -518,7 +540,25 @@ export function buildSearchCandidateCommand(aggregate, progress) {
     const round = progress.nextRound;
     const slotIndex = progress.nextSlot;
     const globalSlot = (round - 1) * contract.candidatesPerRound + slotIndex;
-    const boundedCandidateId = contract.boundedCandidateIds?.[globalSlot] ?? null;
+    const manifest = contract.enumerandManifest === undefined
+        ? null
+        : normalizeEnumerandManifest(
+            contract.enumerandManifest,
+            {
+                topology: contract.hypothesisTopology,
+                observableRegistry: contract.observableRegistry,
+                hypothesisPolicy: contract.hypothesisPolicy,
+            },
+        );
+    const assignedEnumerand = manifest?.entries[globalSlot] ?? null;
+    if (manifest !== null && assignedEnumerand === null) {
+        throw deterministicStrategyError(
+            `search slot ${globalSlot} is outside the frozen enumerand manifest`,
+        );
+    }
+    const boundedCandidateId = assignedEnumerand?.id
+        ?? contract.boundedCandidateIds?.[globalSlot]
+        ?? null;
     const replacement = replacementOrdinal(aggregate, round, slotIndex);
     const candidateId = boundedCandidateId
         ?? generatedCandidateId(round, slotIndex, replacement);
@@ -576,10 +616,24 @@ export function buildSearchCandidateCommand(aggregate, progress) {
         parentEvidenceIds: parents,
         promptContextRefs,
         replacementOrdinal: replacement,
+        enumerandHash: assignedEnumerand?.enumerandHash ?? null,
     });
 
+    const harnessId =
+        contract.harnessSuite?.roles?.search?.harnessId
+        ?? contract.harnessId;
+    const parserVersion =
+        contract.harnessSuite?.roles?.search?.parser?.version
+        ?? contract.parserVersion;
     return immutableCanonical({
         kind: "search_candidate",
+        ...(harnessId === undefined || parserVersion === undefined
+            ? {}
+            : {
+                harnessRole: "search",
+                harnessId,
+                parserVersion,
+            }),
         round,
         slotIndex,
         candidateId,
@@ -590,6 +644,18 @@ export function buildSearchCandidateCommand(aggregate, progress) {
         seed,
         replacementOrdinal: replacement,
         ...(boundedCandidateId === null ? {} : { boundedCandidateId }),
+        ...(assignedEnumerand === null
+            ? {}
+            : {
+                enumerand: enumerandBinding(manifest, assignedEnumerand, {
+                    topology: contract.hypothesisTopology,
+                    observableRegistry: contract.observableRegistry,
+                    hypothesisPolicy: contract.hypothesisPolicy,
+                }),
+                ...(assignedEnumerand.hypotheses === undefined
+                    ? {}
+                    : { hypotheses: assignedEnumerand.hypotheses }),
+            }),
     });
 }
 

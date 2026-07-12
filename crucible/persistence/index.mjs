@@ -64,6 +64,13 @@ export {
     objectRelPath,
 } from "./artifact-store.mjs";
 
+export {
+    materializeFiniteEnumerand,
+    stageBoundedParameterizedManifest,
+    stageFiniteEnumerandManifest,
+    verifyStagedFiniteEnumerands,
+} from "./enumerand-staging.mjs";
+
 // Self-contained audit bundle export/import.
 export {
     exportBundle,
@@ -77,6 +84,7 @@ export {
     BundleTamperError,
     BundleInventoryError,
     BundleManifestError,
+    BundleDomainVersionMismatchError,
     BundleAuthenticationError,
     BundleSourceChangedError,
     BundleUnsafePathError,

@@ -7,7 +7,7 @@
 // the SDK boundary can surface them clearly.
 //
 // Deterministic identity: an investigationId is derived from the canonical
-// objective + projectDir + harnessId as a safe slug plus a SHA-256 suffix, and
+// objective + projectDir + complete contract/suite identities as a safe slug plus a SHA-256 suffix, and
 // all state/artifact directories live under the local state root — never under
 // the project, a NAS mount, or a cloud-sync folder.
 
@@ -17,7 +17,11 @@ import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 
 import { assertLocalDatabasePath } from "../persistence/index.mjs";
-import { CONTRACT_LIMITS, DOMAIN_VERSION } from "../domain/index.mjs";
+import {
+    CONTRACT_LIMITS,
+    DOMAIN_VERSION,
+    deriveAuthorizedInvestigationId,
+} from "../domain/index.mjs";
 import { EnvironmentError } from "./errors.mjs";
 
 // Fixed contract defaults the tool surface does not expose as arguments. These
@@ -28,6 +32,7 @@ export const CRITICALITY = "standard";
 
 const DEFAULT_ROOT_DIRNAME = "Crucible";
 const DEFAULT_ALLOWLIST_FILENAME = "harnesses.json";
+const DEFAULT_CASE_STORE_DIRNAME = "operator-corpus";
 const DEFAULT_INVESTIGATIONS_DIRNAME = "investigations";
 const IDENTIFIER_RE = /^[A-Za-z0-9][A-Za-z0-9._@-]{0,127}$/u;
 const PREFLIGHT_WORKSPACES = new WeakSet();
@@ -57,7 +62,7 @@ function localAppData(env) {
     const value = env?.LOCALAPPDATA;
     if (!hasText(value)) {
         throw new EnvironmentError(
-            "LOCALAPPDATA is not set; set CRUCIBLE_ALLOWLIST_PATH and CRUCIBLE_STATE_ROOT explicitly",
+            "LOCALAPPDATA is not set; set CRUCIBLE_ALLOWLIST_PATH, CRUCIBLE_CASE_STORE_PATH, and CRUCIBLE_STATE_ROOT explicitly",
             { variable: "LOCALAPPDATA" },
         );
     }
@@ -71,6 +76,13 @@ export function resolveAllowlistPath(env) {
         ? env.CRUCIBLE_ALLOWLIST_PATH
         : path.join(localAppData(env), DEFAULT_ROOT_DIRNAME, DEFAULT_ALLOWLIST_FILENAME);
     return requireAbsoluteLocalPath(raw, "CRUCIBLE_ALLOWLIST_PATH", env);
+}
+
+export function resolveCaseStorePath(env) {
+    const raw = hasText(env?.CRUCIBLE_CASE_STORE_PATH)
+        ? env.CRUCIBLE_CASE_STORE_PATH
+        : path.join(localAppData(env), DEFAULT_ROOT_DIRNAME, DEFAULT_CASE_STORE_DIRNAME);
+    return requireAbsoluteLocalPath(raw, "CRUCIBLE_CASE_STORE_PATH", env);
 }
 
 // Local investigation state root: CRUCIBLE_STATE_ROOT, else default under
@@ -125,6 +137,7 @@ export function resolveCliPath(env) {
 export function resolveStartEnvironment(env) {
     return Object.freeze({
         allowlistPath: resolveAllowlistPath(env),
+        caseStorePath: resolveCaseStorePath(env),
         stateRoot: resolveStateRoot(env),
         sdkPath: resolveSdkPath(env),
         cliPath: resolveCliPath(env),
@@ -176,35 +189,83 @@ function slugify(text) {
 
 // Deterministic, filesystem-safe investigationId: safe slug of the objective
 // plus a SHA-256 suffix over domain version + canonical objective + projectDir
-// + harness id + canonical allowlist-entry hash. Replacing an entry under the
-// same id therefore creates a new investigation identity instead of silently
-// changing the measurement authority of an existing investigation.
+// + suite id/identity + complete contract hash. Any frozen-policy, enumerand,
+// corpus, or harness-suite change therefore creates a new investigation id.
 export function deriveInvestigationId({
+    experimentId = null,
     objective,
     projectDir,
-    harnessId,
-    harnessEntryHash,
+    harnessSuiteId,
+    harnessSuiteIdentity,
+    contractHash,
+    trustFingerprint = null,
+    experimentAuthorityIdentity = null,
 }) {
     const canonicalObj = canonicalObjective(objective);
     if (!hasText(projectDir)) {
         throw new EnvironmentError("project_dir must be a non-empty string", { field: "project_dir" });
     }
-    if (typeof harnessId !== "string"
-        || !IDENTIFIER_RE.test(harnessId)
-        || harnessId.includes("..")) {
-        throw new EnvironmentError("harness_id must be a safe identifier", { field: "harness_id" });
-    }
-    if (typeof harnessEntryHash !== "string"
-        || !/^sha256:[a-z0-9][a-z0-9._-]*:[a-f0-9]{64}$/u.test(harnessEntryHash)) {
+    if (typeof harnessSuiteId !== "string"
+        || !IDENTIFIER_RE.test(harnessSuiteId)
+        || harnessSuiteId.includes("..")) {
         throw new EnvironmentError(
-            "harness entry hash must be an algorithm-tagged SHA-256",
-            { field: "harnessEntryHash" },
+            "harness_suite_id must be a safe identifier",
+            { field: "harness_suite_id" },
         );
+    }
+    for (const [field, value] of [
+        ["harnessSuiteIdentity", harnessSuiteIdentity],
+        ["contractHash", contractHash],
+        ...(experimentAuthorityIdentity === null
+            ? []
+            : [["experimentAuthorityIdentity", experimentAuthorityIdentity]]),
+    ]) {
+        if (typeof value !== "string"
+            || !/^sha256:[a-z0-9][a-z0-9._-]*:[a-f0-9]{64}$/u.test(value)) {
+            throw new EnvironmentError(
+                `${field} must be an algorithm-tagged SHA-256`,
+                { field },
+            );
+        }
+    }
+    if (!contractHash.startsWith("sha256:crucible-contract-v4:")) {
+        throw new EnvironmentError(
+            "contractHash must use the v4 Crucible contract identity domain",
+            { field: "contractHash" },
+        );
+    }
+    if ((experimentId === null) !== (trustFingerprint === null)) {
+        throw new EnvironmentError(
+            "experimentId and trustFingerprint must be provided together",
+            { experimentId, trustFingerprint },
+        );
+    }
+    if (experimentId !== null) {
+        try {
+            return deriveAuthorizedInvestigationId({
+                experimentId,
+                objective: canonicalObj,
+                projectDir,
+                harnessSuiteId,
+                harnessSuiteIdentity,
+                contractHash,
+                trustFingerprint,
+            });
+        } catch (error) {
+            throw new EnvironmentError(
+                `authorized investigation identity is invalid: ${
+                    error?.message ?? String(error)
+                }`,
+                { cause: error?.code ?? null },
+            );
+        }
     }
     const material = [
         `crucible-investigation-domain-v${DOMAIN_VERSION}`,
-        harnessId,
-        harnessEntryHash,
+        harnessSuiteId,
+        harnessSuiteIdentity,
+        contractHash,
+        experimentAuthorityIdentity ?? "unsigned-internal-contract",
         canonicalObj,
         normalizeProjectDirForHash(projectDir),
     ].join("\u0000");

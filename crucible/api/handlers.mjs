@@ -18,7 +18,9 @@ import fs from "node:fs";
 import path from "node:path";
 
 import {
+    DOMAIN_VERSION,
     SEARCH_OPERATORS,
+    assessPersistedTerminalReadiness,
     buildCandidateArchive,
     decideNext,
     detectPlateau,
@@ -38,15 +40,20 @@ import {
     probeWindowsSandboxAvailability,
 } from "../measurement/index.mjs";
 import {
+    RUNTIME_ERROR_CODES,
+    assertSupervisorConfigMatchesRuntimeAuthority,
     createDomainRepositoryAdapter,
     ensureSupervisor,
     isExactPidAlive,
     loadSupervisorConfig,
     normalizeSupervisorConfig,
+    resolveNodeExecutable,
     readSupervisorLock,
     readStatus,
     requestStop,
     supervisorPaths,
+    supervisorConfigFromRuntimeAuthority,
+    verifyRuntimeConfigAuthority,
     validateSupervisorAdmission,
 } from "../runtime/index.mjs";
 
@@ -55,19 +62,28 @@ import {
     resolveStateRoot,
 } from "./environment.mjs";
 import {
+    loadExperimentRegistry,
+    reverifyExperimentRegistryFile,
+} from "./experiment-registry.mjs";
+import {
+    verifyExperimentAuthority,
+} from "./experiment-authority.mjs";
+import {
     applyStartPreflight,
     disposeStartPreflight,
     preflightStartInvestigation,
 } from "./preflight.mjs";
-import { TOOL_SPECS } from "./schema.mjs";
+import { PUBLIC_TOOL_NAMES, TOOL_SPECS } from "./schema.mjs";
 import {
     NON_RESULT_BANNER,
     TERMINAL_BANNER,
     INTEGRITY_NON_RESULT_BANNER,
     failure,
-    success,
+    terminalAvailable,
+    toolSuccess,
 } from "./result.mjs";
 import {
+    API_ERROR_CODES,
     InvestigationNotFoundError,
     CrucibleApiError,
 } from "./errors.mjs";
@@ -82,6 +98,8 @@ export function makeDefaultDeps(env = process.env, log = () => {}) {
         log,
         isPidAlive: isExactPidAlive,
         loadHarnessAllowlist,
+        loadExperimentRegistry,
+        reverifyExperimentRegistryFile,
         probeSandboxAvailability: probeWindowsSandboxAvailability,
         openRepository,
         openRepositoryReadOnly,
@@ -120,14 +138,34 @@ function openInvestigationForRead(
             investigationId,
             ensure: false,
         });
-        const replay = verifyTerminalArtifacts
-            ? adapter.verifyTerminalArtifactClosure({
+        let replay = adapter.replay();
+        const authority = replay.aggregate.experimentAuthority;
+        const payload = authority?.manifest?.experimentPayload;
+        if (authority === null
+            || replay.aggregate.experimentAuthorityIdentity === null
+            || authority.identity
+                !== replay.aggregate.experimentAuthorityIdentity) {
+            throw new Error(
+                "persisted v4 investigation has no valid experiment authority",
+            );
+        }
+        verifyExperimentAuthority({
+            authority,
+            experimentId: payload?.experimentId,
+            projectDir: payload?.projectDir,
+            harnessSuiteId: payload?.harnessSuiteId,
+            contract: replay.aggregate.contract,
+            investigationId,
+            env: deps.env,
+        });
+        if (verifyTerminalArtifacts && replay.aggregate.terminal !== null) {
+            replay = adapter.verifyTerminalArtifactClosure({
                 artifactStore: deps.openArtifactStoreReadOnly({
                     root: artifactRoot,
                     env: deps.env,
                 }),
-            })
-            : adapter.replay();
+            });
+        }
         const operationalNonResult = adapter.latestOperationalNonResult();
         return {
             aggregate: replay.aggregate,
@@ -198,7 +236,12 @@ export function startInvestigation(args, deps) {
             return {
                 is_result: false,
                 investigation_id: plan.investigationId,
+                ...(plan.experimentId === undefined
+                    ? {}
+                    : { experiment_id: plan.experimentId }),
                 contract_hash: plan.hashes.contractHash,
+                harness_suite_identity:
+                    plan.contract.harnessSuiteIdentity,
                 idempotent: opened.idempotent,
                 reattached_by_id: plan.kind === "reattach",
                 resumed: opened.resumed,
@@ -351,14 +394,57 @@ function buildSupervisorHealth(status, lock, isPidAlive, now = Date.now(), stale
     };
 }
 
-function tryRestartSupervisor(deps, env, paths, investigationId) {
+function tryRestartSupervisor(
+    deps,
+    env,
+    paths,
+    investigationId,
+    aggregate,
+) {
     const configPath = supervisorPaths(paths.stateDir, investigationId).configPath;
     if (!fs.existsSync(configPath)) {
         return { action: "no-persisted-config" };
     }
     try {
-        const config = deps.loadSupervisorConfig(configPath, { env });
-        const result = deps.ensureSupervisor(config, { env });
+        const runtimeAuthority = aggregate.runtimeConfigAuthority;
+        if (runtimeAuthority === null
+            || runtimeAuthority.fingerprint
+                !== aggregate.runtimeConfigFingerprint) {
+            throw new Error(
+                "persisted investigation has no immutable runtime config authority",
+            );
+        }
+        if (runtimeAuthority.sandbox?.required === true) {
+            return { action: "explicit-reattach-required" };
+        }
+        const persisted = deps.loadSupervisorConfig(configPath, { env });
+        const matched = assertSupervisorConfigMatchesRuntimeAuthority(
+            persisted,
+            runtimeAuthority,
+            { env },
+        );
+        const config = supervisorConfigFromRuntimeAuthority(
+            runtimeAuthority,
+            {
+                deadlineMs: matched.runner.deadlineMs,
+                env,
+            },
+        );
+        const admission = (deps.validateSupervisorAdmission
+            ?? validateSupervisorAdmission)(config, { env });
+        const admittedConfig = admission?.config ?? config;
+        const nodeExecutable =
+            admission?.nodeExecutable
+            ?? (deps.resolveNodeExecutable ?? resolveNodeExecutable)(env);
+        verifyRuntimeConfigAuthority(runtimeAuthority, {
+            env,
+            deadlineMs: matched.runner.deadlineMs,
+            expectedInvestigationId: investigationId,
+            expectedStateDir: paths.stateDir,
+            expectedArtifactRoot: paths.artifactRoot,
+            nodeExecutable,
+        });
+        const result = deps.ensureSupervisor(admittedConfig, { env });
         return summarizeSupervisorAction(result);
     } catch (error) {
         deps.log?.(`[crucible] crucible_status supervisor restart failed: ${error?.message ?? String(error)}`);
@@ -379,6 +465,61 @@ function integrityBlockedPayload(investigationId) {
     };
 }
 
+function scientificBlockedPayload(investigationId, assessment) {
+    if (assessment.integrityBound !== true) {
+        return {
+            ...integrityBlockedPayload(investigationId),
+            scientific_blocked: true,
+            terminal_available: false,
+        };
+    }
+    return {
+        is_result: false,
+        banner: NON_RESULT_BANNER,
+        investigation_id: investigationId,
+        integrity_blocked: false,
+        scientific_blocked: true,
+        terminal_available: false,
+        non_result: true,
+        non_result_code: assessment.nonResultCode,
+        reason:
+            "A persisted terminal event does not satisfy the frozen scientific readiness policy. No result is available.",
+        message: NON_RESULT_BANNER,
+    };
+}
+
+function legacyIncompatiblePayload(investigationId, details = {}) {
+    return {
+        is_result: false,
+        banner: NON_RESULT_BANNER,
+        investigation_id: investigationId,
+        compatibility: "legacy_incompatible",
+        legacy_incompatible: true,
+        restart_required: true,
+        required_action: "start_new_investigation",
+        expected_domain_version:
+            details.expectedDomainVersion ?? DOMAIN_VERSION,
+        actual_domain_version: details.actualDomainVersion ?? null,
+        contract_domain_version: details.contractDomainVersion ?? null,
+        event_count: details.eventCount ?? null,
+        read_only: true,
+        archiveable: details.archiveable === true,
+        integrity_blocked: false,
+        terminal_available: false,
+        non_result: true,
+        non_result_code: "LEGACY_INCOMPATIBLE",
+        reason:
+            "Persisted state belongs to an incompatible legacy Crucible domain. "
+            + "It may be inventoried or archived read-only, but it cannot resume, append, or emit a newly computed result.",
+        message: NON_RESULT_BANNER,
+    };
+}
+
+function isLegacyIncompatibleError(error) {
+    return error?.code === RUNTIME_ERROR_CODES.LEGACY_INCOMPATIBLE
+        || error?.details?.compatibility === "legacy_incompatible";
+}
+
 function readInvestigationOrIntegrityBlock(
     deps,
     investigationId,
@@ -388,6 +529,7 @@ function readInvestigationOrIntegrityBlock(
     try {
         return {
             blocked: null,
+            legacy: null,
             read: openInvestigationForRead(
                 deps,
                 investigationId,
@@ -397,11 +539,22 @@ function readInvestigationOrIntegrityBlock(
         };
     } catch (error) {
         if (error instanceof InvestigationNotFoundError) throw error;
+        if (isLegacyIncompatibleError(error)) {
+            return {
+                blocked: null,
+                legacy: legacyIncompatiblePayload(
+                    investigationId,
+                    error?.details ?? {},
+                ),
+                read: null,
+            };
+        }
         deps.log?.(
             `[crucible] integrity verification blocked read for ${investigationId}: ${error?.message ?? String(error)}`,
         );
         return {
             blocked: integrityBlockedPayload(investigationId),
+            legacy: null,
             read: null,
         };
     }
@@ -427,13 +580,21 @@ export function statusInvestigation(args, deps) {
             note: "Integrity verification failed; status cannot expose or trust a terminal decision.",
         };
     }
+    if (verifiedRead.legacy !== null) {
+        return {
+            ...verifiedRead.legacy,
+            paused: false,
+            status: "legacy_incompatible",
+            note:
+                "Legacy state is read-only and restart-required; start a new v4 investigation.",
+        };
+    }
     const { aggregate, operationalNonResult } = verifiedRead.read;
     if (aggregate.terminal !== null) {
-        return {
-            is_result: false,
-            investigation_id: investigationId,
-            terminal_available: true,
-        };
+        const readiness = assessPersistedTerminalReadiness(aggregate);
+        return readiness.ready
+            ? terminalAvailable(investigationId)
+            : scientificBlockedPayload(investigationId, readiness);
     }
 
     const recommendation = aggregate.contract === null
@@ -462,7 +623,13 @@ export function statusInvestigation(args, deps) {
 
     let ensureAction = null;
     if (domainNonterminal && supervisorMissing) {
-        ensureAction = tryRestartSupervisor(deps, env, paths, investigationId);
+        ensureAction = tryRestartSupervisor(
+            deps,
+            env,
+            paths,
+            investigationId,
+            aggregate,
+        );
     }
 
     return {
@@ -503,6 +670,48 @@ export function stopInvestigation(args, deps) {
             investigationId,
         });
     }
+    const verifiedRead = readInvestigationOrIntegrityBlock(
+        deps,
+        investigationId,
+        paths,
+    );
+    if (verifiedRead.blocked !== null) {
+        return {
+            ...verifiedRead.blocked,
+            terminal_available: false,
+            stop_state: "integrity_blocked",
+            pause_requested: false,
+            pause_in_flight: false,
+            pause_persisted: false,
+            resumable: false,
+            appended: false,
+            paused: false,
+            status: "integrity_blocked",
+            already_terminal: false,
+        };
+    }
+    if (verifiedRead.legacy !== null) {
+        return {
+            ...verifiedRead.legacy,
+            stop_state: "legacy_incompatible",
+            pause_requested: false,
+            pause_in_flight: false,
+            pause_persisted: false,
+            resumable: false,
+            appended: false,
+            paused: false,
+            status: "legacy_incompatible",
+            already_terminal: false,
+        };
+    }
+    if (verifiedRead.read.aggregate.terminal !== null) {
+        const readiness = assessPersistedTerminalReadiness(
+            verifiedRead.read.aggregate,
+        );
+        return readiness.ready
+            ? terminalAvailable(investigationId)
+            : scientificBlockedPayload(investigationId, readiness);
+    }
 
     const result = deps.requestStop({
         stateDir: paths.stateDir,
@@ -514,24 +723,26 @@ export function stopInvestigation(args, deps) {
     });
     const aggregate = result?.aggregate ?? null;
     const alreadyTerminal = aggregate?.terminal != null;
+    if (alreadyTerminal) {
+        const readiness = assessPersistedTerminalReadiness(aggregate);
+        return readiness.ready
+            ? terminalAvailable(investigationId)
+            : scientificBlockedPayload(investigationId, readiness);
+    }
     const domainNonResult = (aggregate?.nonResults?.length ?? 0) > 0;
     const operationalNonResult = result?.operationalNonResult ?? null;
     const pausePersisted = result?.pausePersisted === true || aggregate?.pause !== null;
     const resumable = pausePersisted
-        && !alreadyTerminal
         && !domainNonResult
         && operationalNonResult === null;
-    const stopState = alreadyTerminal
-        ? "already_terminal"
-        : operationalNonResult !== null
-            ? "operational_non_result"
-            : domainNonResult
-                ? "domain_non_result"
-                : pausePersisted
-                    ? "pause_persisted"
-                    : "pause_requested";
+    const stopState = operationalNonResult !== null
+        ? "operational_non_result"
+        : domainNonResult
+            ? "domain_non_result"
+            : pausePersisted
+                ? "pause_persisted"
+                : "pause_requested";
     const pauseRequested = result?.appended === true
-        && !alreadyTerminal
         && !domainNonResult
         && operationalNonResult === null;
     const pauseInFlight = stopState === "pause_requested";
@@ -539,8 +750,6 @@ export function stopInvestigation(args, deps) {
         ?? aggregate?.nonResults?.at(-1)?.code
         ?? null;
     const messages = {
-        already_terminal:
-            "Investigation is already terminal; no pause was requested and it is not resumable.",
         operational_non_result:
             "A persisted operational non-result blocks resumability; reattach by investigation_id with any required later deadline/reset policy.",
         domain_non_result:
@@ -561,7 +770,6 @@ export function stopInvestigation(args, deps) {
         resumable,
         appended: result?.appended === true,
         status: aggregate?.status ?? "pause_requested",
-        already_terminal: alreadyTerminal,
         non_result: domainNonResult || operationalNonResult !== null,
         non_result_code: nonResultCode,
         message: messages[stopState],
@@ -601,11 +809,22 @@ export function resultInvestigation(args, deps) {
     if (verifiedRead.blocked !== null) {
         return verifiedRead.blocked;
     }
+    if (verifiedRead.legacy !== null) {
+        return {
+            ...verifiedRead.legacy,
+            status: "legacy_incompatible",
+            paused: false,
+        };
+    }
     const { aggregate, operationalNonResult } = verifiedRead.read;
     const terminal = aggregate.terminal;
     const isTerminalResult = terminal !== null && TERMINAL_DECISIONS.includes(terminal.decision);
 
     if (isTerminalResult) {
+        const readiness = assessPersistedTerminalReadiness(aggregate);
+        if (!readiness.ready) {
+            return scientificBlockedPayload(investigationId, readiness);
+        }
         return {
             is_result: true,
             banner: TERMINAL_BANNER,
@@ -616,7 +835,9 @@ export function resultInvestigation(args, deps) {
             terminal_event_hash: terminal.eventHash,
             contract_hash: aggregate.contractHash,
             event_head_hash: aggregate.lastEventHash,
-            candidate_id: terminal.candidateId ?? null,
+            ...(terminal.decision === "VERIFIED_RESULT"
+                ? { candidate_id: terminal.candidateId }
+                : {}),
             evidence_id: terminal.evidenceId ?? null,
             evidence_hash: terminal.evidenceHash ?? null,
             evidence_closure: terminal.evidenceClosure ?? terminal.basis?.evidenceClosure ?? null,
@@ -659,17 +880,40 @@ export function runToolBoundary(spec, handler, rawArgs, deps) {
         deps.log?.(
             `[crucible] ${spec.name} failed (${code ?? "ERROR"}): ${error?.message ?? String(error)}`,
         );
-        return failure(error?.message ?? String(error), { code, tool: spec.name });
+        const compatibility = error?.details?.compatibility;
+        const terminalAvailableForStart =
+            spec.name === "crucible_start"
+            && code === API_ERROR_CODES.INVESTIGATION_NOT_RESUMABLE
+            && error?.details?.status === "terminal";
+        return failure(error?.message ?? String(error), {
+            code,
+            tool: spec.name,
+            ...(terminalAvailableForStart ? { terminal_available: true } : {}),
+            ...(compatibility === "legacy_incompatible"
+                ? {
+                    compatibility,
+                    legacy_incompatible: true,
+                    restart_required: true,
+                    required_action: "start_new_investigation",
+                    expected_domain_version:
+                        error?.details?.expectedDomainVersion ?? DOMAIN_VERSION,
+                    actual_domain_version:
+                        error?.details?.actualDomainVersion ?? null,
+                    terminal_available: false,
+                }
+                : {}),
+        });
     };
+    const finish = (payload) => toolSuccess(spec.name, payload);
     try {
         const args = spec.parse(rawArgs ?? {});
         const payload = handler(args, deps);
         if (payload !== null
             && (typeof payload === "object" || typeof payload === "function")
             && typeof payload.then === "function") {
-            return Promise.resolve(payload).then(success, handleFailure);
+            return Promise.resolve(payload).then(finish).catch(handleFailure);
         }
-        return success(payload);
+        return finish(payload);
     } catch (error) {
         return handleFailure(error);
     }
@@ -680,13 +924,19 @@ export function runToolBoundary(spec, handler, rawArgs, deps) {
 // entrypoint passes straight to joinSession.
 export function buildRegistration({ env = process.env, log = () => {}, deps } = {}) {
     const resolvedDeps = deps ?? makeDefaultDeps(env, log);
-    const tools = TOOL_SPECS.map((spec) => ({
-        name: spec.name,
-        description: spec.description,
-        parameters: spec.parameters,
-        handler: (rawArgs) => runToolBoundary(spec, HANDLERS[spec.name], rawArgs, resolvedDeps),
-    }));
-    return { tools };
+    const specs = new Map(TOOL_SPECS.map((spec) => [spec.name, spec]));
+    const tools = PUBLIC_TOOL_NAMES.map((name) => {
+        const spec = specs.get(name);
+        const handler = HANDLERS[name];
+        if (spec === undefined || typeof handler !== "function") {
+            throw new Error(`Crucible public tool registration is incomplete for ${name}`);
+        }
+        return Object.freeze({
+            name,
+            description: spec.description,
+            parameters: spec.parameters,
+            handler: (rawArgs) => runToolBoundary(spec, handler, rawArgs, resolvedDeps),
+        });
+    });
+    return Object.freeze({ tools: Object.freeze(tools) });
 }
-
-export { HANDLERS };

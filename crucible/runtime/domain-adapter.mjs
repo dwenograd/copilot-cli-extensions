@@ -1,10 +1,14 @@
 import {
+    DOMAIN_VERSION,
     EVENT_TYPES,
     OBSERVATION_STREAM_HASH_ALGORITHM,
     SNAPSHOT_EXECUTION_HASH_ALGORITHM,
     artifactRefsFromProvenance,
+    assertExperimentAuthorityContractBinding,
     canonicalEqual,
     canonicalJson,
+    contractHash,
+    createInvestigationContract,
     constructEvidenceCommittedEvent,
     constructHarnessObservedEvent,
     constructInvestigationResumedEvent,
@@ -14,11 +18,17 @@ import {
     createInvestigationOpenedEvent,
     createMeasurementProvenance,
     createSnapshotProvenance,
+    enumerandArtifactMeasurementHash,
+    enumerandBindingHash,
     hashCanonical,
+    normalizeRuntimeConfigAuthority,
     reduceEvent,
     replayEvents,
     verifyEventChain,
 } from "../domain/index.mjs";
+import {
+    readVerifiedExperimentAuthority,
+} from "../api/experiment-authority.mjs";
 import {
     ERROR_CODES as PERSISTENCE_ERROR_CODES,
     openRepository,
@@ -32,6 +42,7 @@ import {
 } from "../measurement/index.mjs";
 import {
     CrucibleRuntimeError,
+    LegacyIncompatibleRuntimeError,
     RUNTIME_ERROR_CODES,
     RuntimeConfigError,
     RuntimeIntegrityError,
@@ -44,7 +55,8 @@ import {
 } from "./utils.mjs";
 import { PROMPT_CONTEXT_HASH_ALGORITHM } from "./prompt-context.mjs";
 
-const DOMAIN_KIND_PREFIX = "domain:";
+const DOMAIN_KIND_PREFIX = `domain:v${DOMAIN_VERSION}:`;
+const LEGACY_DOMAIN_KIND_PREFIX = "domain:";
 const OPERATIONAL_INVESTIGATION_SUFFIX = ".runtime-evidence";
 const TERMINAL_METADATA = Object.freeze({
     [EVENT_TYPES.VERIFIED_RESULT]: "verified_result",
@@ -101,6 +113,119 @@ const MEASUREMENT_RECEIPT_KEYS = Object.freeze([
 
 function isCasConflict(error) {
     return error?.code === PERSISTENCE_ERROR_CODES.CAS_CONFLICT;
+}
+
+function domainVersionOrNull(value) {
+    return Number.isSafeInteger(value) && value > 0 ? value : null;
+}
+
+export function inspectInvestigationDomainCompatibility({
+    repository,
+    investigationId,
+} = {}) {
+    if (repository === null
+        || typeof repository !== "object"
+        || typeof repository.getInvestigation !== "function"
+        || typeof repository.listEvents !== "function"
+        || typeof repository.getHead !== "function") {
+        throw new RuntimeConfigError(
+            "inspectInvestigationDomainCompatibility requires an EventRepository",
+        );
+    }
+    const id = requireIdentifier(investigationId, "investigationId");
+    const investigation = repository.getInvestigation(id);
+    if (investigation === null) {
+        return Object.freeze({
+            investigationId: id,
+            present: false,
+            compatibility: "absent",
+            compatible: true,
+            domainVersion: null,
+            contractDomainVersion: null,
+            eventCount: 0,
+            headSeq: 0,
+            readOnly: true,
+            archiveable: false,
+        });
+    }
+
+    const head = repository.getHead(id);
+    const first = repository.listEvents(id, { fromSeq: 1, toSeq: 1 })[0] ?? null;
+    const metadataDomainVersion = domainVersionOrNull(
+        investigation.metadata?.domainVersion,
+    );
+    if (first === null) {
+        const compatible = metadataDomainVersion === DOMAIN_VERSION;
+        return Object.freeze({
+            investigationId: id,
+            present: true,
+            compatibility: compatible ? "current_empty" : "legacy_incompatible",
+            compatible,
+            domainVersion: metadataDomainVersion,
+            contractDomainVersion: null,
+            eventCount: 0,
+            headSeq: 0,
+            readOnly: true,
+            archiveable: !compatible,
+        });
+    }
+
+    const domainEvent = first.payload?.domainEvent ?? null;
+    const eventDomainVersion = domainVersionOrNull(
+        domainEvent?.payload?.domainVersion,
+    );
+    const contractDomainVersion = domainVersionOrNull(
+        domainEvent?.payload?.contract?.domainVersion,
+    );
+    const currentKind =
+        `${DOMAIN_KIND_PREFIX}${EVENT_TYPES.INVESTIGATION_OPENED}`;
+    const legacyKind =
+        `${LEGACY_DOMAIN_KIND_PREFIX}${EVENT_TYPES.INVESTIGATION_OPENED}`;
+    // The repository kind is the outer version namespace. If it is the current
+    // v4 kind, malformed/missing inner fields remain integrity failures during
+    // replay rather than being mislabeled as archived legacy state.
+    const compatible = first.seq === 1 && first.kind === currentKind;
+    const recognizableOpening = first.seq === 1
+        && [currentKind, legacyKind].includes(first.kind)
+        && domainEvent?.type === EVENT_TYPES.INVESTIGATION_OPENED;
+
+    return Object.freeze({
+        investigationId: id,
+        present: true,
+        compatibility: compatible ? "current" : "legacy_incompatible",
+        compatible,
+        domainVersion: eventDomainVersion ?? metadataDomainVersion,
+        contractDomainVersion,
+        eventCount: head.seq,
+        headSeq: head.seq,
+        readOnly: true,
+        archiveable: !compatible && recognizableOpening,
+    });
+}
+
+export function assertInvestigationDomainCompatible(
+    repository,
+    investigationId,
+) {
+    const compatibility = inspectInvestigationDomainCompatibility({
+        repository,
+        investigationId,
+    });
+    if (!compatibility.compatible) {
+        throw new LegacyIncompatibleRuntimeError(
+            "Persisted investigation is not compatible with the active Crucible domain; start a new investigation",
+            {
+                investigationId: compatibility.investigationId,
+                expectedDomainVersion: DOMAIN_VERSION,
+                actualDomainVersion: compatibility.domainVersion,
+                contractDomainVersion: compatibility.contractDomainVersion,
+                eventCount: compatibility.eventCount,
+                archiveable: compatibility.archiveable,
+                readOnly: true,
+            },
+        );
+    }
+    return compatibility;
 }
 
 function expectedTerminalKind(domainEvent) {
@@ -796,7 +921,31 @@ function verifyCandidateArtifacts(
         `candidate ${evidence.evidenceId} proposal`,
     );
     const value = proposalArtifact.value;
-    if (!exactKeys(value, ["assignment", "promptContext", "promptContextHash", "proposal"])
+    const finiteEnumerand = command.enumerand?.topology === "finite_enumerable";
+    const boundedEnumerand =
+        command.enumerand?.topology === "bounded_parameterized";
+    const enumerandOptions = {
+        observableRegistry: aggregate.contract.observableRegistry,
+        hypothesisPolicy: aggregate.contract.hypothesisPolicy,
+    };
+    const expectedKeys = finiteEnumerand
+        ? [
+            "assignment",
+            "enumerand",
+            "promptContext",
+            "promptContextHash",
+            "proposal",
+        ]
+        : boundedEnumerand
+            ? [
+                "assignment",
+                "generationRequest",
+                "promptContext",
+                "promptContextHash",
+                "proposal",
+            ]
+            : ["assignment", "promptContext", "promptContextHash", "proposal"];
+    if (!exactKeys(value, expectedKeys)
         || value.promptContextHash !== provenance.promptContextHash
         || hashCanonical(value.promptContext, PROMPT_CONTEXT_HASH_ALGORITHM)
             !== provenance.promptContextHash
@@ -808,12 +957,52 @@ function verifyCandidateArtifacts(
             evidenceId: evidence.evidenceId,
         });
     }
-    verifyProposalSnapshot(
-        value.proposal,
-        measurements[0],
-        reader,
-        `candidate ${evidence.evidenceId}`,
-    );
+    if (finiteEnumerand) {
+        const measuredSnapshot =
+            measurements[0].measurement.snapshot.manifestArtifact.objectId;
+        if (!canonicalEqual(value.enumerand, command.enumerand)
+            || !Array.isArray(value.proposal.files)
+            || value.proposal.files.length !== 0
+            || value.proposal.identity?.source !== "frozen_enumerand_manifest"
+            || value.proposal.identity?.enumerandBindingHash
+                !== enumerandBindingHash(command.enumerand, enumerandOptions)
+            || measuredSnapshot !== command.enumerand.artifactSnapshotHash
+            || observation.receipt.candidateArtifactHash
+                !== enumerandArtifactMeasurementHash(
+                    command.enumerand.artifactSnapshotHash,
+                )) {
+            integrityFailure(
+                "Finite enumerand proposal does not match its frozen snapshot binding",
+                { evidenceId: evidence.evidenceId },
+            );
+        }
+    } else {
+        if (boundedEnumerand
+            && (!canonicalEqual(
+                value.generationRequest?.enumerandBinding,
+                command.enumerand,
+            )
+                || value.generationRequest?.enumerandBindingHash
+                !== enumerandBindingHash(command.enumerand, enumerandOptions)
+                || value.proposal.identity?.source
+                    !== "trusted_parameterized_generator"
+                || value.proposal.identity?.enumerandBindingHash
+                    !== enumerandBindingHash(
+                        command.enumerand,
+                        enumerandOptions,
+                    ))) {
+            integrityFailure(
+                "Parameterized proposal does not match its frozen enumerand binding",
+                { evidenceId: evidence.evidenceId },
+            );
+        }
+        verifyProposalSnapshot(
+            value.proposal,
+            measurements[0],
+            reader,
+            `candidate ${evidence.evidenceId}`,
+        );
+    }
 
     if (provenance.measurementReuseArtifact !== null) {
         const reused = reader.readJson(
@@ -1123,15 +1312,40 @@ export class DomainRepositoryAdapter {
         this.#operationalInvestigationId =
             `${this.#investigationId}${OPERATIONAL_INVESTIGATION_SUFFIX}`;
         if (ensure) {
+            const compatibility = assertInvestigationDomainCompatible(
+                this.#repository,
+                this.#investigationId,
+            );
+            const operational = this.#repository.getInvestigation(
+                this.#operationalInvestigationId,
+            );
+            if (operational !== null
+                && operational.metadata?.domainVersion !== DOMAIN_VERSION) {
+                throw new LegacyIncompatibleRuntimeError(
+                    "Persisted operational evidence belongs to an incompatible Crucible domain",
+                    {
+                        investigationId: this.#investigationId,
+                        operationalInvestigationId: this.#operationalInvestigationId,
+                        expectedDomainVersion: DOMAIN_VERSION,
+                        actualDomainVersion:
+                            domainVersionOrNull(operational.metadata?.domainVersion),
+                        readOnly: true,
+                    },
+                );
+            }
             this.#repository.ensureInvestigation({
                 investigationId: this.#investigationId,
-                metadata: { role: "crucible-domain" },
+                metadata: {
+                    role: "crucible-domain",
+                    domainVersion: DOMAIN_VERSION,
+                },
             });
             this.#repository.ensureInvestigation({
                 investigationId: this.#operationalInvestigationId,
                 metadata: {
                     role: "crucible-runtime-evidence",
                     domainInvestigationId: this.#investigationId,
+                    domainVersion: DOMAIN_VERSION,
                 },
             });
         }
@@ -1149,11 +1363,22 @@ export class DomainRepositoryAdapter {
         return this.#operationalInvestigationId;
     }
 
+    inspectCompatibility() {
+        return inspectInvestigationDomainCompatibility({
+            repository: this.#repository,
+            investigationId: this.#investigationId,
+        });
+    }
+
     domainFactIdentity(domainEvent) {
         return domainFactIdentity(domainEvent);
     }
 
     replay() {
+        assertInvestigationDomainCompatible(
+            this.#repository,
+            this.#investigationId,
+        );
         const repositoryReport = this.#repository.verifyInvestigation(this.#investigationId);
         if (!repositoryReport.ok) {
             throw new RuntimeIntegrityError(
@@ -1274,7 +1499,11 @@ export class DomainRepositoryAdapter {
         };
     }
 
-    openInvestigation(contract) {
+    openInvestigation(
+        contract,
+        verifiedExperimentAuthority,
+        runtimeConfigAuthority,
+    ) {
         const current = this.replay();
         if (current.domainEvents.length !== 0) {
             throw new CrucibleRuntimeError(
@@ -1283,12 +1512,92 @@ export class DomainRepositoryAdapter {
                 { investigationId: this.#investigationId },
             );
         }
-        return this.appendDomainEvent(createInvestigationOpenedEvent(contract), {
+        let authority;
+        let normalizedContract;
+        try {
+            const verified = readVerifiedExperimentAuthority(
+                verifiedExperimentAuthority,
+            );
+            normalizedContract = createInvestigationContract(contract);
+            authority = assertExperimentAuthorityContractBinding(
+                verified.authority,
+                normalizedContract,
+                this.#investigationId,
+            );
+            if (verified.trustedPublicKeyFingerprint
+                    !== authority.trustFingerprint
+                || !canonicalEqual(verified.signedPayload, authority.manifest)
+                || verified.signedPayloadIdentity
+                    !== authority.manifestIdentity
+                || verified.signature !== authority.signature
+                || verified.contractHash !== contractHash(normalizedContract)
+                || verified.investigationId !== this.#investigationId
+                || !canonicalEqual(
+                    verified.signedPayload.experimentPayload.contract,
+                    normalizedContract,
+                )) {
+                throw new Error(
+                    "verified experiment authority capability bindings do not match the requested opening",
+                );
+            }
+        } catch (error) {
+            throw new CrucibleRuntimeError(
+                RUNTIME_ERROR_CODES.DOMAIN_EVENT_INVALID,
+                `V4 investigation opening requires an exact verified Ed25519 authority capability: ${
+                    error?.message ?? String(error)
+                }`,
+                {
+                    investigationId: this.#investigationId,
+                    cause: error?.code ?? null,
+                },
+                { cause: error },
+            );
+        }
+        let runtimeAuthority;
+        try {
+            runtimeAuthority = normalizeRuntimeConfigAuthority(
+                runtimeConfigAuthority,
+            );
+            if (runtimeAuthority.securityConfig?.runner?.investigationId
+                !== this.#investigationId) {
+                throw new Error(
+                    "runtime config authority belongs to a different investigation",
+                );
+            }
+        } catch (error) {
+            throw new CrucibleRuntimeError(
+                RUNTIME_ERROR_CODES.DOMAIN_EVENT_INVALID,
+                `V4 investigation opening requires immutable runtime config authority: ${
+                    error?.message ?? String(error)
+                }`,
+                {
+                    investigationId: this.#investigationId,
+                    cause: error?.code ?? null,
+                },
+                { cause: error },
+            );
+        }
+        return this.#appendDomainEvent(createInvestigationOpenedEvent(
+            normalizedContract,
+            authority,
+            runtimeAuthority,
+        ), {
             aggregate: current.aggregate,
         });
     }
 
     appendDomainEvent(domainEvent, options = {}) {
+        if (domainEvent?.type === EVENT_TYPES.INVESTIGATION_OPENED) {
+            throw new CrucibleRuntimeError(
+                RUNTIME_ERROR_CODES.DOMAIN_EVENT_INVALID,
+                "Investigation opening events may only be appended through openInvestigation with a verified authority capability",
+                { investigationId: this.#investigationId },
+            );
+        }
+        return this.#appendDomainEvent(domainEvent, options);
+    }
+
+    #appendDomainEvent(domainEvent, options = {}) {
         const replayed = options.aggregate === undefined
             ? this.replay()
             : { aggregate: options.aggregate };

@@ -5,6 +5,7 @@ import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 
 import {
+    BUNDLE_VERSION,
     openRepository,
     openArtifactStore,
     exportBundle,
@@ -13,6 +14,13 @@ import {
     canonicalize,
     BUNDLE_ERROR_CODES,
 } from "../persistence/index.mjs";
+import {
+    DEFAULT_SEARCH_POLICY,
+    DOMAIN_VERSION,
+    createInvestigationContract,
+} from "../domain/index.mjs";
+import { appendLegacyV3Investigation } from "./legacy-v3-fixture.mjs";
+import { makeV4ContractInput } from "./v4-contract-fixture.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SNAPSHOT_CONTENT_TYPE = "application/vnd.crucible.snapshot+json";
@@ -105,7 +113,10 @@ beforeEach(() => {
     extraObject = store.putBytes(Buffer.from("standalone-attachment"));
 
     repo = openRepository({ file: path.join(base, "events.sqlite") });
-    repo.ensureInvestigation({ investigationId: "inv-1", metadata: { case: "audit" } });
+    repo.ensureInvestigation({
+        investigationId: "inv-1",
+        metadata: { case: "audit", domainVersion: DOMAIN_VERSION },
+    });
     repo.appendEvents({
         investigationId: "inv-1",
         expectedHead: null,
@@ -143,6 +154,20 @@ function doExport(destName = "bundle", overrides = {}) {
     return { destDir, res };
 }
 
+function bundleDomainContract() {
+    return createInvestigationContract(makeV4ContractInput({
+        objective: "Archive a legacy Crucible investigation",
+        acceptancePredicate: { kind: "harness_pass" },
+        hypothesisTopology: "open_generative",
+        criticality: "standard",
+        policyVersion: "policy-v1",
+        workerModels: ["model-a"],
+        candidatesPerRound: 1,
+        maxRounds: 1,
+        searchPolicy: DEFAULT_SEARCH_POLICY,
+    }));
+}
+
 describe("canonical export", () => {
     it("produces a strict deterministic bundle bound to schema, head, and referenced closure", () => {
         const first = doExport("bundle-a");
@@ -150,11 +175,13 @@ describe("canonical export", () => {
 
         const manifest = readBundleManifest(first.destDir);
         expect(manifest.type).toBe("crucible-audit-bundle");
-        expect(manifest.version).toBe(2);
+        expect(BUNDLE_VERSION).toBe(3);
+        expect(manifest.version).toBe(BUNDLE_VERSION);
         expect(manifest.database.path).toBe("db/database.sqlite");
         expect(manifest.database.schemaFingerprint).toMatch(/^[0-9a-f]{64}$/);
         expect(manifest.investigation).toEqual({
             id: "inv-1",
+            domainVersion: 4,
             domainHead: repo.getHead("inv-1"),
         });
         expect(manifest.snapshots).toEqual([snap.snapshot]);
@@ -165,6 +192,7 @@ describe("canonical export", () => {
             "standalone-object",
         ]);
         expect(first.res.objectCount).toBe(4);
+        expect(first.res.domainVersion).toBe(4);
         expect(first.res.digest).toBe(second.res.digest);
         expect(fs.readFileSync(path.join(first.destDir, "manifest.json")))
             .toEqual(fs.readFileSync(path.join(second.destDir, "manifest.json")));
@@ -247,6 +275,64 @@ describe("canonical export", () => {
 });
 
 describe("bundle import and round trip", () => {
+    it("archives v3 state read-only but rejects importing it into active v4", () => {
+        const investigationId = "legacy-v3-bundle";
+        const dbFile = path.join(base, "legacy-v3.sqlite");
+        const legacyRepository = openRepository({ file: dbFile });
+        const legacyStore = openArtifactStore({
+            root: path.join(base, "legacy-v3-cas"),
+        });
+        try {
+            appendLegacyV3Investigation(
+                legacyRepository,
+                investigationId,
+                bundleDomainContract(),
+            );
+            const before = legacyRepository.listEvents(investigationId);
+            const bundleDir = path.join(base, "legacy-v3-bundle");
+            const archived = exportBundle({
+                store: legacyStore,
+                dbFile,
+                destDir: bundleDir,
+                investigationId,
+                now: () => "2026-07-09T00:00:00.000Z",
+            });
+
+            expect(archived).toMatchObject({
+                investigationId,
+                domainVersion: 3,
+                fileCount: 2,
+            });
+            expect(readBundleManifest(bundleDir)).toMatchObject({
+                version: BUNDLE_VERSION,
+                investigation: {
+                    id: investigationId,
+                    domainVersion: 3,
+                },
+            });
+            expect(legacyRepository.listEvents(investigationId)).toEqual(before);
+
+            const importedDir = path.join(base, "legacy-v3-import");
+            const error = catchErr(() => importBundle({
+                bundleDir,
+                destDir: importedDir,
+                allowUnauthenticated: true,
+            }));
+            expect(error).toMatchObject({
+                code: BUNDLE_ERROR_CODES.DOMAIN_VERSION_MISMATCH,
+                details: expect.objectContaining({
+                    compatibility: "legacy_incompatible",
+                    expectedDomainVersion: 4,
+                    actualDomainVersion: 3,
+                    restartRequired: true,
+                }),
+            });
+            expect(fs.existsSync(importedDir)).toBe(false);
+        } finally {
+            legacyRepository.close();
+        }
+    });
+
     it("authenticates the expected digest and materializes an identical bundle", () => {
         const { destDir, res } = doExport();
         const dest = path.join(base, "imported");
@@ -263,6 +349,7 @@ describe("bundle import and round trip", () => {
             trustLevel: "authenticated",
             digest: res.digest,
             investigationId: "inv-1",
+            domainVersion: 4,
         });
         expect(listFiles(dest)).toEqual(listFiles(destDir));
         for (const rel of listFiles(destDir)) {

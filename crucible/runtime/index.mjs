@@ -1,6 +1,7 @@
 export {
     RUNTIME_ERROR_CODES,
     CrucibleRuntimeError,
+    LegacyIncompatibleRuntimeError,
     RuntimeConfigError,
     RuntimeIntegrityError,
     WorkerProtocolError,
@@ -20,6 +21,13 @@ export {
     supervisorConfigDocument,
     supervisorConfigFingerprint,
 } from "./config.mjs";
+
+export {
+    assertSupervisorConfigMatchesRuntimeAuthority,
+    buildRuntimeConfigAuthority,
+    supervisorConfigFromRuntimeAuthority,
+    verifyRuntimeConfigAuthority,
+} from "./config-authority.mjs";
 
 export {
     STRICT_ISO_TIMESTAMP_PATTERN_SOURCE,
@@ -45,6 +53,12 @@ export {
 } from "./worker-pool.mjs";
 
 export {
+    assertBoundedEnumerandRequest,
+    assertFiniteEnumerandSnapshot,
+    resolveCommandEnumerand,
+} from "./enumerand-execution.mjs";
+
+export {
     PROMPT_CONTEXT_VERSION,
     PROMPT_CONTEXT_HASH_ALGORITHM,
     DEFAULT_PROMPT_CONTEXT_BYTE_CAP,
@@ -55,7 +69,9 @@ export {
 
 export {
     DomainRepositoryAdapter,
+    assertInvestigationDomainCompatible,
     createDomainRepositoryAdapter,
+    inspectInvestigationDomainCompatibility,
     openDomainRepositoryAdapter,
     formatAttemptCommand,
 } from "./domain-adapter.mjs";
@@ -79,6 +95,7 @@ export {
     startSupervisor,
     readStatus,
     requestStop,
+    resolveNodeExecutable,
     ensureSupervisor,
     waitForSupervisorAcknowledgement,
     terminateSupervisor,

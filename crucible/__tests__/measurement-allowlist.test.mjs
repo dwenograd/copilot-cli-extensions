@@ -248,8 +248,8 @@ describe("verifyEntry (re-verify before every run)", () => {
         const p = writeAllowlist(root, "e1", {
             allowedEnv: { CRUCIBLE_MODE: "strict" },
             validationCases: {
-                good: { snapshotHash: good },
-                bad: { snapshotHash: bad },
+                good: { snapshotHash: good, expectation: "accept" },
+                bad: { snapshotHash: bad, expectation: "reject" },
             },
         });
         const list = loadHarnessAllowlist(p);
@@ -280,6 +280,17 @@ describe("verifyEntry (re-verify before every run)", () => {
             ],
         }));
         expect(mismatch.code).toBe(MEASUREMENT_ERROR_CODES.ALLOWLIST_INVALID);
+
+        const relabel = catchIt(() => verifyHarnessPreflight(list, "e1", {
+            parserVersion: PARSER_VERSION,
+            validationCases: [{
+                id: "good",
+                expectation: "reject",
+                artifactHash: good,
+            }],
+        }));
+        expect(relabel.code).toBe(MEASUREMENT_ERROR_CODES.ALLOWLIST_INVALID);
+        expect(relabel.message).toMatch(/cannot relabel/u);
     });
 
     it("freezes provider identity, policy fields, and Job limits", () => {

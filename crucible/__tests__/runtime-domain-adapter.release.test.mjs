@@ -33,6 +33,12 @@ import {
     formatAttemptCommand,
 } from "../runtime/index.mjs";
 import { fakeHarnessIdentity } from "./harness-identity-fixture.mjs";
+import {
+    createRuntimeConfigAuthorityFixture,
+    createSignedInvestigationAuthority,
+} from "./experiment-authority-fixture.mjs";
+import { upgradeLegacyContractInput } from "./v4-contract-fixture.mjs";
+import { removeTreeRobust } from "./test-cleanup.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const roots = [];
@@ -81,23 +87,7 @@ function releaseRepository(repository) {
     repository.close();
 }
 
-function removeRootWithRetry(root, attempts = 10) {
-    for (let attempt = 0; ; attempt += 1) {
-        try {
-            fs.rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 25 });
-            if (fs.existsSync(root)) {
-                throw new Error(`runtime adapter root survived cleanup: ${root}`);
-            }
-            return;
-        } catch (error) {
-            if (attempt >= attempts) {
-                throw error;
-            }
-        }
-    }
-}
-
-afterEach(() => {
+afterEach(async () => {
     const failures = [];
     for (const repository of openRepositories) {
         try {
@@ -109,7 +99,10 @@ afterEach(() => {
     openRepositories.clear();
     for (const root of roots.splice(0)) {
         try {
-            removeRootWithRetry(root);
+            await removeTreeRobust(root, {
+                label: "runtime domain-adapter test root",
+                timeoutMs: 30_000,
+            });
         } catch (error) {
             failures.push(error);
         }
@@ -132,21 +125,21 @@ describe("H7 concurrent runner ownership failure matrix", () => {
             repositoryA,
             repositoryB,
             adapterA,
+            investigationId,
         } = openSharedAdapters(`h7-incarnation-${expectedState}`);
-        adapterA.openInvestigation(createInvestigationContract(contractInput()));
         repositoryA.claimSupervisorGeneration({
-            investigationId: "inv-runtime",
+            investigationId,
             supervisorGeneration: 9,
             supervisorNonce: "supervisor-nine",
         });
         repositoryA.issueRunnerIncarnation({
-            investigationId: "inv-runtime",
+            investigationId,
             supervisorGeneration: 9,
             supervisorNonce: "supervisor-nine",
             runnerIncarnation: "runner-nine-old",
         });
         const oldLease = repositoryA.acquireLease({
-            investigationId: "inv-runtime",
+            investigationId,
             leaseId: `lease-old-${expectedState}`,
             owner: "runner-old",
             supervisorGeneration: 9,
@@ -155,7 +148,7 @@ describe("H7 concurrent runner ownership failure matrix", () => {
         const attemptId = `attempt-${expectedState}`;
         const command = `command-${expectedState}`;
         repositoryA.reserveCommand({
-            investigationId: "inv-runtime",
+            investigationId,
             attemptId,
             command,
             leaseId: oldLease.leaseId,
@@ -166,7 +159,7 @@ describe("H7 concurrent runner ownership failure matrix", () => {
         });
         for (const toState of transitions) {
             repositoryA.transitionCommand({
-                investigationId: "inv-runtime",
+                investigationId,
                 attemptId,
                 toState,
                 leaseId: oldLease.leaseId,
@@ -179,13 +172,13 @@ describe("H7 concurrent runner ownership failure matrix", () => {
         expect(repositoryA.getCommandAttempt(attemptId).state).toBe(expectedState);
 
         repositoryB.issueRunnerIncarnation({
-            investigationId: "inv-runtime",
+            investigationId,
             supervisorGeneration: 9,
             supervisorNonce: "supervisor-nine",
             runnerIncarnation: "runner-nine-current",
         });
         const currentLease = repositoryB.acquireLease({
-            investigationId: "inv-runtime",
+            investigationId,
             leaseId: `lease-current-${expectedState}`,
             owner: "runner-current",
             supervisorGeneration: 9,
@@ -199,7 +192,7 @@ describe("H7 concurrent runner ownership failure matrix", () => {
         const before = repositoryB.getCommandAttempt(attemptId);
 
         expect(() => repositoryA.transitionCommand({
-            investigationId: "inv-runtime",
+            investigationId,
             attemptId,
             toState: nextState,
             leaseId: oldLease.leaseId,
@@ -213,7 +206,7 @@ describe("H7 concurrent runner ownership failure matrix", () => {
         expect(repositoryB.getCommandAttempt(attemptId)).toEqual(before);
 
         const abandoned = repositoryB.abandonStaleCommand({
-            investigationId: "inv-runtime",
+            investigationId,
             attemptId,
             leaseId: currentLease.leaseId,
             fencingToken: currentLease.fencingToken,
@@ -225,33 +218,32 @@ describe("H7 concurrent runner ownership failure matrix", () => {
     });
 
     it("rejects a delayed stale generation before it can acquire or resume authority", () => {
-        const { repositoryA, repositoryB, adapterA } =
+        const { repositoryA, repositoryB, investigationId } =
             openSharedAdapters("h7-delayed-generation");
-        adapterA.openInvestigation(createInvestigationContract(contractInput()));
         repositoryA.claimSupervisorGeneration({
-            investigationId: "inv-runtime",
+            investigationId,
             supervisorGeneration: 4,
             supervisorNonce: "supervisor-four",
         });
         repositoryA.issueRunnerIncarnation({
-            investigationId: "inv-runtime",
+            investigationId,
             supervisorGeneration: 4,
             supervisorNonce: "supervisor-four",
             runnerIncarnation: "runner-four",
         });
         repositoryA.claimSupervisorGeneration({
-            investigationId: "inv-runtime",
+            investigationId,
             supervisorGeneration: 5,
             supervisorNonce: "supervisor-five",
         });
         repositoryB.issueRunnerIncarnation({
-            investigationId: "inv-runtime",
+            investigationId,
             supervisorGeneration: 5,
             supervisorNonce: "supervisor-five",
             runnerIncarnation: "runner-five",
         });
         const current = repositoryB.acquireLease({
-            investigationId: "inv-runtime",
+            investigationId,
             leaseId: "lease-five",
             owner: "runner-five",
             supervisorGeneration: 5,
@@ -259,7 +251,7 @@ describe("H7 concurrent runner ownership failure matrix", () => {
         });
 
         expect(() => repositoryA.acquireLease({
-            investigationId: "inv-runtime",
+            investigationId,
             leaseId: "lease-four-delayed",
             owner: "runner-four-delayed",
             supervisorGeneration: 4,
@@ -267,7 +259,7 @@ describe("H7 concurrent runner ownership failure matrix", () => {
         })).toThrow(expect.objectContaining({
             code: PERSISTENCE_ERROR_CODES.FENCE_REJECTED,
         }));
-        expect(repositoryB.getActiveLease("inv-runtime")).toMatchObject(current);
+        expect(repositoryB.getActiveLease(investigationId)).toMatchObject(current);
     });
 });
 
@@ -298,7 +290,7 @@ function searchPolicy(overrides = {}) {
 }
 
 function contractInput(overrides = {}) {
-    return {
+    return upgradeLegacyContractInput({
         objective: "Find a score of at least 90",
         acceptancePredicate: {
             kind: "all",
@@ -331,45 +323,84 @@ function contractInput(overrides = {}) {
         searchPolicy: searchPolicy(),
         declaredLimits: { maxCommands: 10 },
         ...overrides,
-    };
+    });
 }
 
-function openAdapter(label = "db") {
+function openAdapter(
+    label = "db",
+    contract = createInvestigationContract(contractInput()),
+) {
     const root = makeRoot(label);
     const repository = trackRepository(
         openRepository({ file: path.join(root, "events.sqlite") }),
     );
+    const signed = createSignedInvestigationAuthority({
+        contract,
+        experimentId: `release-${label}`,
+        projectDir: root,
+    });
     const adapter = createDomainRepositoryAdapter({
         repository,
-        investigationId: "inv-runtime",
+        investigationId: signed.investigationId,
     });
-    return { root, repository, adapter };
+    adapter.openInvestigation(
+        contract,
+        signed.capability,
+        createRuntimeConfigAuthorityFixture(signed.investigationId),
+    );
+    return {
+        root,
+        repository,
+        adapter,
+        investigationId: signed.investigationId,
+    };
 }
 
-function openSharedAdapters(label) {
+function openSharedAdapters(
+    label,
+    contract = createInvestigationContract(contractInput()),
+) {
     const root = makeRoot(label);
     const file = path.join(root, "events.sqlite");
     const repositoryA = trackRepository(openRepository({ file }));
+    const signed = createSignedInvestigationAuthority({
+        contract,
+        experimentId: `release-${label}`,
+        projectDir: root,
+    });
     const adapterA = createDomainRepositoryAdapter({
         repository: repositoryA,
-        investigationId: "inv-runtime",
+        investigationId: signed.investigationId,
     });
     const repositoryB = trackRepository(openRepository({ file }));
     const adapterB = createDomainRepositoryAdapter({
         repository: repositoryB,
-        investigationId: "inv-runtime",
+        investigationId: signed.investigationId,
     });
-    return { root, file, repositoryA, repositoryB, adapterA, adapterB };
+    adapterA.openInvestigation(
+        contract,
+        signed.capability,
+        createRuntimeConfigAuthorityFixture(signed.investigationId),
+    );
+    return {
+        root,
+        file,
+        repositoryA,
+        repositoryB,
+        adapterA,
+        adapterB,
+        investigationId: signed.investigationId,
+    };
 }
 
-function domainPersistenceSnapshot(repository) {
+function domainPersistenceSnapshot(repository, investigationId) {
     return {
-        events: repository.listEvents("inv-runtime").map((event) => event.eventHash),
-        refs: repository.listArtifactRefs("inv-runtime").map((ref) => ({
+        events: repository.listEvents(investigationId).map((event) => event.eventHash),
+        refs: repository.listArtifactRefs(investigationId).map((ref) => ({
             artifactId: ref.artifactId,
             seq: ref.seq,
         })),
-        attempts: repository.listCommandAttempts("inv-runtime").map((attempt) => ({
+        attempts: repository.listCommandAttempts(investigationId).map((attempt) => ({
             attemptId: attempt.attemptId,
             command: attempt.command,
             state: attempt.state,
@@ -393,11 +424,15 @@ function fakeArtifact(label, hash) {
     };
 }
 
-function registerProvenanceArtifacts(repository, provenance) {
+function registerProvenanceArtifacts(
+    repository,
+    investigationId,
+    provenance,
+) {
     for (const artifact of artifactRefsFromProvenance(provenance)) {
         if (repository.getArtifact(artifact.artifactId) !== null) continue;
         repository.registerExternalArtifact({
-            investigationId: "inv-runtime",
+            investigationId,
             artifactId: artifact.artifactId,
             algo: "sha256",
             hash: artifact.objectId.slice("sha256:".length),
@@ -408,7 +443,14 @@ function registerProvenanceArtifacts(repository, provenance) {
     }
 }
 
-function harnessReceipt(repository, contract, command, attemptId, purpose) {
+function harnessReceipt(
+    repository,
+    investigationId,
+    contract,
+    command,
+    attemptId,
+    purpose,
+) {
     const subjectIds = purpose === "validation"
         ? contract.validationCases.map((item) => item.id)
         : [command.candidateId];
@@ -492,7 +534,7 @@ function harnessReceipt(repository, contract, command, attemptId, purpose) {
             : null,
         measurements,
     }, { purpose, command, contract });
-    registerProvenanceArtifacts(repository, provenance);
+    registerProvenanceArtifacts(repository, investigationId, provenance);
     return {
         version: 1,
         attemptId,
@@ -529,9 +571,6 @@ function prepareValidationCommand(adapter, repository, {
     supervisorGeneration = null,
     runnerIncarnation = null,
 } = {}) {
-    if (adapter.replay().domainEvents.length === 0) {
-        adapter.openInvestigation(createInvestigationContract(contractInput()));
-    }
     const reserved = adapter.appendKernelDecision().domainEvent.payload;
     adapter.appendExternal(EVENT_TYPES.COMMAND_DISPATCHED, {
         commandId: reserved.commandId,
@@ -559,6 +598,7 @@ function prepareValidationCommand(adapter, repository, {
             purpose: "validation",
             receipt: harnessReceipt(
                 repository,
+                adapter.investigationId,
                 aggregate.contract,
                 reserved.command,
                 attemptId,
@@ -574,12 +614,16 @@ function prepareValidationCommand(adapter, repository, {
     };
 }
 
+function fullVerifiedHistoryContract() {
+    return createInvestigationContract(contractInput({
+        hypothesisTopology: "open_generative",
+        maxRounds: 1,
+        searchPolicy: searchPolicy(),
+    }));
+}
+
 function appendFullVerifiedHistory(adapter, { includeTerminal = true } = {}) {
-    let aggregate = adapter.openInvestigation(
-        createInvestigationContract(contractInput({
-            searchPolicy: searchPolicy({ stopOnFirstAccept: true }),
-        })),
-    ).aggregate;
+    let aggregate = adapter.replay().aggregate;
     aggregate = adapter.appendDomainEvent(
         constructKernelDecisionEvent(aggregate),
         { aggregate },
@@ -598,6 +642,7 @@ function appendFullVerifiedHistory(adapter, { includeTerminal = true } = {}) {
             purpose: "validation",
             receipt: harnessReceipt(
                 adapter.repository,
+                adapter.investigationId,
                 aggregate.contract,
                 aggregate.commands["cmd-000001"].command,
                 "validation-attempt",
@@ -643,6 +688,7 @@ function appendFullVerifiedHistory(adapter, { includeTerminal = true } = {}) {
             // search-candidate assignment; supplying our own would be rejected.
             receipt: harnessReceipt(
                 adapter.repository,
+                adapter.investigationId,
                 aggregate.contract,
                 aggregate.commands["cmd-000002"].command,
                 "candidate-attempt",
@@ -670,27 +716,31 @@ function appendFullVerifiedHistory(adapter, { includeTerminal = true } = {}) {
 
 describe("Crucible domain/persistence adapter", () => {
     it("stores one canonical repository event per domain event with identical sequence", () => {
-        const { repository, adapter } = openAdapter("one-to-one");
+        const { repository, adapter, investigationId } = openAdapter(
+            "one-to-one",
+            fullVerifiedHistoryContract(),
+        );
         const aggregate = appendFullVerifiedHistory(adapter);
-        const rows = repository.listEvents("inv-runtime");
+        const rows = repository.listEvents(investigationId);
 
         expect(rows).toHaveLength(aggregate.lastSeq);
         for (const row of rows) {
-            expect(row.kind).toBe(`domain:${row.payload.domainEvent.type}`);
+            expect(row.kind).toBe(`domain:v4:${row.payload.domainEvent.type}`);
             expect(row.seq).toBe(row.payload.domainEvent.seq);
             expect(Object.keys(row.payload)).toEqual(["domainEvent"]);
         }
         expect(rows.at(-1)).toMatchObject({
-            isTerminal: true,
-            terminalKind: "verified_result",
+            kind: "domain:v4:non_result_recorded",
+            isTerminal: false,
+            terminalKind: null,
         });
         expect(adapter.replay().aggregate).toEqual(aggregate);
         releaseRepository(repository);
     });
 
     it("keeps non-domain evidence in the companion log without shifting domain sequence", () => {
-        const { repository, adapter } = openAdapter("side-log");
-        let aggregate = adapter.openInvestigation(createInvestigationContract(contractInput())).aggregate;
+        const { repository, adapter, investigationId } = openAdapter("side-log");
+        let aggregate = adapter.replay().aggregate;
         adapter.ingestOperationalEvidence({
             attemptId: "attempt-side",
             evidenceKind: "candidate:candidate-a",
@@ -701,22 +751,21 @@ describe("Crucible domain/persistence adapter", () => {
             { aggregate },
         ).aggregate;
 
-        expect(repository.listEvents("inv-runtime").map((row) => row.seq)).toEqual([1, 2]);
+        expect(repository.listEvents(investigationId).map((row) => row.seq)).toEqual([1, 2]);
         expect(repository.listEvents(adapter.operationalInvestigationId)).toHaveLength(1);
         expect(aggregate.lastSeq).toBe(2);
         releaseRepository(repository);
     });
 
     it("detects repository tampering before domain replay", () => {
-        const { root, repository, adapter } = openAdapter("repo-tamper");
-        adapter.openInvestigation(createInvestigationContract(contractInput()));
+        const { root, repository, investigationId } = openAdapter("repo-tamper");
         releaseRepository(repository);
 
         const raw = new DatabaseSync(path.join(root, "events.sqlite"));
         try {
             raw.exec("PRAGMA journal_mode=WAL;");
             raw.prepare("UPDATE events SET payload = ? WHERE investigation_id = ? AND seq = 1")
-                .run(JSON.stringify({ domainEvent: { forged: true } }), "inv-runtime");
+                .run(JSON.stringify({ domainEvent: { forged: true } }), investigationId);
         } finally {
             raw.close();
         }
@@ -724,7 +773,7 @@ describe("Crucible domain/persistence adapter", () => {
         const reopened = trackRepository(openRepository({ file: path.join(root, "events.sqlite") }));
         const replayAdapter = createDomainRepositoryAdapter({
             repository: reopened,
-            investigationId: "inv-runtime",
+            investigationId,
         });
         expect(() => replayAdapter.replay()).toThrow(expect.objectContaining({
             code: RUNTIME_ERROR_CODES.INTEGRITY_FAILURE,
@@ -733,9 +782,8 @@ describe("Crucible domain/persistence adapter", () => {
     });
 
     it("detects a forged domain event even when the repository hash is recomputed", () => {
-        const { root, repository, adapter } = openAdapter("domain-tamper");
-        adapter.openInvestigation(createInvestigationContract(contractInput()));
-        const row = repository.getEvent("inv-runtime", 1);
+        const { root, repository, investigationId } = openAdapter("domain-tamper");
+        const row = repository.getEvent(investigationId, 1);
         releaseRepository(repository);
 
         const forgedPayload = JSON.parse(JSON.stringify(row.payload));
@@ -757,7 +805,7 @@ describe("Crucible domain/persistence adapter", () => {
         try {
             raw.exec("PRAGMA journal_mode=WAL;");
             raw.prepare("UPDATE events SET payload = ?, event_hash = ? WHERE investigation_id = ? AND seq = 1")
-                .run(payloadCanonical, repositoryHash, "inv-runtime");
+                .run(payloadCanonical, repositoryHash, investigationId);
         } finally {
             raw.close();
         }
@@ -765,9 +813,9 @@ describe("Crucible domain/persistence adapter", () => {
         const reopened = trackRepository(openRepository({ file: path.join(root, "events.sqlite") }));
         const replayAdapter = createDomainRepositoryAdapter({
             repository: reopened,
-            investigationId: "inv-runtime",
+            investigationId,
         });
-        expect(reopened.verifyInvestigation("inv-runtime").ok).toBe(true);
+        expect(reopened.verifyInvestigation(investigationId).ok).toBe(true);
         expect(() => replayAdapter.replay()).toThrow(expect.objectContaining({
             code: RUNTIME_ERROR_CODES.INTEGRITY_FAILURE,
         }));
@@ -775,10 +823,13 @@ describe("Crucible domain/persistence adapter", () => {
     });
 
     it("prevents evidence commitment when an observation artifact ref is missing", () => {
-        const { root, repository, adapter } = openAdapter("missing-artifact-ref");
-        let aggregate = adapter.openInvestigation(
-            createInvestigationContract(contractInput()),
-        ).aggregate;
+        const {
+            root,
+            repository,
+            adapter,
+            investigationId,
+        } = openAdapter("missing-artifact-ref");
+        let aggregate = adapter.replay().aggregate;
         const reserved = adapter.appendKernelDecision();
         aggregate = reserved.aggregate;
         aggregate = adapter.appendExternal(EVENT_TYPES.COMMAND_DISPATCHED, {
@@ -786,6 +837,7 @@ describe("Crucible domain/persistence adapter", () => {
         }).aggregate;
         const receipt = harnessReceipt(
             repository,
+            adapter.investigationId,
             aggregate.contract,
             reserved.domainEvent.payload.command,
             "missing-ref-attempt",
@@ -804,7 +856,7 @@ describe("Crucible domain/persistence adapter", () => {
             },
         });
         const observationSeq = observed.domainEvent.seq;
-        expect(repository.listArtifactRefsForEvent("inv-runtime", observationSeq).length)
+        expect(repository.listArtifactRefsForEvent(investigationId, observationSeq).length)
             .toBeGreaterThan(0);
 
         const raw = new DatabaseSync(path.join(root, "events.sqlite"));
@@ -816,7 +868,7 @@ describe("Crucible domain/persistence adapter", () => {
                     SELECT ref_id FROM artifact_refs
                     WHERE investigation_id = ? AND seq = ?
                     ORDER BY ref_id ASC LIMIT 1
-                )`).run("inv-runtime", observationSeq);
+                )`).run(investigationId, observationSeq);
         } finally {
             raw.close();
         }
@@ -827,14 +879,13 @@ describe("Crucible domain/persistence adapter", () => {
         })).toThrow(expect.objectContaining({
             code: RUNTIME_ERROR_CODES.INTEGRITY_FAILURE,
         }));
-        expect(repository.listEvents("inv-runtime").some((row) =>
-            row.kind === "domain:evidence_committed")).toBe(false);
+        expect(repository.listEvents(investigationId).some((row) =>
+            row.kind === "domain:v4:evidence_committed")).toBe(false);
         releaseRepository(repository);
     });
 
     it("abandons stale reserved/dispatched attempts before replacement work", () => {
         const { repository, adapter } = openAdapter("recovery");
-        adapter.openInvestigation(createInvestigationContract(contractInput()));
         const first = adapter.acquireRunnerLease({ leaseId: "lease-one", owner: "runner-one" });
         adapter.reserveAttempt({
             attemptId: "attempt-reserved",
@@ -873,6 +924,7 @@ describe("Crucible domain/persistence adapter", () => {
             repositoryB,
             adapterA,
             adapterB,
+            investigationId,
         } = openSharedAdapters("multiprocess-fence-race");
         const prepared = prepareValidationCommand(adapterA, repositoryA, {
             leaseId: "lease-old-process",
@@ -882,7 +934,7 @@ describe("Crucible domain/persistence adapter", () => {
         const inputPath = path.join(root, "fence-race-input.json");
         fs.writeFileSync(inputPath, JSON.stringify({
             databasePath: file,
-            investigationId: "inv-runtime",
+            investigationId,
             observation: prepared.observation,
             attemptId: "attempt-old-process",
             command: prepared.command,
@@ -911,14 +963,18 @@ describe("Crucible domain/persistence adapter", () => {
                 leaseId: "lease-current-process",
                 owner: "runner-current-process",
             });
-            const beforeStaleWrite = domainPersistenceSnapshot(repositoryB);
+            const beforeStaleWrite = domainPersistenceSnapshot(
+                repositoryB,
+                investigationId,
+            );
             child.send({ type: "go" });
             const result = await waitForChildMessage(child, "result");
             expect(result, stderr).toMatchObject({
                 ok: false,
                 code: PERSISTENCE_ERROR_CODES.FENCE_REJECTED,
             });
-            expect(domainPersistenceSnapshot(repositoryB)).toEqual(beforeStaleWrite);
+            expect(domainPersistenceSnapshot(repositoryB, investigationId))
+                .toEqual(beforeStaleWrite);
             if (child.exitCode === null && child.signalCode === null) {
                 await new Promise((resolve) => child.once("exit", resolve));
             }
@@ -936,6 +992,7 @@ describe("Crucible domain/persistence adapter", () => {
             repositoryB,
             adapterA,
             adapterB,
+            investigationId,
         } = openSharedAdapters("two-handle-observation-takeover");
         const prepared = prepareValidationCommand(adapterA, repositoryA, {
             leaseId: "lease-a",
@@ -943,11 +1000,14 @@ describe("Crucible domain/persistence adapter", () => {
             attemptId: "attempt-a",
         });
         const leaseB = repositoryB.acquireLease({
-            investigationId: "inv-runtime",
+            investigationId,
             leaseId: "lease-b",
             owner: "runner-b",
         });
-        const beforeStaleWrite = domainPersistenceSnapshot(repositoryB);
+        const beforeStaleWrite = domainPersistenceSnapshot(
+            repositoryB,
+            investigationId,
+        );
 
         expect(() => adapterA.appendHarnessObservationFenced(
             prepared.observation,
@@ -959,7 +1019,8 @@ describe("Crucible domain/persistence adapter", () => {
         )).toThrow(expect.objectContaining({
             code: PERSISTENCE_ERROR_CODES.FENCE_REJECTED,
         }));
-        expect(domainPersistenceSnapshot(repositoryB)).toEqual(beforeStaleWrite);
+        expect(domainPersistenceSnapshot(repositoryB, investigationId))
+            .toEqual(beforeStaleWrite);
         expect(repositoryB.getCommandAttempt("attempt-a").state).toBe("dispatched");
 
         adapterB.recoverStaleAttempts(leaseB);
@@ -976,6 +1037,7 @@ describe("Crucible domain/persistence adapter", () => {
             observationId: "current-validation-observation",
             receipt: harnessReceipt(
                 repositoryB,
+                adapterB.investigationId,
                 currentAggregate.contract,
                 prepared.reserved.command,
                 currentAttemptId,
@@ -987,7 +1049,7 @@ describe("Crucible domain/persistence adapter", () => {
             command: prepared.command,
             lease: leaseB,
         });
-        const eventCount = repositoryB.countEvents("inv-runtime");
+        const eventCount = repositoryB.countEvents(investigationId);
         expect(() => adapterB.appendHarnessObservationFenced(currentObservation, {
             attemptId: currentAttemptId,
             command: prepared.command,
@@ -995,7 +1057,7 @@ describe("Crucible domain/persistence adapter", () => {
         })).toThrow(expect.objectContaining({
             code: PERSISTENCE_ERROR_CODES.ILLEGAL_TRANSITION,
         }));
-        expect(repositoryB.countEvents("inv-runtime")).toBe(eventCount);
+        expect(repositoryB.countEvents(investigationId)).toBe(eventCount);
         expect(repositoryB.getCommandAttempt(currentAttemptId).state).toBe("observed");
     });
 
@@ -1005,14 +1067,15 @@ describe("Crucible domain/persistence adapter", () => {
             repositoryB,
             adapterA,
             adapterB,
+            investigationId,
         } = openSharedAdapters("same-generation-incarnation");
         repositoryA.claimSupervisorGeneration({
-            investigationId: "inv-runtime",
+            investigationId,
             supervisorGeneration: 4,
             supervisorNonce: "supervisor-four",
         });
         repositoryA.issueRunnerIncarnation({
-            investigationId: "inv-runtime",
+            investigationId,
             supervisorGeneration: 4,
             supervisorNonce: "supervisor-four",
             runnerIncarnation: "runner-four-one",
@@ -1025,13 +1088,17 @@ describe("Crucible domain/persistence adapter", () => {
             runnerIncarnation: "runner-four-one",
         });
         repositoryB.issueRunnerIncarnation({
-            investigationId: "inv-runtime",
+            investigationId,
             supervisorGeneration: 4,
             supervisorNonce: "supervisor-four",
             runnerIncarnation: "runner-four-two",
         });
-        const activeBeforeRejection = repositoryB.getActiveLease("inv-runtime");
-        const beforeStaleWrite = domainPersistenceSnapshot(repositoryB);
+        const activeBeforeRejection =
+            repositoryB.getActiveLease(investigationId);
+        const beforeStaleWrite = domainPersistenceSnapshot(
+            repositoryB,
+            investigationId,
+        );
 
         expect(() => adapterA.appendHarnessObservationFenced(
             prepared.observation,
@@ -1043,11 +1110,13 @@ describe("Crucible domain/persistence adapter", () => {
         )).toThrow(expect.objectContaining({
             code: PERSISTENCE_ERROR_CODES.FENCE_REJECTED,
         }));
-        expect(domainPersistenceSnapshot(repositoryB)).toEqual(beforeStaleWrite);
-        expect(repositoryB.getActiveLease("inv-runtime")).toEqual(activeBeforeRejection);
+        expect(domainPersistenceSnapshot(repositoryB, investigationId))
+            .toEqual(beforeStaleWrite);
+        expect(repositoryB.getActiveLease(investigationId))
+            .toEqual(activeBeforeRejection);
 
         expect(() => repositoryA.acquireLease({
-            investigationId: "inv-runtime",
+            investigationId,
             leaseId: "lease-four-old-retry",
             owner: "runner-four-old-retry",
             supervisorGeneration: 4,
@@ -1055,8 +1124,10 @@ describe("Crucible domain/persistence adapter", () => {
         })).toThrow(expect.objectContaining({
             code: PERSISTENCE_ERROR_CODES.FENCE_REJECTED,
         }));
-        expect(domainPersistenceSnapshot(repositoryB)).toEqual(beforeStaleWrite);
-        expect(repositoryB.getActiveLease("inv-runtime")).toEqual(activeBeforeRejection);
+        expect(domainPersistenceSnapshot(repositoryB, investigationId))
+            .toEqual(beforeStaleWrite);
+        expect(repositoryB.getActiveLease(investigationId))
+            .toEqual(activeBeforeRejection);
 
         const currentLease = adapterB.acquireRunnerLease({
             leaseId: "lease-four-two",
@@ -1076,6 +1147,7 @@ describe("Crucible domain/persistence adapter", () => {
             observationId: "runner-four-two-observation",
             receipt: harnessReceipt(
                 repositoryB,
+                adapterB.investigationId,
                 aggregate.contract,
                 prepared.reserved.command,
                 "attempt-four-two",
@@ -1098,6 +1170,7 @@ describe("Crucible domain/persistence adapter", () => {
             repositoryB,
             adapterA,
             adapterB,
+            investigationId,
         } = openSharedAdapters("cas-takeover");
         const prepared = prepareValidationCommand(adapterA, repositoryA, {
             leaseId: "lease-a",
@@ -1114,7 +1187,7 @@ describe("Crucible domain/persistence adapter", () => {
                         authorityReads += 1;
                         if (authorityReads === 2) {
                             leaseB = repositoryB.acquireLease({
-                                investigationId: "inv-runtime",
+                                investigationId,
                                 leaseId: "lease-b",
                                 owner: "runner-b",
                             });
@@ -1143,7 +1216,7 @@ describe("Crucible domain/persistence adapter", () => {
         });
         const racingAdapter = createDomainRepositoryAdapter({
             repository: repositoryProxy,
-            investigationId: "inv-runtime",
+            investigationId,
             ensure: false,
         });
 
@@ -1162,7 +1235,7 @@ describe("Crucible domain/persistence adapter", () => {
         expect(leaseB).not.toBeNull();
         expect(repositoryB.getCommandAttempt("attempt-a").state).toBe("dispatched");
         expect(adapterB.replay().aggregate.observationOrder).toEqual([]);
-        expect(repositoryB.listArtifactRefs("inv-runtime")).toEqual([]);
+        expect(repositoryB.listArtifactRefs(investigationId)).toEqual([]);
 
         adapterB.recoverStaleAttempts(leaseB);
         adapterB.reserveAttempt({
@@ -1177,6 +1250,7 @@ describe("Crucible domain/persistence adapter", () => {
             observationId: "cas-current-observation",
             receipt: harnessReceipt(
                 repositoryB,
+                adapterB.investigationId,
                 aggregate.contract,
                 prepared.reserved.command,
                 "attempt-b",
@@ -1198,6 +1272,7 @@ describe("Crucible domain/persistence adapter", () => {
             repositoryB,
             adapterA,
             adapterB,
+            investigationId,
         } = openSharedAdapters("two-handle-evidence-takeover");
         const prepared = prepareValidationCommand(adapterA, repositoryA, {
             leaseId: "lease-a",
@@ -1210,11 +1285,14 @@ describe("Crucible domain/persistence adapter", () => {
             lease: prepared.lease,
         });
         const leaseB = repositoryB.acquireLease({
-            investigationId: "inv-runtime",
+            investigationId,
             leaseId: "lease-b",
             owner: "runner-b",
         });
-        const beforeStaleWrite = domainPersistenceSnapshot(repositoryB);
+        const beforeStaleWrite = domainPersistenceSnapshot(
+            repositoryB,
+            investigationId,
+        );
 
         expect(() => adapterA.appendEvidenceCommitFenced({
             evidenceId: "evidence-000001",
@@ -1226,7 +1304,8 @@ describe("Crucible domain/persistence adapter", () => {
         })).toThrow(expect.objectContaining({
             code: PERSISTENCE_ERROR_CODES.FENCE_REJECTED,
         }));
-        expect(domainPersistenceSnapshot(repositoryB)).toEqual(beforeStaleWrite);
+        expect(domainPersistenceSnapshot(repositoryB, investigationId))
+            .toEqual(beforeStaleWrite);
         expect(repositoryB.getCommandAttempt("attempt-a").state).toBe("observed");
 
         adapterB.recoverStaleAttempts(leaseB);
@@ -1250,25 +1329,30 @@ describe("Crucible domain/persistence adapter", () => {
             command: pendingCommand,
             lease: leaseB,
         });
-        const evidenceEvents = repositoryB.listEvents("inv-runtime")
-            .filter((event) => event.kind === "domain:evidence_committed");
+        const evidenceEvents = repositoryB.listEvents(investigationId)
+            .filter((event) => event.kind === "domain:v4:evidence_committed");
         expect(evidenceEvents).toHaveLength(1);
         expect(repositoryB.getCommandAttempt("attempt-b").state).toBe("committed");
     });
 
-    it("fences terminal takeover and lets only the current owner persist it once", () => {
+    it("fences scientific non-result takeover and lets only the current owner persist it once", () => {
         const {
             repositoryA,
             repositoryB,
             adapterA,
             adapterB,
-        } = openSharedAdapters("two-handle-terminal-takeover");
+            investigationId,
+        } = openSharedAdapters(
+            "two-handle-terminal-takeover",
+            fullVerifiedHistoryContract(),
+        );
         const aggregate = appendFullVerifiedHistory(adapterA, { includeTerminal: false });
-        const terminalEvent = constructKernelDecisionEvent(aggregate);
-        const factHash = adapterA.domainFactIdentity(terminalEvent);
-        const terminalCommand = formatAttemptCommand("domain-event", {
+        const decisionEvent = constructKernelDecisionEvent(aggregate);
+        expect(decisionEvent.type).toBe(EVENT_TYPES.NON_RESULT_RECORDED);
+        const factHash = adapterA.domainFactIdentity(decisionEvent);
+        const decisionCommand = formatAttemptCommand("domain-event", {
             scope: "kernel-decision",
-            eventType: terminalEvent.type,
+            eventType: decisionEvent.type,
             factHash,
         });
         const leaseA = adapterA.acquireRunnerLease({
@@ -1277,55 +1361,62 @@ describe("Crucible domain/persistence adapter", () => {
         }).lease;
         adapterA.reserveAttempt({
             attemptId: "terminal-a",
-            command: terminalCommand,
+            command: decisionCommand,
             lease: leaseA,
         });
         adapterA.dispatchAttempt("terminal-a", leaseA);
         adapterA.observeAttempt("terminal-a", leaseA);
         const leaseB = repositoryB.acquireLease({
-            investigationId: "inv-runtime",
+            investigationId,
             leaseId: "lease-b",
             owner: "runner-b",
         });
-        const beforeStaleWrite = domainPersistenceSnapshot(repositoryB);
+        const beforeStaleWrite = domainPersistenceSnapshot(
+            repositoryB,
+            investigationId,
+        );
 
         expect(() => adapterA.appendKernelDecisionFenced({
             attemptId: "terminal-a",
-            command: terminalCommand,
+            command: decisionCommand,
             lease: leaseA,
             expectedDomainFactHash: factHash,
         })).toThrow(expect.objectContaining({
             code: PERSISTENCE_ERROR_CODES.FENCE_REJECTED,
         }));
-        expect(domainPersistenceSnapshot(repositoryB)).toEqual(beforeStaleWrite);
-        expect(repositoryB.getTerminalEvent("inv-runtime")).toBeNull();
+        expect(domainPersistenceSnapshot(repositoryB, investigationId))
+            .toEqual(beforeStaleWrite);
+        expect(repositoryB.getTerminalEvent(investigationId)).toBeNull();
 
         adapterB.recoverStaleAttempts(leaseB);
         adapterB.reserveAttempt({
             attemptId: "terminal-b",
-            command: terminalCommand,
+            command: decisionCommand,
             lease: leaseB,
         });
         adapterB.dispatchAttempt("terminal-b", leaseB);
         adapterB.observeAttempt("terminal-b", leaseB);
         adapterB.appendKernelDecisionFenced({
             attemptId: "terminal-b",
-            command: terminalCommand,
+            command: decisionCommand,
             lease: leaseB,
             expectedDomainFactHash: factHash,
         });
-        expect(repositoryB.listEvents("inv-runtime")
-            .filter((event) => event.isTerminal)).toHaveLength(1);
+        expect(repositoryB.listEvents(investigationId)
+            .filter((event) =>
+                event.kind === "domain:v4:non_result_recorded")).toHaveLength(1);
+        expect(repositoryB.getTerminalEvent(investigationId)).toBeNull();
         expect(repositoryB.getCommandAttempt("terminal-b").state).toBe("committed");
         expect(() => adapterB.appendKernelDecisionFenced({
             attemptId: "terminal-b",
-            command: terminalCommand,
+            command: decisionCommand,
             lease: leaseB,
             expectedDomainFactHash: factHash,
         })).toThrow(expect.objectContaining({
             code: PERSISTENCE_ERROR_CODES.ILLEGAL_TRANSITION,
         }));
-        expect(repositoryB.listEvents("inv-runtime")
-            .filter((event) => event.isTerminal)).toHaveLength(1);
+        expect(repositoryB.listEvents(investigationId)
+            .filter((event) =>
+                event.kind === "domain:v4:non_result_recorded")).toHaveLength(1);
     });
 });

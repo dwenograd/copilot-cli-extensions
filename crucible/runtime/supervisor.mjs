@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 
+import { DOMAIN_VERSION } from "../domain/index.mjs";
 import { createDefaultProcessAdapter } from "../measurement/windows-adapter.mjs";
 import { openRepository } from "../persistence/index.mjs";
 import {
@@ -10,6 +11,7 @@ import {
     supervisorPaths,
 } from "./config.mjs";
 import {
+    assertInvestigationDomainCompatible,
     createDomainRepositoryAdapter,
     formatAttemptCommand,
 } from "./domain-adapter.mjs";
@@ -59,9 +61,16 @@ function openSupervisorAuthorityRepository(config, dependencies, clock) {
         })
         : dependencies.authorityRepository;
     try {
+        assertInvestigationDomainCompatible(
+            repository,
+            config.runner.investigationId,
+        );
         repository.ensureInvestigation({
             investigationId: config.runner.investigationId,
-            metadata: { role: "crucible-domain" },
+            metadata: {
+                role: "crucible-domain",
+                domainVersion: DOMAIN_VERSION,
+            },
         });
         return { repository, owned };
     } catch (error) {

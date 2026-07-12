@@ -25,14 +25,22 @@ import {
     createSnapshotProvenance,
     decideNext,
     detectPlateau,
+    enumerandArtifactMeasurementHash,
     hashCanonical,
     normalizeEventIdentifier,
+    normalizeHypotheses,
     reduceEvent,
     replayEvents,
     searchProgress,
     verifyEventChain,
 } from "../domain/index.mjs";
 import { fakeHarnessIdentity } from "./harness-identity-fixture.mjs";
+import { createLegacyV3OpenedEvent } from "./legacy-v3-fixture.mjs";
+import {
+    createRuntimeConfigAuthorityFixture,
+    createSignedInvestigationAuthority,
+} from "./experiment-authority-fixture.mjs";
+import { upgradeLegacyContractInput } from "./v4-contract-fixture.mjs";
 
 function artifactHash(character) {
     return `sha256:${character.repeat(64)}`;
@@ -58,7 +66,7 @@ function searchPolicy(overrides = {}) {
 }
 
 function contractInput(overrides = {}) {
-    return {
+    return upgradeLegacyContractInput({
         objective: "Find a candidate accepted by the terminal harness",
         acceptancePredicate: { kind: "harness_pass" },
         validationCases: [
@@ -81,7 +89,7 @@ function contractInput(overrides = {}) {
         searchPolicy: searchPolicy(),
         declaredLimits: { maxCommands: 100 },
         ...overrides,
-    };
+    });
 }
 
 function validationData() {
@@ -288,12 +296,18 @@ function forgeEvent(event, payload) {
 
 function openInvestigation(overrides = {}) {
     const contract = createInvestigationContract(contractInput(overrides));
+    const signed = createSignedInvestigationAuthority({ contract });
     const context = {
         contract,
+        investigationId: signed.investigationId,
         history: [],
         aggregate: createInitialAggregate(),
     };
-    append(context, createInvestigationOpenedEvent(contract));
+    append(context, createInvestigationOpenedEvent(
+        contract,
+        signed.authority,
+        createRuntimeConfigAuthorityFixture(signed.investigationId),
+    ));
     return context;
 }
 
@@ -370,13 +384,19 @@ function commitCandidate(context, {
 } = {}) {
     const reserved = reserveAndDispatch(context);
     expect(reserved.command.kind).toBe("search_candidate");
+    const boundArtifactHash =
+        reserved.command.enumerand?.topology === "finite_enumerable"
+            ? candidateArtifactHash ?? enumerandArtifactMeasurementHash(
+                reserved.command.enumerand.artifactSnapshotHash,
+            )
+            : candidateArtifactHash;
     const evidence = observeAndCommit(context, reserved.commandId, {
         purpose: "candidate",
         observationId: `candidate-observation-${label}`,
         evidenceId: `candidate-evidence-${label}`,
         data,
         annotations,
-        candidateArtifactHash,
+        candidateArtifactHash: boundArtifactHash,
     });
     return { command: reserved.command, evidence };
 }
@@ -453,12 +473,27 @@ function commitImpossibility(context, reserved, label, facts = {}) {
     return context.aggregate.evidence[evidenceId];
 }
 
-describe("Crucible domain version 3 kernel", () => {
-    it("stamps investigation_opened with DOMAIN_VERSION=3 and replays deterministically", () => {
+describe("Crucible domain version 4 kernel", () => {
+    it("does not export an unsigned v4 opening event constructor path", () => {
+        const contract = createInvestigationContract(contractInput());
+        expect(() => createInvestigationOpenedEvent(contract))
+            .toThrow(expect.objectContaining({
+                code: ERROR_CODES.INVALID_CONTRACT,
+            }));
+    });
+
+    it("stamps the contract and investigation_opened with DOMAIN_VERSION=4", () => {
         const context = validateInvestigation(openInvestigation());
         const opened = context.history[0];
-        expect(DOMAIN_VERSION).toBe(3);
-        expect(opened.payload.domainVersion).toBe(3);
+        expect(DOMAIN_VERSION).toBe(4);
+        expect(opened.payload.domainVersion).toBe(4);
+        expect(opened.payload.contract.domainVersion).toBe(4);
+        expect(opened.payload.contractHash).toMatch(
+            /^sha256:crucible-contract-v4:[a-f0-9]{64}$/u,
+        );
+        expect(opened.eventHash).toMatch(
+            /^sha256:crucible-event-v4:[a-f0-9]{64}$/u,
+        );
 
         const replayed = replayEvents(context.history);
         expect(canonicalJson(replayed)).toBe(canonicalJson(context.aggregate));
@@ -470,12 +505,75 @@ describe("Crucible domain version 3 kernel", () => {
         });
     });
 
-    it("fails old event histories with a typed restart-required error", () => {
-        const opened = JSON.parse(JSON.stringify(
-            createInvestigationOpenedEvent(createInvestigationContract(contractInput())),
-        ));
-        opened.payload.domainVersion = 2;
-        opened.eventHash = computeEventHash(opened);
+    it("replays appended candidate observations with sealed hypotheses", () => {
+            const observableRegistry = [{
+                key: "score",
+                kind: "numeric",
+                minimum: 0,
+                maximum: 1,
+            }];
+            const hypothesisPolicy = {
+                required: true,
+                maxPredictions: 2,
+                allowedKinds: ["threshold"],
+                allowRequiredForResult: true,
+            };
+            const context = validateInvestigation(openInvestigation({
+                maxRounds: 1,
+                observableRegistry,
+                hypothesisPolicy,
+            }));
+            const hypotheses = normalizeHypotheses({
+                predictions: [{
+                    id: "score-threshold",
+                    kind: "threshold",
+                    observable: "score",
+                    operator: ">=",
+                    value: 0.8,
+                    refutation: {
+                        kind: "threshold",
+                        operator: "<",
+                        value: 0.8,
+                    },
+                    requiredForResult: true,
+                }],
+            }, {
+                observableRegistry,
+                hypothesisPolicy,
+            });
+            commitCandidate(context, {
+                label: "hypothesis-replay",
+                data: { pass: true, metrics: { score: 0.9 } },
+                annotations: {
+                    mechanism: "exercise canonical hypothesis replay",
+                    hypotheses,
+                },
+            });
+
+            const replayed = replayEvents(context.history);
+            expect(replayed.observations["candidate-observation-hypothesis-replay"]
+                .annotations.hypotheses).toEqual(hypotheses);
+            expect(canonicalJson(replayed)).toBe(canonicalJson(context.aggregate));
+            expect(decideNext(context.aggregate)).toMatchObject({
+                kind: "NON_RESULT",
+                code: NON_RESULT_CODES.SCIENTIFIC_CONFIRMATION_REQUIRED,
+                readiness: {
+                    ready: false,
+                    requiredPredictionIds: ["score-threshold"],
+                    unsupportedRequiredPredictionIds: ["score-threshold"],
+                    missing: expect.arrayContaining([
+                        "trusted_confirmation_closure",
+                        "trusted_challenge_closure",
+                        "trusted_required_prediction_evaluations",
+                    ]),
+                },
+        });
+    });
+
+    it("rejects an actual v3 opening before v4 hash or contract normalization", () => {
+        const opened = createLegacyV3OpenedEvent(
+            createInvestigationContract(contractInput()),
+        );
 
         for (const operation of [
             () => replayEvents([opened]),
@@ -484,7 +582,12 @@ describe("Crucible domain version 3 kernel", () => {
             expect(operation).toThrow(DomainVersionRestartRequiredError);
             expect(operation).toThrow(expect.objectContaining({
                 code: ERROR_CODES.DOMAIN_VERSION_RESTART_REQUIRED,
-                details: expect.objectContaining({ restartRequired: true }),
+                details: expect.objectContaining({
+                    compatibility: "legacy_incompatible",
+                    actualDomainVersion: 3,
+                    contractDomainVersion: null,
+                    restartRequired: true,
+                }),
             }));
         }
     });
@@ -555,47 +658,16 @@ describe("Crucible domain version 3 kernel", () => {
     it("rejects contract identifiers that cannot be addressed by domain events", () => {
         const invalidIdentifiers = ["constructor", "prototype", "trailing."];
         const contractCases = [
-            ["validationCases[0].id", (identifier) => {
-                const input = contractInput();
-                input.validationCases = [
-                    { ...input.validationCases[0], id: identifier },
-                    input.validationCases[1],
-                ];
-                return input;
-            }],
-            ["harnessId", (identifier) => contractInput({
-                harnessId: identifier,
-                harnessIdentity: fakeHarnessIdentity({
-                    harnessId: identifier,
-                    parserVersion: "parser-v2",
-                }),
-            })],
             ["policyVersion", (identifier) => contractInput({ policyVersion: identifier })],
-            ["parserVersion", (identifier) => contractInput({
-                parserVersion: identifier,
-                harnessIdentity: fakeHarnessIdentity({
-                    harnessId: "primary-harness",
-                    parserVersion: identifier,
-                }),
-            })],
             ["search.workerModels[0]", (identifier) => contractInput({
                 workerModels: [identifier],
             })],
-            ["search.boundedCandidateIds[0]", (identifier) => contractInput({
-                hypothesisTopology: "finite_enumerable",
-                boundedCandidateIds: [identifier],
-            })],
-            ["metrics[0].key", (identifier) => contractInput({
-                metrics: [{ key: identifier, direction: "max", epsilon: 0 }],
-            })],
-            ["harnessIdentity.sandbox.policyIdentity.policyId", (identifier) => {
-                const harnessIdentity = fakeHarnessIdentity({
-                    harnessId: "primary-harness",
-                    parserVersion: "parser-v2",
-                    executesCandidateCode: true,
-                });
-                harnessIdentity.sandbox.policyIdentity.policyId = identifier;
-                return contractInput({ harnessIdentity });
+            ["statisticalPolicy.metrics[0].key", (identifier) => {
+                const input = contractInput();
+                input.observableRegistry[0].key = identifier;
+                input.statisticalPolicy.metrics[0].key = identifier;
+                input.statisticalPolicy.control.tolerances[0].metric = identifier;
+                return input;
             }],
         ];
 
@@ -607,7 +679,6 @@ describe("Crucible domain version 3 kernel", () => {
                 expect(() => createInvestigationContract(makeInput(identifier))).toThrow(
                     expect.objectContaining({
                         code: ERROR_CODES.INVALID_CONTRACT,
-                        details: expect.objectContaining({ field }),
                     }),
                 );
             }
@@ -794,21 +865,23 @@ describe("Crucible domain version 3 kernel", () => {
         }))).toThrow(expect.objectContaining({ code: ERROR_CODES.INVALID_ACCEPTANCE_PREDICATE }));
     });
 
-    it("requires bounded ids exactly for finite and bounded topologies", () => {
+    it("requires immutable manifests exactly for finite and bounded topologies", () => {
         for (const hypothesisTopology of ["finite_enumerable", "bounded_parameterized"]) {
+            const missing = contractInput({
+                hypothesisTopology,
+            });
+            delete missing.enumerandManifest;
+            expect(() => createInvestigationContract(missing))
+                .toThrow(expect.objectContaining({ code: ERROR_CODES.INVALID_CONTRACT }));
             expect(() => createInvestigationContract(contractInput({
                 hypothesisTopology,
-            }))).toThrow(expect.objectContaining({ code: ERROR_CODES.INVALID_CONTRACT }));
-            expect(() => createInvestigationContract(contractInput({
-                hypothesisTopology,
-                boundedCandidateIds: ["candidate-a"],
             }))).not.toThrow();
         }
         for (const hypothesisTopology of ["open_generative", "certified_impossibility"]) {
-            expect(() => createInvestigationContract(contractInput({
-                hypothesisTopology,
-                boundedCandidateIds: ["candidate-a"],
-            }))).toThrow(expect.objectContaining({ code: ERROR_CODES.INVALID_CONTRACT }));
+            const legacy = contractInput({ hypothesisTopology });
+            legacy.boundedCandidateIds = ["candidate-a"];
+            expect(() => createInvestigationContract(legacy))
+                .toThrow(expect.objectContaining({ code: ERROR_CODES.INVALID_CONTRACT }));
         }
     });
 
@@ -930,7 +1003,7 @@ describe("Crucible domain version 3 kernel", () => {
         const context = validateInvestigation(openInvestigation());
         const first = commitCandidate(context, {
             label: "context",
-            data: { pass: false, marker: "context" },
+            data: { pass: false, marker: "context", metrics: { score: 0.1 } },
         });
 
         const next = decideNext(context.aggregate);
@@ -1005,50 +1078,10 @@ describe("Crucible domain version 3 kernel", () => {
         expect(recommendation.command.round).toBe(2);
     });
 
-    it("supports explicit first-pass termination", () => {
-        const context = validateInvestigation(openInvestigation({
-            maxRounds: 3,
+    it("forbids the v3 stopOnFirstAccept policy field", () => {
+        expect(() => openInvestigation({
             searchPolicy: searchPolicy({ stopOnFirstAccept: true }),
-        }));
-        const accepted = commitCandidate(context, {
-            label: "first-pass",
-            data: { pass: true },
-        }).evidence;
-
-        const recommendation = decideNext(context.aggregate);
-        expect(recommendation).toMatchObject({
-            kind: "TERMINAL",
-            decision: "VERIFIED_RESULT",
-            candidateId: accepted.candidateId,
-            basis: { kind: "first_passing_candidate" },
-            event: {
-                payload: {
-                    evidenceClosure: {
-                        version: 1,
-                        validation: {
-                            evidenceId: "validation-evidence",
-                        },
-                        decisive: {
-                            kind: "winner",
-                            evidence: {
-                                evidenceId: accepted.evidenceId,
-                                provenanceRoot: accepted.provenanceRoot,
-                            },
-                        },
-                        receipts: { count: 3, evidenceCount: 2 },
-                    },
-                },
-            },
-        });
-        expect(recommendation.event.payload.evidenceClosure.closureRoot).toMatch(
-            /^sha256:crucible-terminal-evidence-closure-v1:[a-f0-9]{64}$/,
-        );
-        expect(recommendation.event.payload.evidenceClosure.frontier.digest).toMatch(
-            /^sha256:crucible-terminal-frontier-v1:[a-f0-9]{64}$/,
-        );
-        expect(recommendation.event.payload.evidenceClosure.archive.digest).toMatch(
-            /^sha256:crucible-terminal-archive-v1:[a-f0-9]{64}$/,
-        );
+        })).toThrow(expect.objectContaining({ code: ERROR_CODES.INVALID_CONTRACT }));
     });
 
     it("retains the best incumbent until round exhaustion", () => {
@@ -1071,10 +1104,16 @@ describe("Crucible domain version 3 kernel", () => {
 
         const recommendation = decideNext(context.aggregate);
         expect(recommendation).toMatchObject({
-            decision: "VERIFIED_RESULT",
+            kind: "NON_RESULT",
+            code: NON_RESULT_CODES.SCIENTIFIC_CONFIRMATION_REQUIRED,
             candidateId: best.evidence.candidateId,
             evidenceId: best.evidence.evidenceId,
             basis: { kind: "rounds_exhausted_with_incumbent" },
+            readiness: {
+                ready: false,
+                confirmationSupported: false,
+                challengeSupported: false,
+            },
         });
         expect(recommendation.candidateId).not.toBe(first.evidence.candidateId);
     });
@@ -1110,7 +1149,8 @@ describe("Crucible domain version 3 kernel", () => {
         });
 
         expect(decideNext(context.aggregate)).toMatchObject({
-            decision: "VERIFIED_RESULT",
+            kind: "NON_RESULT",
+            code: NON_RESULT_CODES.SCIENTIFIC_CONFIRMATION_REQUIRED,
             basis: { kind: "plateau_after_mandatory_escape" },
         });
     });
@@ -1285,8 +1325,8 @@ describe("Crucible domain version 3 kernel", () => {
         expect(candidate.evidence.outcomeClass).toBe("accepted");
         const recommendation = decideNext(context.aggregate);
         expect(recommendation).toMatchObject({
-            kind: "TERMINAL",
-            decision: "VERIFIED_RESULT",
+            kind: "NON_RESULT",
+            code: NON_RESULT_CODES.SCIENTIFIC_CONFIRMATION_REQUIRED,
             candidateId: candidate.evidence.candidateId,
         });
         expect(recommendation.command?.kind).not.toBe("verify_impossibility");
@@ -1436,7 +1476,7 @@ describe("Crucible domain version 3 kernel", () => {
         });
     });
 
-    it("can prove a finite declared search space unreachable without a stop request", () => {
+    it("requires an independent verifier after finite search-space exhaustion", () => {
         const context = validateInvestigation(openInvestigation({
             hypothesisTopology: "finite_enumerable",
             workerModels: ["model-alpha"],
@@ -1446,7 +1486,7 @@ describe("Crucible domain version 3 kernel", () => {
         }));
         const candidate = commitCandidate(context, {
             label: "bounded",
-            data: { pass: false },
+            data: { pass: false, metrics: { score: 0.1 } },
         });
 
         expect(candidate.command).toMatchObject({
@@ -1454,8 +1494,8 @@ describe("Crucible domain version 3 kernel", () => {
             boundedCandidateId: "bounded-a",
         });
         expect(decideNext(context.aggregate)).toMatchObject({
-            kind: "TERMINAL",
-            decision: "TARGET_UNREACHABLE",
+            kind: "NON_RESULT",
+            code: NON_RESULT_CODES.INDEPENDENT_VERIFICATION_REQUIRED,
             basis: { kind: "search_space_exhausted" },
         });
     });
@@ -1470,7 +1510,7 @@ describe("Crucible domain version 3 kernel", () => {
         }));
         const first = commitCandidate(context, {
             label: "bounded-invalidated",
-            data: { pass: true },
+            data: { pass: true, metrics: { score: 0.9 } },
         });
         append(context, createExternalEvent(context.aggregate, EVENT_TYPES.EVIDENCE_INVALIDATED, {
             evidenceId: first.evidence.evidenceId,
@@ -1501,26 +1541,21 @@ describe("Crucible domain version 3 kernel", () => {
 
         const replacement = commitCandidate(context, {
             label: "bounded-replacement",
-            data: { pass: false },
+            data: { pass: false, metrics: { score: 0.1 } },
         });
         expect(replacement.command.replacementOrdinal).toBe(1);
         expect(context.aggregate.evidence[first.evidence.evidenceId].invalidated).toBe(true);
         const terminal = decideNext(context.aggregate);
         expect(terminal).toMatchObject({
-            decision: "TARGET_UNREACHABLE",
+            kind: "NON_RESULT",
+            code: NON_RESULT_CODES.INDEPENDENT_VERIFICATION_REQUIRED,
             basis: { kind: "search_space_exhausted" },
-            event: {
-                payload: {
-                    evidenceClosure: {
-                        decisive: { kind: "bounded_search", evidence: null },
-                        receipts: { count: 4, evidenceCount: 3 },
-                    },
-                },
+            readiness: {
+                ready: false,
+                independentVerifierSupported: false,
             },
         });
-        expect(terminal.event.payload.evidenceClosure.receipts.root).toMatch(
-            /^sha256:crucible-terminal-receipt-roots-v1:[a-f0-9]{64}$/,
-        );
+        expect(terminal.event.type).toBe(EVENT_TYPES.NON_RESULT_RECORDED);
     });
 
     it("uses a deterministic replacement candidate id and removes invalidated rounds from plateau accounting", () => {

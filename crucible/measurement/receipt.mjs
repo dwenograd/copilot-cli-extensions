@@ -25,6 +25,8 @@
 //   - parserVersion        : version tag of the parser that produced facts
 //   - sandbox              : enforced capability/provider/full policy binding
 //                            (including explicit Job limits) | null
+//   - role / phase / replicateIndex / blockIndex / deterministicSeed /
+//     subjectId / environmentIdentity / suiteIdentity: HarnessSuiteV4 binding
 //   - attemptId / runnerEpochId: caller-supplied stable identifiers
 //   - startedAt / completedAt / durationMs
 //   - exit                 : { code | signal | timedOut }
@@ -40,11 +42,24 @@ import {
     hashCanonical,
     immutableCanonical,
 } from "../domain/canonical.mjs";
+import { normalizeHarnessResultBinding } from "./parser.mjs";
 
 export const RECEIPT_HASH_ALGORITHM = "sha256:crucible-measurement-receipt-v1";
 export const ARGV_HASH_ALGORITHM = "sha256:crucible-measurement-argv-v1";
 export const ENV_HASH_ALGORITHM = "sha256:crucible-measurement-env-v1";
 export const RECEIPT_VERSION = 5;
+export const HARNESS_SUITE_RECEIPT_VERSION = 6;
+
+const MEASUREMENT_BINDING_KEYS = Object.freeze([
+    "role",
+    "phase",
+    "replicateIndex",
+    "blockIndex",
+    "deterministicSeed",
+    "subjectId",
+    "environmentIdentity",
+    "suiteIdentity",
+]);
 
 // Keys within the receipt that are input-derived (deterministic given the
 // same inputs). Timing fields are excluded so callers can prove determinism
@@ -76,6 +91,10 @@ export const RECEIPT_DETERMINISM_KEYS = Object.freeze([
     "exit",
     "parsed",
 ]);
+export const HARNESS_SUITE_RECEIPT_DETERMINISM_KEYS = Object.freeze([
+    ...RECEIPT_DETERMINISM_KEYS,
+    ...MEASUREMENT_BINDING_KEYS,
+]);
 
 export function hashArgv(argv) {
     return hashCanonical(argv, ARGV_HASH_ALGORITHM);
@@ -95,7 +114,10 @@ export function hashReceipt(receipt) {
 // external verifiers who want to compare two runs modulo timing).
 export function projectDeterministicReceipt(receipt) {
     const out = {};
-    for (const key of RECEIPT_DETERMINISM_KEYS) {
+    const keys = receipt?.version === HARNESS_SUITE_RECEIPT_VERSION
+        ? HARNESS_SUITE_RECEIPT_DETERMINISM_KEYS
+        : RECEIPT_DETERMINISM_KEYS;
+    for (const key of keys) {
         if (Object.hasOwn(receipt, key)) {
             out[key] = receipt[key];
         }
@@ -153,11 +175,56 @@ function normalizeOutputCapture(value) {
     };
 }
 
+function pickMeasurementBinding(value) {
+    if (value === null || value === undefined || typeof value !== "object") {
+        return null;
+    }
+    const picked = {};
+    let present = false;
+    for (const key of MEASUREMENT_BINDING_KEYS) {
+        const fieldValue = value[key];
+        picked[key] = fieldValue ?? null;
+        if (fieldValue !== undefined && fieldValue !== null) {
+            present = true;
+        }
+    }
+    return present ? picked : null;
+}
+
+function bindingEqual(left, right) {
+    return MEASUREMENT_BINDING_KEYS.every((key) => left[key] === right[key]);
+}
+
+function normalizeReceiptBinding(input) {
+    const candidates = [
+        pickMeasurementBinding(input.measurementBinding),
+        pickMeasurementBinding(input),
+        pickMeasurementBinding(input.parsed),
+    ].filter((value) => value !== null)
+        .map((value) => normalizeHarnessResultBinding(value, {
+            field: "measurement receipt binding",
+            required: true,
+        }));
+    if (candidates.length === 0) return null;
+    const binding = candidates[0];
+    for (const candidate of candidates.slice(1)) {
+        if (!bindingEqual(binding, candidate)) {
+            throw new TypeError(
+                "measurement receipt binding disagrees with the parsed harness result",
+            );
+        }
+    }
+    return binding;
+}
+
 // Build the receipt object. All hash-typed fields are algorithm-tagged
 // SHA-256 strings. Timing fields are ISO strings + a numeric duration.
 export function buildMeasurementReceipt(input) {
+    const measurementBinding = normalizeReceiptBinding(input);
     const receipt = {
-        version: RECEIPT_VERSION,
+        version: measurementBinding === null
+            ? RECEIPT_VERSION
+            : HARNESS_SUITE_RECEIPT_VERSION,
         allowlistFileHash: input.allowlistFileHash,
         harnessEntryHash: input.harnessEntryHash,
         executableHash: input.executableHash,
@@ -217,6 +284,18 @@ export function buildMeasurementReceipt(input) {
                 capabilityLaunchUsed: input.sandbox.capabilityLaunchUsed,
                 permittedStagedRoots: [...input.sandbox.permittedStagedRoots],
             },
+        ...(measurementBinding === null
+            ? {}
+            : {
+                role: measurementBinding.role,
+                phase: measurementBinding.phase,
+                replicateIndex: measurementBinding.replicateIndex,
+                blockIndex: measurementBinding.blockIndex,
+                deterministicSeed: measurementBinding.deterministicSeed,
+                subjectId: measurementBinding.subjectId,
+                environmentIdentity: measurementBinding.environmentIdentity,
+                suiteIdentity: measurementBinding.suiteIdentity,
+            }),
         attemptId: input.attemptId,
         runnerEpochId: input.runnerEpochId,
         startedAt: input.startedAt,

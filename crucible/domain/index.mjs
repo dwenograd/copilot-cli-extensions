@@ -13,6 +13,31 @@ export {
 } from "./canonical.mjs";
 
 export {
+    EXPERIMENT_AUTHORITY_ALGORITHM,
+    EXPERIMENT_AUTHORITY_IDENTITY_ALGORITHM,
+    EXPERIMENT_AUTHORITY_MANIFEST_IDENTITY_ALGORITHM,
+    EXPERIMENT_AUTHORITY_MANIFEST_KIND,
+    EXPERIMENT_AUTHORITY_MANIFEST_VERSION,
+    EXPERIMENT_AUTHORITY_VERSION,
+    EXPERIMENT_PUBLIC_KEY_FINGERPRINT_ALGORITHM,
+    assertExperimentAuthorityContractBinding,
+    deriveAuthorizedInvestigationId,
+    experimentAuthorityIdentity,
+    experimentAuthorityManifestBytes,
+    experimentAuthorityManifestIdentity,
+    normalizeExperimentAuthority,
+    normalizeExperimentAuthorityManifest,
+} from "./authority.mjs";
+
+export {
+    RUNTIME_CONFIG_AUTHORITY_FINGERPRINT_ALGORITHM,
+    RUNTIME_CONFIG_AUTHORITY_KIND,
+    RUNTIME_CONFIG_AUTHORITY_VERSION,
+    normalizeRuntimeConfigAuthority,
+    runtimeConfigAuthorityFingerprint,
+} from "./runtime-authority.mjs";
+
+export {
     acceptanceSatisfied,
     availableCandidateMetricValues,
     assessAcceptancePredicate,
@@ -22,15 +47,69 @@ export {
     contractHash,
     createInvestigationContract,
     createSearchPolicy,
+    createStatisticalPolicy,
     defaultSearchPolicy,
+    harnessSuiteRoleCases,
     normalizeSearchPolicy,
+    normalizeStatisticalPolicy,
+    requiredHarnessRoles,
+    statisticalEvaluationRequirements,
+    statisticalPolicyHash,
     validationSatisfied,
 } from "./contract.mjs";
+
+export {
+    DEFAULT_HYPOTHESIS_POLICY,
+    HYPOTHESES_IDENTITY_HASH_ALGORITHM,
+    HYPOTHESES_VERSION,
+    HYPOTHESIS_LIMITS,
+    HYPOTHESIS_POLICY_IDENTITY_HASH_ALGORITHM,
+    OBSERVABLE_REGISTRY_IDENTITY_HASH_ALGORITHM,
+    PREDICTION_IDENTITY_HASH_ALGORITHM,
+    PREDICTION_KINDS,
+    hypothesesIdentity,
+    hypothesisPolicyIdentity,
+    normalizeHypotheses,
+    normalizeHypothesisPolicy,
+    normalizeObservableRegistry,
+    normalizePrediction,
+    normalizeSealedHypotheses,
+    observableRegistryIdentity,
+    predictionIdentity,
+} from "./hypotheses.mjs";
+
+export {
+    ENUMERAND_BINDING_HASH_ALGORITHM,
+    ENUMERAND_COVERAGE_HASH_ALGORITHM,
+    ENUMERAND_EXHAUSTION_HASH_ALGORITHM,
+    ENUMERAND_IDENTITY_HASH_ALGORITHM,
+    ENUMERAND_LEAF_HASH_ALGORITHM,
+    ENUMERAND_MANIFEST_ROOT_HASH_ALGORITHM,
+    ENUMERAND_MANIFEST_VERSION,
+    ENUMERAND_NODE_HASH_ALGORITHM,
+    ENUMERAND_PARAMETER_TUPLE_HASH_ALGORITHM,
+    assertEnumerandBinding,
+    computeEnumerandMerkleRoot,
+    enumerandArtifactMeasurementHash,
+    enumerandBinding,
+    enumerandBindingHash,
+    enumerandCoverage,
+    enumerandExhaustion,
+    enumerandIdentity,
+    isEnumerandSpaceExhaustible,
+    normalizeEnumerandBinding,
+    normalizeEnumerandManifest,
+    normalizeParameterTuple,
+    parameterTupleHash,
+    resolveControlEnumerand,
+    selectUntriedEnumerand,
+} from "./enumerands.mjs";
 
 export {
     ANNOTATION_LIMITS,
     CANDIDATE_OUTCOME_CLASSES,
     CONTRACT_LIMITS,
+    DEFAULT_SCIENTIFIC_TERMINAL_POLICY,
     DEFAULT_IMPOSSIBILITY_POLICY,
     DEFAULT_SEARCH_POLICY,
     DOMAIN_VERSION,
@@ -41,6 +120,7 @@ export {
     EVENT_TYPES,
     EVENT_VOCABULARY,
     EXTERNAL_EVENT_TYPES,
+    GOAL_MODES,
     HYPOTHESIS_TOPOLOGIES,
     IMPOSSIBILITY_CERTIFICATE_VERSION,
     IMPOSSIBILITY_REQUEST_HASH_ALGORITHM,
@@ -50,9 +130,14 @@ export {
     KERNEL_DECISION_EVENT_TYPES,
     KERNEL_CONTROL_EVENT_TYPES,
     NON_RESULT_CODES,
+    MISSINGNESS_MODES,
     SEARCH_POLICY_LIMITS,
     SEARCH_OPERATORS,
+    SCIENTIFIC_TERMINAL_POLICY_VERSION,
     SOURCE_KINDS,
+    STATISTICAL_METRIC_DIRECTIONS,
+    STATISTICAL_POLICY_HASH_ALGORITHM,
+    STATISTICAL_POLICY_VERSION,
     TERMINAL_EVENT_TYPES,
 } from "./constants.mjs";
 
@@ -61,6 +146,12 @@ export {
     impossibilitySearchEvidenceHash,
     isImpossibilityVerdict,
 } from "./impossibility.mjs";
+
+export {
+    assessPersistedTerminalReadiness,
+    assessTargetUnreachableReadiness,
+    assessVerifiedResultReadiness,
+} from "./scientific-readiness.mjs";
 
 export {
     EVIDENCE_PROVENANCE_HASH_ALGORITHM,

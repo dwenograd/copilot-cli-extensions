@@ -24,9 +24,11 @@ import {
     createMeasurementProvenance,
     createSnapshotProvenance,
     canonicalJson,
+    contractHash,
     computeEventHash as computeDomainEventHash,
     decideNext,
     deriveImpossibilityVerdict,
+    enumerandBindingHash,
     hashCanonical,
 } from "../domain/index.mjs";
 import {
@@ -63,6 +65,7 @@ import {
     resolveStateRoot,
 } from "../api/environment.mjs";
 import {
+    buildRegistration,
     resultInvestigation,
     startInvestigation,
     statusInvestigation,
@@ -74,30 +77,53 @@ import {
 import {
     ContractConflictError,
     EnvironmentError,
+    ExperimentAuthorityMismatchApiError,
     HarnessConfigurationError,
     HarnessNotAllowlistedError,
     InvestigationNotResumableError,
     InvestigationNotFoundError,
+    LegacyIncompatibleApiError,
     OperationalResetRequiredError,
+    SchemaValidationError,
     StartFailedError,
     StartPreflightError,
     ValidationCasePathError,
 } from "../api/errors.mjs";
+import { configureExperiment } from "../tools/configure-experiment.mjs";
+import { loadExperimentRegistry } from "../api/experiment-registry.mjs";
 import { fakeHarnessIdentity } from "./harness-identity-fixture.mjs";
+import { appendLegacyV3Investigation } from "./legacy-v3-fixture.mjs";
+import {
+    buildHarnessSuiteForAllowlist,
+    fakeHypothesisPolicy,
+    fakeObservableRegistry,
+    fakeStatisticalPolicy,
+    upgradeLegacyContractInput,
+} from "./v4-contract-fixture.mjs";
+import {
+    createExperimentAuthorityFixture,
+    createRuntimeConfigAuthorityFixture,
+    createSignedInvestigationAuthority,
+    prepareAndSignExperiment,
+} from "./experiment-authority-fixture.mjs";
+import { removeTrackedRoots } from "./test-cleanup.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const roots = [];
+const authorityFixturesByStateRoot = new Map();
 
-afterEach(() => {
-    for (const root of roots.splice(0)) {
-        fs.rmSync(root, { recursive: true, force: true });
-    }
+afterEach(async () => {
+    await removeTrackedRoots(roots, {
+        label: "api-handlers test root",
+    });
+    authorityFixturesByStateRoot.clear();
 });
 
 function makeWorkspace(label) {
     const safeLabel = label.replace(/[^A-Za-z0-9._-]/gu, "-");
     const root = fs.mkdtempSync(path.join(HERE, `.api-handlers-${safeLabel}-`));
     roots.push(root);
+    const experimentAuthority = createExperimentAuthorityFixture();
     const stateRoot = path.join(root, "state-root");
     const projectDir = path.join(root, "project");
     const goodDir = path.join(projectDir, "cases", "good");
@@ -107,19 +133,35 @@ function makeWorkspace(label) {
     fs.writeFileSync(path.join(goodDir, "input.txt"), "good-case");
     fs.writeFileSync(path.join(badDir, "input.txt"), "bad-case");
 
-    const snapshotStoreRoot = path.join(root, "allowlist-snapshot-staging");
+    const snapshotStoreRoot = path.join(root, "operator-corpus");
     const snapshotStore = openArtifactStore({ root: snapshotStoreRoot });
     const goodSnapshot = snapshotStore.ingestDirectory({ sourceDir: goodDir }).snapshot;
     const badSnapshot = snapshotStore.ingestDirectory({ sourceDir: badDir }).snapshot;
-    fs.rmSync(snapshotStoreRoot, { recursive: true, force: true });
+    const extraCases = {};
+    for (const [id, text] of [
+        ["search", "search-case"],
+        ["confirmation", "confirmation-case"],
+        ["challenge", "challenge-case"],
+        ["novelty", "novelty-case"],
+    ]) {
+        const sourceDir = path.join(root, `${id}-case`);
+        fs.mkdirSync(sourceDir, { recursive: true });
+        fs.writeFileSync(path.join(sourceDir, "input.txt"), text);
+        extraCases[id] = snapshotStore.ingestDirectory({ sourceDir }).snapshot;
+    }
     const harnessExecutable = path.join(root, "trusted-harness.exe");
     fs.writeFileSync(harnessExecutable, "trusted harness fixture");
     const harnessExecutableSha256 = createHash("sha256")
         .update(fs.readFileSync(harnessExecutable))
         .digest("hex");
+    const verifierExecutable = path.join(root, "trusted-verifier.exe");
+    fs.writeFileSync(verifierExecutable, "independent verifier fixture");
+    const verifierExecutableSha256 = createHash("sha256")
+        .update(fs.readFileSync(verifierExecutable))
+        .digest("hex");
 
     const allowlistPath = path.join(root, "harnesses.json");
-    fs.writeFileSync(allowlistPath, JSON.stringify({
+    const allowlistJson = {
         version: 1,
         entries: {
             "primary-harness": {
@@ -132,20 +174,82 @@ function makeWorkspace(label) {
                 maxStderrBytes: 262144,
                 executesCandidateCode: false,
                 validationCases: {
-                    good: { snapshotHash: goodSnapshot },
-                    bad: { snapshotHash: badSnapshot },
+                    good: { snapshotHash: goodSnapshot, expectation: "accept" },
+                    bad: { snapshotHash: badSnapshot, expectation: "reject" },
+                    search: {
+                        snapshotHash: extraCases.search,
+                        expectation: "accept",
+                    },
+                    confirmation: {
+                        snapshotHash: extraCases.confirmation,
+                        expectation: "accept",
+                    },
+                    challenge: {
+                        snapshotHash: extraCases.challenge,
+                        expectation: "reject",
+                    },
+                    novelty: {
+                        snapshotHash: extraCases.novelty,
+                        expectation: "accept",
+                    },
                 },
             },
+            "verifier-harness": {
+                executable: verifierExecutable,
+                executableSha256: verifierExecutableSha256,
+                argvTemplate: [],
+                allowedEnv: {},
+                timeoutMs: 15000,
+                maxStdoutBytes: 1048576,
+                maxStderrBytes: 262144,
+                executesCandidateCode: false,
+            },
         },
-    }, null, 2));
+    };
+    fs.writeFileSync(allowlistPath, JSON.stringify(allowlistJson, null, 2));
+    const initialAllowlist = loadHarnessAllowlist(allowlistPath);
+    allowlistJson.suites = {
+        "primary-suite": buildHarnessSuiteForAllowlist(initialAllowlist, {
+            includeVerifier: true,
+            verifierHarnessId: "verifier-harness",
+            roleCaseIds: {
+                calibration: ["good", "bad"],
+                search: ["search"],
+                confirmation: ["confirmation"],
+                challenge: ["challenge"],
+                novelty: ["novelty"],
+            },
+        }),
+    };
+    fs.writeFileSync(allowlistPath, JSON.stringify(allowlistJson, null, 2));
+    loadHarnessAllowlist(allowlistPath);
 
     const env = {
         CRUCIBLE_ALLOWLIST_PATH: allowlistPath,
+        CRUCIBLE_CASE_STORE_PATH: snapshotStoreRoot,
+        CRUCIBLE_EXPERIMENT_REGISTRY_PATH: path.join(root, "experiments.json"),
         CRUCIBLE_STATE_ROOT: stateRoot,
         COPILOT_SDK_PATH: path.join(root, "sdk"),
         COPILOT_CLI_PATH: path.join(root, "cli.exe"),
+        ...experimentAuthority.env,
     };
-    return { root, stateRoot, projectDir, allowlistPath, env };
+    const sdkPath = env.COPILOT_SDK_PATH;
+    fs.mkdirSync(sdkPath, { recursive: true });
+    fs.writeFileSync(path.join(sdkPath, "index.js"), "export {};\n");
+    fs.writeFileSync(env.COPILOT_CLI_PATH, "fixture copilot cli");
+    authorityFixturesByStateRoot.set(stateRoot, {
+        fixture: experimentAuthority,
+        projectDir,
+    });
+    return {
+        root,
+        stateRoot,
+        projectDir,
+        allowlistPath,
+        caseStorePath: snapshotStoreRoot,
+        env,
+        experimentAuthority,
+    };
 }
 
 function persistSupervisorConfig(config) {
@@ -213,11 +317,28 @@ function makeDeps(env, overrides = {}) {
     return { deps, calls };
 }
 
-function startArgs(projectDir, overrides = {}) {
-    return {
+function startArgs(workspace, overrides = {}) {
+    const { projectDir } = workspace;
+    const configured = JSON.parse(fs.readFileSync(
+        path.join(path.dirname(projectDir), "harnesses.json"),
+        "utf8",
+    ));
+    const controlSnapshot =
+        configured.entries["primary-harness"].validationCases.good.snapshotHash;
+    const statisticalPolicy = fakeStatisticalPolicy({
+        topology: overrides.hypothesis_topology ?? "open_generative",
+        searchSlots:
+            (overrides.candidates_per_round ?? 1)
+            * (overrides.max_rounds ?? 2),
+    });
+    const {
+        deadline_iso,
+        ...authorityOverrides
+    } = overrides;
+    const authority = {
         objective: "find a candidate scoring at least 90",
         project_dir: projectDir,
-        harness_id: "primary-harness",
+        harness_suite_id: "primary-suite",
         acceptance_predicate: {
             kind: "all",
             predicates: [
@@ -226,15 +347,55 @@ function startArgs(projectDir, overrides = {}) {
             ],
         },
         hypothesis_topology: "open_generative",
-        validation_cases: [
-            { id: "good", expectation: "accept", path: "cases/good" },
-            { id: "bad", expectation: "reject", path: "cases/bad" },
-        ],
-        metrics: [{ key: "score", direction: "max", epsilon: 0 }],
+        observable_registry: fakeObservableRegistry().map((observable) => ({
+            ...observable,
+            maximum: observable.key === "score" ? 100 : observable.maximum,
+        })),
+        hypothesis_policy: fakeHypothesisPolicy(),
+        statistical_policy: {
+            ...statisticalPolicy,
+            metrics: statisticalPolicy.metrics.map((metric) => ({
+                ...metric,
+                maximum: 100,
+                acceptanceThreshold: 90,
+                practicalEquivalenceDelta: 1,
+            })),
+            control: {
+                ...statisticalPolicy.control,
+                identity: controlSnapshot,
+            },
+        },
         worker_models: ["model-a"],
         candidates_per_round: 1,
         max_rounds: 2,
-        ...overrides,
+        ...authorityOverrides,
+    };
+    const root = path.dirname(projectDir);
+    const experiment_id = `test-${createHash("sha256")
+        .update(JSON.stringify(authority))
+        .digest("hex")
+        .slice(0, 24)}`;
+    const registryPath = path.join(root, "experiments.json");
+    const config = {
+        experiment_id,
+        ...authority,
+    };
+    const { signature } = prepareAndSignExperiment({
+        config,
+        allowlistPath: path.join(root, "harnesses.json"),
+        env: workspace.env,
+        privateKey: workspace.experimentAuthority.privateKey,
+    });
+    configureExperiment({
+        config,
+        registryPath,
+        allowlistPath: path.join(root, "harnesses.json"),
+        signature,
+        env: workspace.env,
+    });
+    return {
+        experiment_id,
+        ...(deadline_iso === undefined ? {} : { deadline_iso }),
     };
 }
 
@@ -546,15 +707,32 @@ function seedReceipt(adapter, store, aggregate, reserved, observationId, purpose
             promptContext,
             PROMPT_CONTEXT_HASH_ALGORITHM,
         );
+        const finiteEnumerand =
+            reserved.enumerand?.topology === "finite_enumerable";
         const proposal = {
             candidateId: reserved.candidateId,
-            files: [{
-                path: "candidate.txt",
-                content: `candidate-${reserved.candidateId}-${observationId}`,
-            }],
-            identity: null,
+            files: finiteEnumerand
+                ? []
+                : [{
+                    path: "candidate.txt",
+                    content: `candidate-${reserved.candidateId}-${observationId}`,
+                }],
+            identity: finiteEnumerand
+                ? {
+                    source: "frozen_enumerand_manifest",
+                    enumerandBindingHash:
+                        enumerandBindingHash(reserved.enumerand),
+                }
+                : null,
         };
-        candidateSnapshot = createSeedSnapshot(store, proposal.files);
+        candidateSnapshot = reserved.enumerand?.topology === "finite_enumerable"
+            ? {
+                snapshotId: reserved.enumerand.artifactSnapshotHash,
+                manifest: store.loadManifest(
+                    reserved.enumerand.artifactSnapshotHash,
+                ),
+            }
+            : createSeedSnapshot(store, proposal.files);
         candidateProposalArtifact = persistSeedBytes(
             adapter,
             store,
@@ -563,6 +741,9 @@ function seedReceipt(adapter, store, aggregate, reserved, observationId, purpose
                 assignment,
                 promptContext,
                 promptContextHash,
+                ...(finiteEnumerand
+                    ? { enumerand: reserved.enumerand }
+                    : {}),
                 proposal,
             }), "utf8"),
             "application/vnd.crucible.candidate-proposal+json",
@@ -850,7 +1031,7 @@ function seedImpossibilityObservation(adapter, store, aggregate, reserved, obser
 }
 
 function baseSeedContract(overrides = {}) {
-    return {
+    return upgradeLegacyContractInput({
         objective: "seed objective",
         acceptancePredicate: {
             kind: "all",
@@ -875,7 +1056,7 @@ function baseSeedContract(overrides = {}) {
         searchPolicy: searchPolicy(),
         declaredLimits: {},
         ...overrides,
-    };
+    });
 }
 
 // Generic domain driver: consumes decideNext recommendations, supplying
@@ -994,20 +1175,161 @@ function driveToTerminal(adapter, store, candidateQueue) {
 }
 
 function seedInvestigation(stateRoot, investigationId, contractInput, seedFn) {
-    const paths = resolveInvestigationPaths(stateRoot, investigationId);
+    const fixture = authorityFixturesByStateRoot.get(stateRoot);
+    if (fixture === undefined) {
+        throw new Error("seed investigation requires the workspace authority fixture");
+    }
+    const stagingId = `seed-staging-${createHash("sha256")
+        .update(investigationId)
+        .digest("hex")
+        .slice(0, 16)}`;
+    const stagingPaths = resolveInvestigationPaths(stateRoot, stagingId);
+    const stagingStore = openArtifactStore({ root: stagingPaths.artifactRoot });
+    const resolvedContract = typeof contractInput === "function"
+        ? contractInput(stagingStore)
+        : contractInput;
+    const signed = createSignedInvestigationAuthority({
+        contract: createInvestigationContract(resolvedContract),
+        experimentId: `seed-${investigationId}`.replace(/[^a-z0-9._-]/gu, "-"),
+        projectDir: fixture.projectDir,
+        fixture: fixture.fixture,
+    });
+    const paths = resolveInvestigationPaths(stateRoot, signed.investigationId);
+    fs.mkdirSync(stateRoot, { recursive: true });
+    if (fs.existsSync(paths.investigationDir)) {
+        fs.rmSync(stagingPaths.investigationDir, {
+            recursive: true,
+            force: true,
+        });
+        throw new Error("seeded investigation identity already exists");
+    }
+    fs.renameSync(stagingPaths.investigationDir, paths.investigationDir);
     fs.mkdirSync(paths.stateDir, { recursive: true });
     const store = openArtifactStore({ root: paths.artifactRoot });
     const repository = openRepository({ file: paths.eventsDbPath });
     try {
-        const adapter = createDomainRepositoryAdapter({ repository, investigationId });
-        const resolvedContract = typeof contractInput === "function"
-            ? contractInput(store)
-            : contractInput;
-        adapter.openInvestigation(createInvestigationContract(resolvedContract));
-        return seedFn(adapter, store);
+        const adapter = createDomainRepositoryAdapter({
+            repository,
+            investigationId: signed.investigationId,
+        });
+        adapter.openInvestigation(
+            createInvestigationContract(
+                resolvedContract,
+            ),
+            signed.capability,
+            createRuntimeConfigAuthorityFixture(signed.investigationId),
+        );
+        return {
+            aggregate: seedFn(adapter, store),
+            investigationId: signed.investigationId,
+            paths,
+        };
     } finally {
         repository.close();
     }
+}
+
+function seedLegacyV3State(stateRoot, investigationId) {
+    const paths = resolveInvestigationPaths(stateRoot, investigationId);
+    fs.mkdirSync(paths.stateDir, { recursive: true });
+    fs.mkdirSync(paths.artifactRoot, { recursive: true });
+    const repository = openRepository({ file: paths.eventsDbPath });
+    try {
+        const contract = createInvestigationContract(baseSeedContract({
+            hypothesisTopology: "open_generative",
+            workerModels: ["model-a"],
+            candidatesPerRound: 1,
+            maxRounds: 1,
+        }));
+        appendLegacyV3Investigation(repository, investigationId, contract);
+    } finally {
+        repository.close();
+    }
+    return paths;
+}
+
+function seedUnsignedForgedTerminal(stateRoot, investigationId) {
+    const paths = resolveInvestigationPaths(stateRoot, investigationId);
+    fs.mkdirSync(paths.stateDir, { recursive: true });
+    fs.mkdirSync(paths.artifactRoot, { recursive: true });
+    const repository = openRepository({ file: paths.eventsDbPath });
+    try {
+        const contract = createInvestigationContract(baseSeedContract({
+            hypothesisTopology: "open_generative",
+            workerModels: ["model-a"],
+            candidatesPerRound: 1,
+            maxRounds: 1,
+        }));
+        const openedCore = {
+            seq: 1,
+            type: EVENT_TYPES.INVESTIGATION_OPENED,
+            prevHash: null,
+            payload: {
+                domainVersion: DOMAIN_VERSION,
+                contract,
+                contractHash: contractHash(contract),
+            },
+        };
+        const opened = {
+            ...openedCore,
+            eventHash: computeDomainEventHash(openedCore),
+        };
+        const terminalCore = {
+            seq: 2,
+            type: EVENT_TYPES.VERIFIED_RESULT,
+            prevHash: opened.eventHash,
+            payload: {
+                decision: "VERIFIED_RESULT",
+                candidateId: "forged-winner",
+                evidenceId: "forged-evidence",
+                evidenceHash: `sha256:${"f".repeat(64)}`,
+            },
+        };
+        const terminal = {
+            ...terminalCore,
+            eventHash: computeDomainEventHash(terminalCore),
+        };
+        repository.ensureInvestigation({
+            investigationId,
+            metadata: {
+                role: "crucible-domain",
+                domainVersion: DOMAIN_VERSION,
+            },
+        });
+        repository.appendEvents({
+            investigationId,
+            expectedHead: null,
+            events: [
+                {
+                    kind: "domain:v4:investigation_opened",
+                    payload: { domainEvent: opened },
+                },
+                {
+                    kind: "domain:v4:verified_result",
+                    payload: { domainEvent: terminal },
+                },
+            ],
+        });
+    } finally {
+        repository.close();
+    }
+    return paths;
+}
+
+function persistLegacyV3SupervisorConfig(workspace, investigationId, paths) {
+    const config = normalizeSupervisorConfig({
+        runner: {
+            investigationId,
+            stateDir: paths.stateDir,
+            artifactRoot: paths.artifactRoot,
+            allowlistPath: workspace.allowlistPath,
+            copilotSdkPath: workspace.env.COPILOT_SDK_PATH,
+            copilotCliPath: workspace.env.COPILOT_CLI_PATH,
+            runnerEpochId: "epoch-legacy-v3",
+            options: {},
+        },
+    }, { env: workspace.env });
+    persistSupervisorConfig(config);
 }
 
 function seedVerifiedResult(stateRoot, investigationId) {
@@ -1018,10 +1340,9 @@ function seedVerifiedResult(stateRoot, investigationId) {
             hypothesisTopology: "open_generative",
             workerModels: ["model-a"],
             candidatesPerRound: 1,
-            maxRounds: 3,
+            maxRounds: 1,
             validationCases: seedValidationCases(store),
-            // Immediate terminal: the first accepted candidate verifies.
-            searchPolicy: searchPolicy({ stopOnFirstAccept: true }),
+            searchPolicy: searchPolicy(),
         }),
         (adapter, store) => driveToTerminal(adapter, store, [
             { data: { pass: true, metrics: { score: 95 } } },
@@ -1037,14 +1358,29 @@ function seedTargetUnreachable(stateRoot, investigationId) {
     return seedInvestigation(
         stateRoot,
         investigationId,
-        (store) => baseSeedContract({
-            hypothesisTopology: "finite_enumerable",
-            workerModels: ["model-a"],
-            candidatesPerRound: 2,
-            maxRounds: 1,
-            boundedCandidateIds: ["cand-a", "cand-b"],
-            validationCases: seedValidationCases(store),
-        }),
+        (store) => {
+            const enumerands = ["cand-a", "cand-b"].map((id, ordinal) => ({
+                id,
+                ordinal,
+                artifactSnapshotHash: createSeedSnapshot(store, [{
+                    path: "candidate.txt",
+                    content: `frozen-${id}`,
+                }]).snapshotId,
+            }));
+            return baseSeedContract({
+                hypothesisTopology: "finite_enumerable",
+                workerModels: ["model-a"],
+                candidatesPerRound: 2,
+                maxRounds: 1,
+                boundedCandidateIds: ["cand-a", "cand-b"],
+                enumerandManifest: {
+                    topology: "finite_enumerable",
+                    entries: enumerands,
+                    control: { kind: "enumerand", ordinal: 0 },
+                },
+                validationCases: seedValidationCases(store),
+            });
+        },
         (adapter, store) => driveToTerminal(adapter, store, [
             { data: { pass: false, metrics: { score: 10 } } },
             { data: { pass: false, metrics: { score: 20 } } },
@@ -1150,6 +1486,65 @@ function replayAggregate(stateRoot, investigationId) {
     } finally {
         repository.close();
     }
+}
+
+function withSyntheticTerminal(aggregate, decision) {
+    const evidence = aggregate.evidenceOrder
+        .map((id) => aggregate.evidence[id])
+        .find((item) => item.purpose === "candidate");
+    const decisiveKind = decision === "VERIFIED_RESULT"
+        ? "winner"
+        : "impossibility_certificate";
+    return {
+        ...aggregate,
+        status: "terminal",
+        nonResults: [],
+        terminal: {
+            decision,
+            candidateId: decision === "VERIFIED_RESULT"
+                ? evidence.candidateId
+                : null,
+            evidenceId: evidence.evidenceId,
+            evidenceHash: evidence.commitEventHash,
+            contractHash: aggregate.contractHash,
+            basis: { kind: "synthetic_search_only_terminal" },
+            evidenceClosure: {
+                decisive: { kind: decisiveKind },
+                closureRoot: hashCanonical(
+                    { decision, evidenceHash: evidence.commitEventHash },
+                    "sha256:crucible-terminal-evidence-closure-v1",
+                ),
+            },
+            seq: aggregate.lastSeq + 1,
+            eventHash: hashCanonical(
+                { decision, evidenceHash: evidence.commitEventHash },
+                "sha256:crucible-synthetic-terminal-v1",
+            ),
+        },
+    };
+}
+
+function depsForSyntheticTerminal(workspace, aggregate) {
+    const paths = resolveInvestigationPaths(
+        workspace.stateRoot,
+        aggregate.experimentAuthority.manifest.investigationId,
+    );
+    fs.mkdirSync(paths.stateDir, { recursive: true });
+    fs.writeFileSync(paths.eventsDbPath, "synthetic persisted terminal fixture");
+    const repository = { close() {} };
+    const adapter = {
+        replay: () => ({ aggregate }),
+        verifyTerminalArtifactClosure: () => ({
+            aggregate,
+            artifactClosureReport: { verified: true },
+        }),
+        latestOperationalNonResult: () => null,
+    };
+    return makeDeps(workspace.env, {
+        openRepositoryReadOnly: () => repository,
+        openArtifactStoreReadOnly: () => ({}),
+        createDomainRepositoryAdapter: () => adapter,
+    }).deps;
 }
 
 function terminalArtifactClasses(stateRoot, investigationId) {
@@ -1343,17 +1738,20 @@ function seedDispatchedCommand(stateRoot, investigationId) {
 
 describe("environment: path + state resolution", () => {
     it("derives a deterministic, filesystem-safe investigationId", () => {
+        const contractHash = `sha256:crucible-contract-v4:${"c".repeat(64)}`;
         const id1 = deriveInvestigationId({
             objective: "  find   a  candidate ",
             projectDir: "C:\\proj",
-            harnessId: "h1",
-            harnessEntryHash: fixtureHarnessEntryHash(),
+            harnessSuiteId: "suite-1",
+            harnessSuiteIdentity: fixtureHarnessEntryHash(),
+            contractHash,
         });
         const id2 = deriveInvestigationId({
             objective: "find a candidate",
             projectDir: "C:\\proj\\",
-            harnessId: "h1",
-            harnessEntryHash: fixtureHarnessEntryHash(),
+            harnessSuiteId: "suite-1",
+            harnessSuiteIdentity: fixtureHarnessEntryHash(),
+            contractHash,
         });
         expect(id1).toBe(id2); // whitespace + trailing-slash canonicalized
         expect(id1).toMatch(/^[A-Za-z0-9][A-Za-z0-9._@-]{0,127}$/u);
@@ -1362,20 +1760,23 @@ describe("environment: path + state resolution", () => {
         const differentObjective = deriveInvestigationId({
             objective: "find another candidate",
             projectDir: "C:\\proj",
-            harnessId: "h1",
-            harnessEntryHash: fixtureHarnessEntryHash(),
+            harnessSuiteId: "suite-1",
+            harnessSuiteIdentity: fixtureHarnessEntryHash(),
+            contractHash,
         });
         const differentHarness = deriveInvestigationId({
             objective: "find a candidate",
             projectDir: "C:\\proj",
-            harnessId: "h2",
-            harnessEntryHash: fixtureHarnessEntryHash(),
+            harnessSuiteId: "suite-2",
+            harnessSuiteIdentity: fixtureHarnessEntryHash(),
+            contractHash,
         });
         const differentEntry = deriveInvestigationId({
             objective: "find a candidate",
             projectDir: "C:\\proj",
-            harnessId: "h1",
-            harnessEntryHash: fixtureHarnessEntryHash("b"),
+            harnessSuiteId: "suite-1",
+            harnessSuiteIdentity: fixtureHarnessEntryHash("b"),
+            contractHash,
         });
         expect(differentObjective).not.toBe(id1);
         expect(differentHarness).not.toBe(id1);
@@ -1385,11 +1786,12 @@ describe("environment: path + state resolution", () => {
     it("includes DOMAIN_VERSION in the deterministic investigation identity", () => {
         const objective = "find a candidate";
         const projectDir = "C:\\proj";
-        const harnessId = "h1";
-        const harnessEntryHash = fixtureHarnessEntryHash();
+        const harnessSuiteId = "suite-1";
+        const harnessSuiteIdentity = fixtureHarnessEntryHash();
+        const contractHash = `sha256:crucible-contract-v4:${"c".repeat(64)}`;
         const legacyMaterial = [
             "crucible-investigation-v1",
-            harnessId,
+            harnessSuiteId,
             objective,
             path.resolve(projectDir).replace(/\//gu, "\\").toLowerCase(),
         ].join("\u0000");
@@ -1398,20 +1800,36 @@ describe("environment: path + state resolution", () => {
             .digest("hex")
             .slice(0, 16);
         const legacyId = `find-a-candidate-${legacySuffix}`;
+        const v3Material = [
+            "crucible-investigation-domain-v3",
+            harnessSuiteId,
+            harnessSuiteIdentity,
+            objective,
+            path.resolve(projectDir).replace(/\//gu, "\\").toLowerCase(),
+        ].join("\u0000");
+        const v3Id = `find-a-candidate-${
+            createHash("sha256")
+                .update(v3Material, "utf8")
+                .digest("hex")
+                .slice(0, 16)
+        }`;
         const currentId = deriveInvestigationId({
             objective,
             projectDir,
-            harnessId,
-            harnessEntryHash,
+            harnessSuiteId,
+            harnessSuiteIdentity,
+            contractHash,
         });
 
-        expect(DOMAIN_VERSION).toBe(3);
+        expect(DOMAIN_VERSION).toBe(4);
         expect(currentId).not.toBe(legacyId);
+        expect(currentId).not.toBe(v3Id);
         expect(currentId).toBe(deriveInvestigationId({
             objective,
             projectDir,
-            harnessId,
-            harnessEntryHash,
+            harnessSuiteId,
+            harnessSuiteIdentity,
+            contractHash,
         }));
     });
 
@@ -1424,11 +1842,13 @@ describe("environment: path + state resolution", () => {
 
     it("fails clearly when required environment configuration is unavailable", () => {
         expect(() => resolveStateRoot({})).toThrow(EnvironmentError);
-        const { env } = makeWorkspace("env-missing-sdk");
+        const workspace = makeWorkspace("env-missing-sdk");
+        const args = startArgs(workspace);
+        const { env } = workspace;
         const withoutSdk = { ...env };
         delete withoutSdk.COPILOT_SDK_PATH;
         const { deps } = makeDeps(withoutSdk);
-        expect(() => startInvestigation(startArgs(makeWorkspace("proj").projectDir), deps))
+        expect(() => startInvestigation(args, deps))
             .toThrow(EnvironmentError);
     });
 });
@@ -1436,22 +1856,59 @@ describe("environment: path + state resolution", () => {
 // --- crucible_start ----------------------------------------------------------
 
 describe("crucible_start", () => {
+    it("rejects v3 reattach through a typed restart-required path", () => {
+        const workspace = makeWorkspace("legacy-v3-reattach");
+        const investigationId = "legacy-v3-investigation";
+        const paths = seedLegacyV3State(
+            workspace.stateRoot,
+            investigationId,
+        );
+        persistLegacyV3SupervisorConfig(
+            workspace,
+            investigationId,
+            paths,
+        );
+        const { deps, calls } = makeDeps(workspace.env);
+
+        expect(() => startInvestigation({
+            investigation_id: investigationId,
+        }, deps)).toThrow(LegacyIncompatibleApiError);
+        expect(() => startInvestigation({
+            investigation_id: investigationId,
+        }, deps)).toThrow(expect.objectContaining({
+            code: "CRUCIBLE_API_LEGACY_INCOMPATIBLE",
+            details: expect.objectContaining({
+                compatibility: "legacy_incompatible",
+                actualDomainVersion: 3,
+                restartRequired: true,
+            }),
+        }));
+        expect(calls.ensure).toHaveLength(0);
+    });
+
     it("freezes a contract, ingests validation cases, and starts the supervisor", () => {
         const workspace = makeWorkspace("start");
         const { deps, calls } = makeDeps(workspace.env);
-        const result = startInvestigation(startArgs(workspace.projectDir), deps);
+        const result = startInvestigation(startArgs(workspace), deps);
 
         expect(result.is_result).toBe(false);
         expect(result.idempotent).toBe(false);
-        expect(result.contract_hash).toMatch(/^sha256:crucible-contract-v1:[a-f0-9]{64}$/u);
+        expect(result.contract_hash).toMatch(/^sha256:crucible-contract-v4:[a-f0-9]{64}$/u);
 
+        const experiment = loadExperimentRegistry(
+            workspace.env.CRUCIBLE_EXPERIMENT_REGISTRY_PATH,
+            { env: workspace.env },
+        ).getExperiment(result.experiment_id);
         const expectedId = deriveInvestigationId({
+            experimentId: result.experiment_id,
             objective: "find a candidate scoring at least 90",
             projectDir: fs.realpathSync.native(workspace.projectDir),
-            harnessId: "primary-harness",
-            harnessEntryHash:
+            harnessSuiteId: "primary-suite",
+            harnessSuiteIdentity:
                 loadHarnessAllowlist(workspace.allowlistPath)
-                    .getEntryHash("primary-harness"),
+                    .getSuiteIdentity("primary-suite"),
+            contractHash: result.contract_hash,
+            trustFingerprint: experiment.authority.trustFingerprint,
         });
         expect(result.investigation_id).toBe(expectedId);
 
@@ -1474,29 +1931,45 @@ describe("crucible_start", () => {
 
         // Only immutable content hashes entered the contract.
         const aggregate = replayAggregate(resolveStateRoot(workspace.env), expectedId);
-        expect(aggregate.contract.harnessIdentity).toMatchObject({
-            version: 1,
-            harnessId: "primary-harness",
-            allowlistVersion: 1,
-            executesCandidateCode: false,
-            sandbox: {
-                required: false,
-                policyIdentity: null,
-                policyDigest: null,
+        expect(aggregate.contract).toMatchObject({
+            harnessSuite: {
+                version: 4,
+                kind: "HarnessSuiteV4",
+                id: "primary-suite",
+            },
+            harnessSuiteIdentity: result.harness_suite_identity,
+            statisticalPolicy: {
+                goalMode: "optimize",
             },
         });
-        for (const field of [
-            "allowlistFileHash",
-            "harnessEntryHash",
-            "executableHash",
-            "argvTemplateHash",
-            "allowedEnvHash",
-            "parserVersionHash",
-            "parserSourceHash",
-        ]) {
-            expect(aggregate.contract.harnessIdentity[field])
-                .toMatch(/^sha256:[a-z0-9._-]+:[a-f0-9]{64}$/u);
-        }
+        expect(aggregate.contract.harnessSuiteIdentity)
+            .toMatch(/^sha256:crucible-harness-suite-v4:[a-f0-9]{64}$/u);
+        expect(aggregate.experimentAuthority).toMatchObject({
+            algorithm: "Ed25519",
+            trustFingerprint:
+                expect.stringMatching(/^sha256:crucible-experiment-public-key-v1:[a-f0-9]{64}$/u),
+            manifest: {
+                investigationId: expectedId,
+                trustFingerprint: experiment.authority.trustFingerprint,
+            },
+        });
+        expect(aggregate.experimentAuthorityIdentity)
+            .toBe(aggregate.experimentAuthority.identity);
+        expect(aggregate.runtimeConfigAuthority).toMatchObject({
+            fingerprint: expect.stringMatching(
+                /^sha256:crucible-runtime-config-authority-v1:[a-f0-9]{64}$/u,
+            ),
+            securityConfig: {
+                runner: {
+                    investigationId: expectedId,
+                    stateDir: paths.stateDir,
+                    artifactRoot: paths.artifactRoot,
+                    allowlistPath: path.resolve(workspace.allowlistPath),
+                },
+            },
+        });
+        expect(aggregate.runtimeConfigFingerprint)
+            .toBe(aggregate.runtimeConfigAuthority.fingerprint);
         for (const validationCase of aggregate.contract.validationCases) {
             expect(validationCase.artifactHash).toMatch(/^sha256:[a-f0-9]{64}$/u);
             expect(validationCase).not.toHaveProperty("path");
@@ -1506,7 +1979,7 @@ describe("crucible_start", () => {
     it("freezes the certified-impossibility trigger and certificate prerequisites", () => {
         const workspace = makeWorkspace("start-certified");
         const { deps } = makeDeps(workspace.env);
-        const started = startInvestigation(startArgs(workspace.projectDir, {
+        const started = startInvestigation(startArgs(workspace, {
             hypothesis_topology: "certified_impossibility",
             max_rounds: 1,
         }), deps);
@@ -1524,8 +1997,8 @@ describe("crucible_start", () => {
     it("is idempotent for an identical contract and returns the existing investigation", () => {
         const workspace = makeWorkspace("idem");
         const { deps, calls } = makeDeps(workspace.env);
-        const first = startInvestigation(startArgs(workspace.projectDir), deps);
-        const second = startInvestigation(startArgs(workspace.projectDir), deps);
+        const first = startInvestigation(startArgs(workspace), deps);
+        const second = startInvestigation(startArgs(workspace), deps);
 
         expect(second.idempotent).toBe(true);
         expect(second.investigation_id).toBe(first.investigation_id);
@@ -1539,7 +2012,7 @@ describe("crucible_start", () => {
     it("resumes a persisted pause on identical crucible_start reattach and ensures the supervisor", () => {
         const workspace = makeWorkspace("resume");
         const { deps, calls } = makeDeps(workspace.env);
-        const args = startArgs(workspace.projectDir);
+        const args = startArgs(workspace);
         const started = startInvestigation(args, deps);
         persistPauseForStarted(workspace, started);
         const stopped = stopInvestigation({
@@ -1561,10 +2034,35 @@ describe("crucible_start", () => {
         expect(aggregate.pauseHistory).toHaveLength(1);
     });
 
+    it("requires a new investigation when the trusted experiment key changes", () => {
+        const workspace = makeWorkspace("reattach-trust-change");
+        const { deps } = makeDeps(workspace.env);
+        const started = startInvestigation(startArgs(workspace), deps);
+        const replacementTrust = createExperimentAuthorityFixture();
+        const { deps: changedDeps, calls } = makeDeps({
+            ...workspace.env,
+            ...replacementTrust.env,
+        });
+
+        expect(() => startInvestigation({
+            investigation_id: started.investigation_id,
+        }, changedDeps)).toThrow(ExperimentAuthorityMismatchApiError);
+        expect(() => startInvestigation({
+            investigation_id: started.investigation_id,
+        }, changedDeps)).toThrow(expect.objectContaining({
+            code: "CRUCIBLE_API_EXPERIMENT_AUTHORITY_MISMATCH",
+            details: expect.objectContaining({
+                restartRequired: true,
+                requiredAction: "start_new_investigation",
+            }),
+        }));
+        expect(calls.ensure).toHaveLength(0);
+    });
+
     it("resumes by investigation id after the original project and case directories are deleted", () => {
         const workspace = makeWorkspace("resume-without-project");
         const { deps } = makeDeps(workspace.env);
-        const started = startInvestigation(startArgs(workspace.projectDir), deps);
+        const started = startInvestigation(startArgs(workspace), deps);
         persistPauseForStarted(workspace, started);
         const stopped = stopInvestigation({
             investigation_id: started.investigation_id,
@@ -1592,7 +2090,7 @@ describe("crucible_start", () => {
     it("rejects invalid persisted resume configuration without mutating paused state", () => {
         const workspace = makeWorkspace("resume-invalid-config");
         const { deps, calls } = makeDeps(workspace.env);
-        const started = startInvestigation(startArgs(workspace.projectDir), deps);
+        const started = startInvestigation(startArgs(workspace), deps);
         persistPauseForStarted(workspace, started);
         stopInvestigation({ investigation_id: started.investigation_id }, deps);
         const before = replayAggregate(workspace.stateRoot, started.investigation_id);
@@ -1610,7 +2108,7 @@ describe("crucible_start", () => {
 
         expect(() => startInvestigation({
             investigation_id: started.investigation_id,
-        }, deps)).toThrow(StartPreflightError);
+        }, deps)).toThrow(ExperimentAuthorityMismatchApiError);
 
         const after = replayAggregate(workspace.stateRoot, started.investigation_id);
         expect(after.lastSeq).toBe(before.lastSeq);
@@ -1621,7 +2119,7 @@ describe("crucible_start", () => {
     it("compensates a failed asynchronous supervisor acknowledgement to a durable pause", async () => {
         const workspace = makeWorkspace("resume-supervisor-failure");
         const { deps } = makeDeps(workspace.env);
-        const started = startInvestigation(startArgs(workspace.projectDir), deps);
+        const started = startInvestigation(startArgs(workspace), deps);
         persistPauseForStarted(workspace, started);
         stopInvestigation({ investigation_id: started.investigation_id }, deps);
         const workingEnsure = deps.ensureSupervisor;
@@ -1649,7 +2147,7 @@ describe("crucible_start", () => {
     it("preflights a reattach before recording recovery/resume or ensuring the supervisor", () => {
         const workspace = makeWorkspace("resume-preflight");
         const { deps, calls } = makeDeps(workspace.env);
-        const args = startArgs(workspace.projectDir);
+        const args = startArgs(workspace);
         const started = startInvestigation(args, deps);
         persistPauseForStarted(workspace, started);
         const stopped = stopInvestigation({
@@ -1665,7 +2163,7 @@ describe("crucible_start", () => {
 
         expect(() => startInvestigation({
             investigation_id: started.investigation_id,
-        }, deps)).toThrow(HarnessConfigurationError);
+        }, deps)).toThrow(ExperimentAuthorityMismatchApiError);
 
         const after = replayAggregate(workspace.stateRoot, started.investigation_id);
         expect(after.lastSeq).toBe(before.lastSeq);
@@ -1677,11 +2175,67 @@ describe("crucible_start", () => {
         ).toEqual([]);
     });
 
+    it.each([
+        ["runnerCliPath", (document, workspace) => {
+            document.runnerCliPath = workspace.env.COPILOT_CLI_PATH;
+        }],
+        ["workerAdditionalContext", (document) => {
+            document.runner.options.workerAdditionalContext =
+                "tampered operator context";
+        }],
+        ["runner options", (document) => {
+            document.runner.options.sessionTimeoutMs += 1;
+        }],
+        ["derived paths", (document, workspace) => {
+            document.runner.stateDir = path.join(
+                workspace.root,
+                "tampered-state",
+            );
+        }],
+    ])("keeps a paused investigation paused when persisted %s is tampered", (
+        _label,
+        mutate,
+    ) => {
+        const workspace = makeWorkspace(`reattach-tamper-${_label}`);
+        const { deps, calls } = makeDeps(workspace.env);
+        const started = startInvestigation(startArgs(workspace), deps);
+        persistPauseForStarted(workspace, started);
+        const paths = resolveInvestigationPaths(
+            workspace.stateRoot,
+            started.investigation_id,
+        );
+        const configPath = supervisorPaths(
+            paths.stateDir,
+            started.investigation_id,
+        ).configPath;
+        const document = JSON.parse(fs.readFileSync(configPath, "utf8"));
+        mutate(document, workspace);
+        fs.writeFileSync(configPath, JSON.stringify(document));
+        const before = replayAggregate(
+            workspace.stateRoot,
+            started.investigation_id,
+        );
+        const ensureCount = calls.ensure.length;
+
+        expect(() => startInvestigation({
+            investigation_id: started.investigation_id,
+        }, deps)).toThrow(ExperimentAuthorityMismatchApiError);
+
+        const after = replayAggregate(
+            workspace.stateRoot,
+            started.investigation_id,
+        );
+        expect(after.lastSeq).toBe(before.lastSeq);
+        expect(after.pause).toEqual(before.pause);
+        expect(calls.ensure).toHaveLength(ensureCount);
+    });
+
     it("does not resume terminal investigations without a new identity", () => {
         const workspace = makeWorkspace("terminal-reattach");
         const { deps } = makeDeps(workspace.env);
-        const args = startArgs(workspace.projectDir, {
-            search_policy: searchPolicy({ stopOnFirstAccept: true }),
+        const args = startArgs(workspace, {
+            hypothesis_topology: "certified_impossibility",
+            max_rounds: 1,
         });
         const started = startInvestigation(args, deps);
         const paths = resolveInvestigationPaths(workspace.stateRoot, started.investigation_id);
@@ -1693,7 +2247,13 @@ describe("crucible_start", () => {
                 investigationId: started.investigation_id,
             });
             driveToTerminal(adapter, store, [
-                { data: { pass: true, metrics: { score: 95 } } },
+                { data: { pass: false, metrics: { score: 20 } } },
+                {
+                    certificateFacts: {
+                        pass: true,
+                        searchSpaceExhausted: true,
+                    },
+                },
             ]);
         } finally {
             repository.close();
@@ -1702,12 +2262,29 @@ describe("crucible_start", () => {
             investigation_id: started.investigation_id,
         }, deps))
             .toThrow(InvestigationNotResumableError);
+
+        const startTool = buildRegistration({ deps }).tools
+            .find((tool) => tool.name === "crucible_start");
+        const boundary = startTool.handler({
+            investigation_id: started.investigation_id,
+        });
+        expect(boundary.resultType).toBe("failure");
+        const payload = JSON.parse(boundary.textResultForLlm);
+        expect(payload).toMatchObject({
+            ok: false,
+            is_result: false,
+            tool: "crucible_start",
+            code: "CRUCIBLE_API_INVESTIGATION_NOT_RESUMABLE",
+            terminal_available: true,
+        });
+        expect(JSON.stringify(payload)).not.toContain("VERIFIED_RESULT");
+        expect(JSON.stringify(payload)).not.toContain(FIRST_GENERATED_CANDIDATE_ID);
     });
 
     it("does not resume persisted domain non-results", () => {
         const workspace = makeWorkspace("domain-non-result-reattach");
         const { deps } = makeDeps(workspace.env);
-        const started = startInvestigation(startArgs(workspace.projectDir, {
+        const started = startInvestigation(startArgs(workspace, {
             hypothesis_topology: "certified_impossibility",
             max_rounds: 1,
         }), deps);
@@ -1741,7 +2318,7 @@ describe("crucible_start", () => {
     it("requires explicit operational recovery policy and accepts a later deadline", () => {
         const workspace = makeWorkspace("operational-recovery");
         const { deps, calls } = makeDeps(workspace.env);
-        const args = startArgs(workspace.projectDir, {
+        const args = startArgs(workspace, {
             deadline_iso: "2026-07-10T00:00:00.000Z",
         });
         const started = startInvestigation(args, deps);
@@ -1790,19 +2367,25 @@ describe("crucible_start", () => {
         expect(reset.operational_recovery).toBe("circuit_open");
     });
 
-    it("rejects a conflicting contract for the same identity", () => {
+    it("derives a distinct identity when the complete contract changes", () => {
         const workspace = makeWorkspace("conflict");
         const { deps } = makeDeps(workspace.env);
-        startInvestigation(startArgs(workspace.projectDir), deps);
-        // Same objective/project/harness (=> same id) but a different contract.
-        expect(() => startInvestigation(startArgs(workspace.projectDir, { max_rounds: 5 }), deps))
-            .toThrow(ContractConflictError);
+        const first = startInvestigation(startArgs(workspace), deps);
+        const second = startInvestigation(
+            startArgs(workspace, { max_rounds: 5 }),
+            deps,
+        );
+        expect(second.investigation_id).not.toBe(first.investigation_id);
     });
 
     it("refuses a harness with no operator allowlist entry", () => {
         const workspace = makeWorkspace("allow-miss");
         const { deps } = makeDeps(workspace.env);
-        expect(() => startInvestigation(startArgs(workspace.projectDir, { harness_id: "unknown-harness" }), deps))
+        const args = startArgs(workspace);
+        const allowlist = JSON.parse(fs.readFileSync(workspace.allowlistPath, "utf8"));
+        delete allowlist.suites["primary-suite"];
+        fs.writeFileSync(workspace.allowlistPath, JSON.stringify(allowlist));
+        expect(() => startInvestigation(args, deps))
             .toThrow(HarnessNotAllowlistedError);
     });
 
@@ -1810,43 +2393,107 @@ describe("crucible_start", () => {
         const workspace = makeWorkspace("allow-file-missing");
         fs.rmSync(workspace.allowlistPath, { force: true });
         const { deps } = makeDeps(workspace.env);
-        expect(() => startInvestigation(startArgs(workspace.projectDir), deps)).toThrow();
+        expect(() => startInvestigation(startArgs(workspace), deps)).toThrow();
     });
 
-    it("refuses a validation-case path that escapes project_dir", () => {
+    it("rejects legacy caller-supplied validation cases without state", () => {
         const workspace = makeWorkspace("escape");
         const outside = path.join(workspace.root, "outside");
         fs.mkdirSync(outside, { recursive: true });
         fs.writeFileSync(path.join(outside, "x.txt"), "x");
         const { deps } = makeDeps(workspace.env);
-        const args = startArgs(workspace.projectDir, {
+        const args = {
+            ...startArgs(workspace),
             validation_cases: [
                 { id: "good", expectation: "accept", path: "cases/good" },
                 { id: "bad", expectation: "reject", path: "..\\outside" },
             ],
-        });
-        expect(() => startInvestigation(args, deps)).toThrow(ValidationCasePathError);
+        };
+        expect(() => startInvestigation(args, deps)).toThrow(SchemaValidationError);
+        expect(fs.existsSync(workspace.stateRoot)).toBe(false);
     });
 
-    it("refuses a validation-case path that is a file, not a directory", () => {
+    it("rejects legacy caller-supplied validation-case files without state", () => {
         const workspace = makeWorkspace("case-file");
         fs.writeFileSync(path.join(workspace.projectDir, "loose.txt"), "not a dir");
         const { deps } = makeDeps(workspace.env);
-        const args = startArgs(workspace.projectDir, {
+        const args = {
+            ...startArgs(workspace),
             validation_cases: [
                 { id: "good", expectation: "accept", path: "cases/good" },
                 { id: "bad", expectation: "reject", path: "loose.txt" },
             ],
-        });
-        expect(() => startInvestigation(args, deps)).toThrow(ValidationCasePathError);
+        };
+        expect(() => startInvestigation(args, deps)).toThrow(SchemaValidationError);
+        expect(fs.existsSync(workspace.stateRoot)).toBe(false);
     });
 });
 
 describe("crucible_status", () => {
+    it("discovers v3 state read-only without restart, append, or result disclosure", () => {
+        const workspace = makeWorkspace("legacy-v3-read-only");
+        const investigationId = "legacy-v3-read-only";
+        const paths = seedLegacyV3State(
+            workspace.stateRoot,
+            investigationId,
+        );
+        const { deps, calls } = makeDeps(workspace.env);
+
+        const registration = buildRegistration({ deps });
+        const invoke = (name) => {
+            const response = registration.tools
+                .find((tool) => tool.name === name)
+                .handler({ investigation_id: investigationId });
+            expect(response.resultType).toBe("success");
+            return JSON.parse(response.textResultForLlm);
+        };
+        const status = invoke("crucible_status");
+        const result = invoke("crucible_result");
+        const stopped = invoke("crucible_stop");
+
+        for (const payload of [status, result, stopped]) {
+            expect(payload).toMatchObject({
+                ok: true,
+                is_result: false,
+                compatibility: "legacy_incompatible",
+                legacy_incompatible: true,
+                restart_required: true,
+                required_action: "start_new_investigation",
+                expected_domain_version: 4,
+                actual_domain_version: 3,
+                event_count: 1,
+                read_only: true,
+                archiveable: true,
+                non_result_code: "LEGACY_INCOMPATIBLE",
+            });
+            expect(payload).not.toHaveProperty("decision");
+            expect(payload).not.toHaveProperty("candidate_id");
+            expect(payload).not.toHaveProperty("contract_hash");
+        }
+        expect(stopped).toMatchObject({
+            stop_state: "legacy_incompatible",
+            appended: false,
+            resumable: false,
+        });
+        expect(calls.ensure).toHaveLength(0);
+
+        const repository = openRepositoryReadOnly({
+            file: paths.eventsDbPath,
+        });
+        try {
+            expect(repository.countEvents(investigationId)).toBe(1);
+            expect(repository.getInvestigation(
+                `${investigationId}.runtime-evidence`,
+            )).toBeNull();
+        } finally {
+            repository.close();
+        }
+    });
+
     it("reports nonterminal progress, contract hash, event head, and a recommendation", () => {
         const workspace = makeWorkspace("status");
         const { deps } = makeDeps(workspace.env);
-        const started = startInvestigation(startArgs(workspace.projectDir), deps);
+        const started = startInvestigation(startArgs(workspace), deps);
 
         const status = statusInvestigation({ investigation_id: started.investigation_id }, deps);
         expect(status.is_result).toBe(false);
@@ -1860,19 +2507,12 @@ describe("crucible_status", () => {
     it("restarts a missing supervisor from persisted config when nonterminal", () => {
         const workspace = makeWorkspace("status-restart");
         const { deps } = makeDeps(workspace.env);
-        const started = startInvestigation(startArgs(workspace.projectDir), deps);
-
-        // Simulate a persisted supervisor config existing on disk.
-        const paths = resolveInvestigationPaths(resolveStateRoot(workspace.env), started.investigation_id);
-        const configPath = supervisorPaths(paths.stateDir, started.investigation_id).configPath;
-        fs.mkdirSync(path.dirname(configPath), { recursive: true });
-        fs.writeFileSync(configPath, JSON.stringify({ persisted: true }));
+        const started = startInvestigation(startArgs(workspace), deps);
 
         const restartCalls = [];
         const { deps: statusDeps } = makeDeps(workspace.env, {
             readStatus: () => null, // supervisor missing
             isPidAlive: () => false,
-            loadSupervisorConfig: () => ({ loaded: "config" }),
             ensureSupervisor: (input) => {
                 restartCalls.push(input);
                 return { action: "started", pid: 999 };
@@ -1881,14 +2521,15 @@ describe("crucible_status", () => {
 
         const status = statusInvestigation({ investigation_id: started.investigation_id }, statusDeps);
         expect(restartCalls).toHaveLength(1);
-        expect(restartCalls[0]).toEqual({ loaded: "config" });
+        expect(restartCalls[0].runner.investigationId)
+            .toBe(started.investigation_id);
         expect(status.supervisor_health.ensure_action.action).toBe("started");
     });
 
     it("does not restart when the supervisor is alive", () => {
         const workspace = makeWorkspace("status-alive");
         const { deps } = makeDeps(workspace.env);
-        const started = startInvestigation(startArgs(workspace.projectDir), deps);
+        const started = startInvestigation(startArgs(workspace), deps);
 
         const ensureCalls = [];
         const { deps: statusDeps } = makeDeps(workspace.env, {
@@ -1920,7 +2561,10 @@ describe("crucible_status", () => {
 
     it("does not restart a terminal investigation", () => {
         const workspace = makeWorkspace("status-terminal");
-        seedVerifiedResult(workspace.stateRoot, "verified-inv");
+        const seeded = seedCertifiedTargetUnreachable(
+            workspace.stateRoot,
+            "verified-inv",
+        );
         const ensureCalls = [];
         const { deps } = makeDeps(workspace.env, {
             readStatus: () => null,
@@ -1930,10 +2574,12 @@ describe("crucible_status", () => {
                 return { action: "started" };
             },
         });
-        const status = statusInvestigation({ investigation_id: "verified-inv" }, deps);
+        const status = statusInvestigation({
+            investigation_id: seeded.investigationId,
+        }, deps);
         expect(status).toEqual({
             is_result: false,
-            investigation_id: "verified-inv",
+            investigation_id: seeded.investigationId,
             terminal_available: true,
         });
         expect(ensureCalls).toHaveLength(0);
@@ -1941,9 +2587,14 @@ describe("crucible_status", () => {
 
     it("uses the exact terminal status key allowlist before result verification", () => {
         const workspace = makeWorkspace("status-redaction");
-        seedVerifiedResult(workspace.stateRoot, "verified-inv");
+        const seeded = seedCertifiedTargetUnreachable(
+            workspace.stateRoot,
+            "verified-inv",
+        );
         const { deps } = makeDeps(workspace.env, { readStatus: () => null });
-        const status = statusInvestigation({ investigation_id: "verified-inv" }, deps);
+        const status = statusInvestigation({
+            investigation_id: seeded.investigationId,
+        }, deps);
         expect(Object.keys(status).sort()).toEqual([
             "investigation_id",
             "is_result",
@@ -1951,7 +2602,7 @@ describe("crucible_status", () => {
         ]);
         expect(status).toEqual({
             is_result: false,
-            investigation_id: "verified-inv",
+            investigation_id: seeded.investigationId,
             terminal_available: true,
         });
         const serialized = JSON.stringify(status);
@@ -1964,7 +2615,7 @@ describe("crucible_status", () => {
     it("reports an integrity-checked operational deadline as a non-result", () => {
         const workspace = makeWorkspace("status-deadline");
         const { deps } = makeDeps(workspace.env);
-        const started = startInvestigation(startArgs(workspace.projectDir), deps);
+        const started = startInvestigation(startArgs(workspace), deps);
         recordOperationalNonResult(workspace.stateRoot, started.investigation_id, {
             attemptId: "deadline-status",
             code: "DEADLINE_EXCEEDED",
@@ -1985,10 +2636,13 @@ describe("crucible_status", () => {
 
     it("describes a persisted domain non-result without calling it in progress", () => {
         const workspace = makeWorkspace("status-domain-non-result");
-        seedCertifiedNonResult(workspace.stateRoot, "certified-non-result-inv");
+        const seeded = seedCertifiedNonResult(
+            workspace.stateRoot,
+            "certified-non-result-inv",
+        );
         const { deps } = makeDeps(workspace.env, { readStatus: () => null });
         const status = statusInvestigation({
-            investigation_id: "certified-non-result-inv",
+            investigation_id: seeded.investigationId,
         }, deps);
         expect(status).toMatchObject({
             is_result: false,
@@ -2014,7 +2668,7 @@ describe("crucible_stop", () => {
     it("does not claim resumability until the pause transition is persisted", () => {
         const workspace = makeWorkspace("stop");
         const { deps } = makeDeps(workspace.env);
-        const started = startInvestigation(startArgs(workspace.projectDir), deps);
+        const started = startInvestigation(startArgs(workspace), deps);
         // Leave a dispatched (in-flight) command so the kernel cannot persist the
         // pause yet; the stop request is recorded but not resumable.
         seedDispatchedCommand(workspace.stateRoot, started.investigation_id);
@@ -2026,7 +2680,6 @@ describe("crucible_stop", () => {
         expect(stop.pause_in_flight).toBe(true);
         expect(stop.resumable).toBe(false);
         expect(stop.appended).toBe(true);
-        expect(stop.already_terminal).toBe(false);
         expect(stop.pause_persisted).toBe(false);
 
         const aggregate = replayAggregate(resolveStateRoot(workspace.env), started.investigation_id);
@@ -2039,7 +2692,7 @@ describe("crucible_stop", () => {
     it("returns resumable only after the pause event is durably persisted", () => {
         const workspace = makeWorkspace("stop-persisted");
         const { deps } = makeDeps(workspace.env);
-        const started = startInvestigation(startArgs(workspace.projectDir), deps);
+        const started = startInvestigation(startArgs(workspace), deps);
         persistPauseForStarted(workspace, started);
         const stop = stopInvestigation({
             investigation_id: started.investigation_id,
@@ -2051,7 +2704,6 @@ describe("crucible_stop", () => {
             pause_in_flight: false,
             pause_persisted: true,
             resumable: true,
-            already_terminal: false,
         });
         expect(replayAggregate(workspace.stateRoot, started.investigation_id).pause)
             .not.toBeNull();
@@ -2059,15 +2711,18 @@ describe("crucible_stop", () => {
 
     it("is honest when stop is called after a terminal result", () => {
         const workspace = makeWorkspace("stop-terminal");
-        seedVerifiedResult(workspace.stateRoot, "verified-inv");
+        const seeded = seedCertifiedTargetUnreachable(
+            workspace.stateRoot,
+            "verified-inv",
+        );
         const { deps } = makeDeps(workspace.env);
-        const stop = stopInvestigation({ investigation_id: "verified-inv" }, deps);
-        expect(stop).toMatchObject({
-            stop_state: "already_terminal",
-            appended: false,
-            pause_persisted: false,
-            resumable: false,
-            already_terminal: true,
+        const stop = stopInvestigation({
+            investigation_id: seeded.investigationId,
+        }, deps);
+        expect(stop).toEqual({
+            is_result: false,
+            investigation_id: seeded.investigationId,
+            terminal_available: true,
         });
     });
 
@@ -2110,7 +2765,7 @@ describe("crucible_stop", () => {
     ) => {
         const workspace = makeWorkspace(`stop-${expectedState}`);
         const { deps } = makeDeps(workspace.env);
-        const started = startInvestigation(startArgs(workspace.projectDir), deps);
+        const started = startInvestigation(startArgs(workspace), deps);
         const aggregate = replayAggregate(workspace.stateRoot, started.investigation_id);
         deps.requestStop = () => buildResult(aggregate);
 
@@ -2138,60 +2793,233 @@ describe("crucible_stop", () => {
 // --- crucible_result ---------------------------------------------------------
 
 describe("crucible_result", () => {
-    it("returns is_result:true with the verified terminal decision + hashes", () => {
-        const workspace = makeWorkspace("result-verified");
-        seedVerifiedResult(workspace.stateRoot, "verified-inv");
+    it("blocks a directly forged unsigned v4 terminal without disclosing hashes", () => {
+        const workspace = makeWorkspace("result-unsigned-forged");
+        const investigationId = "unsigned-forged-terminal";
+        seedUnsignedForgedTerminal(workspace.stateRoot, investigationId);
         const { deps } = makeDeps(workspace.env);
 
-        const result = resultInvestigation({ investigation_id: "verified-inv" }, deps);
-        expect(result.is_result).toBe(true);
-        expect(result.banner).toBe("===== CRUCIBLE TERMINAL RESULT =====");
-        expect(result.decision).toBe("VERIFIED_RESULT");
-        expect(result.candidate_id).toBe(FIRST_GENERATED_CANDIDATE_ID);
-        expect(result.evidence_hash).toMatch(/^sha256:/u);
-        expect(result.contract_hash).toMatch(/^sha256:crucible-contract-v1:/u);
-        expect(typeof result.terminal_event_hash).toBe("string");
-        expect(result.message).toContain("VERIFIED_RESULT");
-        const persisted = replayAggregate(workspace.stateRoot, "verified-inv").terminal;
-        expect(result).toMatchObject({
-            decision: persisted.decision,
-            terminal_seq: persisted.seq,
-            terminal_event_hash: persisted.eventHash,
-            candidate_id: persisted.candidateId,
-            evidence_id: persisted.evidenceId,
-            evidence_hash: persisted.evidenceHash,
-            evidence_closure: persisted.evidenceClosure,
-            basis: persisted.basis,
+        const status = statusInvestigation({
+            investigation_id: investigationId,
+        }, deps);
+        expect(status).toMatchObject({
+            is_result: false,
+            integrity_blocked: true,
+            terminal_available: false,
         });
+        const result = resultInvestigation({
+            investigation_id: investigationId,
+        }, deps);
+        expectIntegrityBlocked(result);
+        expect(JSON.stringify(result)).not.toContain("forged-winner");
+        expect(result).not.toHaveProperty("terminal_event_hash");
+        expect(result).not.toHaveProperty("contract_hash");
     });
 
-    it("returns is_result:true for a target-unreachable terminal decision", () => {
+    it("recomputes the signed investigation identity before terminal disclosure", () => {
+        const workspace = makeWorkspace("result-authority-id-mismatch");
+        const seeded = seedCertifiedTargetUnreachable(
+            workspace.stateRoot,
+            "authority-source",
+        );
+        const deps = depsForSyntheticTerminal(workspace, seeded.aggregate);
+        const mismatchedId = "mismatched-signed-investigation";
+        const paths = resolveInvestigationPaths(
+            workspace.stateRoot,
+            mismatchedId,
+        );
+        fs.mkdirSync(paths.stateDir, { recursive: true });
+        fs.writeFileSync(paths.eventsDbPath, "forged id alias");
+
+        const result = resultInvestigation({
+            investigation_id: mismatchedId,
+        }, deps);
+        expectIntegrityBlocked(result);
+        expect(result).not.toHaveProperty("decision");
+        expect(result).not.toHaveProperty("evidence_hash");
+        expect(result).not.toHaveProperty("terminal_event_hash");
+    });
+
+    it("blocks status and result after the configured trust root changes", () => {
+        const workspace = makeWorkspace("result-trust-change");
+        const seeded = seedCertifiedTargetUnreachable(
+            workspace.stateRoot,
+            "trust-change-source",
+        );
+        const changedTrust = createExperimentAuthorityFixture();
+        const { deps } = makeDeps({
+            ...workspace.env,
+            ...changedTrust.env,
+        });
+
+        const status = statusInvestigation({
+            investigation_id: seeded.investigationId,
+        }, deps);
+        expect(status).toMatchObject({
+            is_result: false,
+            integrity_blocked: true,
+            terminal_available: false,
+        });
+        const result = resultInvestigation({
+            investigation_id: seeded.investigationId,
+        }, deps);
+        expectIntegrityBlocked(result);
+        expect(result).not.toHaveProperty("decision");
+        expect(result).not.toHaveProperty("contract_hash");
+    });
+
+    it("does not disclose a persisted search-only VERIFIED_RESULT", () => {
+        const workspace = makeWorkspace("result-verified");
+        const seeded = seedVerifiedResult(
+            workspace.stateRoot,
+            "search-only-source",
+        );
+        const aggregate = withSyntheticTerminal(
+            seeded.aggregate,
+            "VERIFIED_RESULT",
+        );
+        const deps = depsForSyntheticTerminal(workspace, aggregate);
+
+        const result = resultInvestigation({
+            investigation_id: seeded.investigationId,
+        }, deps);
+        expect(result).toMatchObject({
+            is_result: false,
+            scientific_blocked: true,
+            terminal_available: false,
+            non_result: true,
+            non_result_code: "SCIENTIFIC_CONFIRMATION_REQUIRED",
+        });
+        expect(result).not.toHaveProperty("decision");
+        expect(result).not.toHaveProperty("candidate_id");
+        expect(result).not.toHaveProperty("evidence_id");
+        expect(result).not.toHaveProperty("evidence_hash");
+        expect(result).not.toHaveProperty("contract_hash");
+
+        const status = statusInvestigation({
+            investigation_id: seeded.investigationId,
+        }, deps);
+        expect(status).toMatchObject({
+            is_result: false,
+            scientific_blocked: true,
+            terminal_available: false,
+            non_result_code: "SCIENTIFIC_CONFIRMATION_REQUIRED",
+        });
+        expect(status).not.toHaveProperty("decision");
+        expect(status).not.toHaveProperty("candidate_id");
+        expect(status).not.toHaveProperty("evidence_id");
+    });
+
+    it("does not disclose a synthetic search-only TARGET_UNREACHABLE", () => {
+        const workspace = makeWorkspace("result-synthetic-unreachable");
+        const seeded = seedTargetUnreachable(
+            workspace.stateRoot,
+            "search-only-unreachable-source",
+        );
+        const aggregate = withSyntheticTerminal(
+            seeded.aggregate,
+            "TARGET_UNREACHABLE",
+        );
+        const deps = depsForSyntheticTerminal(workspace, aggregate);
+
+        const result = resultInvestigation({
+            investigation_id: seeded.investigationId,
+        }, deps);
+        expect(result).toMatchObject({
+            is_result: false,
+            integrity_blocked: true,
+            scientific_blocked: true,
+            terminal_available: false,
+            non_result_code: "INTEGRITY_BLOCKED",
+        });
+        for (const forbidden of [
+            "decision",
+            "candidate_id",
+            "evidence_id",
+            "evidence_hash",
+            "contract_hash",
+            "terminal_event_hash",
+        ]) {
+            expect(result).not.toHaveProperty(forbidden);
+        }
+    });
+
+    it("does not treat finite search exhaustion as TARGET_UNREACHABLE", () => {
         const workspace = makeWorkspace("result-unreach");
-        seedTargetUnreachable(workspace.stateRoot, "unreach-inv");
+        const seeded = seedTargetUnreachable(
+            workspace.stateRoot,
+            "unreach-inv",
+        );
         const { deps } = makeDeps(workspace.env);
 
-        const result = resultInvestigation({ investigation_id: "unreach-inv" }, deps);
-        expect(result.is_result).toBe(true);
-        expect(result.banner).toBe("===== CRUCIBLE TERMINAL RESULT =====");
-        expect(result.decision).toBe("TARGET_UNREACHABLE");
-        expect(result.basis.kind).toBe("search_space_exhausted");
-        const persisted = replayAggregate(workspace.stateRoot, "unreach-inv").terminal;
+        const result = resultInvestigation({
+            investigation_id: seeded.investigationId,
+        }, deps);
         expect(result).toMatchObject({
-            decision: persisted.decision,
-            terminal_seq: persisted.seq,
-            terminal_event_hash: persisted.eventHash,
-            evidence_closure: persisted.evidenceClosure,
-            basis: persisted.basis,
+            is_result: false,
+            non_result: true,
+            non_result_code: "INDEPENDENT_VERIFICATION_REQUIRED",
         });
+        expect(replayAggregate(
+            workspace.stateRoot,
+            seeded.investigationId,
+        ).terminal)
+            .toBeNull();
+    });
+
+    it("reserves terminal disclosure to the actual registered result handler", async () => {
+        const workspace = makeWorkspace("registered-terminal-boundary");
+        const seeded = seedCertifiedTargetUnreachable(
+            workspace.stateRoot,
+            "verified-inv",
+        );
+        const { deps } = makeDeps(workspace.env);
+        const registration = buildRegistration({ deps });
+        const invoke = async (name) => {
+            const tool = registration.tools.find((candidate) => candidate.name === name);
+            const response = await tool.handler({
+                investigation_id: seeded.investigationId,
+            });
+            return {
+                response,
+                payload: JSON.parse(response.textResultForLlm),
+            };
+        };
+
+        for (const name of ["crucible_status", "crucible_stop"]) {
+            const { response, payload } = await invoke(name);
+            expect(response.resultType).toBe("success");
+            expect(payload).toEqual({
+                is_result: false,
+                investigation_id: seeded.investigationId,
+                terminal_available: true,
+                ok: true,
+            });
+        }
+
+        const { response, payload } = await invoke("crucible_result");
+        expect(response.resultType).toBe("success");
+        expect(payload).toMatchObject({
+            ok: true,
+            is_result: true,
+            decision: "TARGET_UNREACHABLE",
+        });
+        expect(payload).not.toHaveProperty("candidate_id");
+        expect(payload.evidence_id).toBeTruthy();
+        expect(payload.evidence_hash).toMatch(/^sha256:/u);
+        expect(payload.evidence_closure).toBeTruthy();
     });
 
     it("returns a persisted certificate-backed TARGET_UNREACHABLE only at result", () => {
         const workspace = makeWorkspace("result-certified-unreach");
-        seedCertifiedTargetUnreachable(workspace.stateRoot, "certified-unreach-inv");
+        const seeded = seedCertifiedTargetUnreachable(
+            workspace.stateRoot,
+            "certified-unreach-inv",
+        );
         const { deps } = makeDeps(workspace.env);
 
         const result = resultInvestigation({
-            investigation_id: "certified-unreach-inv",
+            investigation_id: seeded.investigationId,
         }, deps);
         expect(result).toMatchObject({
             is_result: true,
@@ -2217,21 +3045,24 @@ describe("crucible_result", () => {
         "snapshot object",
     ])("refuses a terminal result when the %s artifact is corrupt", (artifactClass) => {
         const workspace = makeWorkspace(`result-${artifactClass}-corrupt`);
-        seedVerifiedResult(workspace.stateRoot, "verified-inv");
-        const { artifacts } = terminalArtifactClasses(
+        const seeded = seedCertifiedTargetUnreachable(
             workspace.stateRoot,
             "verified-inv",
+        );
+        const { artifacts } = terminalArtifactClasses(
+            workspace.stateRoot,
+            seeded.investigationId,
         );
         expect(artifacts[artifactClass]).toBeTruthy();
         corruptCasArtifact(
             workspace.stateRoot,
-            "verified-inv",
+            seeded.investigationId,
             artifacts[artifactClass],
             "corrupt",
         );
         const { deps } = makeDeps(workspace.env);
         expectIntegrityBlocked(resultInvestigation({
-            investigation_id: "verified-inv",
+            investigation_id: seeded.investigationId,
         }, deps));
     });
 
@@ -2239,10 +3070,13 @@ describe("crucible_result", () => {
         "refuses a terminal result when decisive measurement evidence is %s",
         (mode) => {
             const workspace = makeWorkspace(`result-measurement-${mode}`);
-            seedVerifiedResult(workspace.stateRoot, "verified-inv");
-            const { artifacts } = terminalArtifactClasses(
+            const seeded = seedCertifiedTargetUnreachable(
                 workspace.stateRoot,
                 "verified-inv",
+            );
+            const { artifacts } = terminalArtifactClasses(
+                workspace.stateRoot,
+                seeded.investigationId,
             );
             const artifact = artifacts["measurement receipt"];
             const replacement = Object.values(artifacts).find((candidate) =>
@@ -2250,48 +3084,54 @@ describe("crucible_result", () => {
                 && candidate.objectId !== artifact.objectId);
             corruptCasArtifact(
                 workspace.stateRoot,
-                "verified-inv",
+                seeded.investigationId,
                 artifact,
                 mode,
                 replacement,
             );
             const { deps } = makeDeps(workspace.env);
             expectIntegrityBlocked(resultInvestigation({
-                investigation_id: "verified-inv",
+                investigation_id: seeded.investigationId,
             }, deps));
         },
     );
 
     it("refuses a certified terminal result with a corrupt impossibility certificate", () => {
         const workspace = makeWorkspace("result-certificate-corrupt");
-        seedCertifiedTargetUnreachable(
+        const seeded = seedCertifiedTargetUnreachable(
             workspace.stateRoot,
             "certified-unreach-inv",
         );
         const { artifacts } = terminalArtifactClasses(
             workspace.stateRoot,
-            "certified-unreach-inv",
+            seeded.investigationId,
         );
         corruptCasArtifact(
             workspace.stateRoot,
-            "certified-unreach-inv",
+            seeded.investigationId,
             artifacts["impossibility certificate"],
             "corrupt",
         );
         const { deps } = makeDeps(workspace.env);
         expectIntegrityBlocked(resultInvestigation({
-            investigation_id: "certified-unreach-inv",
+            investigation_id: seeded.investigationId,
         }, deps));
     });
 
     it("refuses external artifact size metadata that does not match CAS bytes", () => {
         const workspace = makeWorkspace("result-size-mismatch");
-        seedVerifiedResult(workspace.stateRoot, "verified-inv");
-        const { artifacts } = terminalArtifactClasses(
+        const seeded = seedCertifiedTargetUnreachable(
             workspace.stateRoot,
             "verified-inv",
         );
-        const paths = resolveInvestigationPaths(workspace.stateRoot, "verified-inv");
+        const { artifacts } = terminalArtifactClasses(
+            workspace.stateRoot,
+            seeded.investigationId,
+        );
+        const paths = resolveInvestigationPaths(
+            workspace.stateRoot,
+            seeded.investigationId,
+        );
         const db = new DatabaseSync(paths.eventsDbPath);
         try {
             db.prepare(
@@ -2302,18 +3142,24 @@ describe("crucible_result", () => {
         }
         const { deps } = makeDeps(workspace.env);
         expectIntegrityBlocked(resultInvestigation({
-            investigation_id: "verified-inv",
+            investigation_id: seeded.investigationId,
         }, deps));
     });
 
     it("refuses an external artifact with incomplete size metadata", () => {
         const workspace = makeWorkspace("result-size-missing");
-        seedVerifiedResult(workspace.stateRoot, "verified-inv");
-        const { artifacts } = terminalArtifactClasses(
+        const seeded = seedCertifiedTargetUnreachable(
             workspace.stateRoot,
             "verified-inv",
         );
-        const paths = resolveInvestigationPaths(workspace.stateRoot, "verified-inv");
+        const { artifacts } = terminalArtifactClasses(
+            workspace.stateRoot,
+            seeded.investigationId,
+        );
+        const paths = resolveInvestigationPaths(
+            workspace.stateRoot,
+            seeded.investigationId,
+        );
         const db = new DatabaseSync(paths.eventsDbPath);
         try {
             db.prepare(
@@ -2324,31 +3170,43 @@ describe("crucible_result", () => {
         }
         const { deps } = makeDeps(workspace.env);
         expectIntegrityBlocked(resultInvestigation({
-            investigation_id: "verified-inv",
+            investigation_id: seeded.investigationId,
         }, deps));
     });
 
     it("does not recreate or repair a missing artifact store during result", () => {
         const workspace = makeWorkspace("result-no-artifact-repair");
-        seedVerifiedResult(workspace.stateRoot, "verified-inv");
-        const paths = resolveInvestigationPaths(workspace.stateRoot, "verified-inv");
+        const seeded = seedCertifiedTargetUnreachable(
+            workspace.stateRoot,
+            "verified-inv",
+        );
+        const paths = resolveInvestigationPaths(
+            workspace.stateRoot,
+            seeded.investigationId,
+        );
         fs.rmSync(paths.artifactRoot, { recursive: true, force: true });
         const { deps } = makeDeps(workspace.env);
         expectIntegrityBlocked(resultInvestigation({
-            investigation_id: "verified-inv",
+            investigation_id: seeded.investigationId,
         }, deps));
         expect(fs.existsSync(paths.artifactRoot)).toBe(false);
     });
 
     it("verifies inline artifact checksums before returning a result", () => {
         const workspace = makeWorkspace("result-inline-corrupt");
-        seedVerifiedResult(workspace.stateRoot, "verified-inv");
-        const { artifacts } = terminalArtifactClasses(
+        const seeded = seedCertifiedTargetUnreachable(
             workspace.stateRoot,
             "verified-inv",
         );
+        const { artifacts } = terminalArtifactClasses(
+            workspace.stateRoot,
+            seeded.investigationId,
+        );
         const proposal = artifacts["proposal/context"];
-        const paths = resolveInvestigationPaths(workspace.stateRoot, "verified-inv");
+        const paths = resolveInvestigationPaths(
+            workspace.stateRoot,
+            seeded.investigationId,
+        );
         const store = openArtifactStoreReadOnly({ root: paths.artifactRoot });
         const bytes = store.readObject(proposal.objectId);
         const db = new DatabaseSync(paths.eventsDbPath);
@@ -2367,7 +3225,7 @@ describe("crucible_result", () => {
         }
         const { deps } = makeDeps(workspace.env);
         expect(resultInvestigation({
-            investigation_id: "verified-inv",
+            investigation_id: seeded.investigationId,
         }, deps).is_result).toBe(true);
 
         const mutated = Buffer.from(bytes);
@@ -2387,53 +3245,65 @@ describe("crucible_result", () => {
             corruptDb.close();
         }
         expectIntegrityBlocked(resultInvestigation({
-            investigation_id: "verified-inv",
+            investigation_id: seeded.investigationId,
         }, deps));
     });
 
     it("refuses a synthetic terminal event that omits its evidence closure", () => {
         const workspace = makeWorkspace("result-synthetic-terminal");
-        seedVerifiedResult(workspace.stateRoot, "verified-inv");
-        rewriteTerminalWithoutClosure(workspace.stateRoot, "verified-inv");
+        const seeded = seedCertifiedTargetUnreachable(
+            workspace.stateRoot,
+            "verified-inv",
+        );
+        rewriteTerminalWithoutClosure(
+            workspace.stateRoot,
+            seeded.investigationId,
+        );
         const { deps } = makeDeps(workspace.env);
         expectIntegrityBlocked(resultInvestigation({
-            investigation_id: "verified-inv",
+            investigation_id: seeded.investigationId,
         }, deps));
     });
 
     it("refuses a terminal event whose persisted closure root is inconsistent", () => {
         const workspace = makeWorkspace("result-terminal-closure-root");
-        seedVerifiedResult(workspace.stateRoot, "verified-inv");
-        rewriteTerminalEvent(workspace.stateRoot, "verified-inv", (payload) => {
+        const seeded = seedCertifiedTargetUnreachable(
+            workspace.stateRoot,
+            "verified-inv",
+        );
+        rewriteTerminalEvent(workspace.stateRoot, seeded.investigationId, (payload) => {
             payload.evidenceClosure.closureRoot =
                 `sha256:crucible-terminal-evidence-closure-v1:${"0".repeat(64)}`;
         });
         const { deps } = makeDeps(workspace.env);
         expectIntegrityBlocked(resultInvestigation({
-            investigation_id: "verified-inv",
+            investigation_id: seeded.investigationId,
         }, deps));
     });
 
     it("status exposes only terminal availability while result alone verifies artifacts", () => {
         const workspace = makeWorkspace("status-integrity-blocked");
-        seedVerifiedResult(workspace.stateRoot, "verified-inv");
-        const { artifacts } = terminalArtifactClasses(
+        const seeded = seedCertifiedTargetUnreachable(
             workspace.stateRoot,
             "verified-inv",
         );
+        const { artifacts } = terminalArtifactClasses(
+            workspace.stateRoot,
+            seeded.investigationId,
+        );
         corruptCasArtifact(
             workspace.stateRoot,
-            "verified-inv",
+            seeded.investigationId,
             artifacts["proposal/context"],
             "corrupt",
         );
         const { deps } = makeDeps(workspace.env);
         const status = statusInvestigation({
-            investigation_id: "verified-inv",
+            investigation_id: seeded.investigationId,
         }, deps);
         expect(status).toEqual({
             is_result: false,
-            investigation_id: "verified-inv",
+            investigation_id: seeded.investigationId,
             terminal_available: true,
         });
         expect(JSON.stringify(status)).not.toContain("VERIFIED_RESULT");
@@ -2441,17 +3311,20 @@ describe("crucible_result", () => {
         expect(status).not.toHaveProperty("candidate_id");
         expect(status).not.toHaveProperty("evidence_id");
         expectIntegrityBlocked(resultInvestigation({
-            investigation_id: "verified-inv",
+            investigation_id: seeded.investigationId,
         }, deps));
     });
 
     it("keeps an inconclusive certificate behind the strict non-result boundary", () => {
         const workspace = makeWorkspace("result-certified-non-result");
-        seedCertifiedNonResult(workspace.stateRoot, "certified-non-result-inv");
+        const seeded = seedCertifiedNonResult(
+            workspace.stateRoot,
+            "certified-non-result-inv",
+        );
         const { deps } = makeDeps(workspace.env);
 
         const result = resultInvestigation({
-            investigation_id: "certified-non-result-inv",
+            investigation_id: seeded.investigationId,
         }, deps);
         expect(result).toMatchObject({
             is_result: false,
@@ -2474,7 +3347,7 @@ describe("crucible_result", () => {
     it("strictly redacts an in-progress non-result", () => {
         const workspace = makeWorkspace("result-inprogress");
         const { deps } = makeDeps(workspace.env);
-        const started = startInvestigation(startArgs(workspace.projectDir), deps);
+        const started = startInvestigation(startArgs(workspace), deps);
 
         const result = resultInvestigation({ investigation_id: started.investigation_id }, deps);
         expect(result.is_result).toBe(false);
@@ -2499,10 +3372,12 @@ describe("crucible_result", () => {
 
     it("strictly redacts a paused non-result", () => {
         const workspace = makeWorkspace("result-paused");
-        seedPaused(workspace.stateRoot, "paused-inv");
+        const seeded = seedPaused(workspace.stateRoot, "paused-inv");
         const { deps } = makeDeps(workspace.env);
 
-        const result = resultInvestigation({ investigation_id: "paused-inv" }, deps);
+        const result = resultInvestigation({
+            investigation_id: seeded.investigationId,
+        }, deps);
         expect(result.is_result).toBe(false);
         expect(result.banner).toBe(NON_RESULT_BANNER);
         expect(result.paused).toBe(true);
@@ -2514,7 +3389,7 @@ describe("crucible_result", () => {
     it("returns persisted operational deadline outcome instead of 'still in progress'", () => {
         const workspace = makeWorkspace("result-deadline");
         const { deps } = makeDeps(workspace.env);
-        const started = startInvestigation(startArgs(workspace.projectDir), deps);
+        const started = startInvestigation(startArgs(workspace), deps);
         recordOperationalNonResult(workspace.stateRoot, started.investigation_id, {
             attemptId: "deadline-result",
             code: "DEADLINE_EXCEEDED",

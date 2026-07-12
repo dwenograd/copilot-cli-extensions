@@ -1,6 +1,7 @@
 import {
     EVENT_HASH_ALGORITHM,
     canonicalEqual,
+    canonicalJson,
     hashCanonical,
     immutableCanonical,
     isAlgorithmTaggedSha256,
@@ -10,6 +11,12 @@ import {
     createInvestigationContract,
     isSafeDomainIdentifier,
 } from "./contract.mjs";
+import {
+    assertExperimentAuthorityContractBinding,
+} from "./authority.mjs";
+import {
+    normalizeRuntimeConfigAuthority,
+} from "./runtime-authority.mjs";
 import {
     ANNOTATION_LIMITS,
     DOMAIN_VERSION,
@@ -33,6 +40,7 @@ import {
     normalizeEvidenceProvenance,
 } from "./evidence.mjs";
 import { deriveImpossibilityVerdict } from "./impossibility.mjs";
+import { normalizeSealedHypotheses } from "./hypotheses.mjs";
 import { createInitialAggregate } from "./state.mjs";
 
 const RECEIPT_FIELDS = Object.freeze([
@@ -176,14 +184,36 @@ export function normalizeCommandDispatchedPayload(payload) {
     });
 }
 
-function normalizeAnnotations(value, maximumCitations = ANNOTATION_LIMITS.citedEvidenceCount) {
+function normalizeAnnotationHypotheses(value, options) {
+    try {
+        return normalizeSealedHypotheses(value, {
+            observableRegistry: options.observableRegistry ?? [],
+            hypothesisPolicy: options.hypothesisPolicy ?? {},
+            assignedParentEvidenceIds: options.assignedParentEvidenceIds ?? [],
+        });
+    } catch (error) {
+        throw new TransitionError(
+            ERROR_CODES.INVALID_EVENT,
+            error.message,
+            error.details ?? null,
+        );
+    }
+}
+
+function normalizeAnnotations(
+    value,
+    maximumCitations = ANNOTATION_LIMITS.citedEvidenceCount,
+    hypothesisOptions = {},
+) {
     if (value === undefined || value === null) {
+        const hypotheses = normalizeAnnotationHypotheses(undefined, hypothesisOptions);
         return {
             mechanism: null,
             hypothesis: null,
             expectedEffects: [],
             citedEvidenceIds: [],
             finding: null,
+            ...(hypotheses === null ? {} : { hypotheses }),
         };
     }
     if (typeof value !== "object" || Array.isArray(value)) {
@@ -198,6 +228,7 @@ function normalizeAnnotations(value, maximumCitations = ANNOTATION_LIMITS.citedE
         "expectedEffects",
         "citedEvidenceIds",
         "finding",
+        "hypotheses",
     ]);
     for (const key of Object.keys(value)) {
         if (!allowed.has(key)) {
@@ -286,6 +317,10 @@ function normalizeAnnotations(value, maximumCitations = ANNOTATION_LIMITS.citedE
             ANNOTATION_LIMITS.findingBytes,
         ),
     };
+    const hypotheses = normalizeAnnotationHypotheses(value.hypotheses, hypothesisOptions);
+    if (hypotheses !== null) {
+        normalized.hypotheses = hypotheses;
+    }
     const totalBytes = [
         normalized.mechanism,
         normalized.hypothesis,
@@ -296,7 +331,10 @@ function normalizeAnnotations(value, maximumCitations = ANNOTATION_LIMITS.citedE
         (sum, item) => sum + (item === null ? 0 : Buffer.byteLength(item, "utf8")),
         0,
     );
-    if (totalBytes > ANNOTATION_LIMITS.totalBytes) {
+    const hypothesesBytes = hypotheses === null
+        ? 0
+        : Buffer.byteLength(canonicalJson(hypotheses), "utf8");
+    if (totalBytes + hypothesesBytes > ANNOTATION_LIMITS.totalBytes) {
         throw new TransitionError(
             ERROR_CODES.INVALID_EVENT,
             `annotations exceed ${ANNOTATION_LIMITS.totalBytes} total UTF-8 bytes`,
@@ -499,7 +537,7 @@ function normalizeImpossibilityData(value, command) {
     });
 }
 
-export function normalizeCommandObservedPayload(payload, aggregate = null) {
+export function normalizeCommandObservedPayload(payload, aggregate = null, options = {}) {
     const input = requirePlainObject(payload, "payload");
     const sourceKind = requireOwnField(input, "sourceKind", "sourceKind");
     const purpose = requireOwnField(input, "purpose", "purpose");
@@ -564,6 +602,20 @@ export function normalizeCommandObservedPayload(payload, aggregate = null) {
                 annotations,
                 aggregate?.contract?.searchPolicy?.promptCaps?.promptContextRefs
                     ?? ANNOTATION_LIMITS.citedEvidenceCount,
+                {
+                    observableRegistry:
+                        options.observableRegistry
+                        ?? aggregate?.contract?.observableRegistry
+                        ?? [],
+                    hypothesisPolicy:
+                        options.hypothesisPolicy
+                        ?? aggregate?.contract?.hypothesisPolicy
+                        ?? {},
+                    assignedParentEvidenceIds:
+                        options.assignedParentEvidenceIds
+                        ?? command?.parentEvidenceIds
+                        ?? [],
+                },
             )
             : null,
         data: purpose === "impossibility"
@@ -620,14 +672,14 @@ export function normalizeStopRequestedPayload(payload) {
     });
 }
 
-export function normalizeExternalEventPayload(type, payload, aggregate = null) {
+export function normalizeExternalEventPayload(type, payload, aggregate = null, options = {}) {
     switch (type) {
         case EVENT_TYPES.CAPABILITY_EPOCH_RECORDED:
             return normalizeCapabilityEpochPayload(payload);
         case EVENT_TYPES.COMMAND_DISPATCHED:
             return normalizeCommandDispatchedPayload(payload);
         case EVENT_TYPES.COMMAND_OBSERVED:
-            return normalizeCommandObservedPayload(payload, aggregate);
+            return normalizeCommandObservedPayload(payload, aggregate, options);
         case EVENT_TYPES.EVIDENCE_INVALIDATED:
             return normalizeEvidenceInvalidatedPayload(payload);
         case EVENT_TYPES.STOP_REQUESTED:
@@ -648,13 +700,69 @@ export function computeEventHash(event) {
     return hashCanonical(hashInput, EVENT_HASH_ALGORITHM);
 }
 
-export function createInvestigationOpenedEvent(contract) {
+export function createInvestigationOpenedEvent(
+    contract,
+    experimentAuthority,
+    runtimeConfigAuthority,
+) {
     const initial = createInitialAggregate();
     const normalizedContract = createInvestigationContract(contract);
+    if (experimentAuthority === null || experimentAuthority === undefined) {
+        throw new TransitionError(
+            ERROR_CODES.INVALID_CONTRACT,
+            "V4 investigations require persisted Ed25519 experiment authority",
+        );
+    }
+    let authority;
+    try {
+        authority = assertExperimentAuthorityContractBinding(
+            experimentAuthority,
+            normalizedContract,
+        );
+    } catch (error) {
+        throw new TransitionError(
+            ERROR_CODES.INVALID_CONTRACT,
+            `V4 experiment authority is invalid: ${
+                error?.message ?? String(error)
+            }`,
+            { cause: error?.code ?? null },
+        );
+    }
+    if (runtimeConfigAuthority === null
+        || runtimeConfigAuthority === undefined) {
+        throw new TransitionError(
+            ERROR_CODES.INVALID_CONTRACT,
+            "V4 investigations require immutable runtime config authority",
+        );
+    }
+    let runtimeAuthority;
+    try {
+        runtimeAuthority = normalizeRuntimeConfigAuthority(
+            runtimeConfigAuthority,
+        );
+        if (runtimeAuthority.securityConfig?.runner?.investigationId
+            !== authority.manifest.investigationId) {
+            throw new Error(
+                "runtime config authority belongs to a different investigation",
+            );
+        }
+    } catch (error) {
+        throw new TransitionError(
+            ERROR_CODES.INVALID_CONTRACT,
+            `V4 runtime config authority is invalid: ${
+                error?.message ?? String(error)
+            }`,
+            { cause: error?.code ?? null },
+        );
+    }
     return makeEnvelope(initial, EVENT_TYPES.INVESTIGATION_OPENED, {
         domainVersion: DOMAIN_VERSION,
         contract: normalizedContract,
         contractHash: contractHash(normalizedContract),
+        experimentAuthority: authority,
+        experimentAuthorityIdentity: authority.identity,
+        runtimeConfigAuthority: runtimeAuthority,
+        runtimeConfigFingerprint: runtimeAuthority.fingerprint,
     });
 }
 
@@ -677,7 +785,7 @@ export function constructInvestigationResumedEvent(aggregate) {
     });
 }
 
-export function createExternalEvent(aggregate, type, payload) {
+export function createExternalEvent(aggregate, type, payload, options = {}) {
     if (aggregate.terminal !== null) {
         throw new TransitionError(
             ERROR_CODES.TERMINAL_STATE,
@@ -693,36 +801,44 @@ export function createExternalEvent(aggregate, type, payload) {
     return makeEnvelope(
         aggregate,
         type,
-        normalizeExternalEventPayload(type, payload, aggregate),
+        normalizeExternalEventPayload(type, payload, aggregate, options),
     );
 }
 
-export function constructHarnessObservedEvent(aggregate, payload) {
+export function constructHarnessObservedEvent(aggregate, payload, options = {}) {
     if (aggregate.terminal !== null) {
         throw new TransitionError(
             ERROR_CODES.TERMINAL_STATE,
             "Terminal investigations reject subsequent events",
         );
     }
+    const reserved = aggregate.commands?.[payload?.commandId]?.command ?? null;
+    const hypothesisOptions = {
+        ...options,
+        observableRegistry: aggregate.contract.observableRegistry,
+        hypothesisPolicy: aggregate.contract.hypothesisPolicy,
+        assignedParentEvidenceIds: reserved?.parentEvidenceIds ?? [],
+    };
     return makeEnvelope(
         aggregate,
         EVENT_TYPES.COMMAND_OBSERVED,
         normalizeCommandObservedPayload({
             ...payload,
             sourceKind: "harness",
-            harnessId: aggregate.contract.harnessId,
-            parserVersion: aggregate.contract.parserVersion,
-        }, aggregate),
+            harnessId: reserved?.harnessId ?? aggregate.contract.harnessId,
+            parserVersion: reserved?.parserVersion ?? aggregate.contract.parserVersion,
+        }, aggregate, hypothesisOptions),
     );
 }
 
-export function constructModelObservedEvent(aggregate, payload) {
+export function constructModelObservedEvent(aggregate, payload, options = {}) {
     if (aggregate.terminal !== null) {
         throw new TransitionError(
             ERROR_CODES.TERMINAL_STATE,
             "Terminal investigations reject subsequent events",
         );
     }
+    const reserved = aggregate.commands?.[payload?.commandId]?.command ?? null;
     return makeEnvelope(
         aggregate,
         EVENT_TYPES.COMMAND_OBSERVED,
@@ -732,7 +848,12 @@ export function constructModelObservedEvent(aggregate, payload) {
             harnessId: null,
             parserVersion: null,
             receipt: null,
-        }, aggregate),
+        }, aggregate, {
+            ...options,
+            observableRegistry: aggregate.contract.observableRegistry,
+            hypothesisPolicy: aggregate.contract.hypothesisPolicy,
+            assignedParentEvidenceIds: reserved?.parentEvidenceIds ?? [],
+        }),
     );
 }
 

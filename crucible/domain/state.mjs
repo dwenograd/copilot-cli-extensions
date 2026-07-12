@@ -10,6 +10,11 @@ import {
 } from "./archive.mjs";
 import { DOMAIN_VERSION } from "./constants.mjs";
 import { impossibilitySearchEvidenceHash } from "./impossibility.mjs";
+import {
+    enumerandCoverage,
+    enumerandExhaustion,
+    normalizeEnumerandManifest,
+} from "./enumerands.mjs";
 
 const BOUNDED_CANDIDATE_SET_HASH_ALGORITHM =
     "sha256:crucible-bounded-candidate-set-v1";
@@ -48,6 +53,10 @@ export function createInitialAggregate() {
         status: "empty",
         contract: null,
         contractHash: null,
+        experimentAuthority: null,
+        experimentAuthorityIdentity: null,
+        runtimeConfigAuthority: null,
+        runtimeConfigFingerprint: null,
         lastSeq: 0,
         lastEventHash: null,
         capabilityEpochs: {},
@@ -205,10 +214,23 @@ export function searchProgress(aggregate) {
         candidates.map((evidence) => `${evidence.round}:${evidence.slotIndex}`),
     );
     const capacity = aggregate.contract.candidatesPerRound * aggregate.contract.maxRounds;
+    const manifestOptions = {
+        topology: aggregate.contract.hypothesisTopology,
+        observableRegistry: aggregate.contract.observableRegistry,
+        hypothesisPolicy: aggregate.contract.hypothesisPolicy,
+    };
+    const enumerandManifest = aggregate.contract.enumerandManifest === undefined
+        ? null
+        : normalizeEnumerandManifest(
+            aggregate.contract.enumerandManifest,
+            manifestOptions,
+        );
     const boundedCandidateIds = aggregate.contract.boundedCandidateIds;
-    const maxSlots = boundedCandidateIds === undefined
-        ? capacity
-        : boundedCandidateIds.length;
+    const maxSlots = enumerandManifest !== null
+        ? enumerandManifest.entries.length
+        : boundedCandidateIds === undefined
+            ? capacity
+            : boundedCandidateIds.length;
     let nextRound = null;
     let nextSlot = null;
     for (let globalSlot = 0; globalSlot < maxSlots; globalSlot += 1) {
@@ -220,18 +242,46 @@ export function searchProgress(aggregate) {
             break;
         }
     }
-    const evidencedCandidateIds = new Set(
-        candidates
-            .filter((evidence) => evidence.outcomeClass !== "invalid_metrics")
-            .map((evidence) => evidence.candidateId),
-    );
-    const boundedComplete = boundedCandidateIds !== undefined
-        && boundedCandidateIds.every((candidateId) => evidencedCandidateIds.has(candidateId));
-    const attemptedCandidateIds = new Set(
-        candidates.map((evidence) => evidence.candidateId),
-    );
-    const boundedAttempted = boundedCandidateIds !== undefined
-        && boundedCandidateIds.every((candidateId) => attemptedCandidateIds.has(candidateId));
+    let enumerandCoverageSummary = null;
+    let attemptedEnumerandCoverage = null;
+    let boundedComplete;
+    let boundedAttempted;
+    if (enumerandManifest !== null) {
+        const attempts = candidates.map((evidence) => ({
+            enumerandOrdinal: evidence.enumerandOrdinal,
+            enumerandHash: evidence.enumerandHash,
+            invalidated: evidence.invalidated,
+            outcomeClass: evidence.outcomeClass,
+            acceptanceSatisfied: evidence.acceptanceSatisfied,
+        }));
+        enumerandCoverageSummary = enumerandCoverage(
+            enumerandManifest,
+            attempts,
+            manifestOptions,
+        );
+        attemptedEnumerandCoverage = enumerandCoverage(
+            enumerandManifest,
+            attempts,
+            { ...manifestOptions, countInvalidMetrics: true },
+        );
+        boundedComplete = enumerandCoverageSummary.complete;
+        boundedAttempted = attemptedEnumerandCoverage.complete;
+    } else {
+        const evidencedCandidateIds = new Set(
+            candidates
+                .filter((evidence) => evidence.outcomeClass !== "invalid_metrics")
+                .map((evidence) => evidence.candidateId),
+        );
+        boundedComplete = boundedCandidateIds !== undefined
+            && boundedCandidateIds.every((candidateId) =>
+                evidencedCandidateIds.has(candidateId));
+        const attemptedCandidateIds = new Set(
+            candidates.map((evidence) => evidence.candidateId),
+        );
+        boundedAttempted = boundedCandidateIds !== undefined
+            && boundedCandidateIds.every((candidateId) =>
+                attemptedCandidateIds.has(candidateId));
+    }
     const roundProgress = [];
     const totalRoundCount = Math.ceil(maxSlots / aggregate.contract.candidatesPerRound);
     const roundCount = nextRound === null ? totalRoundCount : nextRound;
@@ -277,19 +327,78 @@ export function searchProgress(aggregate) {
         boundedComplete,
         boundedAttempted,
         maxSlots,
+        ...(enumerandCoverageSummary === null
+            ? {}
+            : {
+                enumerandCoverage: enumerandCoverageSummary,
+                attemptedEnumerandCoverage,
+            }),
     };
     return immutableCanonical(progress);
 }
 
 export function candidateSelectionReady(aggregate) {
     const incumbent = qualifyingCandidateEvidence(aggregate);
-    return incumbent !== null && (
-        aggregate.contract.searchPolicy.stopOnFirstAccept
-        || searchProgress(aggregate).roundsExhausted
-    );
+    return incumbent !== null && searchProgress(aggregate).roundsExhausted;
 }
 
 export function boundedSearchExhaustion(aggregate) {
+    if (aggregate.contract.enumerandManifest !== undefined) {
+        const manifestOptions = {
+            topology: aggregate.contract.hypothesisTopology,
+            observableRegistry: aggregate.contract.observableRegistry,
+            hypothesisPolicy: aggregate.contract.hypothesisPolicy,
+        };
+        const manifest = normalizeEnumerandManifest(
+            aggregate.contract.enumerandManifest,
+            manifestOptions,
+        );
+        const progress = searchProgress(aggregate);
+        const attempts = progress.candidates.map((evidence) => ({
+            enumerandOrdinal: evidence.enumerandOrdinal,
+            enumerandHash: evidence.enumerandHash,
+            outcomeClass: evidence.outcomeClass,
+            acceptanceSatisfied: evidence.acceptanceSatisfied,
+        }));
+        const exhaustion = enumerandExhaustion(
+            manifest,
+            attempts,
+            manifestOptions,
+        );
+        if (!exhaustion.exhausted) {
+            return null;
+        }
+        const byEnumerand = new Map(
+            progress.candidates.map((evidence) => [
+                `${evidence.enumerandOrdinal}:${evidence.enumerandHash}`,
+                evidence,
+            ]),
+        );
+        const evidenceClosure = manifest.entries.map((entry) => {
+            const evidence = byEnumerand.get(
+                `${entry.ordinal}:${entry.enumerandHash}`,
+            );
+            return {
+                ordinal: entry.ordinal,
+                enumerandHash: entry.enumerandHash,
+                evidenceHash: evidence.commitEventHash,
+                provenanceRoot: evidence.provenanceRoot,
+            };
+        });
+        return {
+            kind: "search_space_exhausted",
+            searchSpaceExhausted: true,
+            topology: aggregate.contract.hypothesisTopology,
+            enumerandCount: manifest.entries.length,
+            enumerandManifestRoot: manifest.merkleRoot,
+            enumerandCoverageHash: exhaustion.coverage.coverageHash,
+            enumerandExhaustionHash: exhaustion.exhaustionHash,
+            evidenceClosureHash: hashCanonical(
+                evidenceClosure,
+                BOUNDED_EVIDENCE_CLOSURE_HASH_ALGORITHM,
+            ),
+        };
+    }
     const boundedCandidateIds = aggregate.contract.boundedCandidateIds;
     if (boundedCandidateIds === undefined) {
         return null;

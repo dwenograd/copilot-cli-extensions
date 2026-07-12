@@ -1,9 +1,9 @@
 // crucible/tools/configure-harness.mjs
 //
-// Production operator CLI: create or update an Crucible harness allowlist
-// entry BEFORE any investigation starts. This is the only supported way to
-// author the operator-owned allowlist that measurement/allowlist.mjs later
-// loads fail-closed; the extension process never writes it.
+// Production operator CLI: create/update Crucible harness allowlist entries or
+// compose them into a HarnessSuiteV4 BEFORE any investigation starts. This is
+// the supported authoring path for the operator-owned allowlist that
+// measurement/allowlist.mjs later loads fail-closed.
 //
 // The tool takes a strict JSON *config* file (which lists paths, not hashes)
 // and produces a strict *allowlist* entry (which pins content hashes). It:
@@ -12,17 +12,14 @@
 //     dependency files, and that static-file argv entries are declared
 //     dependencies (the same rule the loader enforces);
 //   * computes SHA-256 for the executable and every declared dependency;
-//   * ingests each validation-case source directory through a *temporary*
-//     local ArtifactStore purely to compute the deterministic content-address
-//     snapshot id `crucible_start` will later recompute — the temporary store is
-//     never retained;
+//   * ingests each validation-case source directory into a durable,
+//     operator-owned local ArtifactStore and pins its content address;
 //   * preserves every unrelated existing entry (after a strict parse of the
 //     current allowlist), refusing to overwrite an entry whose executable
 //     changed unless `--replace` is given;
-//   * writes schema version 1 with `validationCases` keyed by id holding
-//     `{ snapshotHash, description? }`. Accept/reject expectations are NOT
-//     written here — they live in the frozen `crucible_start` contract, and the
-//     allowlist schema deliberately does not carry them;
+//   * writes schema version 1 with immutable snapshot/expectation pairs;
+//   * composes existing entries into strict v4 role suites without exposing
+//     protected case manifests through the worker projection;
 //   * installs the replacement atomically (temp file, fsync, backup of the
 //     previous file next to the allowlist, atomic rename) and re-validates the
 //     exact bytes it installs by loading them through the real loader.
@@ -37,14 +34,26 @@
 import fs from "node:fs";
 import path from "node:path";
 import { randomBytes } from "node:crypto";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import {
     FILE_HASH_ALGORITHM,
+    HARNESS_SUITE_V4_KIND,
+    HARNESS_SUITE_V4_REQUIRED_ROLES,
+    HARNESS_SUITE_V4_ROLES,
+    PARSER_SOURCE_HASH_ALGORITHM,
+    PARSER_VERSION,
+    PARSER_VERSION_HASH_ALGORITHM,
+    computeHarnessSuiteV4Identity,
+    hashHarnessEnvironmentV4,
+    hashHarnessObservableSchemaV4,
+    hashHarnessRoleConfigV4,
     loadHarnessAllowlist,
+    normalizeHarnessSuiteV4,
     sha256File,
     verifyLocalRegularFile,
 } from "../measurement/index.mjs";
+import { hashCanonical } from "../domain/canonical.mjs";
 import { assertLocalDatabasePath, openArtifactStore } from "../persistence/index.mjs";
 
 export const CONFIGURE_SCHEMA_VERSION = 1;
@@ -56,12 +65,14 @@ export const CONFIGURE_ERROR_CODES = Object.freeze({
     CONFIG_INVALID_JSON: "CRUCIBLE_CONFIGURE_CONFIG_INVALID_JSON",
     CONFIG_INVALID: "CRUCIBLE_CONFIGURE_CONFIG_INVALID",
     ALLOWLIST_PATH_INVALID: "CRUCIBLE_CONFIGURE_ALLOWLIST_PATH_INVALID",
+    CASE_STORE_PATH_INVALID: "CRUCIBLE_CONFIGURE_CASE_STORE_PATH_INVALID",
     EXECUTABLE_INVALID: "CRUCIBLE_CONFIGURE_EXECUTABLE_INVALID",
     DEPENDENCY_INVALID: "CRUCIBLE_CONFIGURE_DEPENDENCY_INVALID",
     SOURCE_DIR_INVALID: "CRUCIBLE_CONFIGURE_SOURCE_DIR_INVALID",
     VALIDATION_INGEST_FAILED: "CRUCIBLE_CONFIGURE_VALIDATION_INGEST_FAILED",
     EXISTING_ALLOWLIST_INVALID: "CRUCIBLE_CONFIGURE_EXISTING_ALLOWLIST_INVALID",
     ENTRY_CONFLICT: "CRUCIBLE_CONFIGURE_ENTRY_CONFLICT",
+    SUITE_CONFLICT: "CRUCIBLE_CONFIGURE_SUITE_CONFLICT",
     RESULT_INVALID: "CRUCIBLE_CONFIGURE_RESULT_INVALID",
     WRITE_FAILED: "CRUCIBLE_CONFIGURE_WRITE_FAILED",
 });
@@ -79,12 +90,15 @@ export class ConfigureHarnessError extends Error {
 
 // Mirror of the loader's safe-id shape so an id accepted here cannot be
 // rejected by the loader later.
-const SAFE_ID = /^[a-z0-9][a-z0-9._-]{0,127}$/u;
+const SAFE_ID = /^(?!.*\.\.)[a-z0-9][a-z0-9._-]{0,127}$/u;
 const ENV_KEY = /^[A-Z_][A-Z0-9_]{0,127}$/u;
 const DEFAULT_ROOT_DIRNAME = "Crucible";
 const DEFAULT_ALLOWLIST_FILENAME = "harnesses.json";
+const DEFAULT_CASE_STORE_DIRNAME = "operator-corpus";
 const MAX_CONFIG_BYTES = 1 * 1024 * 1024;
 const SNAPSHOT_ID_RE = /^sha256:[a-f0-9]{64}$/u;
+const TAGGED_SHA256_RE =
+    /^sha256:[a-z0-9][a-z0-9._-]*:[a-f0-9]{64}$/u;
 
 const CONFIG_ALLOWED_KEYS = new Set([
     "id",
@@ -103,6 +117,27 @@ const CONFIG_ALLOWED_KEYS = new Set([
 const CONFIG_DEPENDENCY_KEYS = new Set(["path", "role"]);
 const CONFIG_VALIDATION_CASE_KEYS = new Set(["id", "expectation", "sourceDir", "description"]);
 const VALIDATION_EXPECTATIONS = new Set(["accept", "reject"]);
+const SUITE_CONFIG_KEYS = new Set([
+    "kind",
+    "version",
+    "id",
+    "environment",
+    "sharedPlatformDependencies",
+    "roles",
+]);
+const SUITE_ROLE_KEYS = new Set([
+    "harnessId",
+    "observableSchema",
+    "caseIds",
+    "deterministicSeed",
+    "sandboxIdentity",
+]);
+const SUITE_SHARED_DEPENDENCY_KEYS = new Set([
+    "classification",
+    "path",
+    "role",
+]);
+const SUITE_SANDBOX_KEYS = new Set(["required", "policyDigest"]);
 
 // --- config helpers --------------------------------------------------------
 
@@ -337,6 +372,192 @@ function normalizeConfigValidationCases(validationCases) {
     return out;
 }
 
+function isSuiteAuthoringConfig(value) {
+    return value !== null
+        && typeof value === "object"
+        && !Array.isArray(value)
+        && (value.kind === HARNESS_SUITE_V4_KIND
+            || (value.version === 4 && value.roles !== undefined));
+}
+
+function normalizeSuiteSandboxIdentity(value, field) {
+    requireObject(value, field);
+    rejectUnknownKeys(value, SUITE_SANDBOX_KEYS, field);
+    const required = requireBool(value.required, `${field}.required`);
+    if (!required) {
+        if (value.policyDigest !== null) {
+            fail(
+                CONFIGURE_ERROR_CODES.CONFIG_INVALID,
+                `${field}.policyDigest must be null when required is false`,
+            );
+        }
+        return { required: false, policyDigest: null };
+    }
+    if (typeof value.policyDigest !== "string"
+        || !TAGGED_SHA256_RE.test(value.policyDigest)) {
+        fail(
+            CONFIGURE_ERROR_CODES.CONFIG_INVALID,
+            `${field}.policyDigest must be an algorithm-tagged SHA-256 identity`,
+        );
+    }
+    return { required: true, policyDigest: value.policyDigest };
+}
+
+function normalizeSuiteConfig(rawConfig) {
+    requireObject(rawConfig, "config");
+    rejectUnknownKeys(rawConfig, SUITE_CONFIG_KEYS, "config");
+    if (rawConfig.kind !== HARNESS_SUITE_V4_KIND || rawConfig.version !== 4) {
+        fail(
+            CONFIGURE_ERROR_CODES.CONFIG_INVALID,
+            `suite config must declare kind "${HARNESS_SUITE_V4_KIND}" and version 4`,
+        );
+    }
+    const id = requireString(rawConfig.id, "config.id", { maxLength: 128 });
+    if (!SAFE_ID.test(id)) {
+        fail(CONFIGURE_ERROR_CODES.CONFIG_INVALID, "config.id is not a safe id");
+    }
+    requireObject(rawConfig.environment, "config.environment");
+    try {
+        hashHarnessEnvironmentV4(rawConfig.environment);
+    } catch (error) {
+        fail(
+            CONFIGURE_ERROR_CODES.CONFIG_INVALID,
+            `config.environment is not a valid identity payload: ${error?.message ?? String(error)}`,
+        );
+    }
+
+    const sharedPlatformDependencies = rawConfig.sharedPlatformDependencies
+        ?? [];
+    if (!Array.isArray(sharedPlatformDependencies)
+        || sharedPlatformDependencies.length > 128) {
+        fail(
+            CONFIGURE_ERROR_CODES.CONFIG_INVALID,
+            "config.sharedPlatformDependencies must be an array with at most 128 entries",
+        );
+    }
+    const normalizedShared = sharedPlatformDependencies.map((item, index) => {
+        const field = `config.sharedPlatformDependencies[${index}]`;
+        requireObject(item, field);
+        rejectUnknownKeys(item, SUITE_SHARED_DEPENDENCY_KEYS, field);
+        const dependencyPath = requireString(item.path, `${field}.path`);
+        if (!path.isAbsolute(dependencyPath)) {
+            fail(
+                CONFIGURE_ERROR_CODES.CONFIG_INVALID,
+                `${field}.path must be absolute`,
+            );
+        }
+        if (item.classification !== "platform"
+            && item.classification !== "runtime") {
+            fail(
+                CONFIGURE_ERROR_CODES.CONFIG_INVALID,
+                `${field}.classification must be "platform" or "runtime"`,
+            );
+        }
+        return {
+            classification: item.classification,
+            path: dependencyPath,
+            role: requireString(item.role, `${field}.role`, { maxLength: 128 }),
+        };
+    });
+
+    requireObject(rawConfig.roles, "config.roles");
+    for (const role of Object.keys(rawConfig.roles)) {
+        if (!HARNESS_SUITE_V4_ROLES.includes(role)) {
+            fail(
+                CONFIGURE_ERROR_CODES.CONFIG_INVALID,
+                `config.roles has unknown role ${JSON.stringify(role)}`,
+            );
+        }
+    }
+    for (const role of HARNESS_SUITE_V4_REQUIRED_ROLES) {
+        if (!Object.hasOwn(rawConfig.roles, role)) {
+            fail(
+                CONFIGURE_ERROR_CODES.CONFIG_INVALID,
+                `config.roles.${role} is required`,
+            );
+        }
+    }
+    const roles = {};
+    for (const role of HARNESS_SUITE_V4_ROLES) {
+        if (!Object.hasOwn(rawConfig.roles, role)) continue;
+        const field = `config.roles.${role}`;
+        const spec = rawConfig.roles[role];
+        requireObject(spec, field);
+        rejectUnknownKeys(spec, SUITE_ROLE_KEYS, field);
+        const harnessId = requireString(
+            spec.harnessId,
+            `${field}.harnessId`,
+            { maxLength: 128 },
+        );
+        if (!SAFE_ID.test(harnessId)) {
+            fail(
+                CONFIGURE_ERROR_CODES.CONFIG_INVALID,
+                `${field}.harnessId is not a safe id`,
+            );
+        }
+        requireObject(spec.observableSchema, `${field}.observableSchema`);
+        try {
+            hashHarnessObservableSchemaV4(spec.observableSchema);
+        } catch (error) {
+            fail(
+                CONFIGURE_ERROR_CODES.CONFIG_INVALID,
+                `${field}.observableSchema is invalid: ${error?.message ?? String(error)}`,
+            );
+        }
+        if (!Array.isArray(spec.caseIds) || spec.caseIds.length > 4096) {
+            fail(
+                CONFIGURE_ERROR_CODES.CONFIG_INVALID,
+                `${field}.caseIds must be an array with at most 4096 entries`,
+            );
+        }
+        const seen = new Set();
+        const caseIds = spec.caseIds.map((caseId, index) => {
+            const normalized = requireString(
+                caseId,
+                `${field}.caseIds[${index}]`,
+                { maxLength: 128 },
+            );
+            if (!SAFE_ID.test(normalized) || seen.has(normalized)) {
+                fail(
+                    CONFIGURE_ERROR_CODES.CONFIG_INVALID,
+                    `${field}.caseIds contains an invalid or duplicate id`,
+                    { caseId: normalized },
+                );
+            }
+            seen.add(normalized);
+            return normalized;
+        }).sort();
+        if (role === "calibration" && caseIds.length === 0) {
+            fail(
+                CONFIGURE_ERROR_CODES.CONFIG_INVALID,
+                "config.roles.calibration.caseIds must not be empty",
+            );
+        }
+        roles[role] = {
+            harnessId,
+            observableSchema: spec.observableSchema,
+            caseIds,
+            deterministicSeed: requireString(
+                spec.deterministicSeed,
+                `${field}.deterministicSeed`,
+                { maxLength: 256 },
+            ),
+            sandboxIdentity: normalizeSuiteSandboxIdentity(
+                spec.sandboxIdentity,
+                `${field}.sandboxIdentity`,
+            ),
+        };
+    }
+    return {
+        kind: HARNESS_SUITE_V4_KIND,
+        version: 4,
+        id,
+        environment: rawConfig.environment,
+        sharedPlatformDependencies: normalizedShared,
+        roles,
+    };
+}
+
 // --- filesystem verification + hashing -------------------------------------
 
 // Verify a pinned local regular non-symlink file and return its resolved
@@ -444,6 +665,33 @@ export function resolveOutputAllowlistPath(explicitPath, env) {
     }
 }
 
+export function resolveOperatorCorpusStorePath(
+    explicitPath,
+    allowlistPath,
+    env,
+) {
+    const raw = typeof explicitPath === "string"
+        && explicitPath.trim().length > 0
+        ? explicitPath
+        : path.join(path.dirname(allowlistPath), DEFAULT_CASE_STORE_DIRNAME);
+    if (!path.isAbsolute(raw)) {
+        fail(
+            CONFIGURE_ERROR_CODES.CASE_STORE_PATH_INVALID,
+            "operator corpus store path must be absolute",
+            { path: raw },
+        );
+    }
+    try {
+        return assertLocalDatabasePath(raw, { env });
+    } catch (err) {
+        fail(
+            CONFIGURE_ERROR_CODES.CASE_STORE_PATH_INVALID,
+            `operator corpus store must be on a trusted local filesystem: ${err?.message ?? String(err)}`,
+            { path: raw, cause: err?.code ?? null },
+        );
+    }
+}
+
 // --- existing-allowlist preservation ---------------------------------------
 
 // Strict-parse the existing allowlist (if any) via the real loader and
@@ -451,7 +699,7 @@ export function resolveOutputAllowlistPath(explicitPath, env) {
 // file is malformed rather than silently discarding operator entries.
 function loadExistingEntries(allowlistPath) {
     if (!fs.existsSync(allowlistPath)) {
-        return { existed: false, entries: {} };
+        return { existed: false, entries: {}, suites: {} };
     }
     let loaded;
     try {
@@ -467,7 +715,11 @@ function loadExistingEntries(allowlistPath) {
     for (const id of loaded.listEntryIds()) {
         entries[id] = serializeEntry(loaded.getEntry(id));
     }
-    return { existed: true, entries, loaded };
+    const suites = {};
+    for (const id of loaded.listSuiteIds()) {
+        suites[id] = loaded.getSuite(id);
+    }
+    return { existed: true, entries, suites, loaded };
 }
 
 // Convert a loader-normalized entry back into the strict on-disk entry shape,
@@ -495,9 +747,15 @@ function serializeEntry(entry) {
         const cases = {};
         for (const id of Object.keys(entry.validationCases)) {
             const spec = entry.validationCases[id];
-            cases[id] = spec.description === null || spec.description === undefined
-                ? { snapshotHash: spec.snapshotHash }
-                : { snapshotHash: spec.snapshotHash, description: spec.description };
+            cases[id] = {
+                snapshotHash: spec.snapshotHash,
+                ...(spec.expectation === null || spec.expectation === undefined
+                    ? {}
+                    : { expectation: spec.expectation }),
+                ...(spec.description === null || spec.description === undefined
+                    ? {}
+                    : { description: spec.description }),
+            };
         }
         out.validationCases = cases;
     }
@@ -606,17 +864,286 @@ function atomicWriteWithBackup(targetPath, contentString) {
 
 // --- core -----------------------------------------------------------------
 
+function roleConfigFromEntry(entry) {
+    return {
+        argvTemplate: [...entry.argvTemplate],
+        cwd: entry.cwd,
+        allowedEnv: { ...entry.allowedEnv },
+        timeoutMs: entry.timeoutMs,
+        maxStdoutBytes: entry.maxStdoutBytes,
+        maxStderrBytes: entry.maxStderrBytes,
+        executesCandidateCode: entry.executesCandidateCode,
+    };
+}
+
+function taggedFileHash(hex) {
+    return `${FILE_HASH_ALGORITHM}:${hex}`;
+}
+
+function trustedParserIdentity() {
+    const parserPath = fileURLToPath(
+        new URL("../measurement/parser.mjs", import.meta.url),
+    );
+    return {
+        version: PARSER_VERSION,
+        versionHash: hashCanonical(
+            { parserVersion: PARSER_VERSION },
+            PARSER_VERSION_HASH_ALGORITHM,
+        ),
+        sourceHash: sha256File(
+            parserPath,
+            PARSER_SOURCE_HASH_ALGORITHM,
+        ),
+    };
+}
+
+/**
+ * Compose already-pinned allowlist entries into one strict HarnessSuiteV4.
+ * Validation bytes remain in the durable operator corpus CAS created while
+ * authoring the entries; this operation binds their immutable ids and labels.
+ */
+export function configureHarnessSuite(options = {}) {
+    const env = options.env ?? process.env;
+    const replace = options.replace === true;
+    if (options.config !== undefined && options.configPath !== undefined) {
+        fail(CONFIGURE_ERROR_CODES.USAGE, "pass either config or configPath, not both");
+    }
+    const rawConfig = options.config !== undefined
+        ? options.config
+        : loadConfigFile(options.configPath);
+    const config = normalizeSuiteConfig(rawConfig);
+    const allowlistPath = resolveOutputAllowlistPath(
+        options.allowlistPath,
+        env,
+    );
+    const allowlistDir = path.dirname(allowlistPath);
+    fs.mkdirSync(allowlistDir, { recursive: true });
+    const existing = loadExistingEntries(allowlistPath);
+
+    const sharedPlatformDependencies =
+        config.sharedPlatformDependencies.map((dependency, index) => {
+            const verified = verifyAndDigestFile(
+                dependency.path,
+                `config.sharedPlatformDependencies[${index}].path`,
+                CONFIGURE_ERROR_CODES.DEPENDENCY_INVALID,
+            );
+            return {
+                classification: dependency.classification,
+                role: dependency.role,
+                sha256: taggedFileHash(verified.sha256),
+            };
+        }).sort((left, right) =>
+            `${left.classification}\0${left.role}\0${left.sha256}`.localeCompare(
+                `${right.classification}\0${right.role}\0${right.sha256}`,
+            ));
+    const sharedKeys = new Set(
+        sharedPlatformDependencies.map((dependency) =>
+            `${dependency.role}\0${dependency.sha256}`),
+    );
+    const parser = trustedParserIdentity();
+    const operatorCases = {};
+    const roles = {};
+
+    for (const role of HARNESS_SUITE_V4_ROLES) {
+        const roleConfig = config.roles[role];
+        if (roleConfig === undefined) continue;
+        if (!existing.loaded
+            || !existing.loaded.listEntryIds().includes(roleConfig.harnessId)) {
+            fail(
+                CONFIGURE_ERROR_CODES.CONFIG_INVALID,
+                `config.roles.${role}.harnessId does not name an existing allowlist entry`,
+                { harnessId: roleConfig.harnessId },
+            );
+        }
+        const entry = existing.loaded.getEntry(roleConfig.harnessId);
+        if (entry.executesCandidateCode
+            !== roleConfig.sandboxIdentity.required) {
+            fail(
+                CONFIGURE_ERROR_CODES.CONFIG_INVALID,
+                `config.roles.${role}.sandboxIdentity.required must match executesCandidateCode`,
+                {
+                    harnessId: roleConfig.harnessId,
+                    executesCandidateCode: entry.executesCandidateCode,
+                },
+            );
+        }
+        const dependencies = entry.dependencies.map((dependency) => {
+            const sha256 = taggedFileHash(dependency.sha256);
+            return {
+                role: dependency.role,
+                sha256,
+                kind: sharedKeys.has(`${dependency.role}\0${sha256}`)
+                    ? "platform"
+                    : "application",
+            };
+        });
+        const caseManifest = roleConfig.caseIds.map((caseId) => {
+            const pinned = entry.validationCases?.[caseId];
+            if (pinned === undefined) {
+                fail(
+                    CONFIGURE_ERROR_CODES.CONFIG_INVALID,
+                    `config.roles.${role}.caseIds references a case not pinned by harness ${roleConfig.harnessId}`,
+                    { caseId },
+                );
+            }
+            if (pinned.expectation !== "accept"
+                && pinned.expectation !== "reject") {
+                fail(
+                    CONFIGURE_ERROR_CODES.CONFIG_INVALID,
+                    `case ${caseId} has no operator-owned expectation; re-author the harness entry first`,
+                    { harnessId: roleConfig.harnessId, caseId },
+                );
+            }
+            const prior = operatorCases[caseId];
+            const next = {
+                snapshotHash: pinned.snapshotHash,
+                expectation: pinned.expectation,
+            };
+            if (prior !== undefined
+                && (prior.snapshotHash !== next.snapshotHash
+                    || prior.expectation !== next.expectation)) {
+                fail(
+                    CONFIGURE_ERROR_CODES.CONFIG_INVALID,
+                    `case ${caseId} has conflicting operator-owned definitions across role entries`,
+                );
+            }
+            operatorCases[caseId] = next;
+            return { id: caseId, snapshotHash: pinned.snapshotHash };
+        });
+        roles[role] = {
+            harnessId: roleConfig.harnessId,
+            harnessEntryHash: existing.loaded.getEntryHash(
+                roleConfig.harnessId,
+            ),
+            executableHash: taggedFileHash(entry.executableSha256),
+            parser,
+            dependencies,
+            configHash: hashHarnessRoleConfigV4(
+                roleConfigFromEntry(entry),
+            ),
+            observableSchemaHash: hashHarnessObservableSchemaV4(
+                roleConfig.observableSchema,
+            ),
+            caseManifest,
+            deterministicSeed: roleConfig.deterministicSeed,
+            sandboxIdentity: roleConfig.sandboxIdentity,
+        };
+    }
+
+    let suite;
+    try {
+        suite = normalizeHarnessSuiteV4({
+            version: 4,
+            kind: HARNESS_SUITE_V4_KIND,
+            id: config.id,
+            environmentIdentity: hashHarnessEnvironmentV4(
+                config.environment,
+            ),
+            sharedPlatformDependencies,
+            roles,
+            operatorCorpus: {
+                version: 1,
+                cases: operatorCases,
+            },
+        });
+    } catch (error) {
+        fail(
+            CONFIGURE_ERROR_CODES.CONFIG_INVALID,
+            `assembled HarnessSuiteV4 is invalid: ${error?.message ?? String(error)}`,
+            { cause: error?.code ?? null, details: error?.details ?? null },
+        );
+    }
+    const suiteIdentity = computeHarnessSuiteV4Identity(suite);
+    const replaced = Object.hasOwn(existing.suites, config.id);
+    if (replaced) {
+        const priorIdentity = existing.loaded.getSuiteIdentity(config.id);
+        if (priorIdentity !== suiteIdentity && !replace) {
+            fail(
+                CONFIGURE_ERROR_CODES.SUITE_CONFLICT,
+                `suite '${config.id}' has a different identity; pass --replace to overwrite`,
+                {
+                    id: config.id,
+                    existingIdentity: priorIdentity,
+                    newIdentity: suiteIdentity,
+                },
+            );
+        }
+    }
+
+    const mergedSuites = {
+        ...existing.suites,
+        [config.id]: suite,
+    };
+    const document = {
+        version: CONFIGURE_SCHEMA_VERSION,
+        entries: sortedEntries(existing.entries),
+        suites: sortedEntries(mergedSuites),
+    };
+    const contentString = `${JSON.stringify(document, null, 2)}\n`;
+    const validationTmp = path.join(
+        allowlistDir,
+        `.harness-suite-validate-${randomBytes(8).toString("hex")}.json`,
+    );
+    let contentHash;
+    try {
+        fs.writeFileSync(validationTmp, contentString, { flag: "wx" });
+        const loaded = loadHarnessAllowlist(validationTmp);
+        if (loaded.getSuiteIdentity(config.id) !== suiteIdentity) {
+            fail(
+                CONFIGURE_ERROR_CODES.RESULT_INVALID,
+                "assembled suite identity changed during allowlist validation",
+            );
+        }
+        contentHash = loaded.contentHash;
+    } catch (error) {
+        if (error instanceof ConfigureHarnessError) throw error;
+        fail(
+            CONFIGURE_ERROR_CODES.RESULT_INVALID,
+            `assembled suite allowlist failed strict validation: ${error?.message ?? String(error)}`,
+            { path: allowlistPath, cause: error?.code ?? null },
+        );
+    } finally {
+        try { fs.rmSync(validationTmp, { force: true }); } catch { /* ignore */ }
+    }
+    const install = atomicWriteWithBackup(allowlistPath, contentString);
+    return Object.freeze({
+        schemaVersion: CONFIGURE_SCHEMA_VERSION,
+        allowlistPath,
+        suiteId: config.id,
+        suiteIdentity,
+        contentHash,
+        replaced,
+        replacedByOverride: replaced && replace,
+        backupPath: install.backupPath,
+        roleHarnessIds: Object.freeze(Object.fromEntries(
+            Object.entries(suite.roles).map(([role, spec]) => [
+                role,
+                spec.harnessId,
+            ]),
+        )),
+        operatorCorpusIdentity: suite.operatorCorpus.identity,
+        preservedEntryIds: Object.freeze(
+            Object.keys(existing.entries).sort(),
+        ),
+        preservedSuiteIds: Object.freeze(
+            Object.keys(existing.suites)
+                .filter((id) => id !== config.id)
+                .sort(),
+        ),
+    });
+}
+
 /**
  * Pure(ish) configuration entry point. Performs all validation, hashing,
- * temporary ingestion and the atomic allowlist install, returning a plain
+ * durable corpus ingestion and the atomic allowlist install, returning a plain
  * result object. Throws ConfigureHarnessError (with a stable `code`) on any
- * failure. The temporary ArtifactStore it creates for snapshot ingestion is
- * always removed before returning, success or failure.
+ * failure.
  *
  * options:
  *   config        - a parsed config object (mutually exclusive with configPath)
  *   configPath    - path to a strict JSON config file
  *   allowlistPath - explicit output allowlist path (optional)
+ *   caseStorePath - durable operator corpus CAS root (optional)
  *   replace       - allow overwriting an entry whose executable changed
  *   env           - environment object (defaults to process.env)
  */
@@ -628,10 +1155,22 @@ export function configureHarness(options = {}) {
         fail(CONFIGURE_ERROR_CODES.USAGE, "pass either config or configPath, not both");
     }
     const rawConfig = options.config !== undefined ? options.config : loadConfigFile(options.configPath);
+    if (isSuiteAuthoringConfig(rawConfig)) {
+        return configureHarnessSuite({
+            ...options,
+            config: rawConfig,
+            configPath: undefined,
+        });
+    }
     const config = normalizeConfig(rawConfig);
 
     const allowlistPath = resolveOutputAllowlistPath(options.allowlistPath, env);
     const allowlistDir = path.dirname(allowlistPath);
+    const operatorCorpusStorePath = resolveOperatorCorpusStorePath(
+        options.caseStorePath,
+        allowlistPath,
+        env,
+    );
     fs.mkdirSync(allowlistDir, { recursive: true });
 
     // Verify + hash the executable and each declared dependency.
@@ -641,14 +1180,17 @@ export function configureHarness(options = {}) {
         return { path: verified.resolvedPath, sha256: verified.sha256, role: dep.role };
     });
 
-    // Ingest each validation source directory through a throwaway local store.
-    const storeRoot = path.join(allowlistDir, `.crucible-configure-store-${randomBytes(10).toString("hex")}`);
+    // Ingest into the durable operator-owned CAS. The allowlist pins immutable
+    // snapshot identities; the CAS retains their bytes for later verification.
     const validationCaseSnapshots = {};
     let entryHash = null;
     let contentHash = null;
     let install = null;
-    try {
-        const store = openArtifactStore({ root: storeRoot, env });
+    const store = openArtifactStore({
+        root: operatorCorpusStorePath,
+        env,
+    });
+    {
         for (const validationCase of config.validationCases) {
             const sourceDir = verifySourceDir(validationCase.sourceDir, validationCase.id, env);
             let ingested;
@@ -669,6 +1211,7 @@ export function configureHarness(options = {}) {
             }
             validationCaseSnapshots[validationCase.id] = {
                 snapshotHash: ingested.snapshot,
+                expectation: validationCase.expectation,
                 description: validationCase.description,
             };
         }
@@ -683,6 +1226,20 @@ export function configureHarness(options = {}) {
                     CONFIGURE_ERROR_CODES.ENTRY_CONFLICT,
                     `entry '${config.id}' already exists with a different executable; pass --replace to overwrite`,
                     { id: config.id, existingExecutable: prior.executable, newExecutable: executable.resolvedPath },
+                );
+            }
+            const priorCases = serializeValidationCaseBlock(
+                prior.validationCases,
+            );
+            const nextCases = buildValidationCaseBlock(
+                validationCaseSnapshots,
+            );
+            if (JSON.stringify(priorCases) !== JSON.stringify(nextCases)
+                && !replace) {
+                fail(
+                    CONFIGURE_ERROR_CODES.ENTRY_CONFLICT,
+                    `entry '${config.id}' has a different immutable validation corpus; pass --replace to overwrite`,
+                    { id: config.id },
                 );
             }
         }
@@ -708,7 +1265,13 @@ export function configureHarness(options = {}) {
         }
 
         const mergedEntries = { ...existing.entries, [config.id]: newEntry };
-        const document = { version: CONFIGURE_SCHEMA_VERSION, entries: sortedEntries(mergedEntries) };
+        const document = {
+            version: CONFIGURE_SCHEMA_VERSION,
+            entries: sortedEntries(mergedEntries),
+            ...(Object.keys(existing.suites).length === 0
+                ? {}
+                : { suites: sortedEntries(existing.suites) }),
+        };
         const contentString = `${JSON.stringify(document, null, 2)}\n`;
 
         // Pre-validate the exact bytes we are about to install by loading them
@@ -745,18 +1308,13 @@ export function configureHarness(options = {}) {
             executableSha256: executable.sha256,
             dependencies: Object.freeze(dependencies.map((dep) => Object.freeze({ path: dep.path, sha256: dep.sha256, role: dep.role }))),
             validationSnapshots: Object.freeze({ ...mapSnapshots(validationCaseSnapshots) }),
+            operatorCorpusStorePath: store.root,
             replaced,
             replacedByOverride: replaced && replace,
             backupPath: install.backupPath,
             preservedEntryIds: Object.freeze(Object.keys(existing.entries).filter((id) => id !== config.id).sort()),
+            preservedSuiteIds: Object.freeze(Object.keys(existing.suites).sort()),
         });
-    } finally {
-        try {
-            fs.rmSync(storeRoot, { recursive: true, force: true });
-        } catch {
-            // Best-effort cleanup: a residual throwaway store is harmless, but
-            // we never keep it as authoritative.
-        }
     }
 }
 
@@ -764,9 +1322,31 @@ function buildValidationCaseBlock(snapshots) {
     const out = {};
     for (const id of Object.keys(snapshots).sort()) {
         const spec = snapshots[id];
-        out[id] = spec.description === undefined
-            ? { snapshotHash: spec.snapshotHash }
-            : { snapshotHash: spec.snapshotHash, description: spec.description };
+        out[id] = {
+            snapshotHash: spec.snapshotHash,
+            expectation: spec.expectation,
+            ...(spec.description === undefined
+                ? {}
+                : { description: spec.description }),
+        };
+    }
+    return out;
+}
+
+function serializeValidationCaseBlock(validationCases) {
+    if (validationCases === null || validationCases === undefined) return null;
+    const out = {};
+    for (const id of Object.keys(validationCases).sort()) {
+        const spec = validationCases[id];
+        out[id] = {
+            snapshotHash: spec.snapshotHash,
+            ...(spec.expectation === null || spec.expectation === undefined
+                ? {}
+                : { expectation: spec.expectation }),
+            ...(spec.description === null || spec.description === undefined
+                ? {}
+                : { description: spec.description }),
+        };
     }
     return out;
 }
@@ -790,7 +1370,13 @@ function sortedEntries(entries) {
 // --- CLI -------------------------------------------------------------------
 
 export function parseArgs(argv) {
-    const out = { config: undefined, allowlist: undefined, replace: false, help: false };
+    const out = {
+        config: undefined,
+        allowlist: undefined,
+        caseStore: undefined,
+        replace: false,
+        help: false,
+    };
     for (let i = 0; i < argv.length; i += 1) {
         const arg = argv[i];
         if (arg === "--help" || arg === "-h") {
@@ -807,6 +1393,11 @@ export function parseArgs(argv) {
             i += 1;
         } else if (arg.startsWith("--allowlist=")) {
             out.allowlist = arg.slice("--allowlist=".length);
+        } else if (arg === "--case-store") {
+            out.caseStore = argv[i + 1];
+            i += 1;
+        } else if (arg.startsWith("--case-store=")) {
+            out.caseStore = arg.slice("--case-store=".length);
         } else {
             fail(CONFIGURE_ERROR_CODES.USAGE, `unknown argument ${JSON.stringify(arg)}`);
         }
@@ -814,16 +1405,17 @@ export function parseArgs(argv) {
     return out;
 }
 
-const USAGE = `Usage: node tools/configure-harness.mjs --config <path> [--allowlist <path>] [--replace]
+const USAGE = `Usage: node tools/configure-harness.mjs --config <path> [--allowlist <path>] [--case-store <path>] [--replace]
 
-Creates or updates an Crucible operator harness allowlist entry from a strict
-JSON config file, computing executable/dependency SHA-256 digests and the
-deterministic validation-case snapshot ids crucible_start will recompute.
+Creates or updates a Crucible operator harness entry or composes existing
+entries into a HarnessSuiteV4. Validation snapshots are retained in a durable
+operator-owned content-addressed store.
 
 Options:
   --config <path>     Strict JSON harness config (required).
   --allowlist <path>  Output allowlist path (default %LOCALAPPDATA%\\Crucible\\harnesses.json).
-  --replace           Allow overwriting an entry whose executable changed.
+  --case-store <path> Durable validation-case CAS (default beside the allowlist).
+  --replace           Allow replacing changed executable/corpus/suite identity.
   -h, --help          Show this help.`;
 
 export function main(argv = process.argv.slice(2), { env = process.env, stdout = process.stdout, stderr = process.stderr } = {}) {
@@ -846,6 +1438,7 @@ export function main(argv = process.argv.slice(2), { env = process.env, stdout =
         const result = configureHarness({
             configPath: args.config,
             allowlistPath: args.allowlist,
+            caseStorePath: args.caseStore,
             replace: args.replace,
             env,
         });

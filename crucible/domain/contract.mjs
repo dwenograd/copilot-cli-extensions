@@ -9,17 +9,41 @@ import {
     CONTRACT_LIMITS,
     DEFAULT_IMPOSSIBILITY_POLICY,
     DEFAULT_SEARCH_POLICY,
+    DEFAULT_SCIENTIFIC_TERMINAL_POLICY,
+    DOMAIN_VERSION,
     ESCAPE_SEARCH_OPERATORS,
+    GOAL_MODES,
     HYPOTHESIS_TOPOLOGIES,
+    MISSINGNESS_MODES,
     SEARCH_POLICY_LIMITS,
     SEARCH_OPERATORS,
+    STATISTICAL_POLICY_HASH_ALGORITHM,
+    STATISTICAL_METRIC_DIRECTIONS,
+    STATISTICAL_POLICY_VERSION,
 } from "./constants.mjs";
-import { ContractError, ERROR_CODES } from "./errors.mjs";
+import {
+    normalizeEnumerandManifest,
+} from "./enumerands.mjs";
+import {
+    hypothesisPolicyIdentity,
+    normalizeHypothesisPolicy,
+    normalizeObservableRegistry,
+    observableRegistryIdentity,
+} from "./hypotheses.mjs";
+import {
+    ContractError,
+    DomainVersionRestartRequiredError,
+    ERROR_CODES,
+} from "./errors.mjs";
+import {
+    computeHarnessSuiteV4Identity,
+    normalizeHarnessSuiteV4,
+} from "../measurement/harness-suite.mjs";
 
 const COMPARISON_OPERATORS = Object.freeze(["<", "<=", "==", ">=", ">"]);
 const VALIDATION_EXPECTATIONS = Object.freeze(["accept", "reject"]);
-const METRIC_DIRECTIONS = Object.freeze(["min", "max"]);
 const TAGGED_SHA256 = /^sha256:[a-z0-9][a-z0-9._-]*:[a-f0-9]{64}$/u;
+const SNAPSHOT_HASH = /^sha256:[a-f0-9]{64}$/u;
 const SAFE_IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._@-]*$/u;
 const FORBIDDEN_IDENTIFIERS = new Set([
     "__proto__",
@@ -104,7 +128,6 @@ const SEARCH_POLICY_KEYS = Object.freeze([
     "plateauMinImprovement",
     "plateauWindow",
     "promptCaps",
-    "stopOnFirstAccept",
 ]);
 const ARCHIVE_CAP_KEYS = Object.freeze([
     "accepted",
@@ -118,6 +141,108 @@ const ARCHIVE_CAP_KEYS = Object.freeze([
 const PROMPT_CAP_KEYS = Object.freeze([
     "parentEvidenceIds",
     "promptContextRefs",
+]);
+const CONTRACT_INPUT_REQUIRED_KEYS = Object.freeze([
+    "acceptancePredicate",
+    "candidatesPerRound",
+    "criticality",
+    "harnessSuite",
+    "harnessSuiteIdentity",
+    "hypothesisPolicy",
+    "hypothesisTopology",
+    "maxRounds",
+    "objective",
+    "observableRegistry",
+    "policyVersion",
+    "searchPolicy",
+    "statisticalPolicy",
+    "workerModels",
+]);
+const CONTRACT_INPUT_OPTIONAL_KEYS = Object.freeze([
+    "domainVersion",
+    "enumerandManifest",
+    "impossibilityPolicy",
+]);
+const CONTRACT_OUTPUT_REQUIRED_KEYS = Object.freeze([
+    "acceptancePredicate",
+    "candidatesPerRound",
+    "criticality",
+    "declaredLimits",
+    "domainVersion",
+    "harnessId",
+    "harnessSuite",
+    "harnessSuiteIdentity",
+    "hypothesisPolicy",
+    "hypothesisPolicyIdentity",
+    "hypothesisTopology",
+    "maxRounds",
+    "metrics",
+    "objective",
+    "observableRegistry",
+    "observableRegistryIdentity",
+    "parserVersion",
+    "policyVersion",
+    "searchPolicy",
+    "scientificTerminalPolicy",
+    "statisticalPolicy",
+    "statisticalPolicyIdentity",
+    "validationCases",
+    "workerModels",
+]);
+const CONTRACT_OUTPUT_OPTIONAL_KEYS = Object.freeze([
+    "enumerandManifest",
+    "impossibilityPolicy",
+]);
+const STATISTICAL_POLICY_KEYS = Object.freeze([
+    "control",
+    "deterministicBlockSeed",
+    "evaluationBudget",
+    "familyAllocations",
+    "goalMode",
+    "investigationAlpha",
+    "maxBlocks",
+    "maxConfirmations",
+    "metrics",
+    "minBlocks",
+    "missingness",
+    "resourceBudget",
+    "version",
+]);
+const STATISTICAL_METRIC_KEYS = Object.freeze([
+    "acceptanceThreshold",
+    "direction",
+    "estimand",
+    "family",
+    "key",
+    "maximum",
+    "minimum",
+    "practicalEquivalenceDelta",
+    "unit",
+]);
+const FAMILY_ALLOCATION_KEYS = Object.freeze(["alpha", "family"]);
+const CONTROL_KEYS = Object.freeze(["identity", "kind", "tolerances"]);
+const CONTROL_TOLERANCE_KEYS = Object.freeze([
+    "absolute",
+    "metric",
+    "relative",
+]);
+const MISSINGNESS_KEYS = Object.freeze([
+    "maxMissingFraction",
+    "maxMissingPerBlock",
+    "mode",
+]);
+const EVALUATION_BUDGET_KEYS = Object.freeze([
+    "maxCandidateEvaluations",
+    "maxControlEvaluations",
+    "maxTotalEvaluations",
+]);
+const RESOURCE_BUDGET_KEYS = Object.freeze([
+    "perAttemptCasBytes",
+    "perAttemptOutputBytes",
+    "perAttemptReceiptBytes",
+    "perInvestigationCasBytes",
+    "perInvestigationOutputBytes",
+    "perInvestigationReceiptBytes",
 ]);
 
 function requireNonEmptyString(value, field, maximum = 4096) {
@@ -212,6 +337,25 @@ function requireExactObjectKeys(value, field, expectedKeys) {
             field,
             expected,
             actual,
+        });
+    }
+}
+
+function requireObjectKeys(value, field, requiredKeys, optionalKeys = []) {
+    if (value === null || typeof value !== "object" || Array.isArray(value)) {
+        throw new ContractError(`${field} must be an object`, { field });
+    }
+    const allowed = new Set([...requiredKeys, ...optionalKeys]);
+    const actual = Object.keys(value);
+    const missing = requiredKeys.filter((key) => !Object.hasOwn(value, key));
+    const unknown = actual.filter((key) => !allowed.has(key));
+    if (missing.length > 0 || unknown.length > 0) {
+        throw new ContractError(`${field} must contain only the canonical fields`, {
+            field,
+            missing,
+            unknown,
+            required: [...requiredKeys],
+            optional: [...optionalKeys],
         });
     }
 }
@@ -1098,34 +1242,6 @@ function normalizeSearch(search, topology) {
             `search capacity cannot exceed ${CONTRACT_LIMITS.maxEvaluations} candidate evaluations`,
         );
     }
-    const requiresBoundedCandidateIds =
-        topology === "finite_enumerable" || topology === "bounded_parameterized";
-    const hasBoundedCandidateIds =
-        search.boundedCandidateIds !== undefined && search.boundedCandidateIds !== null;
-    if (requiresBoundedCandidateIds && !hasBoundedCandidateIds) {
-        throw new ContractError(
-            "search.boundedCandidateIds is required for finite_enumerable and bounded_parameterized topologies",
-        );
-    }
-    if (!requiresBoundedCandidateIds && hasBoundedCandidateIds) {
-        throw new ContractError(
-            "search.boundedCandidateIds is only valid for finite or bounded topologies",
-        );
-    }
-    if (hasBoundedCandidateIds) {
-        normalized.boundedCandidateIds = normalizeIdentifierArray(
-            search.boundedCandidateIds,
-            "search.boundedCandidateIds",
-            1,
-            CONTRACT_LIMITS.boundedCandidateIds,
-        );
-        if (normalized.boundedCandidateIds.length
-            > normalized.candidatesPerRound * normalized.maxRounds) {
-            throw new ContractError(
-                "search capacity must cover every boundedCandidateId",
-            );
-        }
-    }
     return normalized;
 }
 
@@ -1156,9 +1272,6 @@ function normalizeImpossibilityPolicy(input, topology) {
 
 export function createSearchPolicy(input) {
     requireExactObjectKeys(input, "searchPolicy", SEARCH_POLICY_KEYS);
-    if (typeof input.stopOnFirstAccept !== "boolean") {
-        throw new ContractError("searchPolicy.stopOnFirstAccept must be boolean");
-    }
 
     const plateauWindow = requireSafeIntegerInRange(
         input.plateauWindow,
@@ -1266,7 +1379,6 @@ export function createSearchPolicy(input) {
     }
 
     return immutableCanonical({
-        stopOnFirstAccept: input.stopOnFirstAccept,
         plateauWindow,
         minRoundsBeforePlateau,
         plateauMinImprovement,
@@ -1284,44 +1396,703 @@ export function defaultSearchPolicy() {
 
 export const normalizeSearchPolicy = createSearchPolicy;
 
-function normalizeMetrics(metrics) {
-    if (metrics === undefined || metrics === null) {
-        return [];
+function requireNonNegativeSafeInteger(value, field, maximum = Number.MAX_SAFE_INTEGER) {
+    if (!Number.isSafeInteger(value) || value < 0 || value > maximum) {
+        throw new ContractError(
+            `${field} must be a non-negative safe integer no greater than ${maximum}`,
+            { field, value, maximum },
+        );
     }
-    if (!Array.isArray(metrics)) {
-        throw new ContractError("metrics must be an array");
+    return value;
+}
+
+function checkedProduct(values, field) {
+    let result = 1;
+    for (const value of values) {
+        if (!Number.isSafeInteger(value) || value < 0
+            || (value !== 0 && result > Number.MAX_SAFE_INTEGER / value)) {
+            throw new ContractError(`${field} is not a safe integer`, {
+                field,
+                values,
+            });
+        }
+        result *= value;
     }
-    if (metrics.length > CONTRACT_LIMITS.metrics) {
-        throw new ContractError(`metrics must contain at most ${CONTRACT_LIMITS.metrics} items`);
+    return result;
+}
+
+function checkedSum(values, field) {
+    let result = 0;
+    for (const value of values) {
+        if (!Number.isSafeInteger(value) || value < 0
+            || result > Number.MAX_SAFE_INTEGER - value) {
+            throw new ContractError(`${field} is not a safe integer`, {
+                field,
+                values,
+            });
+        }
+        result += value;
     }
-    const keys = new Set();
-    return metrics.map((metric, index) => {
-        if (metric === null || typeof metric !== "object" || Array.isArray(metric)) {
-            throw new ContractError(`metrics[${index}] must be an object`);
-        }
-        const key = requireIdentifier(metric.key, `metrics[${index}].key`);
-        if (keys.has(key)) {
-            throw new ContractError("metrics keys must be unique", { key });
-        }
-        keys.add(key);
-        if (!METRIC_DIRECTIONS.includes(metric.direction)) {
-            throw new ContractError(`metrics[${index}].direction must be min or max`);
-        }
-        const epsilon = metric.epsilon ?? 0;
-        if (typeof epsilon !== "number" || !Number.isFinite(epsilon) || epsilon < 0) {
-            throw new ContractError(`metrics[${index}].epsilon must be a finite non-negative number`);
+    return result;
+}
+
+export function harnessSuiteRoleCases(value, role) {
+    const suite = normalizeHarnessSuiteV4(value?.harnessSuite ?? value);
+    const roleId = requireIdentifier(role, "role");
+    const roleSpec = suite.roles[roleId];
+    if (roleSpec === undefined) {
+        throw new ContractError(`HarnessSuiteV4 role ${JSON.stringify(roleId)} is unavailable`, {
+            role: roleId,
+        });
+    }
+    return immutableCanonical(roleSpec.caseManifest.map((caseRef) => {
+        const corpusCase = suite.operatorCorpus.cases[caseRef.id];
+        if (corpusCase === undefined
+            || corpusCase.snapshotHash !== caseRef.snapshotHash) {
+            throw new ContractError(
+                `HarnessSuiteV4 role ${JSON.stringify(roleId)} has an invalid corpus binding`,
+                { role: roleId, caseId: caseRef.id },
+            );
         }
         return {
-            key,
-            direction: metric.direction,
-            epsilon,
+            id: caseRef.id,
+            expectation: corpusCase.expectation,
+            artifactHash: caseRef.snapshotHash,
         };
+    }));
+}
+
+export function requiredHarnessRoles(goalMode, topology) {
+    if (!GOAL_MODES.includes(goalMode)) {
+        throw new ContractError("goalMode must be satisfice or optimize", { goalMode });
+    }
+    if (!HYPOTHESIS_TOPOLOGIES.includes(topology)) {
+        throw new ContractError("hypothesisTopology is not supported", {
+            hypothesisTopology: topology ?? null,
+        });
+    }
+    return Object.freeze([
+        "calibration",
+        "search",
+        "confirmation",
+        "challenge",
+        "novelty",
+        ...(topology === "certified_impossibility"
+            ? ["impossibility_verifier"]
+            : []),
+    ]);
+}
+
+function normalizeHarnessSuiteContract(value, identity, goalMode, topology) {
+    let suite;
+    try {
+        suite = normalizeHarnessSuiteV4(value);
+    } catch (error) {
+        throw new ContractError(
+            `harnessSuite is not a valid HarnessSuiteV4: ${error?.message ?? String(error)}`,
+            { cause: error?.code ?? null, details: error?.details ?? null },
+        );
+    }
+    const actualIdentity = computeHarnessSuiteV4Identity(suite);
+    if (requireTaggedSha256(identity, "harnessSuiteIdentity") !== actualIdentity) {
+        throw new ContractError(
+            "harnessSuiteIdentity does not match the canonical HarnessSuiteV4",
+            { expected: actualIdentity, actual: identity },
+        );
+    }
+    for (const role of requiredHarnessRoles(goalMode, topology)) {
+        if (suite.roles[role] === undefined) {
+            throw new ContractError(
+                `HarnessSuiteV4 role ${JSON.stringify(role)} is required for this goal/topology`,
+                { role, goalMode, topology },
+            );
+        }
+    }
+    const parserVersions = new Set(
+        Object.values(suite.roles).map((role) => role.parser.version),
+    );
+    if (parserVersions.size !== 1) {
+        throw new ContractError(
+            "HarnessSuiteV4 roles must use one trusted parser version",
+            { parserVersions: [...parserVersions].sort() },
+        );
+    }
+    return { suite, identity: actualIdentity };
+}
+
+function normalizeStatisticalMetrics(value, observableRegistry) {
+    if (!Array.isArray(value)
+        || value.length < 1
+        || value.length > CONTRACT_LIMITS.metrics) {
+        throw new ContractError(
+            `statisticalPolicy.metrics must contain 1..${CONTRACT_LIMITS.metrics} items`,
+        );
+    }
+    const observableByKey = new Map(
+        observableRegistry.map((observable) => [observable.key, observable]),
+    );
+    const keys = new Set();
+    const metrics = value.map((metric, index) => {
+        const field = `statisticalPolicy.metrics[${index}]`;
+        requireExactObjectKeys(metric, field, STATISTICAL_METRIC_KEYS);
+        const key = requireIdentifier(metric.key, `${field}.key`);
+        if (keys.has(key)) {
+            throw new ContractError("statisticalPolicy.metrics keys must be unique", {
+                key,
+            });
+        }
+        keys.add(key);
+        const minimum = requireFiniteNumberInRange(
+            metric.minimum,
+            `${field}.minimum`,
+            -Number.MAX_SAFE_INTEGER,
+            Number.MAX_SAFE_INTEGER,
+        );
+        const maximum = requireFiniteNumberInRange(
+            metric.maximum,
+            `${field}.maximum`,
+            -Number.MAX_SAFE_INTEGER,
+            Number.MAX_SAFE_INTEGER,
+        );
+        if (minimum >= maximum) {
+            throw new ContractError(`${field}.minimum must be less than maximum`, {
+                minimum,
+                maximum,
+            });
+        }
+        const observable = observableByKey.get(key);
+        if (observable?.kind !== "numeric"
+            || observable.minimum !== minimum
+            || observable.maximum !== maximum) {
+            throw new ContractError(
+                `${field} must exactly match a numeric observable registry entry`,
+                { key, minimum, maximum, observable: observable ?? null },
+            );
+        }
+        if (!STATISTICAL_METRIC_DIRECTIONS.includes(metric.direction)) {
+            throw new ContractError(`${field}.direction must be min or max`);
+        }
+        const acceptanceThreshold = requireFiniteNumberInRange(
+            metric.acceptanceThreshold,
+            `${field}.acceptanceThreshold`,
+            minimum,
+            maximum,
+        );
+        const practicalEquivalenceDelta = requireFiniteNumberInRange(
+            metric.practicalEquivalenceDelta,
+            `${field}.practicalEquivalenceDelta`,
+            Number.MIN_VALUE,
+            maximum - minimum,
+        );
+        return {
+            key,
+            minimum,
+            maximum,
+            estimand: requireBoundedText(
+                metric.estimand,
+                `${field}.estimand`,
+                256,
+                512,
+            ),
+            unit: requireBoundedText(metric.unit, `${field}.unit`, 128, 256),
+            direction: metric.direction,
+            acceptanceThreshold,
+            practicalEquivalenceDelta,
+            family: requireIdentifier(metric.family, `${field}.family`),
+        };
+    });
+    metrics.sort((left, right) => left.key.localeCompare(right.key));
+    return immutableCanonical(metrics);
+}
+
+function normalizeFamilyAllocations(value, investigationAlpha, metrics) {
+    if (!Array.isArray(value)
+        || value.length < 1
+        || value.length > CONTRACT_LIMITS.statisticalFamilies) {
+        throw new ContractError(
+            `statisticalPolicy.familyAllocations must contain 1..${CONTRACT_LIMITS.statisticalFamilies} items`,
+        );
+    }
+    const seen = new Set();
+    const allocations = value.map((allocation, index) => {
+        const field = `statisticalPolicy.familyAllocations[${index}]`;
+        requireExactObjectKeys(allocation, field, FAMILY_ALLOCATION_KEYS);
+        const family = requireIdentifier(allocation.family, `${field}.family`);
+        if (seen.has(family)) {
+            throw new ContractError(
+                "statisticalPolicy family allocations must be disjoint and uniquely named",
+                { family },
+            );
+        }
+        seen.add(family);
+        return {
+            family,
+            alpha: requireFiniteNumberInRange(
+                allocation.alpha,
+                `${field}.alpha`,
+                Number.MIN_VALUE,
+                investigationAlpha,
+            ),
+        };
+    });
+    const sum = allocations.reduce((total, allocation) => total + allocation.alpha, 0);
+    const tolerance = Math.max(1e-12, investigationAlpha * 1e-12);
+    if (!Number.isFinite(sum) || Math.abs(sum - investigationAlpha) > tolerance) {
+        throw new ContractError(
+            "statisticalPolicy family alpha allocations must sum to investigationAlpha",
+            { investigationAlpha, allocationSum: sum, tolerance },
+        );
+    }
+    const metricFamilies = new Set(metrics.map((metric) => metric.family));
+    const allocationFamilies = new Set(allocations.map((allocation) => allocation.family));
+    const missing = [...metricFamilies].filter((family) => !allocationFamilies.has(family));
+    const unused = [...allocationFamilies].filter((family) => !metricFamilies.has(family));
+    if (missing.length > 0 || unused.length > 0) {
+        throw new ContractError(
+            "statisticalPolicy family allocations must partition exactly the metric families",
+            { missing: missing.sort(), unused: unused.sort() },
+        );
+    }
+    allocations.sort((left, right) => left.family.localeCompare(right.family));
+    return immutableCanonical(allocations);
+}
+
+function expectedControlFromManifest(enumerandManifest) {
+    if (enumerandManifest === null) return null;
+    const resolved = enumerandManifest.control.kind === "reference"
+        ? enumerandManifest.control
+        : enumerandManifest.entries[enumerandManifest.control.ordinal];
+    return resolved.kind === "reference"
+        ? { kind: "snapshot", identity: resolved.referenceHash }
+        : { kind: "enumerand", identity: resolved.enumerandHash };
+}
+
+function normalizeStatisticalControl(value, metrics, enumerandManifest) {
+    requireExactObjectKeys(value, "statisticalPolicy.control", CONTROL_KEYS);
+    if (value.kind !== "snapshot" && value.kind !== "enumerand") {
+        throw new ContractError(
+            "statisticalPolicy.control.kind must be snapshot or enumerand",
+        );
+    }
+    const identity = value.kind === "snapshot"
+        ? requireArtifactHash(value.identity, "statisticalPolicy.control.identity")
+        : requireTaggedSha256(value.identity, "statisticalPolicy.control.identity");
+    const expected = expectedControlFromManifest(enumerandManifest);
+    if (expected !== null
+        && (expected.kind !== value.kind || expected.identity !== identity)) {
+        throw new ContractError(
+            "statisticalPolicy.control must match the frozen enumerand manifest control",
+            { expected, actual: { kind: value.kind, identity } },
+        );
+    }
+    if (expected === null && value.kind !== "snapshot") {
+        throw new ContractError(
+            "Non-enumerated investigations require a frozen control snapshot",
+        );
+    }
+    if (!Array.isArray(value.tolerances)
+        || value.tolerances.length !== metrics.length) {
+        throw new ContractError(
+            "statisticalPolicy.control.tolerances must contain exactly one entry per metric",
+        );
+    }
+    const metricByKey = new Map(metrics.map((metric) => [metric.key, metric]));
+    const seen = new Set();
+    const tolerances = value.tolerances.map((tolerance, index) => {
+        const field = `statisticalPolicy.control.tolerances[${index}]`;
+        requireExactObjectKeys(tolerance, field, CONTROL_TOLERANCE_KEYS);
+        const metric = requireIdentifier(tolerance.metric, `${field}.metric`);
+        if (seen.has(metric) || !metricByKey.has(metric)) {
+            throw new ContractError(
+                `${field}.metric must name one previously unused statistical metric`,
+                { metric },
+            );
+        }
+        seen.add(metric);
+        const range = metricByKey.get(metric).maximum - metricByKey.get(metric).minimum;
+        return {
+            metric,
+            absolute: requireFiniteNumberInRange(
+                tolerance.absolute,
+                `${field}.absolute`,
+                0,
+                range,
+            ),
+            relative: requireFiniteNumberInRange(
+                tolerance.relative,
+                `${field}.relative`,
+                0,
+                1,
+            ),
+        };
+    });
+    tolerances.sort((left, right) => left.metric.localeCompare(right.metric));
+    return immutableCanonical({ kind: value.kind, identity, tolerances });
+}
+
+function normalizeMissingness(value) {
+    requireExactObjectKeys(value, "statisticalPolicy.missingness", MISSINGNESS_KEYS);
+    if (!MISSINGNESS_MODES.includes(value.mode)) {
+        throw new ContractError(
+            "statisticalPolicy.missingness.mode must be fail_closed or bounded",
+        );
+    }
+    const maxMissingPerBlock = requireNonNegativeSafeInteger(
+        value.maxMissingPerBlock,
+        "statisticalPolicy.missingness.maxMissingPerBlock",
+        CONTRACT_LIMITS.maxStatisticalEvaluations,
+    );
+    const maxMissingFraction = requireFiniteNumberInRange(
+        value.maxMissingFraction,
+        "statisticalPolicy.missingness.maxMissingFraction",
+        0,
+        1,
+    );
+    if (value.mode === "fail_closed"
+        && (maxMissingPerBlock !== 0 || maxMissingFraction !== 0)) {
+        throw new ContractError(
+            "fail_closed missingness requires zero missing-count and missing-fraction tolerances",
+        );
+    }
+    if (value.mode === "bounded"
+        && maxMissingPerBlock === 0
+        && maxMissingFraction === 0) {
+        throw new ContractError(
+            "bounded missingness must permit a positive bounded amount",
+        );
+    }
+    return immutableCanonical({
+        mode: value.mode,
+        maxMissingPerBlock,
+        maxMissingFraction,
     });
 }
 
+export function statisticalEvaluationRequirements({
+    searchSlots,
+    maxBlocks,
+    maxConfirmations,
+    validationCaseCount,
+    hypothesisTopology,
+}) {
+    const confirmationRoleSlots = checkedProduct(
+        [maxConfirmations, 3],
+        "statistical confirmation role slots",
+    );
+    const experimentalSlots = checkedSum(
+        [searchSlots, confirmationRoleSlots],
+        "statistical experimental slots",
+    );
+    const requiredCandidateEvaluations = checkedProduct(
+        [experimentalSlots, maxBlocks],
+        "required candidate evaluations",
+    );
+    const requiredControlEvaluations = checkedProduct(
+        [experimentalSlots, maxBlocks],
+        "required control evaluations",
+    );
+    const verifierEvaluations = hypothesisTopology === "certified_impossibility" ? 1 : 0;
+    const requiredTotalEvaluations = checkedSum(
+        [
+            validationCaseCount,
+            requiredCandidateEvaluations,
+            requiredControlEvaluations,
+            verifierEvaluations,
+        ],
+        "required total evaluations",
+    );
+    return immutableCanonical({
+        searchSlots,
+        confirmationRoleSlots,
+        requiredCandidateEvaluations,
+        requiredControlEvaluations,
+        validationCaseCount,
+        verifierEvaluations,
+        requiredTotalEvaluations,
+    });
+}
+
+function normalizeEvaluationBudget(value, requirements) {
+    requireExactObjectKeys(
+        value,
+        "statisticalPolicy.evaluationBudget",
+        EVALUATION_BUDGET_KEYS,
+    );
+    const budget = {
+        maxCandidateEvaluations: requirePositiveSafeInteger(
+            value.maxCandidateEvaluations,
+            "statisticalPolicy.evaluationBudget.maxCandidateEvaluations",
+            CONTRACT_LIMITS.maxStatisticalEvaluations,
+        ),
+        maxControlEvaluations: requirePositiveSafeInteger(
+            value.maxControlEvaluations,
+            "statisticalPolicy.evaluationBudget.maxControlEvaluations",
+            CONTRACT_LIMITS.maxStatisticalEvaluations,
+        ),
+        maxTotalEvaluations: requirePositiveSafeInteger(
+            value.maxTotalEvaluations,
+            "statisticalPolicy.evaluationBudget.maxTotalEvaluations",
+            CONTRACT_LIMITS.maxStatisticalEvaluations,
+        ),
+    };
+    if (budget.maxCandidateEvaluations < requirements.requiredCandidateEvaluations
+        || budget.maxControlEvaluations < requirements.requiredControlEvaluations) {
+        throw new ContractError(
+            "statisticalPolicy evaluation budgets cannot cover the frozen block/search/confirmation capacity",
+            { requirements, budget },
+        );
+    }
+    const allocatedTotal = checkedSum(
+        [
+            budget.maxCandidateEvaluations,
+            budget.maxControlEvaluations,
+            requirements.validationCaseCount,
+            requirements.verifierEvaluations,
+        ],
+        "allocated total evaluations",
+    );
+    if (budget.maxTotalEvaluations < allocatedTotal
+        || budget.maxTotalEvaluations < requirements.requiredTotalEvaluations) {
+        throw new ContractError(
+            "statisticalPolicy.evaluationBudget.maxTotalEvaluations is below its allocated capacity",
+            { allocatedTotal, requirements, budget },
+        );
+    }
+    return immutableCanonical(budget);
+}
+
+function normalizeResourceBudget(value, maxTotalEvaluations) {
+    requireExactObjectKeys(
+        value,
+        "statisticalPolicy.resourceBudget",
+        RESOURCE_BUDGET_KEYS,
+    );
+    const budget = {};
+    for (const key of RESOURCE_BUDGET_KEYS) {
+        budget[key] = requirePositiveSafeInteger(
+            value[key],
+            `statisticalPolicy.resourceBudget.${key}`,
+            CONTRACT_LIMITS.maxResourceBytes,
+        );
+    }
+    for (const kind of ["Output", "Receipt", "Cas"]) {
+        const perAttempt = budget[`perAttempt${kind}Bytes`];
+        const perInvestigation = budget[`perInvestigation${kind}Bytes`];
+        if (perInvestigation < perAttempt
+            || perInvestigation < maxTotalEvaluations) {
+            throw new ContractError(
+                `statisticalPolicy.resourceBudget.perInvestigation${kind}Bytes is impossible for the frozen attempt/evaluation budget`,
+                {
+                    perAttempt,
+                    perInvestigation,
+                    maxTotalEvaluations,
+                },
+            );
+        }
+    }
+    return immutableCanonical(budget);
+}
+
+export function createStatisticalPolicy(input, context = {}) {
+    requireObjectKeys(
+        input,
+        "statisticalPolicy",
+        STATISTICAL_POLICY_KEYS.filter((key) => key !== "version"),
+        ["version"],
+    );
+    if (input.version !== undefined
+        && input.version !== STATISTICAL_POLICY_VERSION) {
+        throw new ContractError("statisticalPolicy.version is unsupported", {
+            expected: STATISTICAL_POLICY_VERSION,
+            actual: input.version,
+        });
+    }
+    if (!GOAL_MODES.includes(input.goalMode)) {
+        throw new ContractError("statisticalPolicy.goalMode must be satisfice or optimize");
+    }
+    const observableRegistry = normalizeObservableRegistry(
+        context.observableRegistry ?? [],
+    );
+    const metrics = normalizeStatisticalMetrics(input.metrics, observableRegistry);
+    const investigationAlpha = requireFiniteNumberInRange(
+        input.investigationAlpha,
+        "statisticalPolicy.investigationAlpha",
+        Number.MIN_VALUE,
+        1 - Number.EPSILON,
+    );
+    const familyAllocations = normalizeFamilyAllocations(
+        input.familyAllocations,
+        investigationAlpha,
+        metrics,
+    );
+    const minBlocks = requirePositiveSafeInteger(
+        input.minBlocks,
+        "statisticalPolicy.minBlocks",
+        CONTRACT_LIMITS.maxBlocks,
+    );
+    const maxBlocks = requirePositiveSafeInteger(
+        input.maxBlocks,
+        "statisticalPolicy.maxBlocks",
+        CONTRACT_LIMITS.maxBlocks,
+    );
+    if (minBlocks > maxBlocks) {
+        throw new ContractError(
+            "statisticalPolicy.minBlocks cannot exceed maxBlocks",
+            { minBlocks, maxBlocks },
+        );
+    }
+    const maxConfirmations = requirePositiveSafeInteger(
+        input.maxConfirmations,
+        "statisticalPolicy.maxConfirmations",
+        CONTRACT_LIMITS.maxConfirmations,
+    );
+    const requirements = statisticalEvaluationRequirements({
+        searchSlots: context.searchSlots,
+        maxBlocks,
+        maxConfirmations,
+        validationCaseCount: context.validationCaseCount,
+        hypothesisTopology: context.hypothesisTopology,
+    });
+    const evaluationBudget = normalizeEvaluationBudget(
+        input.evaluationBudget,
+        requirements,
+    );
+    const resourceBudget = normalizeResourceBudget(
+        input.resourceBudget,
+        evaluationBudget.maxTotalEvaluations,
+    );
+    return immutableCanonical({
+        version: STATISTICAL_POLICY_VERSION,
+        goalMode: input.goalMode,
+        metrics,
+        investigationAlpha,
+        familyAllocations,
+        minBlocks,
+        maxBlocks,
+        control: normalizeStatisticalControl(
+            input.control,
+            metrics,
+            context.enumerandManifest ?? null,
+        ),
+        missingness: normalizeMissingness(input.missingness),
+        deterministicBlockSeed: requireBoundedText(
+            input.deterministicBlockSeed,
+            "statisticalPolicy.deterministicBlockSeed",
+            256,
+            512,
+        ),
+        maxConfirmations,
+        evaluationBudget,
+        resourceBudget,
+    });
+}
+
+export const normalizeStatisticalPolicy = createStatisticalPolicy;
+
+export function statisticalPolicyHash(policy, context = {}) {
+    return hashCanonical(
+        createStatisticalPolicy(policy, context),
+        STATISTICAL_POLICY_HASH_ALGORITHM,
+    );
+}
+
+function normalizeEnumerandContract(
+    input,
+    topology,
+    capacity,
+    observableRegistry,
+    hypothesisPolicy,
+) {
+    const requiresManifest =
+        topology === "finite_enumerable" || topology === "bounded_parameterized";
+    const hasManifest = input !== undefined && input !== null;
+    if (requiresManifest !== hasManifest) {
+        throw new ContractError(
+            requiresManifest
+                ? "enumerandManifest is required for finite_enumerable and bounded_parameterized topologies"
+                : "enumerandManifest is forbidden for non-enumerable topologies",
+        );
+    }
+    if (!hasManifest) return null;
+    const manifest = normalizeEnumerandManifest(input, {
+        topology,
+        observableRegistry,
+        hypothesisPolicy,
+    });
+    if (manifest.entries.length > capacity) {
+        throw new ContractError(
+            "search capacity must cover every immutable enumerand",
+            { enumerands: manifest.entries.length, capacity },
+        );
+    }
+    return manifest;
+}
+
 export function createInvestigationContract(input) {
-    if (input === null || typeof input !== "object" || Array.isArray(input)) {
-        throw new ContractError("Investigation contract input must be an object");
+    if (input !== null
+        && typeof input === "object"
+        && !Array.isArray(input)
+        && Object.hasOwn(input, "statisticalPolicyIdentity")) {
+        requireObjectKeys(
+            input,
+            "Sealed investigation contract",
+            CONTRACT_OUTPUT_REQUIRED_KEYS,
+            CONTRACT_OUTPUT_OPTIONAL_KEYS,
+        );
+        const normalized = createInvestigationContract({
+            domainVersion: input.domainVersion,
+            objective: input.objective,
+            acceptancePredicate: input.acceptancePredicate,
+            harnessSuite: input.harnessSuite,
+            harnessSuiteIdentity: input.harnessSuiteIdentity,
+            hypothesisTopology: input.hypothesisTopology,
+            criticality: input.criticality,
+            policyVersion: input.policyVersion,
+            workerModels: input.workerModels,
+            candidatesPerRound: input.candidatesPerRound,
+            maxRounds: input.maxRounds,
+            searchPolicy: input.searchPolicy,
+            observableRegistry: input.observableRegistry,
+            hypothesisPolicy: input.hypothesisPolicy,
+            statisticalPolicy: input.statisticalPolicy,
+            ...(input.enumerandManifest === undefined
+                ? {}
+                : { enumerandManifest: input.enumerandManifest }),
+            ...(input.impossibilityPolicy === undefined
+                ? {}
+                : { impossibilityPolicy: input.impossibilityPolicy }),
+        });
+        if (!canonicalEqual(normalized, input)) {
+            throw new ContractError(
+                "Sealed investigation contract was mutated or is not canonical",
+                {
+                    expectedHash: contractHash(normalized),
+                    actualHash: hashCanonical(input, CONTRACT_HASH_ALGORITHM),
+                },
+            );
+        }
+        return normalized;
+    }
+    requireObjectKeys(
+        input,
+        "Investigation contract input",
+        CONTRACT_INPUT_REQUIRED_KEYS,
+        CONTRACT_INPUT_OPTIONAL_KEYS,
+    );
+    if (Object.hasOwn(input, "domainVersion")
+        && input.domainVersion !== DOMAIN_VERSION) {
+        throw new DomainVersionRestartRequiredError(
+            "Investigation contract uses an incompatible domain version; start a new investigation",
+            {
+                expectedDomainVersion: DOMAIN_VERSION,
+                actualDomainVersion: input.domainVersion ?? null,
+            },
+        );
+    }
+    if (!HYPOTHESIS_TOPOLOGIES.includes(input.hypothesisTopology)) {
+        throw new ContractError("hypothesisTopology is not supported", {
+            hypothesisTopology: input.hypothesisTopology ?? null,
+        });
     }
 
     const objective = requireBoundedText(
@@ -1330,53 +2101,88 @@ export function createInvestigationContract(input) {
         CONTRACT_LIMITS.objectiveCharacters,
         CONTRACT_LIMITS.objectiveBytes,
     );
-    const harnessId = requireIdentifier(input.harnessId, "harnessId");
-    if (!HYPOTHESIS_TOPOLOGIES.includes(input.hypothesisTopology)) {
-        throw new ContractError("hypothesisTopology is not supported", {
-            hypothesisTopology: input.hypothesisTopology ?? null,
-        });
-    }
-
-    if (!Object.hasOwn(input, "searchPolicy")) {
+    const observableRegistry = normalizeObservableRegistry(input.observableRegistry);
+    const hypothesisPolicy = normalizeHypothesisPolicy(input.hypothesisPolicy);
+    if (hypothesisPolicy.required && observableRegistry.length === 0) {
         throw new ContractError(
-            "searchPolicy is required; callers must provide the canonical version-2 search policy",
+            "A required hypothesisPolicy needs at least one registered observable",
         );
     }
+    const search = normalizeSearch(input, input.hypothesisTopology);
+    const searchCapacity = checkedProduct(
+        [search.candidatesPerRound, search.maxRounds],
+        "search capacity",
+    );
+    const enumerandManifest = normalizeEnumerandContract(
+        input.enumerandManifest,
+        input.hypothesisTopology,
+        searchCapacity,
+        observableRegistry,
+        hypothesisPolicy,
+    );
+    const harness = normalizeHarnessSuiteContract(
+        input.harnessSuite,
+        input.harnessSuiteIdentity,
+        input.statisticalPolicy?.goalMode,
+        input.hypothesisTopology,
+    );
+    const validationCases = normalizeValidationCases(
+        harnessSuiteRoleCases(harness.suite, "calibration"),
+    );
+    const statisticalPolicy = createStatisticalPolicy(input.statisticalPolicy, {
+        observableRegistry,
+        enumerandManifest,
+        searchSlots: enumerandManifest?.entries.length ?? searchCapacity,
+        validationCaseCount: validationCases.length,
+        hypothesisTopology: input.hypothesisTopology,
+    });
     const searchPolicy = createSearchPolicy(input.searchPolicy);
     if (!canonicalEqual(searchPolicy, input.searchPolicy)) {
         throw new ContractError("searchPolicy must already be in canonical kernel form");
     }
-
-    const search = normalizeSearch(input.search ?? input, input.hypothesisTopology);
     const impossibilityPolicy = normalizeImpossibilityPolicy(
         input.impossibilityPolicy,
         input.hypothesisTopology,
     );
-    const parserVersion = requireIdentifier(input.parserVersion, "parserVersion");
+    const parserVersion = requireIdentifier(
+        harness.suite.roles.search.parser.version,
+        "harnessSuite.roles.search.parser.version",
+    );
+    const rankingMetrics = statisticalPolicy.metrics.map((metric) => ({
+        key: metric.key,
+        direction: metric.direction,
+        epsilon: metric.practicalEquivalenceDelta,
+    }));
     const contract = {
+        domainVersion: DOMAIN_VERSION,
         objective,
         acceptancePredicate: normalizePredicate(input.acceptancePredicate),
-        validationCases: normalizeValidationCases(input.validationCases),
-        harnessId,
+        validationCases,
+        harnessSuite: harness.suite,
+        harnessSuiteIdentity: harness.identity,
+        harnessId: harness.suite.roles.search.harnessId,
         hypothesisTopology: input.hypothesisTopology,
         criticality: requireNonEmptyString(input.criticality, "criticality", 64),
         policyVersion: requireIdentifier(input.policyVersion, "policyVersion"),
         parserVersion,
-        harnessIdentity: normalizeHarnessIdentity(
-            input.harnessIdentity,
-            harnessId,
-            parserVersion,
-        ),
         workerModels: search.workerModels,
         candidatesPerRound: search.candidatesPerRound,
         maxRounds: search.maxRounds,
-        ...(search.boundedCandidateIds === undefined
-            ? {}
-            : { boundedCandidateIds: search.boundedCandidateIds }),
-        metrics: normalizeMetrics(input.metrics),
+        ...(enumerandManifest === null ? {} : { enumerandManifest }),
+        metrics: rankingMetrics,
+        observableRegistry,
+        observableRegistryIdentity: observableRegistryIdentity(observableRegistry),
+        hypothesisPolicy,
+        hypothesisPolicyIdentity: hypothesisPolicyIdentity(hypothesisPolicy),
+        statisticalPolicy,
+        statisticalPolicyIdentity: hashCanonical(
+            statisticalPolicy,
+            STATISTICAL_POLICY_HASH_ALGORITHM,
+        ),
         searchPolicy,
+        scientificTerminalPolicy: DEFAULT_SCIENTIFIC_TERMINAL_POLICY,
         ...(impossibilityPolicy === null ? {} : { impossibilityPolicy }),
-        declaredLimits: normalizeDeclaredLimits(input.declaredLimits),
+        declaredLimits: {},
     };
 
     return immutableCanonical(contract);

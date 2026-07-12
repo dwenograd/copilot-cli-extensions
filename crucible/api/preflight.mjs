@@ -7,28 +7,29 @@ import fs from "node:fs";
 import path from "node:path";
 
 import {
-    DEFAULT_SEARCH_POLICY,
+    canonicalEqual,
     contractHash,
     createInvestigationContract,
+    harnessSuiteRoleCases,
 } from "../domain/index.mjs";
 import {
     PARSER_VERSION,
-    buildFrozenHarnessIdentity,
-    verifyFrozenHarnessIdentity,
     verifyHarnessPreflight,
 } from "../measurement/index.mjs";
-import { assertLocalDatabasePath } from "../persistence/index.mjs";
 import {
+    RUNTIME_ERROR_CODES,
+    assertSupervisorConfigMatchesRuntimeAuthority,
     assertPromptContractCoreFits,
+    buildRuntimeConfigAuthority,
     deriveRunnerExecutionLimits,
     normalizeStartDeadline,
+    resolveNodeExecutable,
+    supervisorConfigFromRuntimeAuthority,
     supervisorPaths,
+    verifyRuntimeConfigAuthority,
 } from "../runtime/index.mjs";
 import {
-    CRITICALITY,
-    POLICY_VERSION,
     buildSupervisorConfigInput,
-    canonicalObjective,
     createPreflightWorkspace,
     deriveInvestigationId,
     removePreflightWorkspace,
@@ -37,22 +38,71 @@ import {
     resolveStartEnvironment,
 } from "./environment.mjs";
 import {
+    EXPERIMENT_REGISTRY_ERROR_CODES,
+    ExperimentRegistryError,
+    loadExperimentRegistry,
+    resolveExperimentProjectDir,
+    resolveExperimentRegistryPath,
+    reverifyExperimentRegistryFile,
+} from "./experiment-registry.mjs";
+import {
+    EXPERIMENT_AUTHORITY_ERROR_CODES,
+    ExperimentAuthorityError,
+    readVerifiedExperimentAuthority,
+    verifyExperimentAuthority,
+} from "./experiment-authority.mjs";
+import {
     ContractConflictError,
     CrucibleApiError,
     HarnessConfigurationError,
     HarnessNotAllowlistedError,
     InvestigationNotFoundError,
     InvestigationNotResumableError,
+    LegacyIncompatibleApiError,
     OperationalResetRequiredError,
+    ExperimentNotFoundApiError,
+    ExperimentAuthorityMismatchApiError,
+    ExperimentRegistryApiError,
     SandboxUnavailableApiError,
     StartFailedError,
     StartPreflightError,
-    ValidationCasePathError,
 } from "./errors.mjs";
 import { crucibleStartSpec } from "./schema.mjs";
 
 const PREFLIGHT_PLANS = new WeakSet();
 const DISPOSED_PLANS = new WeakSet();
+const AUTHORITY_MISMATCH_CODES = new Set([
+    EXPERIMENT_AUTHORITY_ERROR_CODES.AUTHORITY_INVALID,
+    EXPERIMENT_AUTHORITY_ERROR_CODES.TRUST_NOT_CONFIGURED,
+    EXPERIMENT_AUTHORITY_ERROR_CODES.TRUST_CONFIGURATION_INVALID,
+    EXPERIMENT_AUTHORITY_ERROR_CODES.TRUST_FINGERPRINT_MISMATCH,
+    EXPERIMENT_AUTHORITY_ERROR_CODES.SIGNATURE_INVALID,
+]);
+
+function authorityMismatch(error, message, details = {}) {
+    throw new ExperimentAuthorityMismatchApiError(message, {
+        ...details,
+        cause: error?.code ?? null,
+    }, { cause: error });
+}
+
+function throwLegacyIncompatible(error, investigationId) {
+    if (error?.code !== RUNTIME_ERROR_CODES.LEGACY_INCOMPATIBLE) {
+        throw error;
+    }
+    throw new LegacyIncompatibleApiError(
+        "This investigation belongs to an incompatible legacy domain and cannot be resumed; start a new investigation",
+        {
+            investigationId,
+            expectedDomainVersion: error?.details?.expectedDomainVersion ?? null,
+            actualDomainVersion: error?.details?.actualDomainVersion ?? null,
+            contractDomainVersion: error?.details?.contractDomainVersion ?? null,
+            eventCount: error?.details?.eventCount ?? null,
+            archiveable: error?.details?.archiveable === true,
+            readOnly: true,
+        },
+    );
+}
 
 function isThenable(value) {
     return value !== null
@@ -60,187 +110,256 @@ function isThenable(value) {
         && typeof value.then === "function";
 }
 
-function isInside(childAbs, parentAbs) {
-    const relative = path.relative(path.resolve(parentAbs), path.resolve(childAbs));
-    return relative === ""
-        || (!relative.startsWith(`..${path.sep}`)
-            && relative !== ".."
-            && !path.isAbsolute(relative));
+function sameLocalPath(left, right) {
+    const a = path.resolve(left);
+    const b = path.resolve(right);
+    return process.platform === "win32"
+        ? a.toLowerCase() === b.toLowerCase()
+        : a === b;
 }
 
-function resolveProjectDir(projectDir, env) {
-    if (typeof projectDir !== "string" || !path.isAbsolute(projectDir)) {
-        throw new ValidationCasePathError("project_dir must be an absolute path", { projectDir });
-    }
-    let local;
+function loadPreapprovedExperiment(args, deps) {
+    const registryPath = resolveExperimentRegistryPath(undefined, deps.env);
+    let registry;
     try {
-        local = assertLocalDatabasePath(projectDir, { env });
-    } catch (error) {
-        throw new ValidationCasePathError(
-            `project_dir must be on a trusted local filesystem: ${error?.message ?? String(error)}`,
-            { projectDir },
+        registry = (deps.loadExperimentRegistry ?? loadExperimentRegistry)(
+            registryPath,
+            { experimentId: args.experiment_id, env: deps.env },
         );
-    }
-    let real;
-    try {
-        real = fs.realpathSync.native(local);
-    } catch {
-        throw new ValidationCasePathError("project_dir does not exist", { projectDir });
-    }
-    if (!fs.statSync(real).isDirectory()) {
-        throw new ValidationCasePathError("project_dir is not a directory", { projectDir });
-    }
-    return real;
-}
-
-function resolveCasePathInside(projectRoot, candidate) {
-    const abs = path.isAbsolute(candidate) ? candidate : path.join(projectRoot, candidate);
-    let link;
-    try {
-        link = fs.lstatSync(abs);
-    } catch {
-        throw new ValidationCasePathError("validation case path does not exist", { path: candidate });
-    }
-    if (link.isSymbolicLink()) {
-        throw new ValidationCasePathError("validation case path must not be a symlink", {
-            path: candidate,
-        });
-    }
-    let real;
-    try {
-        real = fs.realpathSync.native(abs);
-    } catch {
-        throw new ValidationCasePathError("validation case path does not exist", { path: candidate });
-    }
-    if (!isInside(real, projectRoot)) {
-        throw new ValidationCasePathError("validation case path escapes project_dir", {
-            path: candidate,
-            projectDir: projectRoot,
-        });
-    }
-    if (!fs.statSync(real).isDirectory()) {
-        throw new ValidationCasePathError("validation case path must be a directory", {
-            path: candidate,
-        });
-    }
-    return real;
-}
-
-function placeholderSnapshot(index) {
-    return `sha256:${index.toString(16).padStart(64, "0")}`;
-}
-
-function placeholderHarnessIdentity(harnessId) {
-    const hash = (label) => `sha256:${label}:${"0".repeat(64)}`;
-    return {
-        version: 1,
-        harnessId,
-        allowlistVersion: 1,
-        allowlistFileHash: hash("crucible-measurement-file-v1"),
-        harnessEntryHash: hash("crucible-measurement-entry-v1"),
-        executableHash: hash("crucible-measurement-file-v1"),
-        dependencyHashes: [],
-        argvTemplateHash: hash("crucible-measurement-argv-template-v1"),
-        allowedEnvHash: hash("crucible-measurement-env-policy-v1"),
-        parserVersion: PARSER_VERSION,
-        parserVersionHash: hash("crucible-measurement-parser-version-v1"),
-        parserSourceHash: hash("crucible-measurement-parser-source-v1"),
-        executesCandidateCode: false,
-        sandbox: {
-            required: false,
-            policyIdentity: null,
-            policyDigest: null,
-        },
-    };
-}
-
-function contractInput(args, objective, validationCases, harnessIdentity) {
-    return {
-        objective,
-        acceptancePredicate: args.acceptance_predicate,
-        validationCases,
-        harnessId: args.harness_id,
-        harnessIdentity,
-        hypothesisTopology: args.hypothesis_topology,
-        criticality: CRITICALITY,
-        policyVersion: POLICY_VERSION,
-        parserVersion: PARSER_VERSION,
-        workerModels: args.worker_models,
-        candidatesPerRound: args.candidates_per_round,
-        maxRounds: args.max_rounds,
-        searchPolicy: args.search_policy ?? DEFAULT_SEARCH_POLICY,
-        ...(args.bounded_candidate_ids === undefined
-            ? {}
-            : { boundedCandidateIds: args.bounded_candidate_ids }),
-        metrics: args.metrics,
-        declaredLimits: {},
-    };
-}
-
-function validateContractShape(args, objective) {
-    const validationCases = args.validation_cases.map((validationCase, index) => ({
-        id: validationCase.id,
-        expectation: validationCase.expectation,
-        artifactHash: placeholderSnapshot(index + 1),
-    }));
-    try {
-        const contract = createInvestigationContract(
-            contractInput(
-                args,
-                objective,
-                validationCases,
-                placeholderHarnessIdentity(args.harness_id),
-            ),
-        );
-        const promptCore = assertPromptContractCoreFits(contract);
-        return { contract, promptCore };
     } catch (error) {
-        throw new StartPreflightError(
-            `crucible_start contract validation failed: ${error?.message ?? String(error)}`,
-            { cause: error?.code ?? null },
+        if (error instanceof ExperimentRegistryError
+            && error.code === EXPERIMENT_REGISTRY_ERROR_CODES.EXPERIMENT_NOT_FOUND) {
+            throw new ExperimentNotFoundApiError(error.message, {
+                experimentId: args.experiment_id,
+                registryPath,
+            }, { cause: error });
+        }
+        if (AUTHORITY_MISMATCH_CODES.has(error?.code)) {
+            authorityMismatch(
+                error,
+                `operator experiment authority verification failed: ${
+                    error?.message ?? String(error)
+                }`,
+                {
+                    experimentId: args.experiment_id,
+                    registryPath,
+                },
+            );
+        }
+        throw new ExperimentRegistryApiError(
+            `operator experiment registry verification failed: ${
+                error?.message ?? String(error)
+            }`,
+            {
+                experimentId: args.experiment_id,
+                registryPath,
+                cause: error?.code ?? null,
+            },
             { cause: error },
         );
     }
-}
-
-function stageValidationCases(store, projectRoot, cases, env) {
-    return cases.map((validationCase) => {
-        const sourceDir = resolveCasePathInside(projectRoot, validationCase.path);
-        let ingested;
-        try {
-            ingested = store.ingestDirectory({ sourceDir, env });
-        } catch (error) {
-            throw new ValidationCasePathError(
-                `validation case '${validationCase.id}' could not be staged: ${error?.message ?? String(error)}`,
-                { id: validationCase.id, path: validationCase.path, code: error?.code ?? null },
+    let experiment;
+    try {
+        experiment = registry.getExperiment(args.experiment_id);
+    } catch (error) {
+        throw new ExperimentNotFoundApiError(error.message, {
+            experimentId: args.experiment_id,
+            registryPath,
+        }, { cause: error });
+    }
+    let projectDir;
+    try {
+        projectDir = resolveExperimentProjectDir(experiment.projectDir, deps.env);
+    } catch (error) {
+        if (AUTHORITY_MISMATCH_CODES.has(error?.code)) {
+            authorityMismatch(
+                error,
+                `operator experiment trust changed after preflight: ${
+                    error?.message ?? String(error)
+                }`,
+                {
+                    experimentId: plan.experimentId,
+                    registryPath:
+                        plan.registryVerification.registryPath,
+                },
             );
         }
-        return Object.freeze({
-            id: validationCase.id,
-            expectation: validationCase.expectation,
-            artifactHash: ingested.snapshot,
-            objectIds: Object.freeze([
-                ...new Set([
-                    ...ingested.manifest.entries.map((entry) => entry.object),
-                    ingested.snapshot,
-                ]),
-            ].sort()),
+        throw new ExperimentRegistryApiError(
+            `preapproved experiment project identity is unavailable: ${
+                error?.message ?? String(error)
+            }`,
+            {
+                experimentId: args.experiment_id,
+                projectDir: experiment.projectDir,
+                cause: error?.code ?? null,
+            },
+            { cause: error },
+        );
+    }
+    if (!sameLocalPath(projectDir, experiment.projectDir)) {
+        throw new ExperimentRegistryApiError(
+            "preapproved experiment project path no longer resolves to its operator-owned identity",
+            {
+                experimentId: args.experiment_id,
+                expected: experiment.projectDir,
+                actual: projectDir,
+            },
+        );
+    }
+    let contract;
+    try {
+        contract = createInvestigationContract(experiment.contract);
+    } catch (error) {
+        throw new ExperimentRegistryApiError(
+            `preapproved experiment contract failed canonical validation: ${
+                error?.message ?? String(error)
+            }`,
+            {
+                experimentId: args.experiment_id,
+                cause: error?.code ?? null,
+            },
+            { cause: error },
+        );
+    }
+    const digest = contractHash(contract);
+    if (!canonicalEqual(contract, experiment.contract)
+        || digest !== experiment.contractHash
+        || contract.harnessSuite.id !== experiment.harnessSuiteId
+        || contract.harnessSuiteIdentity !== experiment.harnessSuiteIdentity) {
+        throw new ExperimentRegistryApiError(
+            "preapproved experiment entry does not match its canonical contract identity",
+            { experimentId: args.experiment_id },
+        );
+    }
+    const investigationId = deriveInvestigationId({
+        experimentId: experiment.experimentId,
+        objective: contract.objective,
+        projectDir,
+        harnessSuiteId: experiment.harnessSuiteId,
+        harnessSuiteIdentity: experiment.harnessSuiteIdentity,
+        contractHash: digest,
+        trustFingerprint: experiment.authority.trustFingerprint,
+    });
+    if (investigationId !== experiment.investigationId) {
+        throw new ExperimentRegistryApiError(
+            "preapproved experiment investigation identity is inconsistent",
+            {
+                experimentId: args.experiment_id,
+                expected: experiment.investigationId,
+                actual: investigationId,
+            },
+        );
+    }
+    return {
+        registry,
+        experiment,
+        projectDir,
+        contract,
+        contractDigest: digest,
+        investigationId,
+        promptCore: assertPromptContractCoreFits(contract),
+        authority: experiment.authority,
+    };
+}
+
+function contractSnapshotReferences(contract) {
+    const references = new Map();
+    const add = (snapshot, purpose) => {
+        if (typeof snapshot === "string" && /^sha256:[a-f0-9]{64}$/u.test(snapshot)) {
+            const purposes = references.get(snapshot) ?? new Set();
+            purposes.add(purpose);
+            references.set(snapshot, purposes);
+        }
+    };
+    for (const [caseId, item] of Object.entries(
+        contract.harnessSuite.operatorCorpus.cases,
+    )) {
+        add(item.snapshotHash, `harness-suite-case:${caseId}`);
+    }
+    if (contract.enumerandManifest?.topology === "finite_enumerable") {
+        for (const entry of contract.enumerandManifest.entries) {
+            add(entry.artifactSnapshotHash, `enumerand:${entry.ordinal}`);
+        }
+    }
+    if (contract.enumerandManifest?.control?.kind === "reference") {
+        add(contract.enumerandManifest.control.referenceHash, "enumerand-control");
+    }
+    if (contract.statisticalPolicy.control.kind === "snapshot") {
+        add(contract.statisticalPolicy.control.identity, "statistical-control");
+    }
+    return references;
+}
+
+function copyDurableSnapshot(source, destination, snapshot, purposes) {
+    const verification = source.verifySnapshot(snapshot);
+    if (verification?.ok !== true) {
+        throw new StartPreflightError(
+            `durable operator snapshot ${snapshot} failed verification`,
+            {
+                snapshot,
+                purposes: [...purposes].sort(),
+                verification,
+            },
+        );
+    }
+    const manifest = source.loadManifest(snapshot);
+    const objectIds = [
+        ...new Set([
+            ...manifest.entries.map((entry) => entry.object),
+            snapshot,
+        ]),
+    ].sort();
+    for (const objectId of objectIds) {
+        const bytes = source.readObject(objectId, { verify: true });
+        const stored = destination.putBytes(bytes, {
+            contentType: objectId === snapshot
+                ? "application/vnd.crucible.snapshot+json"
+                : "application/octet-stream",
         });
+        if (stored.id !== objectId) {
+            throw new StartPreflightError(
+                "durable snapshot changed content address during preflight staging",
+                { expected: objectId, actual: stored.id, snapshot },
+            );
+        }
+    }
+    return objectIds;
+}
+
+function stageContractSnapshots({
+    sourceStore,
+    stagingStore,
+    contract,
+}) {
+    const references = contractSnapshotReferences(contract);
+    const objectIds = new Set();
+    for (const [snapshot, purposes] of references) {
+        for (const objectId of copyDurableSnapshot(
+            sourceStore,
+            stagingStore,
+            snapshot,
+            purposes,
+        )) {
+            objectIds.add(objectId);
+        }
+    }
+    return Object.freeze({
+        snapshots: Object.freeze([...references.keys()].sort()),
+        objectIds: Object.freeze([...objectIds].sort()),
     });
 }
 
-function snapshotStagingPlan(workspace, validationCases) {
+function snapshotStagingPlan(workspace, contract, staged) {
     return Object.freeze({
         root: workspace.snapshotStoreRoot,
-        validationCases: Object.freeze(validationCases.map((validationCase) =>
+        validationCases: Object.freeze(contract.validationCases.map((validationCase) =>
             Object.freeze({
                 id: validationCase.id,
                 expectation: validationCase.expectation,
                 artifactHash: validationCase.artifactHash,
             }))),
-        objectIds: Object.freeze([
-            ...new Set(validationCases.flatMap((validationCase) => validationCase.objectIds)),
-        ].sort()),
+        snapshots: staged.snapshots,
+        objectIds: staged.objectIds,
     });
 }
 
@@ -311,6 +430,7 @@ function inspectExistingInvestigation({
     paths,
     investigationId,
     requestedContractHash,
+    requestedAuthorityIdentity,
     args,
     deadline,
 }) {
@@ -334,7 +454,12 @@ function inspectExistingInvestigation({
             investigationId,
             ensure: false,
         });
-        const current = adapter.replay();
+        let current;
+        try {
+            current = adapter.replay();
+        } catch (error) {
+            throwLegacyIncompatible(error, investigationId);
+        }
         if (current.aggregate.contract === null) {
             throw new StartPreflightError(
                 "existing investigation repository has no frozen contract",
@@ -348,6 +473,18 @@ function inspectExistingInvestigation({
                     investigationId,
                     existingContractHash: current.aggregate.contractHash,
                     requestedContractHash,
+                },
+            );
+        }
+        if (current.aggregate.experimentAuthorityIdentity
+            !== requestedAuthorityIdentity) {
+            throw new ContractConflictError(
+                "an investigation with this identity already exists with different operator authority",
+                {
+                    investigationId,
+                    existingAuthorityIdentity:
+                        current.aggregate.experimentAuthorityIdentity ?? null,
+                    requestedAuthorityIdentity,
                 },
             );
         }
@@ -401,19 +538,69 @@ function normalizeSupervisor(input, deps) {
     }
 }
 
-function verifyHarness(allowlist, harnessId, validationCases) {
+function verifyHarnessSuite(allowlist, suiteId, expectedIdentity) {
     try {
-        return verifyHarnessPreflight(allowlist, harnessId, {
-            validationCases,
-            parserVersion: PARSER_VERSION,
+        const suite = allowlist.getSuite(suiteId);
+        const suiteIdentity = allowlist.getSuiteIdentity(suiteId);
+        if (suiteIdentity !== expectedIdentity) {
+            throw new Error("configured suite identity changed during preflight");
+        }
+        const roles = {};
+        for (const [role, spec] of Object.entries(suite.roles)) {
+            const cases = harnessSuiteRoleCases(suite, role);
+            const verifiedEntry = cases.length === 0
+                ? allowlist.verifyEntry(spec.harnessId)
+                : verifyHarnessPreflight(allowlist, spec.harnessId, {
+                    validationCases: cases,
+                    parserVersion: PARSER_VERSION,
+                }).verifiedEntry;
+            if (verifiedEntry.entryHash !== spec.harnessEntryHash
+                || verifiedEntry.executableHash !== spec.executableHash) {
+                throw new Error(
+                    `verified role ${role} does not match its HarnessSuiteV4 identity`,
+                );
+            }
+            roles[role] = Object.freeze({ spec, verifiedEntry });
+        }
+        return Object.freeze({
+            suite,
+            suiteIdentity,
+            roles: Object.freeze(roles),
         });
     } catch (error) {
         throw new HarnessConfigurationError(
-            `harness preflight failed: ${error?.message ?? String(error)}`,
-            { harnessId, cause: error?.code ?? null, details: error?.details ?? null },
+            `harness-suite preflight failed: ${error?.message ?? String(error)}`,
+            {
+                suiteId,
+                cause: error?.code ?? null,
+                details: error?.details ?? null,
+            },
             { cause: error },
         );
     }
+}
+
+function suiteRequiresSandbox(suite) {
+    return Object.values(suite.roles)
+        .some((role) => role.sandboxIdentity.required);
+}
+
+function validateHarnessSuiteSandbox(suite, sandbox) {
+    for (const [role, spec] of Object.entries(suite.roles)) {
+        if (!spec.sandboxIdentity.required) continue;
+        if (sandbox?.required !== true
+            || sandbox.policyDigest !== spec.sandboxIdentity.policyDigest) {
+            throw new SandboxUnavailableApiError(
+                `sandbox policy does not match HarnessSuiteV4 role '${role}'`,
+                {
+                    role,
+                    expectedPolicyDigest: spec.sandboxIdentity.policyDigest,
+                    actualPolicyDigest: sandbox?.policyDigest ?? null,
+                },
+            );
+        }
+    }
+    return sandbox;
 }
 
 function loadAllowlistForPreflight(deps, allowlistPath) {
@@ -458,35 +645,19 @@ function persistedDeadline(config, args, deps) {
     }
 }
 
-function persistedSupervisorInput(config, deadline) {
-    return {
-        runner: {
-            investigationId: config.runner.investigationId,
-            stateDir: config.runner.stateDir,
-            artifactRoot: config.runner.artifactRoot,
-            allowlistPath: config.runner.allowlistPath,
-            copilotSdkPath: config.runner.sdkPath,
-            copilotCliPath: config.runner.cliPath,
-            runnerEpochId: config.runner.runnerEpochId,
-            ...(deadline.deadlineMs === null ? {} : { deadline: deadline.deadlineMs }),
-            options: config.runner.options,
-        },
-        runnerCliPath: config.runnerCliPath,
-        supervisorEpochId: config.supervisorEpochId,
-        maxRestarts: config.maxRestarts,
-        baseBackoffMs: config.baseBackoffMs,
-        maxBackoffMs: config.maxBackoffMs,
-        heartbeatIntervalMs: config.heartbeatIntervalMs,
-        staleLockMs: config.staleLockMs,
-        circuitWindowMs: config.circuitWindowMs,
-    };
-}
-
 function validateSupervisorAdmission(config, deps) {
-    if (typeof deps.validateSupervisorAdmission !== "function") return config;
     try {
-        const admitted = deps.validateSupervisorAdmission(config, { env: deps.env });
-        return admitted?.config ?? config;
+        const admitted = typeof deps.validateSupervisorAdmission === "function"
+            ? deps.validateSupervisorAdmission(config, { env: deps.env })
+            : null;
+        return Object.freeze({
+            config: admitted?.config ?? config,
+            nodeExecutable:
+                admitted?.nodeExecutable
+                ?? (deps.resolveNodeExecutable ?? resolveNodeExecutable)(
+                    deps.env,
+                ),
+        });
     } catch (error) {
         throw new StartPreflightError(
             `supervisor admission preflight failed: ${error?.message ?? String(error)}`,
@@ -497,18 +668,85 @@ function validateSupervisorAdmission(config, deps) {
 }
 
 function verifyPersistedSnapshots(contract, artifactStore) {
-    for (const validationCase of contract.validationCases) {
-        const verification = artifactStore.verifySnapshot(validationCase.artifactHash);
+    for (const [snapshot, purposes] of contractSnapshotReferences(contract)) {
+        const verification = artifactStore.verifySnapshot(snapshot);
         if (verification?.ok !== true) {
             throw new StartPreflightError(
-                `persisted validation snapshot '${validationCase.id}' failed verification`,
+                `persisted frozen snapshot '${snapshot}' failed verification`,
                 {
-                    id: validationCase.id,
-                    artifactHash: validationCase.artifactHash,
+                    snapshot,
+                    purposes: [...purposes].sort(),
                     verification,
                 },
             );
         }
+    }
+}
+
+function verifyPersistedExperimentAuthority(aggregate, deps, investigationId) {
+    const authority = aggregate.experimentAuthority;
+    if (authority === null
+        || aggregate.experimentAuthorityIdentity === null
+        || authority.identity !== aggregate.experimentAuthorityIdentity) {
+        authorityMismatch(
+            null,
+            "persisted investigation has no valid detached operator authority",
+            {
+                persistedAuthorityIdentity:
+                    aggregate.experimentAuthorityIdentity ?? null,
+            },
+        );
+    }
+    const payload = authority.manifest?.experimentPayload;
+    try {
+        const capability = verifyExperimentAuthority({
+            authority,
+            experimentId: payload?.experimentId,
+            projectDir: payload?.projectDir,
+            harnessSuiteId: payload?.harnessSuiteId,
+            contract: aggregate.contract,
+            investigationId,
+            env: deps.env,
+        });
+        const verified = readVerifiedExperimentAuthority(capability).authority;
+        const expectedInvestigationId = deriveInvestigationId({
+            experimentId: payload.experimentId,
+            objective: aggregate.contract.objective,
+            projectDir: payload.projectDir,
+            harnessSuiteId: payload.harnessSuiteId,
+            harnessSuiteIdentity: aggregate.contract.harnessSuiteIdentity,
+            contractHash: aggregate.contractHash,
+            trustFingerprint: verified.trustFingerprint,
+        });
+        if (expectedInvestigationId !== investigationId) {
+            authorityMismatch(
+                null,
+                "persisted experiment authority belongs to a different investigation identity",
+                {
+                    expectedInvestigationId,
+                    actualInvestigationId: investigationId,
+                    persistedAuthorityIdentity: verified.identity,
+                },
+            );
+        }
+        return capability;
+    } catch (error) {
+        if (error instanceof ExperimentAuthorityError
+            || AUTHORITY_MISMATCH_CODES.has(error?.code)) {
+            authorityMismatch(
+                error,
+                `persisted experiment authority no longer matches the current trust root: ${
+                    error?.message ?? String(error)
+                }`,
+                {
+                    persistedAuthorityIdentity:
+                        aggregate.experimentAuthorityIdentity,
+                    persistedTrustFingerprint:
+                        authority.trustFingerprint ?? null,
+                },
+            );
+        }
+        throw error;
     }
 }
 
@@ -520,26 +758,39 @@ function reattachPlan({
     current,
     operationalNonResult,
     supervisorConfig,
+    supervisorAdmission,
     deadline,
     allowlist,
     sandbox,
     workspace,
+    experimentAuthority,
+    verifiedExperimentAuthority,
+    runtimeConfigAuthority,
+    selection = null,
 }) {
-    let identityVerification;
+    const suiteVerification = verifyHarnessSuite(
+        allowlist,
+        current.aggregate.contract.harnessSuite.id,
+        current.aggregate.contract.harnessSuiteIdentity,
+    );
+    validateHarnessSuiteSandbox(current.aggregate.contract.harnessSuite, sandbox);
     try {
-        identityVerification = verifyFrozenHarnessIdentity(
-            allowlist,
-            current.aggregate.contract.harnessIdentity,
-            {
-                validationCases: current.aggregate.contract.validationCases,
-                sandbox,
-            },
-        );
+        verifyRuntimeConfigAuthority(runtimeConfigAuthority, {
+            env: deps.env,
+            deadlineMs: deadline.deadlineMs,
+            expectedInvestigationId: args.investigation_id,
+            expectedStateDir: paths.stateDir,
+            expectedArtifactRoot: paths.artifactRoot,
+            nodeExecutable: supervisorAdmission.nodeExecutable,
+            sandbox,
+        });
     } catch (error) {
-        throw new HarnessConfigurationError(
-            `frozen harness identity verification failed: ${error?.message ?? String(error)}`,
-            { cause: error?.code ?? null, details: error?.details ?? null },
-            { cause: error },
+        authorityMismatch(
+            error,
+            `current runtime identity differs from the immutable opening state: ${
+                error?.message ?? String(error)
+            }`,
+            { investigationId: args.investigation_id },
         );
     }
     const recovery = operationalRecoveryPlan(operationalNonResult, args, deadline);
@@ -548,33 +799,42 @@ function reattachPlan({
             "reset_policy is only valid when recovering a persisted operational non-result",
         );
     }
-    const identity = current.aggregate.contract.harnessIdentity;
     return createPlan({
         version: 1,
-        kind: "reattach",
+        kind: selection === null ? "reattach" : "contract_reattach",
         canonicalArgs: args,
         environment: Object.freeze({ stateRoot }),
+        ...(selection === null
+            ? {}
+            : {
+                experimentId: selection.experimentId,
+                experimentIdentity: selection.experimentIdentity,
+                registryVerification: selection.registryVerification,
+            }),
         objective: current.aggregate.contract.objective,
-        projectDir: null,
+        projectDir: selection?.projectDir ?? null,
         investigationId: args.investigation_id,
         paths,
         deadline,
         supervisorConfig,
+        runtimeConfigAuthority,
         contract: current.aggregate.contract,
-        harnessIdentity: identity,
+        experimentAuthority,
+        verifiedExperimentAuthority,
+        harnessSuite: current.aggregate.contract.harnessSuite,
         hashes: Object.freeze({
             contractHash: current.aggregate.contractHash,
-            allowlistFileHash: identity.allowlistFileHash,
-            harnessEntryHash: identity.harnessEntryHash,
-            executableHash: identity.executableHash,
-            dependencyHashes: identity.dependencyHashes,
-            argvTemplateHash: identity.argvTemplateHash,
-            allowedEnvHash: identity.allowedEnvHash,
-            parserVersionHash: identity.parserVersionHash,
-            parserSourceHash: identity.parserSourceHash,
-            sandboxPolicyDigest: identity.sandbox.policyDigest,
+            experimentAuthorityIdentity: experimentAuthority.identity,
+            trustFingerprint: experimentAuthority.trustFingerprint,
+            runtimeConfigFingerprint: runtimeConfigAuthority.fingerprint,
+            harnessSuiteIdentity:
+                current.aggregate.contract.harnessSuiteIdentity,
+            harnessRoleEntryHashes: Object.freeze(Object.fromEntries(
+                Object.entries(current.aggregate.contract.harnessSuite.roles)
+                    .map(([role, spec]) => [role, spec.harnessEntryHash]),
+            )),
         }),
-        harnessVerification: identityVerification.verification,
+        harnessVerification: suiteVerification,
         sandbox,
         promptCore: null,
         snapshotStagingPlan: null,
@@ -589,7 +849,7 @@ function reattachPlan({
     });
 }
 
-function preflightReattachInvestigation(args, deps) {
+function preflightReattachInvestigation(args, deps, selection = null) {
     const stateRoot = resolveStateRoot(deps.env);
     const paths = resolveInvestigationPaths(stateRoot, args.investigation_id);
     if (!fs.existsSync(paths.eventsDbPath)) {
@@ -605,29 +865,17 @@ function preflightReattachInvestigation(args, deps) {
     try {
         persistedConfig = deps.loadSupervisorConfig(configPath, { env: deps.env });
     } catch (error) {
-        throw new StartPreflightError(
-            `persisted supervisor configuration is unavailable: ${error?.message ?? String(error)}`,
-            { configPath, cause: error?.code ?? null },
-            { cause: error },
+        authorityMismatch(
+            error,
+            `persisted supervisor configuration is unavailable or invalid: ${
+                error?.message ?? String(error)
+            }`,
+            {
+                investigationId: args.investigation_id,
+                configPath,
+            },
         );
     }
-    if (persistedConfig.runner.investigationId !== args.investigation_id
-        || !samePath(persistedConfig.runner.stateDir, paths.stateDir)
-        || !samePath(persistedConfig.runner.artifactRoot, paths.artifactRoot)) {
-        throw new StartPreflightError(
-            "persisted supervisor configuration does not belong to this investigation",
-            { investigationId: args.investigation_id },
-        );
-    }
-    const deadline = persistedDeadline(persistedConfig, args, deps);
-    const supervisorConfig = validateSupervisorAdmission(
-        normalizeSupervisor(
-            persistedSupervisorInput(persistedConfig, deadline),
-            deps,
-        ),
-        deps,
-    );
-
     const repository = deps.openRepositoryReadOnly({
         file: paths.eventsDbPath,
         env: deps.env,
@@ -640,7 +888,11 @@ function preflightReattachInvestigation(args, deps) {
             investigationId: args.investigation_id,
             ensure: false,
         });
-        current = adapter.replay();
+        try {
+            current = adapter.replay();
+        } catch (error) {
+            throwLegacyIncompatible(error, args.investigation_id);
+        }
         if (current.aggregate.contract === null) {
             throw new StartPreflightError(
                 "existing investigation repository has no frozen contract",
@@ -660,6 +912,74 @@ function preflightReattachInvestigation(args, deps) {
     } finally {
         repository.close();
     }
+    const verifiedExperimentAuthority = verifyPersistedExperimentAuthority(
+        current.aggregate,
+        deps,
+        args.investigation_id,
+    );
+    const experimentAuthority = readVerifiedExperimentAuthority(
+        verifiedExperimentAuthority,
+    ).authority;
+    const runtimeConfigAuthority = current.aggregate.runtimeConfigAuthority;
+    if (runtimeConfigAuthority === null
+        || current.aggregate.runtimeConfigFingerprint === null
+        || runtimeConfigAuthority.fingerprint
+            !== current.aggregate.runtimeConfigFingerprint) {
+        authorityMismatch(
+            null,
+            "persisted investigation has no valid immutable runtime config authority",
+            { investigationId: args.investigation_id },
+        );
+    }
+    let matchedPersistedConfig;
+    try {
+        matchedPersistedConfig =
+            assertSupervisorConfigMatchesRuntimeAuthority(
+                persistedConfig,
+                runtimeConfigAuthority,
+                { env: deps.env },
+            );
+    } catch (error) {
+        authorityMismatch(
+            error,
+            `persisted supervisor configuration was tampered: ${
+                error?.message ?? String(error)
+            }`,
+            { investigationId: args.investigation_id },
+        );
+    }
+    const deadline = persistedDeadline(matchedPersistedConfig, args, deps);
+    let supervisorAdmission;
+    try {
+        const reconstructed = supervisorConfigFromRuntimeAuthority(
+            runtimeConfigAuthority,
+            {
+                deadlineMs: deadline.deadlineMs,
+                env: deps.env,
+            },
+        );
+        supervisorAdmission = validateSupervisorAdmission(
+            reconstructed,
+            deps,
+        );
+        verifyRuntimeConfigAuthority(runtimeConfigAuthority, {
+            env: deps.env,
+            deadlineMs: deadline.deadlineMs,
+            expectedInvestigationId: args.investigation_id,
+            expectedStateDir: paths.stateDir,
+            expectedArtifactRoot: paths.artifactRoot,
+            nodeExecutable: supervisorAdmission.nodeExecutable,
+        });
+    } catch (error) {
+        authorityMismatch(
+            error,
+            `immutable runtime configuration verification failed: ${
+                error?.message ?? String(error)
+            }`,
+            { investigationId: args.investigation_id },
+        );
+    }
+    const supervisorConfig = supervisorAdmission.config;
 
     const artifactStore = deps.openArtifactStoreReadOnly({
         root: paths.artifactRoot,
@@ -669,10 +989,10 @@ function preflightReattachInvestigation(args, deps) {
 
     const allowlist = loadAllowlistForPreflight(
         deps,
-        persistedConfig.runner.allowlistPath,
+        supervisorConfig.runner.allowlistPath,
     );
-    const frozenIdentity = current.aggregate.contract.harnessIdentity;
-    if (!frozenIdentity.executesCandidateCode) {
+    const frozenSuite = current.aggregate.contract.harnessSuite;
+    if (!suiteRequiresSandbox(frozenSuite)) {
         return reattachPlan({
             args,
             deps,
@@ -681,10 +1001,19 @@ function preflightReattachInvestigation(args, deps) {
             current,
             operationalNonResult,
             supervisorConfig,
+            supervisorAdmission,
             deadline,
             allowlist,
-            sandbox: Object.freeze({ required: false, available: true }),
+            sandbox: Object.freeze({
+                required: false,
+                available: true,
+                policyDigest: null,
+            }),
             workspace: null,
+            experimentAuthority,
+            verifiedExperimentAuthority,
+            runtimeConfigAuthority,
+            selection,
         });
     }
 
@@ -706,10 +1035,15 @@ function preflightReattachInvestigation(args, deps) {
             current,
             operationalNonResult,
             supervisorConfig,
+            supervisorAdmission,
             deadline,
             allowlist,
-            sandbox: validateSandboxAvailability(resolved, frozenIdentity.harnessId),
+            sandbox: validateSandboxAvailability(resolved, frozenSuite.id),
             workspace,
+            experimentAuthority,
+            verifiedExperimentAuthority,
+            runtimeConfigAuthority,
+            selection,
         });
         if (isThenable(availability)) {
             return Promise.resolve(availability).then(finish).catch((error) => {
@@ -778,48 +1112,65 @@ function finalizePreflight({
     args,
     deps,
     environment,
+    experiment,
+    registry,
     objective,
     projectDir,
     investigationId,
     paths,
     deadline,
     supervisorConfig,
+    supervisorAdmission,
     workspace,
-    stagedCases,
     stagingPlan,
     allowlist,
     sandbox,
-    harnessVerification: verifiedHarness = null,
+    contract,
+    contractDigest,
+    promptCore,
+    executionLimits,
+    harnessVerification,
 }) {
-    const harnessVerification = verifiedHarness ?? verifyHarness(
-        allowlist,
-        args.harness_id,
-        stagedCases,
-    );
-    const harnessIdentity = buildFrozenHarnessIdentity(harnessVerification, {
-        sandbox,
-    });
-    let contract;
-    let promptCore;
     try {
-        contract = createInvestigationContract(
-            contractInput(
-                args,
-                objective,
-                stagingPlan.validationCases,
-                harnessIdentity,
-            ),
-        );
-        promptCore = assertPromptContractCoreFits(contract);
+        registry.reverifyFile(deps.env);
     } catch (error) {
-        throw new StartPreflightError(
-            `canonical contract creation failed: ${error?.message ?? String(error)}`,
-            { cause: error?.code ?? null },
+        throw new ExperimentRegistryApiError(
+            `operator experiment registry changed during preflight: ${
+                error?.message ?? String(error)
+            }`,
+            {
+                experimentId: experiment.experimentId,
+                registryPath: registry.registryPath,
+                cause: error?.code ?? null,
+            },
             { cause: error },
         );
     }
-    const contractDigest = contractHash(contract);
-    const executionLimits = deriveRunnerExecutionLimits(contract);
+    let verifiedExperimentAuthority;
+    try {
+        verifiedExperimentAuthority = verifyExperimentAuthority({
+            authority: experiment.authority,
+            experimentId: experiment.experimentId,
+            projectDir,
+            harnessSuiteId: experiment.harnessSuiteId,
+            contract,
+            investigationId,
+            env: deps.env,
+        });
+    } catch (error) {
+        throw new ExperimentRegistryApiError(
+            `preapproved experiment authority failed verification during preflight: ${
+                error?.message ?? String(error)
+            }`,
+            {
+                experimentId: experiment.experimentId,
+                investigationId,
+                cause: error?.code ?? null,
+            },
+            { cause: error },
+        );
+    }
+    validateHarnessSuiteSandbox(contract.harnessSuite, sandbox);
     if (supervisorConfig.runner.options.maxLoopIterations
             < executionLimits.maxLoopIterations
         || supervisorConfig.maxRestarts < executionLimits.maxRestarts) {
@@ -838,36 +1189,61 @@ function finalizePreflight({
         paths,
         investigationId,
         requestedContractHash: contractDigest,
+        requestedAuthorityIdentity: experiment.authority.identity,
         args,
         deadline,
     });
+    if (existing.mode !== "new") {
+        throw new StartPreflightError(
+            "investigation appeared during preflight; retry crucible_start so immutable reattach admission can replay it",
+            { investigationId },
+        );
+    }
+    const runtimeConfigAuthority = buildRuntimeConfigAuthority({
+        supervisorConfig,
+        nodeExecutable: supervisorAdmission.nodeExecutable,
+        sandbox,
+        env: deps.env,
+    });
     return createPlan({
         version: 1,
-        kind: existing.mode === "new" ? "new" : "contract_reattach",
+        kind: "new",
         canonicalArgs: args,
         environment,
+        experimentId: experiment.experimentId,
+        experimentIdentity: experiment.experimentIdentity,
+        experimentAuthority: experiment.authority,
+        registryVerification: registry.verification,
         objective,
         projectDir,
         investigationId,
         paths,
         deadline,
         supervisorConfig,
+        runtimeConfigAuthority,
         contract,
-        harnessIdentity,
+        harnessSuite: contract.harnessSuite,
+        verifiedExperimentAuthority,
         hashes: Object.freeze({
             contractHash: contractDigest,
-            allowlistFileHash: harnessVerification.allowlistFileHash,
-            harnessEntryHash: harnessVerification.harnessEntryHash,
-            executableHash: harnessVerification.executableHash,
-            dependencyHashes: harnessVerification.dependencyHashes,
-            argvTemplateHash: harnessVerification.argvTemplateHash,
-            allowedEnvHash: harnessVerification.allowedEnvHash,
-            parserVersionHash: harnessVerification.parserVersionHash,
-            parserSourceHash: harnessVerification.parserSourceHash,
+            experimentIdentity: experiment.experimentIdentity,
+            experimentAuthorityIdentity: experiment.authority.identity,
+            authorityManifestIdentity:
+                experiment.authority.manifestIdentity,
+            trustFingerprint: experiment.authority.trustFingerprint,
+            registryFileHash: registry.registryFileHash,
+            registryIdentity: registry.registryIdentity,
+            allowlistFileHash: allowlist.allowlistFileHash,
+            harnessSuiteIdentity: contract.harnessSuiteIdentity,
+            harnessRoleEntryHashes: Object.freeze(Object.fromEntries(
+                Object.entries(contract.harnessSuite.roles)
+                    .map(([role, spec]) => [role, spec.harnessEntryHash]),
+            )),
             sandboxHelperSourceHash: sandbox?.helperSourceHash ?? null,
             sandboxHelperBinaryHash: sandbox?.helperBinaryHash ?? null,
             sandboxLauncherBinaryHash: sandbox?.launcherBinaryHash ?? null,
             sandboxLauncherScriptHash: sandbox?.launcherScriptHash ?? null,
+            runtimeConfigFingerprint: runtimeConfigAuthority.fingerprint,
         }),
         harnessVerification,
         sandbox,
@@ -883,26 +1259,81 @@ export function preflightStartInvestigation(rawArgs, deps) {
     if (args.investigation_id !== undefined) {
         return preflightReattachInvestigation(args, deps);
     }
+    const preapproved = loadPreapprovedExperiment(args, deps);
+    const reattachStateRoot = resolveStateRoot(deps.env);
+    const reattachPaths = resolveInvestigationPaths(
+        reattachStateRoot,
+        preapproved.investigationId,
+    );
+    if (fs.existsSync(reattachPaths.eventsDbPath)) {
+        const reattachArgs = Object.freeze({
+            investigation_id: preapproved.investigationId,
+            ...(args.deadline_iso === undefined
+                ? {}
+                : { deadline_iso: args.deadline_iso }),
+            ...(args.reset_policy === undefined
+                ? {}
+                : { reset_policy: args.reset_policy }),
+        });
+        const validate = (plan) => {
+            if (plan.hashes.contractHash !== preapproved.contractDigest
+                || plan.hashes.experimentAuthorityIdentity
+                    !== preapproved.experiment.authority.identity) {
+                disposeStartPreflight(plan, deps);
+                throw new ContractConflictError(
+                    "existing investigation does not match the selected authoritative experiment",
+                    { investigationId: preapproved.investigationId },
+                );
+            }
+            return plan;
+        };
+        const reattach = preflightReattachInvestigation(
+            reattachArgs,
+            deps,
+            Object.freeze({
+                experimentId: preapproved.experiment.experimentId,
+                experimentIdentity:
+                    preapproved.experiment.experimentIdentity,
+                registryVerification: preapproved.registry.verification,
+                projectDir: preapproved.projectDir,
+            }),
+        );
+        return isThenable(reattach)
+            ? Promise.resolve(reattach).then(validate)
+            : validate(reattach);
+    }
     const environment = resolveStartEnvironment(deps.env);
-    const objective = canonicalObjective(args.objective);
-    const projectDir = resolveProjectDir(args.project_dir, deps.env);
     const allowlist = loadAllowlistForPreflight(deps, environment.allowlistPath);
-    if (!allowlist.listEntryIds().includes(args.harness_id)) {
+    if (!allowlist.listSuiteIds().includes(preapproved.experiment.harnessSuiteId)) {
         throw new HarnessNotAllowlistedError(
-            `harness '${args.harness_id}' has no operator allowlist entry`,
-            { harnessId: args.harness_id, allowlistPath: environment.allowlistPath },
+            `harness suite '${preapproved.experiment.harnessSuiteId}' has no operator allowlist entry`,
+            {
+                harnessSuiteId: preapproved.experiment.harnessSuiteId,
+                allowlistPath: environment.allowlistPath,
+            },
         );
     }
-    const investigationId = deriveInvestigationId({
-        objective,
-        projectDir,
-        harnessId: args.harness_id,
-        harnessEntryHash: allowlist.getEntryHash(args.harness_id),
-    });
+    const harnessSuite = allowlist.getSuite(preapproved.experiment.harnessSuiteId);
+    const harnessSuiteIdentity = allowlist.getSuiteIdentity(
+        preapproved.experiment.harnessSuiteId,
+    );
+    if (harnessSuiteIdentity !== preapproved.experiment.harnessSuiteIdentity
+        || !canonicalEqual(harnessSuite, preapproved.contract.harnessSuite)) {
+        throw new HarnessConfigurationError(
+            "allowlisted HarnessSuiteV4 no longer matches the preapproved experiment",
+            {
+                experimentId: preapproved.experiment.experimentId,
+                harnessSuiteId: preapproved.experiment.harnessSuiteId,
+                expectedIdentity: preapproved.experiment.harnessSuiteIdentity,
+                actualIdentity: harnessSuiteIdentity,
+            },
+        );
+    }
+    const contractDigest = preapproved.contractDigest;
+    const investigationId = preapproved.investigationId;
     const paths = resolveInvestigationPaths(environment.stateRoot, investigationId);
     const deadline = normalizeDeadline(args, deps);
-    const contractShape = validateContractShape(args, objective);
-    const executionLimits = deriveRunnerExecutionLimits(contractShape.contract);
+    const executionLimits = deriveRunnerExecutionLimits(preapproved.contract);
     const supervisorInput = buildSupervisorConfigInput({
         investigationId,
         stateDir: paths.stateDir,
@@ -913,9 +1344,15 @@ export function preflightStartInvestigation(rawArgs, deps) {
         deadlineIso: deadline.deadlineIso,
         executionLimits,
     });
-    const supervisorConfig = validateSupervisorAdmission(
+    const supervisorAdmission = validateSupervisorAdmission(
         normalizeSupervisor(supervisorInput, deps),
         deps,
+    );
+    const supervisorConfig = supervisorAdmission.config;
+    const harnessVerification = verifyHarnessSuite(
+        allowlist,
+        preapproved.experiment.harnessSuiteId,
+        harnessSuiteIdentity,
     );
 
     let workspace = null;
@@ -929,36 +1366,48 @@ export function preflightStartInvestigation(rawArgs, deps) {
             root: workspace.snapshotStoreRoot,
             env: deps.env,
         });
-        const stagedCases = stageValidationCases(
+        const operatorStore = deps.openArtifactStoreReadOnly({
+            root: environment.caseStorePath,
+            env: deps.env,
+        });
+        const staged = stageContractSnapshots({
+            sourceStore: operatorStore,
             stagingStore,
-            projectDir,
-            args.validation_cases,
-            deps.env,
-        );
-        const stagingPlan = snapshotStagingPlan(workspace, stagedCases);
-        const initialHarnessVerification = verifyHarness(
-            allowlist,
-            args.harness_id,
-            stagedCases,
+            contract: preapproved.contract,
+        });
+        const stagingPlan = snapshotStagingPlan(
+            workspace,
+            preapproved.contract,
+            staged,
         );
 
-        if (!initialHarnessVerification.entry.executesCandidateCode) {
+        if (!suiteRequiresSandbox(harnessSuite)) {
             return finalizePreflight({
                 args,
                 deps,
                 environment,
-                objective,
-                projectDir,
+                experiment: preapproved.experiment,
+                registry: preapproved.registry,
+                objective: preapproved.contract.objective,
+                projectDir: preapproved.projectDir,
                 investigationId,
                 paths,
                 deadline,
                 supervisorConfig,
+                supervisorAdmission,
                 workspace,
-                stagedCases,
                 stagingPlan,
                 allowlist,
-                sandbox: Object.freeze({ required: false, available: true }),
-                harnessVerification: initialHarnessVerification,
+                sandbox: Object.freeze({
+                    required: false,
+                    available: true,
+                    policyDigest: null,
+                }),
+                contract: preapproved.contract,
+                contractDigest,
+                promptCore: preapproved.promptCore,
+                executionLimits,
+                harnessVerification,
             });
         }
 
@@ -970,7 +1419,10 @@ export function preflightStartInvestigation(rawArgs, deps) {
         } catch (error) {
             throw new SandboxUnavailableApiError(
                 `sandbox availability probe failed: ${error?.message ?? String(error)}`,
-                { harnessId: args.harness_id, cause: error?.code ?? null },
+                {
+                    harnessSuiteId: preapproved.experiment.harnessSuiteId,
+                    cause: error?.code ?? null,
+                },
                 { cause: error },
             );
         }
@@ -980,22 +1432,36 @@ export function preflightStartInvestigation(rawArgs, deps) {
                     args,
                     deps,
                     environment,
-                    objective,
-                    projectDir,
+                    experiment: preapproved.experiment,
+                    registry: preapproved.registry,
+                    objective: preapproved.contract.objective,
+                    projectDir: preapproved.projectDir,
                     investigationId,
                     paths,
                     deadline,
                     supervisorConfig,
+                    supervisorAdmission,
                     workspace,
-                    stagedCases,
                     stagingPlan,
                     allowlist,
-                    sandbox: validateSandboxAvailability(resolved, args.harness_id),
+                    sandbox: validateSandboxAvailability(
+                        resolved,
+                        preapproved.experiment.harnessSuiteId,
+                    ),
+                    contract: preapproved.contract,
+                    contractDigest,
+                    promptCore: preapproved.promptCore,
+                    executionLimits,
+                    harnessVerification,
                 }),
                 (error) => {
                     throw new SandboxUnavailableApiError(
                         `sandbox availability probe failed: ${error?.message ?? String(error)}`,
-                        { harnessId: args.harness_id, cause: error?.code ?? null },
+                        {
+                            harnessSuiteId:
+                                preapproved.experiment.harnessSuiteId,
+                            cause: error?.code ?? null,
+                        },
                         { cause: error },
                     );
                 },
@@ -1008,17 +1474,27 @@ export function preflightStartInvestigation(rawArgs, deps) {
             args,
             deps,
             environment,
-            objective,
-            projectDir,
+            experiment: preapproved.experiment,
+            registry: preapproved.registry,
+            objective: preapproved.contract.objective,
+            projectDir: preapproved.projectDir,
             investigationId,
             paths,
             deadline,
             supervisorConfig,
+            supervisorAdmission,
             workspace,
-            stagedCases,
             stagingPlan,
             allowlist,
-            sandbox: validateSandboxAvailability(availability, args.harness_id),
+            sandbox: validateSandboxAvailability(
+                availability,
+                preapproved.experiment.harnessSuiteId,
+            ),
+            contract: preapproved.contract,
+            contractDigest,
+            promptCore: preapproved.promptCore,
+            executionLimits,
+            harnessVerification,
         });
     } catch (error) {
         cleanupWorkspace(workspace, error);
@@ -1065,9 +1541,18 @@ function publishSnapshotStagingPlan(plan, deps) {
 }
 
 function assertReattachState(plan, adapter) {
-    const current = adapter.replay();
+    let current;
+    try {
+        current = adapter.replay();
+    } catch (error) {
+        throwLegacyIncompatible(error, plan.investigationId);
+    }
     const operationalNonResult = adapter.latestOperationalNonResult();
     if (current.aggregate.contractHash !== plan.hashes.contractHash
+        || current.aggregate.experimentAuthorityIdentity
+            !== plan.hashes.experimentAuthorityIdentity
+        || current.aggregate.runtimeConfigFingerprint
+            !== plan.hashes.runtimeConfigFingerprint
         || current.aggregate.lastSeq !== plan.existing.expectedLastSeq
         || (current.aggregate.pause !== null) !== plan.existing.expectedPaused
         || (operationalNonResult?.seq ?? null) !== plan.existing.expectedOperationalSeq
@@ -1081,7 +1566,7 @@ function assertReattachState(plan, adapter) {
     return { current, operationalNonResult };
 }
 
-function applyContractPlan(plan, adapter) {
+function applyContractPlan(plan, adapter, verifiedExperimentAuthority) {
     if (plan.existing.mode === "new") {
         const current = adapter.replay();
         if (current.aggregate.contract !== null) {
@@ -1091,7 +1576,11 @@ function applyContractPlan(plan, adapter) {
             );
         }
 
-        const opened = adapter.openInvestigation(plan.contract);
+        const opened = adapter.openInvestigation(
+            plan.contract,
+            verifiedExperimentAuthority,
+            plan.runtimeConfigAuthority,
+        );
         return {
             idempotent: false,
             aggregate: opened.aggregate,
@@ -1262,7 +1751,88 @@ export function applyStartPreflight(plan, deps) {
         );
     };
 
+    let verifiedExperimentAuthority;
     try {
+        try {
+            const payload =
+                plan.experimentAuthority.manifest.experimentPayload;
+            verifiedExperimentAuthority = verifyExperimentAuthority({
+                authority: plan.experimentAuthority,
+                experimentId: payload.experimentId,
+                projectDir: payload.projectDir,
+                harnessSuiteId: payload.harnessSuiteId,
+                contract: plan.contract,
+                investigationId: plan.investigationId,
+                env: deps.env,
+            });
+        } catch (error) {
+            authorityMismatch(
+                error,
+                `experiment authority changed after preflight: ${
+                    error?.message ?? String(error)
+                }`,
+                {
+                    investigationId: plan.investigationId,
+                    persistedTrustFingerprint:
+                        plan.experimentAuthority?.trustFingerprint ?? null,
+                },
+            );
+        }
+        try {
+            assertSupervisorConfigMatchesRuntimeAuthority(
+                plan.supervisorConfig,
+                plan.runtimeConfigAuthority,
+                { env: deps.env },
+            );
+            const admission = validateSupervisorAdmission(
+                plan.supervisorConfig,
+                deps,
+            );
+            verifyRuntimeConfigAuthority(plan.runtimeConfigAuthority, {
+                env: deps.env,
+                deadlineMs: plan.deadline.deadlineMs,
+                expectedInvestigationId: plan.investigationId,
+                expectedStateDir: plan.paths.stateDir,
+                expectedArtifactRoot: plan.paths.artifactRoot,
+                nodeExecutable: admission.nodeExecutable,
+                sandbox: plan.sandbox,
+            });
+        } catch (error) {
+            authorityMismatch(
+                error,
+                `runtime configuration changed after preflight: ${
+                    error?.message ?? String(error)
+                }`,
+                {
+                    investigationId: plan.investigationId,
+                    runtimeConfigFingerprint:
+                        plan.runtimeConfigAuthority?.fingerprint ?? null,
+                },
+            );
+        }
+        if (plan.registryVerification !== undefined
+            && plan.registryVerification !== null) {
+            try {
+                (deps.reverifyExperimentRegistryFile
+                    ?? reverifyExperimentRegistryFile)(
+                    plan.registryVerification,
+                    { env: deps.env },
+                );
+            } catch (error) {
+                throw new ExperimentRegistryApiError(
+                    `operator experiment registry changed after preflight: ${
+                        error?.message ?? String(error)
+                    }`,
+                    {
+                        experimentId: plan.experimentId,
+                        registryPath:
+                            plan.registryVerification.registryPath,
+                        cause: error?.code ?? null,
+                    },
+                    { cause: error },
+                );
+            }
+        }
         if (isNew) {
             ownership = ensureOwnedInvestigationDirectory(plan);
         }
@@ -1278,7 +1848,11 @@ export function applyStartPreflight(plan, deps) {
             repository,
             investigationId: plan.investigationId,
         });
-        const opened = applyContractPlan(plan, adapter);
+        const opened = applyContractPlan(
+            plan,
+            adapter,
+            verifiedExperimentAuthority,
+        );
         durableApplied = true;
         const acceptSupervisor = (supervisor) => {
             if (!supervisorStartAccepted(supervisor)) {

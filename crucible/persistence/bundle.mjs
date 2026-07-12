@@ -14,6 +14,7 @@ import {
 } from "node:crypto";
 import { TextDecoder } from "node:util";
 
+import { DOMAIN_VERSION } from "../domain/constants.mjs";
 import { CruciblePersistenceError, InvalidArgumentError } from "./errors.mjs";
 import { assertLocalDatabasePath } from "./paths.mjs";
 import { canonicalize, normalizeCreatedAt } from "./canonical.mjs";
@@ -34,7 +35,7 @@ import {
 
 const ALGO = "sha256";
 export const BUNDLE_TYPE = "crucible-audit-bundle";
-export const BUNDLE_VERSION = 2;
+export const BUNDLE_VERSION = 3;
 
 const INVENTORY_NAME = "inventory.sha256";
 const MANIFEST_NAME = "manifest.json";
@@ -75,7 +76,7 @@ const DATABASE_KEYS = Object.freeze([
     "sha256",
     "size",
 ]);
-const INVESTIGATION_KEYS = Object.freeze(["domainHead", "id"]);
+const INVESTIGATION_KEYS = Object.freeze(["domainHead", "domainVersion", "id"]);
 const DOMAIN_HEAD_KEYS = Object.freeze(["eventHash", "seq"]);
 const ARTIFACT_KEYS = Object.freeze([
     "artifactId",
@@ -96,6 +97,7 @@ export const BUNDLE_ERROR_CODES = Object.freeze({
     OBJECT_MISSING: "CRUCIBLE_BUNDLE_OBJECT_MISSING",
     INVENTORY_INVALID: "CRUCIBLE_BUNDLE_INVENTORY_INVALID",
     MANIFEST_INVALID: "CRUCIBLE_BUNDLE_MANIFEST_INVALID",
+    DOMAIN_VERSION_MISMATCH: "CRUCIBLE_BUNDLE_DOMAIN_VERSION_MISMATCH",
     CLOSURE_INVALID: "CRUCIBLE_BUNDLE_CLOSURE_INVALID",
     AUTHENTICATION_REQUIRED: "CRUCIBLE_BUNDLE_AUTHENTICATION_REQUIRED",
     AUTHENTICATION_FAILED: "CRUCIBLE_BUNDLE_AUTHENTICATION_FAILED",
@@ -135,6 +137,18 @@ export class BundleManifestError extends BundleError {
     constructor(message, details) {
         super(BUNDLE_ERROR_CODES.MANIFEST_INVALID, message, details);
         this.name = "BundleManifestError";
+    }
+}
+
+export class BundleDomainVersionMismatchError extends BundleError {
+    constructor(message, details) {
+        super(BUNDLE_ERROR_CODES.DOMAIN_VERSION_MISMATCH, message, {
+            compatibility: "legacy_incompatible",
+            restartRequired: true,
+            requiredAction: "start_new_investigation",
+            ...details,
+        });
+        this.name = "BundleDomainVersionMismatchError";
     }
 }
 
@@ -1263,6 +1277,8 @@ function validateManifest(value, rawBytes = null) {
     if (!hasExactKeys(value.investigation, INVESTIGATION_KEYS)
         || typeof value.investigation.id !== "string"
         || value.investigation.id.length === 0
+        || !Number.isSafeInteger(value.investigation.domainVersion)
+        || value.investigation.domainVersion < 1
         || !hasExactKeys(value.investigation.domainHead, DOMAIN_HEAD_KEYS)) {
         throw new BundleManifestError("manifest investigation binding is invalid");
     }
@@ -1410,6 +1426,76 @@ function removeBundleDatabaseSidecars(dbFile) {
     }
 }
 
+function inspectPersistedDomainVersion(repo, investigation) {
+    const metadataDomainVersion = Number.isSafeInteger(
+        investigation.metadata?.domainVersion,
+    ) && investigation.metadata.domainVersion > 0
+        ? investigation.metadata.domainVersion
+        : null;
+    const first = repo.getEvent(investigation.investigationId, 1);
+    const isDomainOpening = first !== null
+        && /^domain:(?:v[1-9][0-9]*:)?investigation_opened$/u.test(first.kind)
+        && first.payload?.domainEvent?.type === "investigation_opened";
+    if (!isDomainOpening) {
+        if (metadataDomainVersion === null) {
+            throw new BundleError(
+                BUNDLE_ERROR_CODES.SOURCE_INVALID,
+                "investigation domain version is not discoverable from its opening event or metadata",
+                { investigationId: investigation.investigationId },
+            );
+        }
+        return metadataDomainVersion;
+    }
+
+    const eventDomainVersion = first.payload?.domainEvent?.payload?.domainVersion;
+    const contractDomainVersion =
+        first.payload?.domainEvent?.payload?.contract?.domainVersion ?? null;
+    if (!Number.isSafeInteger(eventDomainVersion) || eventDomainVersion < 1) {
+        throw new BundleError(
+            BUNDLE_ERROR_CODES.SOURCE_INVALID,
+            "investigation opening event has no valid domain version",
+            { investigationId: investigation.investigationId },
+        );
+    }
+    if (contractDomainVersion !== null
+        && contractDomainVersion !== eventDomainVersion) {
+        throw new BundleError(
+            BUNDLE_ERROR_CODES.SOURCE_INVALID,
+            "investigation opening event and contract domain versions disagree",
+            {
+                investigationId: investigation.investigationId,
+                eventDomainVersion,
+                contractDomainVersion,
+            },
+        );
+    }
+    if (eventDomainVersion === DOMAIN_VERSION
+        && contractDomainVersion !== DOMAIN_VERSION) {
+        throw new BundleError(
+            BUNDLE_ERROR_CODES.SOURCE_INVALID,
+            "active-domain investigation contract is missing its authoritative domain version",
+            {
+                investigationId: investigation.investigationId,
+                eventDomainVersion,
+                contractDomainVersion,
+            },
+        );
+    }
+    if (metadataDomainVersion !== null
+        && metadataDomainVersion !== eventDomainVersion) {
+        throw new BundleError(
+            BUNDLE_ERROR_CODES.SOURCE_INVALID,
+            "investigation metadata and opening event domain versions disagree",
+            {
+                investigationId: investigation.investigationId,
+                metadataDomainVersion,
+                eventDomainVersion,
+            },
+        );
+    }
+    return eventDomainVersion;
+}
+
 function inspectDatabaseBinding(dbFile, requestedInvestigationId = null) {
     const investigationId = requestedInvestigationId ?? inferInvestigationId(dbFile);
     if (typeof investigationId !== "string" || investigationId.length === 0) {
@@ -1430,6 +1516,7 @@ function inspectDatabaseBinding(dbFile, requestedInvestigationId = null) {
                 violations: report.violations,
             });
         }
+        const domainVersion = inspectPersistedDomainVersion(repo, investigation);
         const head = repo.getHead(investigationId);
         const artifactsById = new Map();
         for (const ref of repo.listArtifactRefs(investigationId)) {
@@ -1472,6 +1559,7 @@ function inspectDatabaseBinding(dbFile, requestedInvestigationId = null) {
             .sort(compareStable);
         return {
             investigationId,
+            domainVersion,
             domainHead: { seq: head.seq, eventHash: head.eventHash },
             artifacts,
             snapshotRoots,
@@ -1731,7 +1819,11 @@ function expectedBundlePaths(manifest) {
     ].sort(compareStable);
 }
 
-function verifyBundleStage(stageRoot, expectedInvestigationId = null) {
+function verifyBundleStage(
+    stageRoot,
+    expectedInvestigationId = null,
+    requiredDomainVersion = null,
+) {
     const scan = scanTree(stageRoot,
         Object.freeze({ operation: "verify", faultInjector: null, hooks: null }));
     const inventoryPath = path.join(stageRoot, INVENTORY_NAME);
@@ -1805,8 +1897,21 @@ function verifyBundleStage(stageRoot, expectedInvestigationId = null) {
             { expectedInvestigationId, actualInvestigationId: binding.investigationId },
         );
     }
+    if (requiredDomainVersion !== null
+        && binding.domainVersion !== requiredDomainVersion) {
+        throw new BundleDomainVersionMismatchError(
+            "bundle domain version is incompatible with the active Crucible domain",
+            {
+                expectedDomainVersion: requiredDomainVersion,
+                actualDomainVersion: binding.domainVersion,
+                manifestDomainVersion: manifest.investigation.domainVersion,
+                investigationId: binding.investigationId,
+            },
+        );
+    }
     if (!canonicalEqual(manifest.investigation, {
         id: binding.investigationId,
+        domainVersion: binding.domainVersion,
         domainHead: binding.domainHead,
     })) {
         throw new BundleError(
@@ -1816,6 +1921,7 @@ function verifyBundleStage(stageRoot, expectedInvestigationId = null) {
                 manifest: manifest.investigation,
                 database: {
                     id: binding.investigationId,
+                    domainVersion: binding.domainVersion,
                     domainHead: binding.domainHead,
                 },
             },
@@ -2094,6 +2200,7 @@ export function exportBundle(options = {}) {
             },
             investigation: {
                 id: binding.investigationId,
+                domainVersion: binding.domainVersion,
                 domainHead: binding.domainHead,
             },
             artifacts: binding.artifacts,
@@ -2135,6 +2242,7 @@ export function exportBundle(options = {}) {
             digest: verification.digest,
             trustLevel: "self-consistent",
             investigationId: verification.binding.investigationId,
+            domainVersion: verification.binding.domainVersion,
             domainHead: verification.binding.domainHead,
         };
     });
@@ -2239,10 +2347,18 @@ export function importBundle(options = {}) {
 
         return {};
     }, (root, _draft, publication) => {
-        const verification = verifyBundleStage(root);
+        const verification = verifyBundleStage(
+            root,
+            null,
+            DOMAIN_VERSION,
+        );
         if (publication.phase === "staged") {
             const trustLevel = authenticateImport(verification, options);
-            const postAuthentication = verifyBundleStage(root);
+            const postAuthentication = verifyBundleStage(
+                root,
+                null,
+                DOMAIN_VERSION,
+            );
             assertSameVerifiedBundle(verification, postAuthentication);
             return {
                 verification: postAuthentication,
@@ -2260,6 +2376,7 @@ export function importBundle(options = {}) {
             digest: verification.digest,
             trustLevel: publication.prepared.trustLevel,
             investigationId: verification.binding.investigationId,
+            domainVersion: verification.binding.domainVersion,
             domainHead: verification.binding.domainHead,
         };
     });

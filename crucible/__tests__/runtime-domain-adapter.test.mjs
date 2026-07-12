@@ -6,15 +6,26 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import {
     DEFAULT_SEARCH_POLICY,
+    createInvestigationOpenedEvent,
     createInvestigationContract,
+    experimentAuthorityIdentity,
 } from "../domain/index.mjs";
+import * as experimentAuthorityApi from "../api/experiment-authority.mjs";
 import { PARSER_VERSION } from "../measurement/index.mjs";
 import { openRepository } from "../persistence/index.mjs";
 import {
+    RUNTIME_ERROR_CODES,
     createDomainRepositoryAdapter,
     formatAttemptCommand,
+    inspectInvestigationDomainCompatibility,
 } from "../runtime/index.mjs";
-import { fakeHarnessIdentity } from "./harness-identity-fixture.mjs";
+import { appendLegacyV3Investigation } from "./legacy-v3-fixture.mjs";
+import {
+    createExperimentAuthorityFixture,
+    createRuntimeConfigAuthorityFixture,
+    createSignedInvestigationAuthority,
+} from "./experiment-authority-fixture.mjs";
+import { makeV4ContractInput } from "./v4-contract-fixture.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const roots = [];
@@ -45,30 +56,33 @@ function artifactHash(character) {
     return `sha256:${character.repeat(64)}`;
 }
 
-function contract() {
-    return createInvestigationContract({
+function contract(overrides = {}) {
+    return createInvestigationContract(makeV4ContractInput({
         objective: "exercise runtime domain adapter fencing",
         acceptancePredicate: { kind: "harness_pass" },
-        validationCases: [
-            { id: "good", expectation: "accept", artifactHash: artifactHash("a") },
-            { id: "bad", expectation: "reject", artifactHash: artifactHash("b") },
-        ],
-        harnessId: "fixture-harness",
         hypothesisTopology: "finite_enumerable",
-        boundedCandidateIds: ["candidate-a"],
         criticality: "high",
         policyVersion: "policy-v1",
-        parserVersion: PARSER_VERSION,
-        harnessIdentity: fakeHarnessIdentity({
-            harnessId: "fixture-harness",
-            parserVersion: PARSER_VERSION,
-        }),
         workerModels: ["model-a"],
         candidatesPerRound: 1,
         maxRounds: 1,
-        metrics: [],
         searchPolicy: DEFAULT_SEARCH_POLICY,
-        declaredLimits: { maxCommands: 4 },
+        ...overrides,
+    }));
+}
+
+function withZeroSignature(authority) {
+    const {
+        identity: _identity,
+        ...unsignedCore
+    } = authority;
+    const core = {
+        ...unsignedCore,
+        signature: Buffer.alloc(64).toString("base64"),
+    };
+    return Object.freeze({
+        ...core,
+        identity: experimentAuthorityIdentity(core),
     });
 }
 
@@ -76,15 +90,303 @@ function openAdapter(label) {
     const root = fs.mkdtempSync(path.join(HERE, `.runtime-adapter-fast-${label}-`));
     roots.push(root);
     const repository = openRepository({ file: path.join(root, "events.sqlite") });
+    const resolvedContract = contract();
+    const signed = createSignedInvestigationAuthority({
+        contract: resolvedContract,
+        experimentId: `runtime-${label}`,
+        projectDir: root,
+    });
     const adapter = createDomainRepositoryAdapter({
         repository,
-        investigationId: "inv-runtime-fast",
+        investigationId: signed.investigationId,
     });
-    adapter.openInvestigation(contract());
+    adapter.openInvestigation(
+        resolvedContract,
+        signed.capability,
+        createRuntimeConfigAuthorityFixture(signed.investigationId),
+    );
     return { repository, adapter };
 }
 
 describe("Crucible domain repository adapter fast component coverage", () => {
+    it("requires the opaque verified capability and persists only its signed envelope", () => {
+        const root = fs.mkdtempSync(
+            path.join(HERE, ".runtime-adapter-capability-"),
+        );
+        roots.push(root);
+        const repository = openRepository({
+            file: path.join(root, "events.sqlite"),
+        });
+        const resolvedContract = contract();
+        const signed = createSignedInvestigationAuthority({
+            contract: resolvedContract,
+            experimentId: "runtime-capability",
+            projectDir: root,
+        });
+        const adapter = createDomainRepositoryAdapter({
+            repository,
+            investigationId: signed.investigationId,
+        });
+        const runtimeAuthority = createRuntimeConfigAuthorityFixture(
+            signed.investigationId,
+        );
+        try {
+            expect(Object.keys(signed.capability)).toEqual([]);
+            expect(Object.isFrozen(signed.capability)).toBe(true);
+            expect(experimentAuthorityApi).not.toHaveProperty(
+                "VerifiedExperimentAuthority",
+            );
+            expect(Object.values(experimentAuthorityApi).some(
+                (value) => typeof value === "symbol",
+            )).toBe(false);
+            expect(() => new signed.capability.constructor(
+                Object.freeze({ authority: signed.authority }),
+            )).toThrow(TypeError);
+
+            for (const forged of [
+                signed.authority,
+                Object.freeze({}),
+                Object.freeze(Object.create(
+                    Object.getPrototypeOf(signed.capability),
+                )),
+            ]) {
+                expect(() => adapter.openInvestigation(
+                    resolvedContract,
+                    forged,
+                    runtimeAuthority,
+                )).toThrow(expect.objectContaining({
+                    code: RUNTIME_ERROR_CODES.DOMAIN_EVENT_INVALID,
+                }));
+                expect(repository.countEvents(signed.investigationId)).toBe(0);
+            }
+
+            const opened = adapter.openInvestigation(
+                resolvedContract,
+                signed.capability,
+                runtimeAuthority,
+            );
+            expect(opened.domainEvent.payload.experimentAuthority)
+                .toEqual(signed.authority);
+            expect(repository.countEvents(signed.investigationId)).toBe(1);
+        } finally {
+            repository.close();
+        }
+    });
+
+    it("rejects an exact zero Ed25519 signature and recomputed opening hashes", () => {
+        const root = fs.mkdtempSync(
+            path.join(HERE, ".runtime-adapter-zero-signature-"),
+        );
+        roots.push(root);
+        const repository = openRepository({
+            file: path.join(root, "events.sqlite"),
+        });
+        const resolvedContract = contract();
+        const signed = createSignedInvestigationAuthority({
+            contract: resolvedContract,
+            experimentId: "runtime-zero-signature",
+            projectDir: root,
+        });
+        const zeroSignatureAuthority = withZeroSignature(signed.authority);
+        const payload = zeroSignatureAuthority.manifest.experimentPayload;
+        const adapter = createDomainRepositoryAdapter({
+            repository,
+            investigationId: signed.investigationId,
+        });
+        const runtimeAuthority = createRuntimeConfigAuthorityFixture(
+            signed.investigationId,
+        );
+        try {
+            expect(() => experimentAuthorityApi.verifyExperimentAuthority({
+                authority: zeroSignatureAuthority,
+                experimentId: payload.experimentId,
+                projectDir: payload.projectDir,
+                harnessSuiteId: payload.harnessSuiteId,
+                contract: resolvedContract,
+                investigationId: signed.investigationId,
+                env: signed.env,
+            })).toThrow(expect.objectContaining({
+                code: experimentAuthorityApi
+                    .EXPERIMENT_AUTHORITY_ERROR_CODES.SIGNATURE_INVALID,
+            }));
+
+            const forgedOpening = createInvestigationOpenedEvent(
+                resolvedContract,
+                zeroSignatureAuthority,
+                runtimeAuthority,
+            );
+            expect(() => adapter.appendDomainEvent(forgedOpening))
+                .toThrow(expect.objectContaining({
+                    code: RUNTIME_ERROR_CODES.DOMAIN_EVENT_INVALID,
+                }));
+            expect(repository.countEvents(signed.investigationId)).toBe(0);
+        } finally {
+            repository.close();
+        }
+    });
+
+    it("rejects capabilities bound to another contract, id, or trust key", () => {
+        const root = fs.mkdtempSync(
+            path.join(HERE, ".runtime-adapter-wrong-capability-"),
+        );
+        roots.push(root);
+        const repository = openRepository({
+            file: path.join(root, "events.sqlite"),
+        });
+        const resolvedContract = contract();
+        const signed = createSignedInvestigationAuthority({
+            contract: resolvedContract,
+            experimentId: "runtime-bound-capability",
+            projectDir: root,
+        });
+        const other = createSignedInvestigationAuthority({
+            contract: resolvedContract,
+            experimentId: "runtime-other-capability",
+            projectDir: root,
+        });
+        const adapter = createDomainRepositoryAdapter({
+            repository,
+            investigationId: signed.investigationId,
+        });
+        const runtimeAuthority = createRuntimeConfigAuthorityFixture(
+            signed.investigationId,
+        );
+        try {
+            expect(() => adapter.openInvestigation(
+                contract({ objective: "different authority-bound contract" }),
+                signed.capability,
+                runtimeAuthority,
+            )).toThrow(expect.objectContaining({
+                code: RUNTIME_ERROR_CODES.DOMAIN_EVENT_INVALID,
+            }));
+            expect(() => adapter.openInvestigation(
+                resolvedContract,
+                other.capability,
+                runtimeAuthority,
+            )).toThrow(expect.objectContaining({
+                code: RUNTIME_ERROR_CODES.DOMAIN_EVENT_INVALID,
+            }));
+
+            const wrongIdAdapter = createDomainRepositoryAdapter({
+                repository,
+                investigationId: "runtime-wrong-capability-id",
+            });
+            expect(() => wrongIdAdapter.openInvestigation(
+                resolvedContract,
+                signed.capability,
+                createRuntimeConfigAuthorityFixture(
+                    "runtime-wrong-capability-id",
+                ),
+            )).toThrow(expect.objectContaining({
+                code: RUNTIME_ERROR_CODES.DOMAIN_EVENT_INVALID,
+            }));
+
+            const replacementTrust = createExperimentAuthorityFixture();
+            const payload = signed.authority.manifest.experimentPayload;
+            expect(() => experimentAuthorityApi.verifyExperimentAuthority({
+                authority: signed.authority,
+                experimentId: payload.experimentId,
+                projectDir: payload.projectDir,
+                harnessSuiteId: payload.harnessSuiteId,
+                contract: resolvedContract,
+                investigationId: signed.investigationId,
+                env: replacementTrust.env,
+            })).toThrow(expect.objectContaining({
+                code: experimentAuthorityApi
+                    .EXPERIMENT_AUTHORITY_ERROR_CODES
+                    .TRUST_FINGERPRINT_MISMATCH,
+            }));
+
+            expect(repository.countEvents(signed.investigationId)).toBe(0);
+            expect(repository.countEvents("runtime-wrong-capability-id")).toBe(0);
+        } finally {
+            repository.close();
+        }
+    });
+
+    it("refuses direct unsigned v4 investigation creation", () => {
+        const root = fs.mkdtempSync(
+            path.join(HERE, ".runtime-adapter-unsigned-"),
+        );
+        roots.push(root);
+        const repository = openRepository({
+            file: path.join(root, "events.sqlite"),
+        });
+        try {
+            const adapter = createDomainRepositoryAdapter({
+                repository,
+                investigationId: "unsigned-forged-v4",
+            });
+            expect(() => adapter.openInvestigation(contract()))
+                .toThrow(expect.objectContaining({
+                    code: RUNTIME_ERROR_CODES.DOMAIN_EVENT_INVALID,
+                }));
+            expect(repository.countEvents("unsigned-forged-v4")).toBe(0);
+        } finally {
+            repository.close();
+        }
+    });
+
+    it("discovers actual v3 state read-only and blocks replay, resume, and append setup", () => {
+        const root = fs.mkdtempSync(path.join(HERE, ".runtime-adapter-v3-"));
+        roots.push(root);
+        const repository = openRepository({
+            file: path.join(root, "events.sqlite"),
+        });
+        const investigationId = "legacy-v3-runtime";
+        try {
+            appendLegacyV3Investigation(
+                repository,
+                investigationId,
+                contract(),
+            );
+            expect(inspectInvestigationDomainCompatibility({
+                repository,
+                investigationId,
+            })).toMatchObject({
+                present: true,
+                compatibility: "legacy_incompatible",
+                compatible: false,
+                domainVersion: 3,
+                contractDomainVersion: null,
+                eventCount: 1,
+                readOnly: true,
+                archiveable: true,
+            });
+
+            const readOnlyAdapter = createDomainRepositoryAdapter({
+                repository,
+                investigationId,
+                ensure: false,
+            });
+            for (const operation of [
+                () => readOnlyAdapter.replay(),
+                () => readOnlyAdapter.resumeInvestigation(),
+            ]) {
+                expect(operation).toThrow(expect.objectContaining({
+                    code: RUNTIME_ERROR_CODES.LEGACY_INCOMPATIBLE,
+                    details: expect.objectContaining({
+                        compatibility: "legacy_incompatible",
+                        actualDomainVersion: 3,
+                        restartRequired: true,
+                    }),
+                }));
+            }
+            expect(() => createDomainRepositoryAdapter({
+                repository,
+                investigationId,
+            })).toThrow(expect.objectContaining({
+                code: RUNTIME_ERROR_CODES.LEGACY_INCOMPATIBLE,
+            }));
+            expect(repository.countEvents(investigationId)).toBe(1);
+            expect(repository.getInvestigation(
+                `${investigationId}.runtime-evidence`,
+            )).toBeNull();
+        } finally {
+            repository.close();
+        }
+    });
+
     it("abandons stale reserved and dispatched attempts before replacement work", () => {
         const { repository, adapter } = openAdapter("recovery");
         try {

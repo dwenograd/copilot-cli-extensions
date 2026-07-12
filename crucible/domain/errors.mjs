@@ -61,6 +61,8 @@ export class DecisionError extends DomainError {
 export class RestartRequiredError extends DomainError {
     constructor(message, details = null) {
         super(ERROR_CODES.DOMAIN_VERSION_RESTART_REQUIRED, message, {
+            compatibility: "legacy_incompatible",
+            legacyIncompatible: true,
             restartRequired: true,
             requiredAction: "start_new_investigation",
             ...details,

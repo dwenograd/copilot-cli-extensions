@@ -24,6 +24,7 @@ import {
     loadHarnessAllowlist,
 } from "../measurement/index.mjs";
 import { openArtifactStore } from "../persistence/index.mjs";
+import { removeTrackedRoots } from "./test-cleanup.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const roots = [];
@@ -34,10 +35,10 @@ function tmp(label) {
     return root;
 }
 
-afterAll(() => {
-    for (const root of roots) {
-        try { fs.rmSync(root, { recursive: true, force: true }); } catch { /* ignore */ }
-    }
+afterAll(async () => {
+    await removeTrackedRoots(roots, {
+        label: "configure-harness test root",
+    });
 });
 
 function writeFile(p, content) {
@@ -126,12 +127,16 @@ describe("configureHarness — first create", () => {
         expect(entry.validationCases.good.description).toBe("accepts");
         expect(entry.validationCases.bad.snapshotHash).toBe(result.validationSnapshots.bad);
 
-        // Expectations are NEVER written to the allowlist — they belong to the
-        // frozen crucible_start contract.
+        // Expectations are operator-owned and immutable; callers may not
+        // relabel the same snapshot during admission.
         const raw = JSON.parse(fs.readFileSync(ws.allowlistPath, "utf8"));
         const rawCase = raw.entries["example-harness"].validationCases.good;
-        expect(rawCase).not.toHaveProperty("expectation");
-        expect(Object.keys(rawCase).sort()).toEqual(["description", "snapshotHash"]);
+        expect(rawCase.expectation).toBe("accept");
+        expect(Object.keys(rawCase).sort()).toEqual([
+            "description",
+            "expectation",
+            "snapshotHash",
+        ]);
     });
 
     it("computes the executable SHA-256 that matches the on-disk bytes", () => {
@@ -212,6 +217,36 @@ describe("configureHarness — replacement refusal / allow", () => {
         });
         expect(ok.replaced).toBe(true);
         expect(loadHarnessAllowlist(ws.allowlistPath).getEntry("example-harness").timeoutMs).toBe(45000);
+    });
+
+    it("requires --replace to alter immutable case bytes or expectations", () => {
+        const ws = workspace("corpus-replace");
+        configureHarness({
+            config: baseConfig(ws),
+            allowlistPath: ws.allowlistPath,
+            env: ws.env,
+        });
+        const relabeled = baseConfig(ws, {
+            validationCases: [
+                { id: "good", expectation: "reject", sourceDir: ws.acceptDir },
+                { id: "bad", expectation: "accept", sourceDir: ws.rejectDir },
+            ],
+        });
+        expect(catchErr(() => configureHarness({
+            config: relabeled,
+            allowlistPath: ws.allowlistPath,
+            env: ws.env,
+        })).code).toBe(CONFIGURE_ERROR_CODES.ENTRY_CONFLICT);
+
+        configureHarness({
+            config: relabeled,
+            allowlistPath: ws.allowlistPath,
+            env: ws.env,
+            replace: true,
+        });
+        expect(loadHarnessAllowlist(ws.allowlistPath)
+            .getEntry("example-harness")
+            .validationCases.good.expectation).toBe("reject");
     });
 });
 
@@ -397,10 +432,25 @@ describe("configureHarness — atomic backup", () => {
     });
 });
 
-describe("configureHarness — throwaway store cleanup", () => {
-    it("leaves no temporary ArtifactStore behind after success", () => {
+describe("configureHarness — durable operator corpus", () => {
+    it("retains validation snapshots in a durable operator-owned ArtifactStore", () => {
         const ws = workspace("cleanup");
-        configureHarness({ config: baseConfig(ws), allowlistPath: ws.allowlistPath, env: ws.env });
+        const result = configureHarness({
+            config: baseConfig(ws),
+            allowlistPath: ws.allowlistPath,
+            env: ws.env,
+        });
+        expect(result.operatorCorpusStorePath)
+            .toBe(path.join(path.dirname(ws.allowlistPath), "operator-corpus"));
+        expect(fs.existsSync(result.operatorCorpusStorePath)).toBe(true);
+        const store = openArtifactStore({
+            root: result.operatorCorpusStorePath,
+            env: ws.env,
+        });
+        expect(store.verifySnapshot(result.validationSnapshots.good).ok)
+            .toBe(true);
+        expect(store.verifySnapshot(result.validationSnapshots.bad).ok)
+            .toBe(true);
         const leftovers = fs.readdirSync(path.dirname(ws.allowlistPath))
             .filter((name) => name.startsWith(".crucible-configure-store-"));
         expect(leftovers).toEqual([]);
@@ -419,6 +469,101 @@ describe("configureHarness — throwaway store cleanup", () => {
             ? fs.readdirSync(dir).filter((name) => name.startsWith(".crucible-configure-store-"))
             : [];
         expect(leftovers).toEqual([]);
+    });
+});
+
+describe("configureHarness — HarnessSuiteV4 authoring", () => {
+    it("composes five pinned role entries into a stable suite identity", () => {
+        const ws = workspace("suite");
+        const roleNames = [
+            "calibration",
+            "search",
+            "confirmation",
+            "challenge",
+            "novelty",
+        ];
+        const suiteRoles = {};
+        for (const role of roleNames) {
+            const acceptDir = makeDir(
+                path.join(ws.root, "suite-cases", role, "accept"),
+                { "case.txt": `${role}-accept` },
+            );
+            const rejectDir = makeDir(
+                path.join(ws.root, "suite-cases", role, "reject"),
+                { "case.txt": `${role}-reject` },
+            );
+            const harnessId = `${role}-harness`;
+            const caseIds = [`${role}-accept`, `${role}-reject`];
+            configureHarness({
+                config: baseConfig(ws, {
+                    id: harnessId,
+                    validationCases: [
+                        {
+                            id: caseIds[0],
+                            expectation: "accept",
+                            sourceDir: acceptDir,
+                        },
+                        {
+                            id: caseIds[1],
+                            expectation: "reject",
+                            sourceDir: rejectDir,
+                        },
+                    ],
+                }),
+                allowlistPath: ws.allowlistPath,
+                env: ws.env,
+            });
+            suiteRoles[role] = {
+                harnessId,
+                observableSchema: {
+                    version: 1,
+                    pass: "boolean",
+                    metrics: ["score"],
+                },
+                caseIds,
+                deterministicSeed: `seed-${role}`,
+                sandboxIdentity: {
+                    required: false,
+                    policyDigest: null,
+                },
+            };
+        }
+
+        const suiteConfig = {
+            kind: "HarnessSuiteV4",
+            version: 4,
+            id: "operator-suite",
+            environment: {
+                os: "fixture-windows",
+                architecture: "x64",
+            },
+            sharedPlatformDependencies: [],
+            roles: suiteRoles,
+        };
+        const result = configureHarness({
+            config: suiteConfig,
+            allowlistPath: ws.allowlistPath,
+            env: ws.env,
+        });
+        expect(result.suiteId).toBe("operator-suite");
+        expect(result.suiteIdentity)
+            .toMatch(/^sha256:crucible-harness-suite-v4:[a-f0-9]{64}$/u);
+
+        const loaded = loadHarnessAllowlist(ws.allowlistPath);
+        expect(loaded.listSuiteIds()).toEqual(["operator-suite"]);
+        expect(loaded.getSuiteIdentity("operator-suite"))
+            .toBe(result.suiteIdentity);
+        expect(loaded.getSuite("operator-suite")
+            .operatorCorpus.cases["challenge-reject"].expectation)
+            .toBe("reject");
+
+        const repeated = configureHarness({
+            config: suiteConfig,
+            allowlistPath: ws.allowlistPath,
+            env: ws.env,
+        });
+        expect(repeated.suiteIdentity).toBe(result.suiteIdentity);
+        expect(repeated.replaced).toBe(true);
     });
 });
 

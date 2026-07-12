@@ -20,10 +20,12 @@ import {
     hashCanonical,
     harnessCandidateEvidenceItems,
     impossibilityEvidenceItems,
+    normalizeEnumerandManifest,
 } from "../domain/index.mjs";
 import {
     PARSER_VERSION,
     buildFrozenHarnessIdentity,
+    computeHarnessSuiteV4Identity,
     createDefaultProcessAdapter,
     createSandboxProvider,
     loadHarnessAllowlist,
@@ -53,6 +55,15 @@ import {
     sha256HexOfFile,
     writeHarnessScript,
 } from "./measurement-fixtures.mjs";
+import {
+    buildHarnessSuiteForAllowlist,
+    upgradeLegacyContractInput,
+} from "./v4-contract-fixture.mjs";
+import {
+    createRuntimeConfigAuthorityFixture,
+    createSignedInvestigationAuthority,
+} from "./experiment-authority-fixture.mjs";
+import { removeTreeRobust } from "./test-cleanup.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const roots = [];
@@ -196,7 +207,7 @@ function makeRoot(label) {
     return root;
 }
 
-afterEach(() => {
+afterEach(async () => {
     const failures = [];
     for (const root of roots.splice(0)) {
         const ownedDebris = fs.existsSync(root)
@@ -212,11 +223,9 @@ afterEach(() => {
             ));
         }
         try {
-            fs.rmSync(root, {
-                recursive: true,
-                force: true,
-                maxRetries: 20,
-                retryDelay: 25,
+            await removeTreeRobust(root, {
+                label: "runtime runner test root",
+                timeoutMs: 30_000,
             });
         } catch (error) {
             failures.push(error);
@@ -305,6 +314,10 @@ function writeRuntimeAllowlist(
                     path: scriptPath,
                     sha256: sha256HexOfFile(scriptPath),
                     role: "harness-script",
+                }, {
+                    path: NODE_EXE,
+                    sha256: nodeExeSha256Hex(),
+                    role: "node-runtime",
                 }],
                 timeoutMs: 15_000,
                 maxStdoutBytes: 1024 * 1024,
@@ -313,7 +326,13 @@ function writeRuntimeAllowlist(
                 validationCases: Object.fromEntries(
                     Object.entries(validationCases).map(([id, snapshot]) => [
                         id,
-                        { snapshotHash: snapshot },
+                        {
+                            snapshotHash: snapshot,
+                            expectation: id === "known-bad"
+                                || id === "challenge-case"
+                                ? "reject"
+                                : "accept",
+                        },
                     ]),
                 ),
             },
@@ -331,9 +350,11 @@ function makeContract({
     maxRounds = 4,
     maxCommands = 20,
     searchPolicy = {},
-    harnessIdentity,
+    harnessSuite,
+    harnessSuiteIdentity,
+    enumerandManifest,
 } = {}) {
-    return createInvestigationContract({
+    const input = upgradeLegacyContractInput({
         objective: "Find a candidate whose trusted score is at least 90",
         acceptancePredicate: {
             kind: "all",
@@ -346,19 +367,17 @@ function makeContract({
             { id: "known-good", expectation: "accept", artifactHash: goodSnapshot },
             { id: "known-bad", expectation: "reject", artifactHash: badSnapshot },
         ],
-        harnessId: "score-harness",
         hypothesisTopology: hypothesisTopology
             ?? (boundedCandidateIds === undefined
                 ? "open_generative"
                 : "finite_enumerable"),
         criticality: "high",
         policyVersion: "policy-v1",
-        parserVersion: PARSER_VERSION,
-        harnessIdentity,
         workerModels: ["model-a", "model-b"],
         candidatesPerRound,
         maxRounds,
         ...(boundedCandidateIds === undefined ? {} : { boundedCandidateIds }),
+        ...(enumerandManifest === undefined ? {} : { enumerandManifest }),
         metrics: [{ key: "score", direction: "max", epsilon: 0 }],
         searchPolicy: {
             ...DEFAULT_SEARCH_POLICY,
@@ -378,6 +397,9 @@ function makeContract({
         },
         declaredLimits: { maxCommands },
     });
+    input.harnessSuite = harnessSuite;
+    input.harnessSuiteIdentity = harnessSuiteIdentity;
+    return createInvestigationContract(input);
 }
 
 function runnerSandboxIdentity() {
@@ -568,6 +590,29 @@ function setupInvestigation(label, contractOptions = {}, {
     const store = openArtifactStore({ root: artifactRoot });
     const goodSnapshot = seedSnapshot(store, root, "good", 100);
     const badSnapshot = seedSnapshot(store, root, "bad", 10);
+    const roleSnapshots = {
+        search: seedSnapshot(store, root, "search-role", 91),
+        confirmation: seedSnapshot(store, root, "confirmation-role", 92),
+        challenge: seedSnapshot(store, root, "challenge-role", 11),
+        novelty: seedSnapshot(store, root, "novelty-role", 94),
+    };
+    let enumerandManifest;
+    if (Array.isArray(contractOptions.boundedCandidateIds)) {
+        enumerandManifest = normalizeEnumerandManifest({
+            topology: "finite_enumerable",
+            entries: contractOptions.boundedCandidateIds.map((id, ordinal) => ({
+                id,
+                ordinal,
+                artifactSnapshotHash: seedSnapshot(
+                    store,
+                    root,
+                    `enumerand-${id}`,
+                    20 + ordinal * 10,
+                ),
+            })),
+            control: { kind: "enumerand", ordinal: 0 },
+        });
+    }
     const harnessCounterPath = path.join(root, "harness-call-count.txt");
     const countHarnessCall = countHarnessCalls
         ? `fs.appendFileSync(${JSON.stringify(harnessCounterPath)}, "1\\n");`
@@ -616,15 +661,65 @@ function setupInvestigation(label, contractOptions = {}, {
     const allowlistPath = writeRuntimeAllowlist(root, "score-harness", scriptPath, {
         "known-good": goodSnapshot,
         "known-bad": badSnapshot,
+        "search-case": roleSnapshots.search,
+        "confirmation-case": roleSnapshots.confirmation,
+        "challenge-case": roleSnapshots.challenge,
+        "novelty-case": roleSnapshots.novelty,
     }, executesCandidateCode);
-    const allowlist = loadHarnessAllowlist(allowlistPath);
+    const verifierScript = path.join(root, "impossibility-verifier.ps1");
+    const verifierResult = JSON.stringify(certificateResult).replaceAll("'", "''");
+    const countVerifierCall = countHarnessCalls
+        ? `Add-Content -LiteralPath '${
+            harnessCounterPath.replaceAll("'", "''")
+        }' -Value '1'`
+        : "";
+    fs.writeFileSync(
+        verifierScript,
+        `
+param([Parameter(Mandatory = $true)][string]$CandidatePath)
+$ErrorActionPreference = "Stop"
+${countVerifierCall}
+$request = Join-Path -Path $CandidatePath -ChildPath "crucible-impossibility-request.json"
+if (-not (Test-Path -LiteralPath $request -PathType Leaf)) {
+    throw "missing Crucible impossibility request"
+}
+[Console]::Out.Write('${verifierResult}')
+`,
+    );
+    const allowlistDocument = JSON.parse(
+        fs.readFileSync(allowlistPath, "utf8"),
+    );
+    allowlistDocument.entries["verifier-harness"] = {
+        executable: WINDOWS_POWERSHELL,
+        executableSha256: sha256HexOfFile(WINDOWS_POWERSHELL),
+        argvTemplate: [verifierScript, "{{candidatePath}}"],
+        dependencies: [{
+            path: verifierScript,
+            sha256: sha256HexOfFile(verifierScript),
+            role: "verifier-script",
+        }],
+        timeoutMs: 15_000,
+        maxStdoutBytes: 1024 * 1024,
+        maxStderrBytes: 256 * 1024,
+        executesCandidateCode: false,
+    };
+    fs.writeFileSync(allowlistPath, JSON.stringify(allowlistDocument, null, 2));
+    let allowlist = loadHarnessAllowlist(allowlistPath);
     const harnessVerification = verifyHarnessPreflight(
         allowlist,
         "score-harness",
         {
             validationCases: [
-                { id: "known-good", artifactHash: goodSnapshot },
-                { id: "known-bad", artifactHash: badSnapshot },
+                {
+                    id: "known-good",
+                    expectation: "accept",
+                    artifactHash: goodSnapshot,
+                },
+                {
+                    id: "known-bad",
+                    expectation: "reject",
+                    artifactHash: badSnapshot,
+                },
             ],
             parserVersion: PARSER_VERSION,
         },
@@ -634,22 +729,52 @@ function setupInvestigation(label, contractOptions = {}, {
             ? runnerSandboxIdentity()
             : { required: false },
     });
+    allowlistDocument.suites = {
+        "score-suite": buildHarnessSuiteForAllowlist(allowlist, {
+            suiteId: "score-suite",
+            harnessId: "score-harness",
+            includeVerifier: true,
+            verifierHarnessId: "verifier-harness",
+            sandboxPolicyDigest: harnessIdentity.sandbox.policyDigest,
+            roleCaseIds: {
+                calibration: ["known-good", "known-bad"],
+                search: ["search-case"],
+                confirmation: ["confirmation-case"],
+                challenge: ["challenge-case"],
+                novelty: ["novelty-case"],
+            },
+        }),
+    };
+    fs.writeFileSync(allowlistPath, JSON.stringify(allowlistDocument, null, 2));
+    allowlist = loadHarnessAllowlist(allowlistPath);
+    const harnessSuite = allowlist.getSuite("score-suite");
     const contract = makeContract({
         goodSnapshot,
         badSnapshot,
-        harnessIdentity,
+        harnessSuite,
+        harnessSuiteIdentity: computeHarnessSuiteV4Identity(harnessSuite),
+        enumerandManifest,
         ...contractOptions,
     });
     const repository = openRepository({ file: path.join(stateDir, "events.sqlite") });
+    const signed = createSignedInvestigationAuthority({
+        contract,
+        experimentId: `runner-${label}`,
+        projectDir: root,
+    });
     const adapter = createDomainRepositoryAdapter({
         repository,
-        investigationId: "runtime-investigation",
+        investigationId: signed.investigationId,
     });
-    adapter.openInvestigation(contract);
+    adapter.openInvestigation(
+        contract,
+        signed.capability,
+        createRuntimeConfigAuthorityFixture(signed.investigationId),
+    );
     repository.close();
 
     const config = {
-        investigationId: "runtime-investigation",
+        investigationId: signed.investigationId,
         stateDir,
         artifactRoot,
         allowlistPath,
@@ -678,7 +803,7 @@ function replaySetup(setup) {
     const repository = openRepository({ file: path.join(setup.stateDir, "events.sqlite") });
     const adapter = createDomainRepositoryAdapter({
         repository,
-        investigationId: "runtime-investigation",
+        investigationId: setup.config.investigationId,
     });
     const replayed = adapter.replay();
     return { repository, adapter, ...replayed };
@@ -790,6 +915,13 @@ function createRunnerContainmentProvider(
     });
 }
 
+function expectScientificConfirmationRequired(result) {
+    expect(result).toMatchObject({
+        kind: "NON_RESULT",
+        code: "SCIENTIFIC_CONFIRMATION_REQUIRED",
+    });
+}
+
 describe("Crucible autonomous runner", () => {
     it("commits one candidate evidence for every adaptive slot", async () => {
         const setup = setupInvestigation("positive", {
@@ -803,12 +935,8 @@ describe("Crucible autonomous runner", () => {
             runnerDependencies(pool),
         );
 
-        expect(result).toMatchObject({
-            kind: "TERMINAL",
-            decision: "VERIFIED_RESULT",
-            candidateId: "candidate-r000002-s000",
-            tempRootCleaned: true,
-        });
+        expectScientificConfirmationRequired(result);
+        expect(result.tempRootCleaned).toBe(true);
         expect(pool.calls).toHaveLength(4);
         expect(pool.calls.map((call) => call.model)).toEqual([
             "model-a",
@@ -829,7 +957,17 @@ describe("Crucible autonomous runner", () => {
         expect(pool.closed).toBe(true);
 
         const replayed = replaySetup(setup);
-        expect(replayed.aggregate.terminal.decision).toBe("VERIFIED_RESULT");
+        expect(replayed.aggregate.terminal).toBeNull();
+        const scientificNonResult = replayed.aggregate.nonResults.at(-1);
+        expect(scientificNonResult).toMatchObject({
+            code: "SCIENTIFIC_CONFIRMATION_REQUIRED",
+            candidateId: "candidate-r000002-s000",
+            readiness: {
+                ready: false,
+                confirmationSupported: false,
+                challengeSupported: false,
+            },
+        });
         expect(replayed.aggregate.capabilityEpochs["runner-epoch-1"].capabilities)
             .toContain("crucible-autonomous-runtime");
         expect(replayed.aggregate.commandOrder.every((commandId) =>
@@ -879,17 +1017,11 @@ describe("Crucible autonomous runner", () => {
                 objectArtifacts: expect.any(Array),
             },
         });
-        expect(replayed.aggregate.terminal.evidenceClosure).toMatchObject({
-            decisive: {
-                kind: "winner",
-                evidence: {
-                    evidenceId: replayed.aggregate.terminal.evidenceId,
-                },
-            },
-            receipts: { count: 6, evidenceCount: 5 },
-        });
-        expect(replayed.aggregate.terminal.evidenceClosure.closureRoot).toMatch(
-            /^sha256:crucible-terminal-evidence-closure-v1:[a-f0-9]{64}$/,
+        expect(scientificNonResult.evidenceId).toBe(
+            replayed.aggregate.evidenceOrder
+                .map((id) => replayed.aggregate.evidence[id])
+                .find((evidence) =>
+                    evidence.candidateId === "candidate-r000002-s000")?.evidenceId,
         );
         for (const evidenceId of replayed.aggregate.evidenceOrder) {
             const evidence = replayed.aggregate.evidence[evidenceId];
@@ -899,7 +1031,7 @@ describe("Crucible autonomous runner", () => {
             expect(
                 replayed.repository
                     .listArtifactRefsForEvent(
-                        "runtime-investigation",
+                        replayed.adapter.investigationId,
                         evidence.committedSeq,
                     )
                     .map((ref) => ref.artifactId)
@@ -928,7 +1060,9 @@ describe("Crucible autonomous runner", () => {
         ).toEqual(
             persistedReceipt.dependencyHashes.map((item) => item.sha256).sort(),
         );
-        expect(replayed.repository.listArtifactRefs("runtime-investigation").length)
+        expect(replayed.repository.listArtifactRefs(
+            replayed.adapter.investigationId,
+        ).length)
             .toBeGreaterThanOrEqual(12);
         replayed.repository.close();
 
@@ -941,7 +1075,7 @@ describe("Crucible autonomous runner", () => {
         const setup = setupInvestigation("cas-attempt-budget", {
             candidatesPerRound: 1,
             maxRounds: 1,
-            searchPolicy: { stopOnFirstAccept: true },
+            searchPolicy: {},
         });
         const inventory = () => {
             const files = [];
@@ -988,7 +1122,7 @@ describe("Crucible autonomous runner", () => {
         const setup = setupInvestigation("cas-investigation-budget", {
             candidatesPerRound: 1,
             maxRounds: 1,
-            searchPolicy: { stopOnFirstAccept: true },
+            searchPolicy: {},
         });
         const store = openArtifactStore({ root: setup.artifactRoot });
         const stored = store.putBytes(Buffer.alloc(2048, 0x61), {
@@ -998,7 +1132,7 @@ describe("Crucible autonomous runner", () => {
             file: path.join(setup.stateDir, "events.sqlite"),
         });
         repository.registerExternalArtifact({
-            investigationId: "runtime-investigation",
+            investigationId: setup.config.investigationId,
             artifactId: "seeded-cas-budget-artifact",
             algo: "sha256",
             hash: stored.id.slice("sha256:".length),
@@ -1007,7 +1141,7 @@ describe("Crucible autonomous runner", () => {
         });
         repository.markArtifactDurable("seeded-cas-budget-artifact");
         repository.referenceArtifact({
-            investigationId: "runtime-investigation",
+            investigationId: setup.config.investigationId,
             artifactId: "seeded-cas-budget-artifact",
         });
         repository.close();
@@ -1048,10 +1182,7 @@ describe("Crucible autonomous runner", () => {
             setup.config,
             runnerDependencies(pool),
         );
-        expect(result).toMatchObject({
-            kind: "TERMINAL",
-            decision: "VERIFIED_RESULT",
-        });
+        expectScientificConfirmationRequired(result);
         const replayed = replaySetup(setup);
         expect(replayed.adapter.latestOperationalNonResult()).toBeNull();
         replayed.repository.close();
@@ -1084,7 +1215,7 @@ describe("Crucible autonomous runner", () => {
         const setup = setupInvestigation(`identity-${_label.replaceAll(" ", "-")}`, {
             candidatesPerRound: 1,
             maxRounds: 1,
-            searchPolicy: { stopOnFirstAccept: true },
+            searchPolicy: {},
         });
         let mutated = false;
         await expect(runAutonomousInvestigation(
@@ -1109,7 +1240,7 @@ describe("Crucible autonomous runner", () => {
             {
                 candidatesPerRound: 1,
                 maxRounds: 1,
-                searchPolicy: { stopOnFirstAccept: true },
+                searchPolicy: {},
             },
             { executesCandidateCode: true },
         );
@@ -1188,10 +1319,7 @@ describe("Crucible autonomous runner", () => {
             }),
         );
 
-        expect(result).toMatchObject({
-            kind: "TERMINAL",
-            decision: "VERIFIED_RESULT",
-        });
+        expectScientificConfirmationRequired(result);
         expect(calls.hostLaunches).toBe(0);
         expect(calls.hostTerminations).toBe(0);
         expect(providerControlRoots).toHaveLength(1);
@@ -1229,15 +1357,16 @@ describe("Crucible autonomous runner", () => {
                         `sha256:runner-fixture-policy-v1:${"c".repeat(64)}`,
                 });
         }
-        expect(replayed.aggregate.terminal.evidenceClosure.closureRoot).toMatch(
-            /^sha256:crucible-terminal-evidence-closure-v1:[a-f0-9]{64}$/u,
-        );
+        expect(replayed.aggregate.terminal).toBeNull();
+        expect(replayed.aggregate.nonResults.at(-1)).toMatchObject({
+            code: "SCIENTIFIC_CONFIRMATION_REQUIRED",
+        });
         replayed.repository.close();
     }, 60_000);
 
-    it("persists a command-budget non-result after successful validation", async () => {
-        const setup = setupInvestigation("budget", { maxCommands: 1 });
-        const pool = new ScriptedOrchestrationWorkerPool([]);
+    it("persists a search-capacity non-result after successful validation", async () => {
+        const setup = setupInvestigation("budget", { maxRounds: 1 });
+        const pool = new ScriptedOrchestrationWorkerPool([20]);
         const result = await runAutonomousInvestigation(
             setup.config,
             runnerDependencies(pool),
@@ -1246,14 +1375,14 @@ describe("Crucible autonomous runner", () => {
             kind: "NON_RESULT",
             code: "BUDGET_EXHAUSTED_INCONCLUSIVE",
         });
-        expect(pool.calls).toHaveLength(0);
+        expect(pool.calls).toHaveLength(1);
         const replayed = replaySetup(setup);
         expect(replayed.aggregate.status).toBe("non_result");
         expect(replayed.aggregate.terminal).toBeNull();
         replayed.repository.close();
     }, 60_000);
 
-    it("bounds a hung worker-pool close after persisting the terminal result", async () => {
+    it("bounds a hung worker-pool close after persisting the scientific non-result", async () => {
         const setup = setupInvestigation("runner-shutdown-bound", { maxRounds: 1 });
         const pool = new ScriptedOrchestrationWorkerPool([95]);
         let closeStartedAt = null;
@@ -1282,8 +1411,9 @@ describe("Crucible autonomous runner", () => {
         expect(closeStartedAt).not.toBeNull();
         expect(Date.now() - closeStartedAt).toBeLessThan(500);
         const replayed = replaySetup(setup);
-        expect(replayed.aggregate.terminal).toMatchObject({
-            decision: "VERIFIED_RESULT",
+        expect(replayed.aggregate.terminal).toBeNull();
+        expect(replayed.aggregate.nonResults.at(-1)).toMatchObject({
+            code: "SCIENTIFIC_CONFIRMATION_REQUIRED",
         });
         replayed.repository.close();
         expect(removeRetainedRuntimeRoots(setup).length).toBeGreaterThan(0);
@@ -1306,7 +1436,9 @@ describe("Crucible autonomous runner", () => {
         const replayed = replaySetup(setup);
         expect(replayed.aggregate.terminal).toBeNull();
         expect(replayed.aggregate.pause).not.toBeNull();
-        expect(replayed.repository.getTerminalEvent("runtime-investigation")).toBeNull();
+        expect(replayed.repository.getTerminalEvent(
+            replayed.adapter.investigationId,
+        )).toBeNull();
         expect(replayed.repository.listEvents(replayed.adapter.operationalInvestigationId)
             .some((row) => row.kind === "runtime:non_result")).toBe(true);
         replayed.repository.close();
@@ -1376,14 +1508,14 @@ describe("Crucible autonomous runner", () => {
             ...setup.config,
             deadline: clock.now() + 60_000,
         }, runnerDependencies(recoveryPool, { clock }));
-        expect(recovered).toMatchObject({
-            kind: "TERMINAL",
-            decision: "VERIFIED_RESULT",
-        });
+        expectScientificConfirmationRequired(recovered);
         expect(recoveryPool.calls).toHaveLength(1);
         const recoveredReplay = replaySetup(setup);
         expect(recoveredReplay.adapter.latestOperationalNonResult()).toBeNull();
-        expect(recoveredReplay.aggregate.terminal).not.toBeNull();
+        expect(recoveredReplay.aggregate.terminal).toBeNull();
+        expect(recoveredReplay.aggregate.nonResults.at(-1)).toMatchObject({
+            code: "SCIENTIFIC_CONFIRMATION_REQUIRED",
+        });
         expect(recoveredReplay.aggregate.pause).toBeNull();
         expect(recoveredReplay.aggregate.pauseHistory).toHaveLength(1);
         expect(harnessCallCount(setup)).toBe(3);
@@ -1465,7 +1597,9 @@ describe("Crucible autonomous runner", () => {
         const replayed = replaySetup(setup);
         expect(replayed.aggregate.terminal).toBeNull();
         expect(harnessCandidateEvidenceItems(replayed.aggregate)).toHaveLength(0);
-        expect(replayed.repository.listCommandAttempts("runtime-investigation")
+        expect(replayed.repository.listCommandAttempts(
+            replayed.adapter.investigationId,
+        )
             .some((attempt) => attempt.state === "observed")).toBe(true);
         replayed.repository.close();
     }, 60_000);
@@ -1547,7 +1681,7 @@ describe("Crucible autonomous runner", () => {
         replayed.repository.close();
     }, 60_000);
 
-    it("suppresses a terminal decision when the deadline crosses before append", async () => {
+    it("suppresses a scientific non-result when the deadline crosses before append", async () => {
         const setup = setupInvestigation(
             "deadline-terminal",
             { maxRounds: 1 },
@@ -1562,7 +1696,7 @@ describe("Crucible autonomous runner", () => {
         }, runnerDependencies(new ScriptedOrchestrationWorkerPool([95]), {
             clock,
             faultInjector(point) {
-                if (!advanced && point === "before_terminal_append") {
+                if (!advanced && point === "before_non_result_append") {
                     advanced = true;
                     clock.advance(30_001);
                 }
@@ -1577,13 +1711,15 @@ describe("Crucible autonomous runner", () => {
         const replayed = replaySetup(setup);
         expect(harnessCandidateEvidenceItems(replayed.aggregate)).toHaveLength(1);
         expect(replayed.aggregate.terminal).toBeNull();
-        expect(replayed.repository.getTerminalEvent("runtime-investigation")).toBeNull();
+        expect(replayed.repository.getTerminalEvent(
+            replayed.adapter.investigationId,
+        )).toBeNull();
         const nonResult = replayed.adapter.latestOperationalNonResult();
-        expect(nonResult.payload.details.terminalRecommendationSuppressed).toBe(true);
+        expect(nonResult.payload.details.terminalRecommendationSuppressed).toBe(false);
         replayed.repository.close();
     }, 60_000);
 
-    it("emits TARGET_UNREACHABLE only after exhausting every frozen bounded id", async () => {
+    it("requires independent verification after exhausting every frozen bounded id", async () => {
         const setup = setupInvestigation("bounded", {
             boundedCandidateIds: ["candidate-a", "candidate-b"],
             candidatesPerRound: 1,
@@ -1595,24 +1731,23 @@ describe("Crucible autonomous runner", () => {
             runnerDependencies(pool),
         );
         expect(result).toMatchObject({
-            kind: "TERMINAL",
-            decision: "TARGET_UNREACHABLE",
+            kind: "NON_RESULT",
+            code: "INDEPENDENT_VERIFICATION_REQUIRED",
         });
-        expect(pool.calls.map((call) => call.allowedCandidateIds)).toEqual([
-            ["candidate-a"],
-            ["candidate-b"],
-        ]);
+        expect(pool.calls).toEqual([]);
         const replayed = replaySetup(setup);
-        expect(replayed.aggregate.terminal.basis).toMatchObject({
-            boundedCandidateCount: 2,
+        expect(replayed.aggregate.terminal).toBeNull();
+        const nonResult = replayed.aggregate.nonResults.at(-1);
+        expect(nonResult.basis).toMatchObject({
+            enumerandCount: 2,
             searchSpaceExhausted: true,
         });
-        expect(replayed.aggregate.terminal.basis.boundedCandidateIdsHash).toMatch(
-            /^sha256:crucible-bounded-candidate-set-v1:[a-f0-9]{64}$/,
+        expect(nonResult.basis.enumerandManifestRoot).toMatch(
+            /^sha256:crucible-enumerand-manifest-root-v1:[a-f0-9]{64}$/,
         );
-        expect(replayed.aggregate.terminal.evidenceClosure).toMatchObject({
-            decisive: { kind: "bounded_search", evidence: null },
-            receipts: { count: 4, evidenceCount: 3 },
+        expect(nonResult.readiness).toMatchObject({
+            ready: false,
+            independentVerifierSupported: false,
         });
         replayed.repository.close();
     }, 60_000);
@@ -1893,11 +2028,7 @@ describe("Crucible autonomous runner", () => {
 
         expect(pool.calls).toHaveLength(3);
         expect(ESCAPE_SEARCH_OPERATORS).toContain(pool.calls[2].operator);
-        expect(result).toMatchObject({
-            kind: "TERMINAL",
-            decision: "VERIFIED_RESULT",
-            candidateId: "candidate-r000003-s000",
-        });
+        expectScientificConfirmationRequired(result);
         const replayed = replaySetup(setup);
         const candidates = harnessCandidateEvidenceItems(replayed.aggregate);
         expect(candidates).toHaveLength(3);
@@ -2057,7 +2188,7 @@ describe("Crucible autonomous runner", () => {
             }),
         );
 
-        expect(result.kind).toBe("TERMINAL");
+        expectScientificConfirmationRequired(result);
         expect(calls).toHaveLength(2);
         expect(calls[1].operator).toBe("refinement");
         expect(calls.every((request) =>
@@ -2254,11 +2385,7 @@ describe("Crucible autonomous runner", () => {
             },
         );
 
-        expect(result).toMatchObject({
-            kind: "TERMINAL",
-            decision: "VERIFIED_RESULT",
-            candidateId: "candidate-r000002-s000",
-        });
+        expectScientificConfirmationRequired(result);
         expect(captured.started).toBe(true);
         expect(captured.stopped).toBe(true);
         expect(captured.prompts).toHaveLength(2);
@@ -2306,7 +2433,7 @@ describe("Crucible autonomous runner", () => {
         const setup = setupInvestigation("pause");
         const stop = requestStop({
             stateDir: setup.stateDir,
-            investigationId: "runtime-investigation",
+            investigationId: setup.config.investigationId,
             reason: "Operator requested pause",
             requestId: "stop-before-run",
         });
@@ -2344,7 +2471,7 @@ describe("Crucible autonomous runner", () => {
                         requested = true;
                         requestStop({
                             stateDir: setup.stateDir,
-                            investigationId: "runtime-investigation",
+                            investigationId: setup.config.investigationId,
                             reason: "Pause while the admitted command drains.",
                             requestId: "pause-during-proposal",
                         });
@@ -2400,17 +2527,16 @@ describe("Crucible autonomous runner", () => {
             setup.config,
             runnerDependencies(recoveredPool),
         );
-        expect(result).toMatchObject({
-            kind: "TERMINAL",
-            decision: "VERIFIED_RESULT",
-        });
+        expectScientificConfirmationRequired(result);
         expect(result.recovery).toMatchObject({
             abandonedCount: 1,
             uncertainDispatched: uncertain,
         });
         expect(recoveredPool.calls).toHaveLength(1);
         const replayed = replaySetup(setup);
-        const attempts = replayed.repository.listCommandAttempts("runtime-investigation");
+        const attempts = replayed.repository.listCommandAttempts(
+            replayed.adapter.investigationId,
+        );
         expect(attempts.filter((attempt) => attempt.state === "abandoned")).toHaveLength(1);
         expect(attempts.some((attempt) => attempt.state === "committed")).toBe(true);
         expect(harnessCandidateEvidenceItems(replayed.aggregate)).toHaveLength(1);
@@ -2451,7 +2577,7 @@ describe("Crucible autonomous runner", () => {
                     );
                     const current = replaySetup(setup);
                     refsAfterCurrent = current.repository.listArtifactRefs(
-                        "runtime-investigation",
+                        current.adapter.investigationId,
                     ).length;
                     current.repository.close();
                 },
@@ -2460,16 +2586,16 @@ describe("Crucible autonomous runner", () => {
             code: PERSISTENCE_ERROR_CODES.FENCE_REJECTED,
         });
 
-        expect(currentResult).toMatchObject({
-            kind: "TERMINAL",
-            decision: "VERIFIED_RESULT",
-        });
+        expectScientificConfirmationRequired(currentResult);
         expect(stalePool.calls).toHaveLength(1);
         expect(currentPool.calls).toHaveLength(0);
         const replayed = replaySetup(setup);
-        expect(replayed.repository.listEvents("runtime-investigation")
-            .filter((event) => event.isTerminal)).toHaveLength(1);
-        expect(replayed.repository.listArtifactRefs("runtime-investigation"))
+        expect(replayed.repository.listEvents(replayed.adapter.investigationId)
+            .filter((event) =>
+                event.kind === "domain:v4:non_result_recorded")).toHaveLength(1);
+        expect(replayed.repository.listArtifactRefs(
+            replayed.adapter.investigationId,
+        ))
             .toHaveLength(refsAfterCurrent);
         expect(replayed.adapter.listOperationalEvidence().filter((event) =>
             event.attemptId === staleProposalAttemptId
@@ -2517,22 +2643,19 @@ describe("Crucible autonomous runner", () => {
             branchB.config,
             runnerDependencies(recoveredPoolB),
         );
-        expect(resultA).toMatchObject({ kind: "TERMINAL", decision: "VERIFIED_RESULT" });
-        expect(resultB).toMatchObject({ kind: "TERMINAL", decision: "VERIFIED_RESULT" });
+        expectScientificConfirmationRequired(resultA);
+        expectScientificConfirmationRequired(resultB);
         expect(recoveredPoolA.calls).toHaveLength(0);
         expect(recoveredPoolB.calls).toHaveLength(0);
         expect(harnessCallCount(setup)).toBe(3);
 
         const replayedA = replaySetup(branchA);
         const replayedB = replaySetup(branchB);
-        expect(replayedA.aggregate.terminal.eventHash).toBe(
-            replayedB.aggregate.terminal.eventHash,
+        expect(replayedA.aggregate.lastEventHash).toBe(
+            replayedB.aggregate.lastEventHash,
         );
-        expect(replayedA.aggregate.terminal.evidenceClosure.closureRoot).toBe(
-            replayedB.aggregate.terminal.evidenceClosure.closureRoot,
-        );
-        expect(replayedA.aggregate.terminal.evidenceClosure.receipts.root).toBe(
-            replayedB.aggregate.terminal.evidenceClosure.receipts.root,
+        expect(replayedA.aggregate.nonResults.at(-1)).toEqual(
+            replayedB.aggregate.nonResults.at(-1),
         );
         const effects = replayedA.adapter.listOperationalEvidence().filter((row) =>
             row.kind === "runtime:model_proposal" || row.kind === "runtime:measurement");
@@ -2540,7 +2663,7 @@ describe("Crucible autonomous runner", () => {
             /^sha256:crucible-runtime-logical-effect-v1:[a-f0-9]{64}$/u
                 .test(row.payload.logicalEffectKey))).toBe(true);
         const effectAttempts = replayedA.repository
-            .listCommandAttempts("runtime-investigation")
+            .listCommandAttempts(replayedA.adapter.investigationId)
             .filter((attempt) => {
                 const metadata = JSON.parse(attempt.command);
                 return metadata.scope === "external-effect";
@@ -2592,17 +2715,17 @@ describe("Crucible autonomous runner", () => {
             branchB.config,
             runnerDependencies(recoveredPoolB),
         );
-        expect(resultA).toMatchObject({ kind: "TERMINAL", decision: "VERIFIED_RESULT" });
-        expect(resultB).toMatchObject({ kind: "TERMINAL", decision: "VERIFIED_RESULT" });
+        expectScientificConfirmationRequired(resultA);
+        expectScientificConfirmationRequired(resultB);
         expect(recoveredPoolA.calls).toHaveLength(0);
         expect(recoveredPoolB.calls).toHaveLength(0);
         expect(harnessCallCount(setup)).toBe(3);
         const replayedA = replaySetup(branchA);
         const replayedB = replaySetup(branchB);
-        expect(replayedA.aggregate.terminal.eventHash)
-            .toBe(replayedB.aggregate.terminal.eventHash);
-        expect(replayedA.aggregate.terminal.evidenceClosure.closureRoot)
-            .toBe(replayedB.aggregate.terminal.evidenceClosure.closureRoot);
+        expect(replayedA.aggregate.lastEventHash)
+            .toBe(replayedB.aggregate.lastEventHash);
+        expect(replayedA.aggregate.nonResults.at(-1))
+            .toEqual(replayedB.aggregate.nonResults.at(-1));
         replayedA.repository.close();
         replayedB.repository.close();
     }, 120_000);
@@ -2687,18 +2810,18 @@ describe("Crucible autonomous runner", () => {
             branchB.config,
             runnerDependencies(recoveredPoolB),
         );
-        expect(resultA).toMatchObject({ kind: "TERMINAL", decision: "VERIFIED_RESULT" });
-        expect(resultB).toMatchObject({ kind: "TERMINAL", decision: "VERIFIED_RESULT" });
+        expectScientificConfirmationRequired(resultA);
+        expectScientificConfirmationRequired(resultB);
         expect(recoveredPoolA.calls).toHaveLength(0);
         expect(recoveredPoolB.calls).toHaveLength(0);
         expect(harnessCallCount(setup)).toBe(3);
         expect(resultA.recovery.uncertainDispatched).toBeGreaterThanOrEqual(1);
         const replayedA = replaySetup(branchA);
         const replayedB = replaySetup(branchB);
-        expect(replayedA.aggregate.terminal.eventHash)
-            .toBe(replayedB.aggregate.terminal.eventHash);
-        expect(replayedA.aggregate.terminal.evidenceClosure.closureRoot)
-            .toBe(replayedB.aggregate.terminal.evidenceClosure.closureRoot);
+        expect(replayedA.aggregate.lastEventHash)
+            .toBe(replayedB.aggregate.lastEventHash);
+        expect(replayedA.aggregate.nonResults.at(-1))
+            .toEqual(replayedB.aggregate.nonResults.at(-1));
         replayedA.repository.close();
         replayedB.repository.close();
     }, 120_000);
@@ -2717,8 +2840,8 @@ describe("H7 systematic runtime failure matrix", () => {
             commandKind: "candidate-measurement",
         },
         {
-            label: "terminal transaction",
-            point: "after_terminal_append",
+            label: "science gate append",
+            point: "after_non_result_append",
             commandKind: null,
         },
     ];
@@ -2755,10 +2878,19 @@ describe("H7 systematic runtime failure matrix", () => {
                 stderr += chunk.toString("utf8");
             });
             try {
-                await waitForForkMessage(
-                    child,
-                    (message) => message?.type === "fault-boundary",
-                );
+                try {
+                    await waitForForkMessage(
+                        child,
+                        (message) => message?.type === "fault-boundary",
+                    );
+                } catch (error) {
+                    throw new Error(
+                        `${error?.message ?? String(error)}${
+                            stderr.length === 0 ? "" : `\n${stderr}`
+                        }`,
+                        { cause: error },
+                    );
+                }
                 expect(child.kill("SIGKILL")).toBe(true);
                 const exit = await waitForForkExit(child);
                 expect(exit.signal ?? "SIGKILL", stderr).toBe("SIGKILL");
@@ -2779,11 +2911,8 @@ describe("H7 systematic runtime failure matrix", () => {
                 setup.config,
                 runnerDependencies(recoveredPool),
             );
-            expect(result).toMatchObject({
-                kind: "TERMINAL",
-                decision: "VERIFIED_RESULT",
-                tempRootCleaned: true,
-            });
+            expectScientificConfirmationRequired(result);
+            expect(result.tempRootCleaned).toBe(true);
             expect(recoveredPool.calls).toHaveLength(0);
             expect(fs.readFileSync(workerCallsPath, "utf8").trim().split(/\r?\n/u))
                 .toHaveLength(1);
@@ -2799,9 +2928,14 @@ describe("H7 systematic runtime failure matrix", () => {
                 row.kind === "runtime:measurement"
                 && row.payload.purpose === "candidate")).toHaveLength(1);
             expect(harnessCandidateEvidenceItems(replayed.aggregate)).toHaveLength(1);
-            expect(replayed.repository.listEvents("runtime-investigation")
-                .filter((event) => event.isTerminal)).toHaveLength(1);
-            const refs = replayed.repository.listArtifactRefs("runtime-investigation");
+            expect(replayed.repository.listEvents(
+                replayed.adapter.investigationId,
+            )
+                .filter((event) =>
+                    event.kind === "domain:v4:non_result_recorded")).toHaveLength(1);
+            const refs = replayed.repository.listArtifactRefs(
+                replayed.adapter.investigationId,
+            );
             expect(new Set(refs.map((ref) => `${ref.seq}:${ref.artifactId}`)).size)
                 .toBe(refs.length);
             replayed.repository.close();
@@ -2900,11 +3034,8 @@ describe("H7 systematic runtime failure matrix", () => {
                         processAdapter: makeProcessOwner(),
                     }),
                 );
-                expect(recovered).toMatchObject({
-                    kind: "TERMINAL",
-                    decision: "VERIFIED_RESULT",
-                    tempRootCleaned: true,
-                });
+                expectScientificConfirmationRequired(recovered);
+                expect(recovered.tempRootCleaned).toBe(true);
                 expect(harnessCallCount(setup)).toBe(3);
                 expect(processOwners[1].closeCalls).toBe(1);
                 expect(
@@ -3124,7 +3255,7 @@ describe("H7 systematic runtime failure matrix", () => {
                 WHERE investigation_id = ?
                   AND content_type = ?
                 ORDER BY artifact_id ASC`).all(
-                "runtime-investigation",
+                setup.config.investigationId,
                 "application/vnd.crucible.effect-recovery+json",
             );
         } finally {

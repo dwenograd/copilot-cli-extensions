@@ -11,7 +11,7 @@ import {
     hashCanonical,
     selectAdaptiveOperator,
 } from "../domain/index.mjs";
-import { fakeHarnessIdentity } from "./harness-identity-fixture.mjs";
+import { makeV4ContractInput } from "./v4-contract-fixture.mjs";
 
 function artifactHash(character) {
     return `sha256:${character.repeat(64)}`;
@@ -37,29 +37,20 @@ function policy(overrides = {}) {
 }
 
 function contract(searchPolicy = policy()) {
-    return createInvestigationContract({
+    const input = makeV4ContractInput({
         objective: "exercise deterministic archive selection",
         acceptancePredicate: { kind: "harness_pass" },
-        validationCases: [
-            { id: "good", expectation: "accept", artifactHash: artifactHash("a") },
-            { id: "bad", expectation: "reject", artifactHash: artifactHash("b") },
-        ],
-        harnessId: "harness",
         hypothesisTopology: "open_generative",
         criticality: "high",
         policyVersion: "policy-v2",
-        parserVersion: "parser-v2",
-        harnessIdentity: fakeHarnessIdentity({
-            harnessId: "harness",
-            parserVersion: "parser-v2",
-        }),
         workerModels: ["model-a"],
         candidatesPerRound: 1,
         maxRounds: 10,
-        metrics: [{ key: "score", direction: "max", epsilon: 0 }],
         searchPolicy,
-        declaredLimits: {},
     });
+    input.statisticalPolicy.metrics[0].practicalEquivalenceDelta =
+        Number.EPSILON;
+    return createInvestigationContract(input);
 }
 
 function evidence({

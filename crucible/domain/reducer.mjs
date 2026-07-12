@@ -8,6 +8,12 @@ import {
     createInvestigationContract,
 } from "./contract.mjs";
 import {
+    assertExperimentAuthorityContractBinding,
+} from "./authority.mjs";
+import {
+    normalizeRuntimeConfigAuthority,
+} from "./runtime-authority.mjs";
+import {
     DOMAIN_VERSION,
     EVENT_TYPES,
     EVENT_VOCABULARY,
@@ -26,6 +32,11 @@ import {
     EventChainError,
     TransitionError,
 } from "./errors.mjs";
+import {
+    assertEnumerandBinding,
+    enumerandArtifactMeasurementHash,
+    normalizeEnumerandManifest,
+} from "./enumerands.mjs";
 import { deriveEvidencePayload } from "./evidence.mjs";
 import {
     cloneAggregateForMutation,
@@ -48,6 +59,25 @@ function objectIdMatchesTaggedHash(objectId, taggedHash) {
         && /^sha256:[a-f0-9]{64}$/u.test(objectId)
         && isAlgorithmTaggedSha256(taggedHash)
         && objectId.slice("sha256:".length) === taggedHash.split(":").at(-1);
+}
+
+function assertOpeningDomainVersion(event) {
+    if (event?.type !== EVENT_TYPES.INVESTIGATION_OPENED) {
+        return;
+    }
+    const eventDomainVersion = event.payload?.domainVersion ?? null;
+    const contractDomainVersion = event.payload?.contract?.domainVersion ?? null;
+    if (eventDomainVersion !== DOMAIN_VERSION
+        || contractDomainVersion !== DOMAIN_VERSION) {
+        throw new DomainVersionRestartRequiredError(
+            "Investigation event history uses an incompatible domain version; start a new investigation",
+            {
+                expectedDomainVersion: DOMAIN_VERSION,
+                actualDomainVersion: eventDomainVersion,
+                contractDomainVersion,
+            },
+        );
+    }
 }
 
 function assertEventEnvelope(aggregate, event) {
@@ -138,15 +168,7 @@ function duplicate(kind, id) {
 }
 
 function applyInvestigationOpened(next, event) {
-    if (event.payload?.domainVersion !== DOMAIN_VERSION) {
-        throw new DomainVersionRestartRequiredError(
-            "Investigation event history uses an incompatible domain version; start a new investigation",
-            {
-                expectedDomainVersion: DOMAIN_VERSION,
-                actualDomainVersion: event.payload?.domainVersion ?? null,
-            },
-        );
-    }
+    assertOpeningDomainVersion(event);
     if (event.payload?.contract === null || typeof event.payload?.contract !== "object") {
         throw new TransitionError(ERROR_CODES.INVALID_CONTRACT, "Opened event has no contract");
     }
@@ -166,6 +188,73 @@ function applyInvestigationOpened(next, event) {
     }
     next.contract = normalizedContract;
     next.contractHash = expectedHash;
+    if (event.payload.experimentAuthority === undefined
+        || event.payload.experimentAuthority === null) {
+        throw new TransitionError(
+            ERROR_CODES.INVALID_CONTRACT,
+            "Opened v4 investigations require persisted Ed25519 experiment authority",
+        );
+    }
+    let authority;
+    try {
+        authority = assertExperimentAuthorityContractBinding(
+            event.payload.experimentAuthority,
+            normalizedContract,
+        );
+    } catch (error) {
+        throw new TransitionError(
+            ERROR_CODES.INVALID_CONTRACT,
+            `Opened event experiment authority is invalid: ${
+                error?.message ?? String(error)
+            }`,
+        );
+    }
+    const authorityIdentity = event.payload.experimentAuthorityIdentity
+        ?? null;
+    if (authorityIdentity === null
+        || authority.identity !== authorityIdentity) {
+        throw new TransitionError(
+            ERROR_CODES.INVALID_CONTRACT,
+            "Opened event experiment authority identity is invalid",
+        );
+    }
+    next.experimentAuthority = authority;
+    next.experimentAuthorityIdentity = authorityIdentity;
+    if (event.payload.runtimeConfigAuthority === undefined
+        || event.payload.runtimeConfigAuthority === null) {
+        throw new TransitionError(
+            ERROR_CODES.INVALID_CONTRACT,
+            "Opened v4 investigations require immutable runtime config authority",
+        );
+    }
+    let runtimeAuthority;
+    try {
+        runtimeAuthority = normalizeRuntimeConfigAuthority(
+            event.payload.runtimeConfigAuthority,
+        );
+        if (runtimeAuthority.securityConfig?.runner?.investigationId
+            !== authority.manifest.investigationId) {
+            throw new Error(
+                "runtime config authority belongs to a different investigation",
+            );
+        }
+    } catch (error) {
+        throw new TransitionError(
+            ERROR_CODES.INVALID_CONTRACT,
+            `Opened event runtime config authority is invalid: ${
+                error?.message ?? String(error)
+            }`,
+        );
+    }
+    if (event.payload.runtimeConfigFingerprint
+        !== runtimeAuthority.fingerprint) {
+        throw new TransitionError(
+            ERROR_CODES.INVALID_CONTRACT,
+            "Opened event runtime config fingerprint is invalid",
+        );
+    }
+    next.runtimeConfigAuthority = runtimeAuthority;
+    next.runtimeConfigFingerprint = runtimeAuthority.fingerprint;
     next.status = "active";
 }
 
@@ -242,9 +331,12 @@ function applyCommandObserved(next, event) {
     if (hasOwnEntry(next.observations, payload.observationId)) {
         duplicate("observation", payload.observationId);
     }
+    const expectedHarnessId = command.command.harnessId ?? next.contract.harnessId;
+    const expectedParserVersion =
+        command.command.parserVersion ?? next.contract.parserVersion;
     if (payload.sourceKind === "harness"
-        && (payload.harnessId !== next.contract.harnessId
-            || payload.parserVersion !== next.contract.parserVersion)) {
+        && (payload.harnessId !== expectedHarnessId
+            || payload.parserVersion !== expectedParserVersion)) {
         throw new TransitionError(
             ERROR_CODES.INVALID_EVIDENCE,
             "Harness observation does not match the immutable contract",
@@ -361,20 +453,77 @@ function applyCommandObserved(next, event) {
                 "Harness candidate observation exceeds the frozen maximum round",
             );
         }
-        const boundedIds = next.contract.boundedCandidateIds;
-        if (boundedIds !== undefined && !boundedIds.includes(payload.candidateId)) {
-            throw new TransitionError(
-                ERROR_CODES.INVALID_EVIDENCE,
-                "Harness candidate is outside the frozen bounded search space",
-                { candidateId: payload.candidateId },
-            );
-        }
-        if ((command.command.boundedCandidateId ?? null)
-            !== (boundedIds === undefined ? null : payload.candidateId)) {
-            throw new TransitionError(
-                ERROR_CODES.INVALID_EVIDENCE,
-                "Harness candidate observation does not match its bounded candidate assignment",
-            );
+        const enumerandManifest = next.contract.enumerandManifest === undefined
+            ? null
+            : normalizeEnumerandManifest(next.contract.enumerandManifest, {
+                topology: next.contract.hypothesisTopology,
+                observableRegistry: next.contract.observableRegistry,
+                hypothesisPolicy: next.contract.hypothesisPolicy,
+            });
+        if (enumerandManifest !== null) {
+            let binding;
+            try {
+                binding = assertEnumerandBinding(
+                    enumerandManifest,
+                    command.command.enumerand,
+                    {
+                        topology: next.contract.hypothesisTopology,
+                        observableRegistry: next.contract.observableRegistry,
+                        hypothesisPolicy: next.contract.hypothesisPolicy,
+                    },
+                );
+            } catch (error) {
+                throw new TransitionError(
+                    ERROR_CODES.INVALID_EVIDENCE,
+                    "Harness candidate command is outside the frozen enumerand manifest",
+                    { cause: error?.message ?? String(error) },
+                );
+            }
+            const globalSlot = (payload.round - 1) * next.contract.candidatesPerRound
+                + payload.slotIndex;
+            if (binding.ordinal !== globalSlot
+                || binding.id !== payload.candidateId) {
+                throw new TransitionError(
+                    ERROR_CODES.INVALID_EVIDENCE,
+                    "Harness candidate observation does not match its enumerand ordinal",
+                    {
+                        expectedOrdinal: globalSlot,
+                        actualOrdinal: binding.ordinal,
+                        expectedId: binding.id,
+                        actualId: payload.candidateId,
+                    },
+                );
+            }
+            if (binding.topology === "finite_enumerable"
+                && payload.receipt.candidateArtifactHash
+                    !== enumerandArtifactMeasurementHash(
+                        binding.artifactSnapshotHash,
+                    )) {
+                throw new TransitionError(
+                    ERROR_CODES.INVALID_EVIDENCE,
+                    "Finite enumerand observation did not measure its staged artifact snapshot",
+                    {
+                        ordinal: binding.ordinal,
+                        enumerandHash: binding.enumerandHash,
+                    },
+                );
+            }
+        } else {
+            const boundedIds = next.contract.boundedCandidateIds;
+            if (boundedIds !== undefined && !boundedIds.includes(payload.candidateId)) {
+                throw new TransitionError(
+                    ERROR_CODES.INVALID_EVIDENCE,
+                    "Harness candidate is outside the frozen bounded search space",
+                    { candidateId: payload.candidateId },
+                );
+            }
+            if ((command.command.boundedCandidateId ?? null)
+                !== (boundedIds === undefined ? null : payload.candidateId)) {
+                throw new TransitionError(
+                    ERROR_CODES.INVALID_EVIDENCE,
+                    "Harness candidate observation does not match its bounded candidate assignment",
+                );
+            }
         }
     }
     next.observations[payload.observationId] = {
@@ -639,6 +788,7 @@ export function reduceEvent(aggregate, event) {
             },
         );
     }
+    assertOpeningDomainVersion(event);
     assertEventEnvelope(aggregate, event);
     if (aggregate.terminal !== null) {
         throw new TransitionError(
@@ -689,18 +839,8 @@ export function verifyEventChain(events) {
     let lastSeq = 0;
     let lastEventHash = null;
     for (const event of events) {
+        assertOpeningDomainVersion(event);
         assertEventEnvelope({ lastSeq, lastEventHash }, event);
-        if (event.seq === 1
-            && event.type === EVENT_TYPES.INVESTIGATION_OPENED
-            && event.payload?.domainVersion !== DOMAIN_VERSION) {
-            throw new DomainVersionRestartRequiredError(
-                "Investigation event history uses an incompatible domain version; start a new investigation",
-                {
-                    expectedDomainVersion: DOMAIN_VERSION,
-                    actualDomainVersion: event.payload?.domainVersion ?? null,
-                },
-            );
-        }
         lastSeq = event.seq;
         lastEventHash = event.eventHash;
     }

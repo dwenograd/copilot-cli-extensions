@@ -10,6 +10,10 @@ import { DecisionError, ERROR_CODES } from "./errors.mjs";
 import { detectPlateau, buildSearchCandidateCommand } from "./strategy.mjs";
 import { buildCandidateArchive } from "./archive.mjs";
 import {
+    assessTargetUnreachableReadiness,
+    assessVerifiedResultReadiness,
+} from "./scientific-readiness.mjs";
+import {
     activeCommand,
     boundedSearchExhaustion,
     currentValidationEvidence,
@@ -84,6 +88,58 @@ function impossibilityNonResultRecommendation(aggregate, evidence) {
         certificateVerdict,
         evidenceId: evidence.evidenceId,
         evidenceHash: evidence.commitEventHash,
+    };
+    return {
+        kind: "NON_RESULT",
+        ...payload,
+        event: {
+            type: EVENT_TYPES.NON_RESULT_RECORDED,
+            payload,
+        },
+    };
+}
+
+function scientificConfirmationRecommendation(
+    aggregate,
+    incumbent,
+    basis,
+    readiness = assessVerifiedResultReadiness(aggregate, incumbent),
+) {
+    const payload = {
+        code: NON_RESULT_CODES.SCIENTIFIC_CONFIRMATION_REQUIRED,
+        reason:
+            "Search evidence identified an incumbent, but trusted confirmation, challenge, and any required prediction evaluations are not closed.",
+        commandCount: aggregate.commandOrder.length,
+        commandBudget: commandBudget(aggregate.contract),
+        maxRounds: aggregate.contract.maxRounds,
+        sourceStopRequestSeq: null,
+        candidateId: incumbent.candidateId,
+        evidenceId: incumbent.evidenceId,
+        evidenceHash: incumbent.commitEventHash,
+        basis,
+        readiness,
+    };
+    return {
+        kind: "NON_RESULT",
+        ...payload,
+        event: {
+            type: EVENT_TYPES.NON_RESULT_RECORDED,
+            payload,
+        },
+    };
+}
+
+function independentVerificationRecommendation(aggregate, basis, readiness) {
+    const payload = {
+        code: NON_RESULT_CODES.INDEPENDENT_VERIFICATION_REQUIRED,
+        reason:
+            "Search-space exhaustion is not authority for TARGET_UNREACHABLE; an independent impossibility verifier must supply trusted evidence.",
+        commandCount: aggregate.commandOrder.length,
+        commandBudget: commandBudget(aggregate.contract),
+        maxRounds: aggregate.contract.maxRounds,
+        sourceStopRequestSeq: null,
+        basis,
+        readiness,
     };
     return {
         kind: "NON_RESULT",
@@ -223,6 +279,15 @@ function terminalEvidenceClosure(
 }
 
 function verifiedRecommendation(aggregate, incumbent, basis) {
+    const readiness = assessVerifiedResultReadiness(aggregate, incumbent);
+    if (!readiness.ready) {
+        return scientificConfirmationRecommendation(
+            aggregate,
+            incumbent,
+            basis,
+            readiness,
+        );
+    }
     const payload = {
         decision: "VERIFIED_RESULT",
         candidateId: incumbent.candidateId,
@@ -255,28 +320,24 @@ function unreachableRecommendation(aggregate) {
     }
     const boundedBasis = boundedSearchExhaustion(aggregate);
     if (boundedBasis !== null) {
-        const evidenceClosure = terminalEvidenceClosure(aggregate, {
-            basis: boundedBasis,
-            decisiveKind: "bounded_search",
-        });
-        return {
-            kind: "TERMINAL",
-            decision: "TARGET_UNREACHABLE",
-            basis: boundedBasis,
-            event: {
-                type: EVENT_TYPES.TARGET_UNREACHABLE,
-                payload: {
-                    decision: "TARGET_UNREACHABLE",
-                    basis: boundedBasis,
-                    evidenceClosure,
-                },
-            },
-        };
+        return independentVerificationRecommendation(
+            aggregate,
+            boundedBasis,
+            assessTargetUnreachableReadiness(aggregate, null),
+        );
     }
 
     const evidence = qualifyingUnreachableEvidence(aggregate);
     if (evidence === null) {
         return null;
+    }
+    const readiness = assessTargetUnreachableReadiness(aggregate, evidence);
+    if (!readiness.ready) {
+        return independentVerificationRecommendation(
+            aggregate,
+            evidence.unreachableBasis,
+            readiness,
+        );
     }
     const observation = aggregate.observations[evidence.observationId];
     const verifierCommand = aggregate.commands[observation.commandId].command;
@@ -306,6 +367,7 @@ function unreachableRecommendation(aggregate) {
                 basis,
                 evidenceId: evidence.evidenceId,
                 evidenceHash: evidence.commitEventHash,
+                contractHash: aggregate.contractHash,
                 evidenceClosure,
             },
         },
@@ -334,8 +396,10 @@ function reserveCommandRecommendation(aggregate) {
     if (validationEvidence === null) {
         command = {
             kind: "run_validation",
-            harnessId: aggregate.contract.harnessId,
-            parserVersion: aggregate.contract.parserVersion,
+            harnessRole: "calibration",
+            harnessId: aggregate.contract.harnessSuite.roles.calibration.harnessId,
+            parserVersion:
+                aggregate.contract.harnessSuite.roles.calibration.parser.version,
             validationCases: aggregate.contract.validationCases,
         };
     } else {
@@ -390,8 +454,11 @@ function buildImpossibilityVerificationCommand(aggregate, progress) {
     };
     return {
         kind: "verify_impossibility",
-        harnessId: aggregate.contract.harnessId,
-        parserVersion: aggregate.contract.parserVersion,
+        harnessRole: "impossibility_verifier",
+        harnessId:
+            aggregate.contract.harnessSuite.roles.impossibility_verifier.harnessId,
+        parserVersion:
+            aggregate.contract.harnessSuite.roles.impossibility_verifier.parser.version,
         attemptOrdinal,
         certificateVersion: aggregate.contract.impossibilityPolicy.certificateVersion,
         request,
@@ -514,14 +581,6 @@ export function decideNext(aggregate) {
     }
 
     const incumbent = qualifyingCandidateEvidence(aggregate);
-    if (incumbent !== null && aggregate.contract.searchPolicy.stopOnFirstAccept) {
-        return verifiedRecommendation(aggregate, incumbent, {
-            kind: "first_passing_candidate",
-            stopOnFirstAccept: true,
-            round: incumbent.round,
-            slotIndex: incumbent.slotIndex,
-        });
-    }
 
     const unreachable = unreachableRecommendation(aggregate);
     if (unreachable !== null) {

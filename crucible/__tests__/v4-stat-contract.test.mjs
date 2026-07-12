@@ -1,0 +1,206 @@
+import { describe, expect, it } from "vitest";
+
+import {
+    DEFAULT_SEARCH_POLICY,
+    contractHash,
+    createInvestigationContract,
+} from "../domain/index.mjs";
+import { computeHarnessSuiteV4Identity } from "../measurement/index.mjs";
+import {
+    buildPromptContext,
+    deriveRunnerExecutionLimits,
+} from "../runtime/index.mjs";
+import {
+    fakeHarnessSuiteV4,
+    makeV4ContractInput,
+    snapshot,
+} from "./v4-contract-fixture.mjs";
+
+function clone(value) {
+    return structuredClone(value);
+}
+
+describe("v4 frozen statistical contract", () => {
+    it("canonicalizes unordered registries, metrics, alpha families, and tolerances", () => {
+        const base = makeV4ContractInput({
+            observableRegistry: [
+                { key: "latency", kind: "numeric", minimum: 0, maximum: 1000 },
+                { key: "score", kind: "numeric", minimum: 0, maximum: 1 },
+            ],
+        });
+        base.statisticalPolicy.metrics = [
+            {
+                key: "latency",
+                minimum: 0,
+                maximum: 1000,
+                estimand: "mean latency difference versus control",
+                unit: "ms",
+                direction: "min",
+                acceptanceThreshold: 200,
+                practicalEquivalenceDelta: 5,
+                family: "secondary",
+            },
+            base.statisticalPolicy.metrics[0],
+        ];
+        base.statisticalPolicy.familyAllocations = [
+            { family: "secondary", alpha: 0.02 },
+            { family: "primary", alpha: 0.03 },
+        ];
+        base.statisticalPolicy.control.tolerances = [
+            { metric: "latency", absolute: 2, relative: 0.01 },
+            { metric: "score", absolute: 0.01, relative: 0 },
+        ];
+
+        const reordered = clone(base);
+        reordered.observableRegistry.reverse();
+        reordered.statisticalPolicy.metrics.reverse();
+        reordered.statisticalPolicy.familyAllocations.reverse();
+        reordered.statisticalPolicy.control.tolerances.reverse();
+
+        const first = createInvestigationContract(base);
+        const second = createInvestigationContract(reordered);
+        expect(second).toEqual(first);
+        expect(contractHash(second)).toBe(contractHash(first));
+        expect(first.statisticalPolicy.metrics.map((metric) => metric.key))
+            .toEqual(["latency", "score"]);
+    });
+
+    it("requires goal/topology roles, finite bounds, and the matching control", () => {
+        const missingRole = makeV4ContractInput();
+        delete missingRole.harnessSuite.roles.novelty;
+        expect(() => createInvestigationContract(missingRole))
+            .toThrow(/roles\.novelty is required|role "novelty" is required/u);
+
+        const missingVerifier = makeV4ContractInput({
+            hypothesisTopology: "certified_impossibility",
+            harnessSuite: fakeHarnessSuiteV4({ includeVerifier: false }),
+        });
+        missingVerifier.harnessSuiteIdentity =
+            computeHarnessSuiteV4Identity(missingVerifier.harnessSuite);
+        expect(() => createInvestigationContract(missingVerifier))
+            .toThrow(/impossibility_verifier/u);
+
+        const unbounded = makeV4ContractInput();
+        unbounded.observableRegistry[0].maximum = Number.POSITIVE_INFINITY;
+        unbounded.statisticalPolicy.metrics[0].maximum =
+            Number.POSITIVE_INFINITY;
+        expect(() => createInvestigationContract(unbounded))
+            .toThrow(/finite bounded number|finite number/u);
+
+        const finite = makeV4ContractInput({
+            hypothesisTopology: "finite_enumerable",
+            candidatesPerRound: 1,
+            maxRounds: 1,
+        });
+        finite.statisticalPolicy.control.identity =
+            `sha256:crucible-wrong-control-v1:${"f".repeat(64)}`;
+        expect(() => createInvestigationContract(finite))
+            .toThrow(/must match the frozen enumerand manifest control/u);
+    });
+
+    it("rejects invalid alpha sums, ranges, and impossible capacity budgets", () => {
+        const alpha = makeV4ContractInput();
+        alpha.statisticalPolicy.familyAllocations[0].alpha = 0.04;
+        expect(() => createInvestigationContract(alpha))
+            .toThrow(/sum to investigationAlpha/u);
+
+        const threshold = makeV4ContractInput();
+        threshold.statisticalPolicy.metrics[0].acceptanceThreshold = 2;
+        expect(() => createInvestigationContract(threshold))
+            .toThrow(/acceptanceThreshold/u);
+
+        const blocks = makeV4ContractInput();
+        blocks.statisticalPolicy.minBlocks = 3;
+        blocks.statisticalPolicy.maxBlocks = 2;
+        expect(() => createInvestigationContract(blocks))
+            .toThrow(/minBlocks cannot exceed maxBlocks/u);
+
+        const evaluation = makeV4ContractInput();
+        evaluation.statisticalPolicy.evaluationBudget.maxCandidateEvaluations = 1;
+        expect(() => createInvestigationContract(evaluation))
+            .toThrow(/cannot cover the frozen block\/search\/confirmation capacity/u);
+
+        const bytes = makeV4ContractInput();
+        bytes.statisticalPolicy.resourceBudget.perInvestigationCasBytes = 1;
+        expect(() => createInvestigationContract(bytes))
+            .toThrow(/resourceBudget.*impossible/u);
+    });
+
+    it("rejects suite relabeling, manifest mutation, and all v3 contract fields", () => {
+        const relabeled = makeV4ContractInput();
+        relabeled.harnessSuite.operatorCorpus.cases["cal-accept"].expectation =
+            "reject";
+        expect(() => createInvestigationContract(relabeled))
+            .toThrow(/identity does not match|relabel|expectation/iu);
+
+        const mutatedManifest = clone(makeV4ContractInput({
+            hypothesisTopology: "finite_enumerable",
+            candidatesPerRound: 1,
+            maxRounds: 1,
+        }));
+        mutatedManifest.enumerandManifest.entries[0].artifactSnapshotHash =
+            snapshot("9");
+        expect(() => createInvestigationContract(mutatedManifest))
+            .toThrow(/Merkle root does not match|enumerandHash does not match/u);
+
+        for (const legacyField of [
+            ["harnessId", "legacy"],
+            ["validationCases", []],
+            ["boundedCandidateIds", ["label-only"]],
+            ["metrics", []],
+            ["declaredLimits", {}],
+            ["parserVersion", "legacy"],
+            ["harnessIdentity", {}],
+        ]) {
+            const input = makeV4ContractInput();
+            input[legacyField[0]] = legacyField[1];
+            expect(() => createInvestigationContract(input))
+                .toThrow(/canonical fields/u);
+        }
+
+        const stopFirst = makeV4ContractInput();
+        stopFirst.searchPolicy = {
+            ...DEFAULT_SEARCH_POLICY,
+            stopOnFirstAccept: true,
+        };
+        expect(() => createInvestigationContract(stopFirst))
+            .toThrow(/searchPolicy.*canonical fields/u);
+    });
+
+    it("redacts held-out case ids/snapshots and control identity from worker context", () => {
+        const contract = createInvestigationContract(makeV4ContractInput());
+        const { context } = buildPromptContext({
+            contract,
+            archive: {},
+            slot: {
+                operator: "fresh",
+                round: 1,
+                slotIndex: 0,
+                candidateId: "candidate-r000001-s000",
+                model: "worker-a",
+                seed: 1,
+                parentEvidenceIds: [],
+                promptContextRefs: [],
+            },
+        });
+        const encoded = JSON.stringify(context);
+        expect(encoded).not.toContain("challenge-case");
+        expect(encoded).not.toContain(snapshot("5"));
+        expect(encoded).not.toContain("confirmation-case");
+        expect(context.harnessSuite.roles.challenge.caseManifest).toBeNull();
+        expect(context.statisticalPolicy.control.identity).toBeNull();
+        expect(context.observableRegistry).toEqual(contract.observableRegistry);
+        expect(context.hypothesisPolicy).toEqual(contract.hypothesisPolicy);
+    });
+
+    it("derives loop/effect/output/CAS limits from the frozen policy", () => {
+        const contract = createInvestigationContract(makeV4ContractInput());
+        const limits = deriveRunnerExecutionLimits(contract);
+        expect(limits.byteBudgets).toEqual(
+            contract.statisticalPolicy.resourceBudget,
+        );
+        expect(limits.maxExternalEffects)
+            .toBeGreaterThan(contract.statisticalPolicy.evaluationBudget.maxTotalEvaluations);
+        expect(limits.maxLoopIterations).toBeGreaterThan(limits.maxExternalEffects);
+    });
+});

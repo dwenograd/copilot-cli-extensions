@@ -30,13 +30,14 @@ import {
     immutableCanonical,
     metricImprovement,
 } from "../domain/index.mjs";
+import { projectHarnessSuiteV4ForWorker } from "../measurement/index.mjs";
 import { RuntimeConfigError } from "./errors.mjs";
 import { requirePlainObject } from "./utils.mjs";
 
 export const PROMPT_CONTEXT_VERSION = "crucible-runtime-prompt-context-v1";
 export const PROMPT_CONTEXT_HASH_ALGORITHM = "sha256:crucible-runtime-prompt-context-v1";
 
-export const DEFAULT_PROMPT_CONTEXT_BYTE_CAP = 16 * 1024;
+export const DEFAULT_PROMPT_CONTEXT_BYTE_CAP = 24 * 1024;
 const MIN_PROMPT_CONTEXT_BYTE_CAP = 2 * 1024;
 const MAX_PROMPT_CONTEXT_BYTE_CAP = 1024 * 1024;
 
@@ -440,6 +441,47 @@ export function buildPromptContext(input = {}) {
             epsilon: finiteNumberOrNull(metric.epsilon) ?? 0,
         }));
     const keys = metricKeys(metrics);
+    let harnessSuite = null;
+    if (contract.harnessSuite !== undefined) {
+        try {
+            harnessSuite = projectHarnessSuiteV4ForWorker(contract.harnessSuite);
+        } catch (error) {
+            throw new RuntimeConfigError(
+                `contract.harnessSuite is invalid: ${error?.message ?? String(error)}`,
+                { cause: error?.code ?? null },
+            );
+        }
+    }
+    let statisticalPolicy = null;
+    if (contract.statisticalPolicy !== undefined) {
+        const frozenStatisticalPolicy = requirePlainObject(
+            contract.statisticalPolicy,
+            "contract.statisticalPolicy",
+        );
+        statisticalPolicy = {
+            ...frozenStatisticalPolicy,
+            control: {
+                ...requirePlainObject(
+                    frozenStatisticalPolicy.control,
+                    "contract.statisticalPolicy.control",
+                ),
+                identity: null,
+            },
+        };
+    }
+    const observableRegistry = contract.observableRegistry === undefined
+        ? null
+        : assertArrayBound(
+            contract.observableRegistry,
+            64,
+            "contract.observableRegistry",
+        );
+    const hypothesisPolicy = contract.hypothesisPolicy === undefined
+        ? null
+        : requirePlainObject(
+            contract.hypothesisPolicy,
+            "contract.hypothesisPolicy",
+        );
 
     const assignment = normalizeAssignment(input.slot);
     if (assignment.parentEvidenceIds.length > promptCap(contract, "parentEvidenceIds")
@@ -517,6 +559,10 @@ export function buildPromptContext(input = {}) {
         objective,
         predicate,
         metrics,
+        ...(statisticalPolicy === null ? {} : { statisticalPolicy }),
+        ...(observableRegistry === null ? {} : { observableRegistry }),
+        ...(hypothesisPolicy === null ? {} : { hypothesisPolicy }),
+        ...(harnessSuite === null ? {} : { harnessSuite }),
         assignment,
         plateau: plateauNotice(input.plateau ?? null),
         priorWork: {
@@ -551,7 +597,8 @@ export function assertPromptContractCoreFits(
     const normalizedCap = normalizeByteCap(byteCap);
     const workerModels = asArray(contract.workerModels)
         .filter((model) => typeof model === "string" && model.length > 0);
-    const boundedCandidateIds = asArray(contract.boundedCandidateIds)
+    const boundedCandidateIds = asArray(contract.enumerandManifest?.entries)
+        .map((entry) => entry?.id)
         .filter((candidateId) => typeof candidateId === "string" && candidateId.length > 0);
     const longest = (values, fallback) => values.reduce(
         (current, value) => (value.length > current.length ? value : current),
@@ -626,7 +673,7 @@ export function assertPromptContractCoreFits(
     const coreBytes = byteLength(context);
     if (coreBytes > normalizedCap) {
         throw new RuntimeConfigError(
-            "The objective, acceptance predicate, metrics, and required prompt metadata exceed the runtime prompt-context byte cap",
+            "The frozen contract core and required prompt metadata exceed the runtime prompt-context byte cap",
             { coreBytes, byteCap: normalizedCap },
         );
     }
