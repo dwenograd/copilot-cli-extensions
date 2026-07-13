@@ -13,6 +13,8 @@
     "test": "vitest run && node --test \"zerotrust-sourcecheck/__tests__/*.test.mjs\"",
     "test:vitest": "vitest run",
     "test:crucible": "vitest run crucible/__tests__",
+    "test:crucible:unit": "vitest run --config vitest.crucible-unit.config.mjs",
+    "test:crucible:changed": "node scripts/run-crucible-related.mjs",
     "test:crucible:science-fixtures": "vitest run crucible/__tests__/science-fixtures",
     "benchmark:crucible:v3-science": "node crucible/scripts/run-v3-science-benchmark.mjs --check",
     "test:crucible:release-safe": "vitest run --config vitest.crucible-release.config.mjs",
