@@ -182,6 +182,36 @@ describe("v4 frozen statistical contract", () => {
             .toThrow(/resourceBudget.*impossible/u);
     });
 
+    it("binds the runtime identity policy and initial root into the signed contract", () => {
+        const input = makeV4ContractInput();
+        const first = createInvestigationContract(input);
+        expect(first.runtimeIdentityPolicyIdentity)
+            .toBe(input.runtimeIdentityPolicyIdentity);
+        expect(first.runtimeIdentityRoot).toBe(input.runtimeIdentityRoot);
+
+        const changedRoot = makeV4ContractInput({
+            runtimeIdentityRoot:
+                `sha256:crucible-runtime-identity-root-v1:${"f".repeat(64)}`,
+        });
+        expect(contractHash(createInvestigationContract(changedRoot)))
+            .not.toBe(contractHash(first));
+
+        const changedPolicy = makeV4ContractInput();
+        changedPolicy.runtimeIdentityPolicy = clone(
+            changedPolicy.runtimeIdentityPolicy,
+        );
+        changedPolicy.runtimeIdentityPolicy.limits.maxFiles -= 1;
+        expect(() => createInvestigationContract(changedPolicy))
+            .toThrow(/runtimeIdentityPolicyIdentity/u);
+
+        const wrongRootDomain = makeV4ContractInput({
+            runtimeIdentityRoot:
+                `sha256:wrong-runtime-root-v1:${"f".repeat(64)}`,
+        });
+        expect(() => createInvestigationContract(wrongRootDomain))
+            .toThrow(/runtimeIdentityRoot must use/u);
+    });
+
     it("rejects suite relabeling, manifest mutation, and all v3 contract fields", () => {
         const relabeled = makeV4ContractInput();
         relabeled.harnessSuite.operatorCorpus.cases["cal-accept"].expectation =

@@ -27,6 +27,11 @@ export const RUNTIME_ERROR_CODES = Object.freeze({
     RESULT_MISSING: "CRUCIBLE_RUNTIME_RESULT_MISSING",
     UNCERTAIN_EXTERNAL_EFFECT: "CRUCIBLE_RUNTIME_UNCERTAIN_EXTERNAL_EFFECT",
     PATH_ESCAPE: "CRUCIBLE_RUNTIME_PATH_ESCAPE",
+    SDK_FAILURE: "CRUCIBLE_RUNTIME_SDK_FAILURE",
+    SDK_RETRY_EXHAUSTED: "CRUCIBLE_RUNTIME_SDK_RETRY_EXHAUSTED",
+    SDK_SUBMISSION_CONFLICT: "CRUCIBLE_RUNTIME_SDK_SUBMISSION_CONFLICT",
+    RESOURCE_UNAVAILABLE: "CRUCIBLE_RUNTIME_RESOURCE_UNAVAILABLE",
+    RUNTIME_DRIFT: "RUNTIME_DRIFT",
     INJECTED_CRASH: "CRUCIBLE_RUNTIME_INJECTED_CRASH",
 });
 
@@ -53,6 +58,18 @@ export class RuntimeIntegrityError extends CrucibleRuntimeError {
     }
 }
 
+export class RuntimeDriftError extends CrucibleRuntimeError {
+    constructor(message, details, options) {
+        super(RUNTIME_ERROR_CODES.RUNTIME_DRIFT, message, {
+            restartRequired: true,
+            forkRequired: true,
+            inPlaceRepinAllowed: false,
+            requiredAction: "start_new_or_forked_investigation",
+            ...details,
+        }, options);
+    }
+}
+
 export class LegacyIncompatibleRuntimeError extends CrucibleRuntimeError {
     constructor(message, details) {
         super(RUNTIME_ERROR_CODES.LEGACY_INCOMPATIBLE, message, {
@@ -68,6 +85,24 @@ export class LegacyIncompatibleRuntimeError extends CrucibleRuntimeError {
 export class WorkerProtocolError extends CrucibleRuntimeError {
     constructor(code, message, details) {
         super(code, message, details);
+    }
+}
+
+export class SdkFailureError extends CrucibleRuntimeError {
+    constructor(message, details, options) {
+        super(RUNTIME_ERROR_CODES.SDK_FAILURE, message, details, options);
+    }
+}
+
+export class SdkRetryExhaustedError extends CrucibleRuntimeError {
+    constructor(message, details, options) {
+        super(RUNTIME_ERROR_CODES.SDK_RETRY_EXHAUSTED, message, details, options);
+    }
+}
+
+export class SdkSubmissionConflictError extends CrucibleRuntimeError {
+    constructor(message, details, options) {
+        super(RUNTIME_ERROR_CODES.SDK_SUBMISSION_CONFLICT, message, details, options);
     }
 }
 

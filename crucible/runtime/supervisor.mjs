@@ -9,10 +9,25 @@ import {
     openRepository,
 } from "../persistence/index.mjs";
 import {
+    assertSupervisorConfigMatchesRuntimeAuthority,
+    verifyRuntimeConfigAuthority,
+} from "./config-authority.mjs";
+import {
     coerceSupervisorConfig,
     supervisorConfigFingerprint,
     supervisorPaths,
 } from "./config.mjs";
+import {
+    buildQuiescenceSnapshot,
+    consumeSupervisorStopSignal,
+    ensureStopDomainIntent,
+    isActiveQuiescentStop,
+    persistPausePending,
+    persistPausedQuiescent,
+    persistQuiescentStopBarrier,
+    stopControlPaths,
+    writeRunnerStopSignal,
+} from "./control-channel.mjs";
 import {
     assertInvestigationDomainCompatible,
     createDomainRepositoryAdapter,
@@ -25,6 +40,7 @@ import {
     RuntimeConfigError,
     SupervisorLockError,
 } from "./errors.mjs";
+import { openResourceBroker } from "./resource-broker.mjs";
 import {
     RUNTIME_TEMP_OWNER_MARKER,
     atomicWriteJson,
@@ -1043,6 +1059,7 @@ function runnerConfigForChild(config, lock, runnerIncarnation) {
         supervisorNonce: lock.nonce,
         runnerIncarnation,
         deadline: config.runner.deadlineMs,
+        resourceBroker: config.runner.resourceBroker,
         resultPath: config.paths.childResultPath,
         options: {
             ...config.runner.options,
@@ -1072,7 +1089,7 @@ function waitForChild(child) {
     });
 }
 
-function defaultSpawnRunner(config, context) {
+async function defaultSpawnRunner(config, context) {
     context.assertOwnership("runner result cleanup");
     fs.rmSync(config.paths.childResultPath, { force: true });
     context.assertOwnership("runner configuration write");
@@ -1082,6 +1099,8 @@ function defaultSpawnRunner(config, context) {
         }`,
     });
     context.assertOwnership("runner process launch");
+    await context.runtimeGuard?.("runner_process_launch");
+    context.assertOwnership("runner process launch after runtime verification");
     const processAdapter = context.processAdapter
         ?? createDefaultProcessAdapter();
     const remaining = remainingDeadlineMs(config.runner.deadlineMs);
@@ -1124,6 +1143,7 @@ function classifySuccessfulResult(envelope) {
         case "terminal":
         case "non_result":
         case "pause":
+        case "quiesced":
             return envelope.state;
         default:
             return null;
@@ -1306,6 +1326,10 @@ export async function runSupervisor(input, dependencies = {}) {
         throw error;
     }
     const scopedPaths = ownerRuntimePaths(config.paths, lock);
+    const controlPaths = stopControlPaths(
+        config.runner.stateDir,
+        config.runner.investigationId,
+    );
     const ownedConfig = Object.freeze({
         ...config,
         paths: Object.freeze({
@@ -1313,6 +1337,47 @@ export async function runSupervisor(input, dependencies = {}) {
             ...scopedPaths,
         }),
     });
+    const runtimeAdapter = createDomainRepositoryAdapter({
+        repository: authorityHandle.repository,
+        artifactStore: (
+            dependencies.artifactStoreFactory ?? openArtifactStore
+        )({ root: config.runner.artifactRoot }),
+        investigationId: config.runner.investigationId,
+    });
+    const openingAggregate = runtimeAdapter.replay().aggregate;
+    const runtimeAuthority = dependencies.runtimeAuthority
+        ?? openingAggregate.runtimeConfigAuthority;
+    if (config.runner.resourceBroker !== null && runtimeAuthority === null) {
+        closeSupervisorAuthorityRepository(authorityHandle);
+        releaseSupervisorLock(lock);
+        throw new CrucibleRuntimeError(
+            RUNTIME_ERROR_CODES.RUNTIME_DRIFT,
+            "Resource-broker runtime requires a persisted runtime authority",
+            { investigationId: config.runner.investigationId },
+        );
+    }
+    let resourceBroker = null;
+    if (config.runner.resourceBroker !== null) {
+        try {
+            resourceBroker = (
+                dependencies.resourceBrokerFactory ?? openResourceBroker
+            )({
+                stateRoot: config.runner.resourceBroker.stateRoot,
+                config: config.runner.resourceBroker.config,
+                env: dependencies.env ?? process.env,
+            });
+            if (resourceBroker.configFingerprint
+                !== config.runner.resourceBroker.configFingerprint) {
+                throw new RuntimeConfigError(
+                    "Resource broker fingerprint differs from supervisor authority",
+                );
+            }
+        } catch (error) {
+            closeSupervisorAuthorityRepository(authorityHandle);
+            releaseSupervisorLock(lock);
+            throw error;
+        }
+    }
     const startedAt = lock.startedAt;
     let status = null;
     let statusRevision = 0;
@@ -1332,8 +1397,137 @@ export async function runSupervisor(input, dependencies = {}) {
     const signalHandlers = new Map();
     let scavenging = null;
     let retainAuthority = false;
+    let processAdapterCloseAttempted = false;
+    let runtimeIdentityHealth = Object.freeze({
+        configured: runtimeAuthority !== null,
+        verified: runtimeAuthority === null,
+        root: runtimeAuthority?.runtimeIdentity?.root ?? null,
+        verifiedAt: null,
+        stage: null,
+        errorCode: null,
+    });
+    let brokerHealth = Object.freeze({
+        configured: resourceBroker !== null,
+        healthy: resourceBroker !== null,
+        configFingerprint:
+            config.runner.resourceBroker?.configFingerprint ?? null,
+        limitsFingerprint:
+            config.runner.resourceBroker?.limitsFingerprint ?? null,
+        activeLeaseCount: 0,
+        errorCode: null,
+    });
+    let controlChannelHealth = Object.freeze({
+        healthy: true,
+        lastPollAt: null,
+        stopState: null,
+        errorCode: null,
+    });
 
     const assertOwnership = (action) => assertSupervisorOwnership(lock, action);
+    const readPersistedStop = () =>
+        authorityHandle.repository.getQuiescentStop(
+            config.runner.investigationId,
+        );
+    const refreshBrokerHealth = () => {
+        if (resourceBroker === null) return brokerHealth;
+        try {
+            const activeLeaseCount = resourceBroker.listActiveLeases({
+                investigationId: config.runner.investigationId,
+            }).length;
+            brokerHealth = Object.freeze({
+                ...brokerHealth,
+                healthy: true,
+                activeLeaseCount,
+                errorCode: null,
+            });
+        } catch (error) {
+            brokerHealth = Object.freeze({
+                ...brokerHealth,
+                healthy: false,
+                errorCode: error?.code ?? RUNTIME_ERROR_CODES.RUNTIME_FAILURE,
+            });
+        }
+        return brokerHealth;
+    };
+    const verifyRuntimeClosure = async (stage) => {
+        if (runtimeAuthority === null) return null;
+        try {
+            const verified = typeof dependencies.runtimeIdentityVerifier
+                === "function"
+                ? await dependencies.runtimeIdentityVerifier({
+                    stage,
+                    config,
+                    authority: runtimeAuthority,
+                })
+                : (() => {
+                    assertSupervisorConfigMatchesRuntimeAuthority(
+                        config,
+                        runtimeAuthority,
+                        { env: dependencies.env ?? process.env },
+                    );
+                    return verifyRuntimeConfigAuthority(runtimeAuthority, {
+                        env: dependencies.env ?? process.env,
+                        deadlineMs: config.runner.deadlineMs,
+                        expectedInvestigationId:
+                            config.runner.investigationId,
+                        expectedStateDir: config.runner.stateDir,
+                        expectedArtifactRoot: config.runner.artifactRoot,
+                        nodeExecutable: process.execPath,
+                    });
+                })();
+            runtimeIdentityHealth = Object.freeze({
+                configured: true,
+                verified: true,
+                root: runtimeAuthority.runtimeIdentity.root,
+                verifiedAt: clock.isoNow(),
+                stage,
+                errorCode: null,
+            });
+            return verified;
+        } catch (error) {
+            runtimeIdentityHealth = Object.freeze({
+                configured: true,
+                verified: false,
+                root: runtimeAuthority.runtimeIdentity.root,
+                verifiedAt: clock.isoNow(),
+                stage,
+                errorCode: error?.code
+                    ?? RUNTIME_ERROR_CODES.RUNTIME_DRIFT,
+            });
+            throw error;
+        }
+    };
+    const claimBrokerAuthority = (runnerIncarnation) => {
+        if (resourceBroker === null) return null;
+        const authority = {
+            investigationId: config.runner.investigationId,
+            supervisorGeneration: lock.supervisorGeneration,
+            supervisorNonce: lock.nonce,
+            runnerIncarnation,
+        };
+        const existing = resourceBroker.getInvestigation(
+            config.runner.investigationId,
+        );
+        const result = existing === null
+            ? resourceBroker.registerInvestigation({
+                ...authority,
+                limits:
+                    config.runner.resourceBroker.investigationLimits,
+            })
+            : resourceBroker.claimAuthority(authority);
+        refreshBrokerHealth();
+        return result;
+    };
+    const retireBrokerAuthority = (reason) => {
+        if (resourceBroker === null) return null;
+        const runnerIncarnation = `supervisor-drain-g${
+            lock.supervisorGeneration
+        }-${sha256Hex(Buffer.from(String(reason), "utf8")).slice(0, 32)}`;
+        return Object.freeze({
+            runnerIncarnation,
+            result: claimBrokerAuthority(runnerIncarnation),
+        });
+    };
     const scavengeRuntime = dependencies.scavengeRuntime
         ?? scavengeStaleGenerationOwnedPaths;
     const scavengingReferences = [
@@ -1391,6 +1585,31 @@ export async function runSupervisor(input, dependencies = {}) {
         shutdownRequest = request;
         resolveShutdown(request);
     };
+    const persistShutdownBarrier = (request) => {
+        if (openingAggregate.contract === null) return null;
+        assertOwnership("shutdown quiescence barrier");
+        return persistQuiescentStopBarrier({
+            repository: authorityHandle.repository,
+            investigationId: config.runner.investigationId,
+            requestId: `shutdown-${lock.supervisorGeneration}-${
+                sha256Hex(Buffer.from(JSON.stringify(request), "utf8"))
+                    .slice(0, 32)
+            }`,
+            reason:
+                `Supervisor shutdown requires quiescence (${request.kind}).`,
+            pauseRequested: true,
+            owner: {
+                pid: lock.pid,
+                nonce: lock.nonce,
+                supervisorGeneration: lock.supervisorGeneration,
+            },
+            runnerPid: currentChildPid,
+            details: {
+                source: "supervisor-shutdown",
+                request,
+            },
+        });
+    };
 
     const requestOwnershipLoss = (action, error = null) => {
         const request = {
@@ -1413,6 +1632,7 @@ export async function runSupervisor(input, dependencies = {}) {
 
     const writeStatus = (state, extra = {}) => {
         assertOwnership(`${state} owner status write`);
+        refreshBrokerHealth();
         const terminalAvailable = state === "terminal"
             || extra.terminal_available === true;
         const nonResultCode = typeof extra.non_result_code === "string"
@@ -1437,6 +1657,15 @@ export async function runSupervisor(input, dependencies = {}) {
             statusRevision: statusRevision + 1,
             terminal_available: terminalAvailable,
             non_result_code: nonResultCode,
+            quiescent: extra.quiescent === true,
+            interventionRequired: extra.interventionRequired === true,
+            stopRequestId:
+                typeof extra.stopRequestId === "string"
+                    ? extra.stopRequestId
+                    : null,
+            runtimeIdentity: runtimeIdentityHealth,
+            resourceBroker: brokerHealth,
+            controlChannel: controlChannelHealth,
         };
         atomicWriteJson(ownedConfig.paths.statusPath, nextStatus, {
             token: `status:${lock.supervisorGeneration}:${lock.nonce}:${nextStatus.statusRevision}`,
@@ -1459,6 +1688,48 @@ export async function runSupervisor(input, dependencies = {}) {
         status = nextStatus;
         return status;
     };
+    const persistRuntimeDrift = (error, stage) => {
+        let aggregate = runtimeAdapter.replay().aggregate;
+        if (aggregate.contract !== null
+            && aggregate.pause === null
+            && aggregate.terminal === null
+            && aggregate.nonResults.length === 0) {
+            runtimeAdapter.requestStop({
+                requestId: `runtime-drift-${lock.supervisorGeneration}-${
+                    sha256Hex(Buffer.from(stage, "utf8")).slice(0, 24)
+                }`,
+                reason:
+                    "Runtime identity drift requires an operational pause.",
+                pauseRequested: true,
+            });
+            aggregate = runtimeAdapter.replay().aggregate;
+            if (aggregate.pause === null) {
+                runtimeAdapter.appendKernelDecision();
+            }
+        }
+        recordSupervisorNonResult({
+            code: RUNTIME_ERROR_CODES.RUNTIME_DRIFT,
+            reason:
+                "The current runtime closure differs from the signed opening identity.",
+            restartCount,
+            details: {
+                stage,
+                cause: error?.message ?? String(error),
+                runtimeIdentity: runtimeIdentityHealth,
+                scientificConclusion: false,
+            },
+        });
+        writeStatus("non_result", {
+            non_result_code: RUNTIME_ERROR_CODES.RUNTIME_DRIFT,
+        });
+        return {
+            kind: "NON_RESULT",
+            status,
+            terminalAvailable: false,
+            nonResultCode: RUNTIME_ERROR_CODES.RUNTIME_DRIFT,
+            error,
+        };
+    };
 
     const startHeartbeat = () => {
         if (heartbeatTimer !== null) return;
@@ -1467,6 +1738,10 @@ export async function runSupervisor(input, dependencies = {}) {
                 writeStatus(status?.state ?? "running", {
                     terminal_available: status?.terminal_available === true,
                     non_result_code: status?.non_result_code ?? null,
+                    quiescent: status?.quiescent === true,
+                    interventionRequired:
+                        status?.interventionRequired === true,
+                    stopRequestId: status?.stopRequestId ?? null,
                 });
             } catch (error) {
                 if (isOwnershipLostError(error)) {
@@ -1492,7 +1767,7 @@ export async function runSupervisor(input, dependencies = {}) {
         }
     };
 
-    const terminateCurrentChild = async () => {
+    const terminateCurrentChild = async (quiescentStop = null) => {
         if (currentChild === null || currentChildWait === null) return null;
         const child = currentChild;
         const wait = currentChildWait;
@@ -1505,6 +1780,53 @@ export async function runSupervisor(input, dependencies = {}) {
         const diagnostics = [];
         let exit = null;
         let jobObjectCloseAttempted = false;
+
+        if (quiescentStop !== null
+            && typeof currentRunnerIncarnation === "string"
+            && currentRunnerIncarnation.length > 0
+            && Number.isSafeInteger(pid)
+            && pid > 0) {
+            try {
+                writeRunnerStopSignal({
+                    paths: controlPaths,
+                    stop: quiescentStop,
+                    owner: {
+                        pid: lock.pid,
+                        nonce: lock.nonce,
+                        supervisorGeneration: lock.supervisorGeneration,
+                    },
+                    runner: {
+                        pid,
+                        runnerIncarnation: currentRunnerIncarnation,
+                    },
+                    clock,
+                });
+                const cooperative = await settleWithin(
+                    wait,
+                    Math.max(
+                        1,
+                        Math.min(shutdownPolicy.drainMs, remaining()),
+                    ),
+                    { timers: shutdownTimers },
+                );
+                diagnostics.push({
+                    phase: "cooperative_runner_stop",
+                    status: cooperative.status,
+                    pid,
+                    runnerIncarnation: currentRunnerIncarnation,
+                });
+                if (cooperative.status === "fulfilled") {
+                    exit = cooperative.value;
+                }
+            } catch (error) {
+                diagnostics.push({
+                    phase: "cooperative_runner_stop",
+                    status: "rejected",
+                    pid,
+                    error: error?.message ?? String(error),
+                });
+            }
+        }
 
         const runPhase = async (phase, force, timeoutMs) => {
             const budget = Math.max(1, Math.min(timeoutMs, remaining()));
@@ -1539,7 +1861,8 @@ export async function runSupervisor(input, dependencies = {}) {
             return false;
         };
 
-        if (!(await runPhase("drain", false, shutdownPolicy.drainMs))) {
+        if (exit === null
+            && !(await runPhase("drain", false, shutdownPolicy.drainMs))) {
             const escalation = runPhase(
                 "escalation",
                 true,
@@ -1619,7 +1942,584 @@ export async function runSupervisor(input, dependencies = {}) {
         return exit;
     };
 
+    const terminateRecordedRunner = async (pid, identityVerified) => {
+        if (!Number.isSafeInteger(pid) || pid < 1) {
+            return Object.freeze({
+                pid: null,
+                attempted: false,
+                active: false,
+                diagnostics: Object.freeze([]),
+            });
+        }
+        const isPidAlive = dependencies.isPidAlive ?? isExactPidAlive;
+        const diagnostics = [];
+        if (!isPidAlive(pid)) {
+            return Object.freeze({
+                pid,
+                attempted: false,
+                active: false,
+                diagnostics: Object.freeze(diagnostics),
+            });
+        }
+        if (identityVerified !== true) {
+            return Object.freeze({
+                pid,
+                attempted: false,
+                active: true,
+                identityVerified: false,
+                diagnostics: Object.freeze([{
+                    phase: "identity_verification",
+                    status: "refused",
+                    reason:
+                        "recorded runner PID no longer matches its generation/incarnation status",
+                }]),
+            });
+        }
+        for (const [phase, force, timeoutMs] of [
+            ["drain", false, shutdownPolicy.drainMs],
+            ["escalation", true, shutdownPolicy.escalationMs],
+        ]) {
+            const outcome = await settleWithin(
+                () => processTreeAdapter.terminateTree(pid, {
+                    phase,
+                    force,
+                    timeoutMs,
+                }),
+                timeoutMs,
+                { timers: shutdownTimers },
+            );
+            diagnostics.push({
+                phase,
+                force,
+                status: outcome.status,
+                result: outcome.value ?? null,
+                error: outcome.error?.message ?? null,
+            });
+            if (!isPidAlive(pid)) break;
+        }
+        if (isPidAlive(pid)
+            && typeof processTreeAdapter.closeJobObject === "function") {
+            const outcome = await settleWithin(
+                () => processTreeAdapter.closeJobObject(pid, {
+                    timeoutMs: shutdownPolicy.escalationMs,
+                }),
+                shutdownPolicy.escalationMs,
+                { timers: shutdownTimers },
+            );
+            diagnostics.push({
+                phase: "job_object_close",
+                status: outcome.status,
+                result: outcome.value ?? null,
+                error: outcome.error?.message ?? null,
+            });
+        }
+        return Object.freeze({
+            pid,
+            attempted: true,
+            active: isPidAlive(pid),
+            identityVerified: true,
+            diagnostics: Object.freeze(diagnostics),
+        });
+    };
+
+    const recordedRunnerIdentityIsExact = (stop) => {
+        if (stop.targetSupervisorGeneration === null
+            || stop.targetSupervisorNonce === null
+            || stop.targetSupervisorPid === null
+            || stop.targetRunnerIncarnation === null
+            || stop.targetRunnerPid === null) {
+            return false;
+        }
+        const targetStatus = readStatusForOwnership(
+            config.paths.statusPath,
+            {
+                pid: stop.targetSupervisorPid,
+                nonce: stop.targetSupervisorNonce,
+                supervisorGeneration:
+                    stop.targetSupervisorGeneration,
+            },
+        );
+        return targetStatus !== null
+            && targetStatus.pid === stop.targetSupervisorPid
+            && targetStatus.nonce === stop.targetSupervisorNonce
+            && targetStatus.supervisorGeneration
+                === stop.targetSupervisorGeneration
+            && targetStatus.childPid === stop.targetRunnerPid
+            && targetStatus.runnerIncarnation
+                === stop.targetRunnerIncarnation;
+    };
+
+    const reconcileQuiescentStop = async (initialStop) => {
+        let stop = initialStop;
+        if (!isActiveQuiescentStop(stop)) return null;
+        if (stop.targetSupervisorGeneration !== null
+            && stop.targetSupervisorGeneration > lock.supervisorGeneration) {
+            throw new SupervisorLockError(
+                RUNTIME_ERROR_CODES.LOCK_HELD,
+                "quiescent stop targets a newer supervisor generation",
+                {
+                    requestId: stop.requestId,
+                    targetSupervisorGeneration:
+                        stop.targetSupervisorGeneration,
+                    supervisorGeneration: lock.supervisorGeneration,
+                },
+            );
+        }
+        assertOwnership("quiescent stop reconciliation");
+        stop = authorityHandle.repository.markQuiescentStopReconciling({
+            investigationId: config.runner.investigationId,
+            requestId: stop.requestId,
+            supervisorGeneration: lock.supervisorGeneration,
+            supervisorNonce: lock.nonce,
+            supervisorPid: lock.pid,
+            details: {
+                sourceTargetGeneration:
+                    stop.targetSupervisorGeneration,
+                sourceTargetRunnerIncarnation:
+                    stop.targetRunnerIncarnation,
+                reconcilerGeneration: lock.supervisorGeneration,
+                reconcilerPid: lock.pid,
+            },
+        });
+        writeStatus("stopping", {
+            quiescent: false,
+            interventionRequired: false,
+            stopRequestId: stop.requestId,
+        });
+
+        const artifactStore = (
+            dependencies.artifactStoreFactory ?? openArtifactStore
+        )({ root: config.runner.artifactRoot });
+        const stopAdapter = createDomainRepositoryAdapter({
+            repository: authorityHandle.repository,
+            artifactStore,
+            investigationId: config.runner.investigationId,
+        });
+        const ensureDomainIntent =
+            dependencies.ensureStopDomainIntent
+            ?? ensureStopDomainIntent;
+        ensureDomainIntent(stopAdapter, stop);
+
+        const exitedRunnerPid = currentChildPid;
+        const exitedRunnerIncarnation = currentRunnerIncarnation;
+        const hadCurrentChild = currentChild !== null;
+        const childExit = !hadCurrentChild
+            ? null
+            : await terminateCurrentChild(stop);
+        if (childExit?.cleanupTimedOut !== true
+            && currentChild === null
+            && exitedRunnerIncarnation !== null) {
+            await reapRunnerOwnedPaths(
+                exitedRunnerIncarnation,
+                exitedRunnerPid,
+            );
+        }
+
+        const recordedTarget = hadCurrentChild
+            ? Object.freeze({
+                pid: exitedRunnerPid,
+                attempted: true,
+                active: childExit?.cleanupTimedOut === true,
+                identityVerified: true,
+                runnerIncarnation: exitedRunnerIncarnation,
+                diagnostics: Object.freeze(
+                    childExit?.shutdown?.diagnostics ?? [],
+                ),
+            })
+            : await terminateRecordedRunner(
+                stop.targetRunnerPid,
+                recordedRunnerIdentityIsExact(stop),
+            );
+        let adapterClose = {
+            status: "fulfilled",
+            value: true,
+            error: null,
+        };
+        if (typeof processTreeAdapter.close === "function") {
+            processAdapterCloseAttempted = true;
+            adapterClose = await settleWithin(
+                () => processTreeAdapter.close({
+                    timeoutMs: shutdownPolicy.finalMs,
+                }),
+                shutdownPolicy.finalMs,
+                { timers: shutdownTimers },
+            );
+        }
+        let brokerDrainError = null;
+        let brokerAuthority = Object.freeze({
+            verified: resourceBroker === null,
+            configured: resourceBroker !== null,
+            authorityRetired: resourceBroker === null,
+            supervisorGeneration: null,
+            supervisorNonce: null,
+            runnerIncarnation: null,
+        });
+        if (resourceBroker !== null
+            && childExit?.cleanupTimedOut !== true
+            && recordedTarget.active !== true
+            && adapterClose.status === "fulfilled") {
+            try {
+                const retirement =
+                    retireBrokerAuthority(`stop:${stop.requestId}`);
+                const investigation = resourceBroker.getInvestigation(
+                    config.runner.investigationId,
+                );
+                if (retirement === null
+                    || investigation === null
+                    || investigation.supervisorGeneration
+                        !== lock.supervisorGeneration
+                    || investigation.supervisorNonce !== lock.nonce
+                    || investigation.runnerIncarnation
+                        !== retirement.runnerIncarnation) {
+                    throw new RuntimeConfigError(
+                        "Resource broker did not persist the retired stop authority",
+                    );
+                }
+                brokerAuthority = Object.freeze({
+                    verified: true,
+                    configured: true,
+                    authorityRetired: true,
+                    supervisorGeneration: lock.supervisorGeneration,
+                    supervisorNonce: lock.nonce,
+                    runnerIncarnation: retirement.runnerIncarnation,
+                });
+            } catch (error) {
+                brokerDrainError = error;
+                brokerAuthority = Object.freeze({
+                    verified: false,
+                    configured: true,
+                    authorityRetired: false,
+                    reason: error?.message ?? String(error),
+                });
+                brokerHealth = Object.freeze({
+                    ...brokerHealth,
+                    healthy: false,
+                    errorCode:
+                        error?.code ?? RUNTIME_ERROR_CODES.RUNTIME_FAILURE,
+                });
+            }
+        } else if (resourceBroker !== null) {
+            brokerAuthority = Object.freeze({
+                verified: false,
+                configured: true,
+                authorityRetired: false,
+                reason:
+                    "Runner/process cleanup did not permit broker authority retirement",
+            });
+        }
+
+        const isPidAlive = dependencies.isPidAlive ?? isExactPidAlive;
+        const buildProof =
+            dependencies.buildQuiescenceSnapshot
+            ?? buildQuiescenceSnapshot;
+        const captureQuiescenceProof = async () => {
+            const ownerStatus = readStatusForOwnership(
+                config.paths.statusPath,
+                lock,
+            );
+            const authority =
+                authorityHandle.repository.getSupervisorAuthority(
+                    config.runner.investigationId,
+                );
+            const exactStatus = statusMatchesOwner(ownerStatus, lock)
+                && authority !== null
+                && authority.supervisorGeneration
+                    === lock.supervisorGeneration
+                && authority.supervisorNonce === lock.nonce
+                && ownerStatus.runnerIncarnation
+                    === stop.targetRunnerIncarnation;
+            let processes = {
+                verified: false,
+                reason: "exact owned PID enumeration is unavailable",
+            };
+            if (adapterClose.status === "fulfilled"
+                && typeof processTreeAdapter.activeOwnedPids === "function") {
+                try {
+                    const ownedPids =
+                        processTreeAdapter.activeOwnedPids();
+                    if (!Array.isArray(ownedPids)) {
+                        throw new RuntimeConfigError(
+                            "activeOwnedPids must return an array",
+                        );
+                    }
+                    const activePids = new Set(ownedPids);
+                    for (const pid of [
+                        currentChildPid,
+                        stop.targetRunnerPid,
+                    ]) {
+                        if (Number.isSafeInteger(pid) && pid > 0) {
+                            const active = isPidAlive(pid);
+                            if (typeof active !== "boolean") {
+                                throw new RuntimeConfigError(
+                                    "isPidAlive must return a boolean",
+                                );
+                            }
+                            if (active) activePids.add(pid);
+                        }
+                    }
+                    processes = {
+                        verified: true,
+                        activePids: [...activePids],
+                    };
+                } catch (error) {
+                    processes = {
+                        verified: false,
+                        reason: error?.message ?? String(error),
+                    };
+                }
+            }
+            const targetPid = stop.targetRunnerPid;
+            let targetActive = false;
+            let targetLivenessVerified = targetPid === null;
+            if (Number.isSafeInteger(targetPid) && targetPid > 0) {
+                try {
+                    targetActive = isPidAlive(targetPid);
+                    targetLivenessVerified =
+                        typeof targetActive === "boolean";
+                } catch {
+                    targetLivenessVerified = false;
+                }
+            }
+            const runnerIdentityVerified = hadCurrentChild
+                ? recordedTarget.identityVerified === true
+                : targetPid === null
+                    ? exactStatus
+                        && stop.targetRunnerIncarnation === null
+                        && ownerStatus.childPid === null
+                    : recordedRunnerIdentityIsExact(stop);
+            const runnerChild = runnerIdentityVerified
+                && targetLivenessVerified
+                ? {
+                    verified: true,
+                    active: targetActive || recordedTarget.active === true,
+                    pid: targetPid,
+                    runnerIncarnation: stop.targetRunnerIncarnation,
+                }
+                : {
+                    verified: false,
+                    reason:
+                        "runner child generation/incarnation ownership is unverified",
+                };
+
+            let activeLeases = [];
+            let brokerProbeVerified = brokerAuthority.verified === true;
+            if (resourceBroker !== null && brokerProbeVerified) {
+                try {
+                    const listed = resourceBroker.listActiveLeases({
+                        investigationId: config.runner.investigationId,
+                    });
+                    if (!Array.isArray(listed)) {
+                        throw new RuntimeConfigError(
+                            "resource broker active lease probe must return an array",
+                        );
+                    }
+                    activeLeases = listed;
+                } catch (error) {
+                    brokerProbeVerified = false;
+                    brokerDrainError ??= error;
+                }
+            }
+            if (typeof dependencies.activeResourceLeaseProbe === "function") {
+                try {
+                    const probed = await dependencies.activeResourceLeaseProbe({
+                        investigationId: config.runner.investigationId,
+                        requestId: stop.requestId,
+                    });
+                    if (!Array.isArray(probed)) {
+                        throw new RuntimeConfigError(
+                            "activeResourceLeaseProbe must return an array",
+                        );
+                    }
+                    activeLeases = [...activeLeases, ...probed];
+                } catch (error) {
+                    brokerProbeVerified = false;
+                    brokerDrainError ??= error;
+                }
+            }
+            const brokerProbe = brokerProbeVerified
+                ? {
+                    ...brokerAuthority,
+                    activeLeases,
+                }
+                : {
+                    verified: false,
+                    reason:
+                        brokerDrainError?.message
+                        ?? brokerAuthority.reason
+                        ?? "resource broker authority is unverified",
+                };
+
+            let sdkSessions = {
+                verified: false,
+                reason: "exact SDK session ownership is unavailable",
+            };
+            if (typeof dependencies.activeSdkSessionProbe === "function") {
+                try {
+                    const activeCount =
+                        await dependencies.activeSdkSessionProbe({
+                            investigationId:
+                                config.runner.investigationId,
+                            requestId: stop.requestId,
+                            runnerIncarnation:
+                                stop.targetRunnerIncarnation,
+                        });
+                    if (!Number.isSafeInteger(activeCount)
+                        || activeCount < 0) {
+                        throw new RuntimeConfigError(
+                            "activeSdkSessionProbe must return a non-negative integer",
+                        );
+                    }
+                    sdkSessions = {
+                        verified: true,
+                        activeCount,
+                        source: "active_sdk_session_probe",
+                    };
+                } catch (error) {
+                    sdkSessions = {
+                        verified: false,
+                        reason: error?.message ?? String(error),
+                    };
+                }
+            } else if (processes.verified === true
+                && processes.activePids.length === 0
+                && runnerChild.verified === true
+                && runnerChild.active === false
+                && brokerProbe.verified === true
+                && brokerProbe.authorityRetired === true
+                && brokerProbe.activeLeases.length === 0) {
+                sdkSessions = {
+                    verified: true,
+                    activeCount: 0,
+                    source: "retired_runner_process_and_broker_authority",
+                };
+            }
+            return buildProof({
+                repository: authorityHandle.repository,
+                investigationId: config.runner.investigationId,
+                supervisorStatus: exactStatus
+                    ? {
+                        verified: true,
+                        pid: ownerStatus.pid,
+                        supervisorGeneration:
+                            ownerStatus.supervisorGeneration,
+                        supervisorNonce: ownerStatus.nonce,
+                        runnerIncarnation:
+                            ownerStatus.runnerIncarnation,
+                        state: ownerStatus.state,
+                    }
+                    : {
+                        verified: false,
+                        reason:
+                            "supervisor status does not match repository ownership",
+                    },
+                processes,
+                sdkSessions,
+                runnerChild,
+                resourceBroker: brokerProbe,
+            });
+        };
+        let proof = await captureQuiescenceProof();
+        if (proof.quiescent === true) {
+            proof = await captureQuiescenceProof();
+        }
+
+        if (proof.quiescent !== true) {
+            retainAuthority = true;
+            const persistPending =
+                dependencies.persistPausePending
+                ?? persistPausePending;
+            stop = persistPending({
+                repository: authorityHandle.repository,
+                stop,
+                proof,
+                reason:
+                    "Supervisor could not prove zero active leases, processes, SDK sessions, and committable attempts within the shutdown bound.",
+            });
+            writeStatus("pause_pending", {
+                non_result_code: RUNTIME_ERROR_CODES.NON_QUIESCENT,
+                quiescent: false,
+                interventionRequired: true,
+                stopRequestId: stop.requestId,
+            });
+            return {
+                kind: "PAUSE_PENDING",
+                status,
+                terminalAvailable: false,
+                nonResultCode: RUNTIME_ERROR_CODES.NON_QUIESCENT,
+                quiescent: false,
+                interventionRequired: true,
+                stop,
+                proof,
+                childExit,
+                recordedTarget,
+            };
+        }
+
+        const persistPaused =
+            dependencies.persistPausedQuiescent
+            ?? persistPausedQuiescent;
+        stop = persistPaused({
+            repository: authorityHandle.repository,
+            adapter: stopAdapter,
+            stop,
+            proof,
+        });
+        if (stop.state === "STOP_SUPERSEDED") {
+            const replay = stopAdapter.replay();
+            const terminal = replay.aggregate.terminal !== null;
+            const nonResultCode =
+                stop.nonResultCode
+                ?? replay.aggregate.nonResults.at(-1)?.code
+                ?? null;
+            writeStatus(terminal ? "terminal" : "non_result", {
+                terminal_available: terminal,
+                non_result_code: nonResultCode,
+                quiescent: false,
+                interventionRequired: false,
+                stopRequestId: stop.requestId,
+            });
+            return {
+                kind: terminal ? "TERMINAL" : "NON_RESULT",
+                status,
+                terminalAvailable: terminal,
+                nonResultCode,
+                quiescent: false,
+                interventionRequired: false,
+                stop,
+                proof,
+                childExit,
+                recordedTarget,
+            };
+        }
+        writeStatus("pause", {
+            non_result_code: "INVESTIGATION_PAUSED",
+            quiescent: true,
+            interventionRequired: false,
+            stopRequestId: stop.requestId,
+        });
+        return {
+            kind: "PAUSE",
+            status,
+            terminalAvailable: false,
+            nonResultCode: "INVESTIGATION_PAUSED",
+            quiescent: true,
+            interventionRequired: false,
+            stop,
+            proof,
+            childExit,
+            recordedTarget,
+        };
+    };
+
     try {
+        try {
+            await verifyRuntimeClosure("supervisor_startup_recovery");
+        } catch (error) {
+            return persistRuntimeDrift(
+                error,
+                "supervisor_startup_recovery",
+            );
+        }
         scavenging = await scavengeOwnedPaths();
         for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"]) {
             const handler = () => requestShutdown({ kind: "signal", signal });
@@ -1627,10 +2527,35 @@ export async function runSupervisor(input, dependencies = {}) {
             signalSource.on?.(signal, handler);
         }
         assertOwnership("stale stop request cleanup");
-        fs.rmSync(ownedConfig.paths.stopRequestPath, { force: true });
+        if (!isActiveQuiescentStop(readPersistedStop())) {
+            fs.rmSync(ownedConfig.paths.stopRequestPath, { force: true });
+        }
         controlTimer = timers.setInterval(() => {
             try {
                 assertOwnership("supervisor control poll");
+                const stop = readPersistedStop();
+                controlChannelHealth = Object.freeze({
+                    healthy: true,
+                    lastPollAt: clock.isoNow(),
+                    stopState: stop?.state ?? null,
+                    errorCode: null,
+                });
+                if (isActiveQuiescentStop(stop)) {
+                    consumeSupervisorStopSignal({
+                        paths: controlPaths,
+                        stop,
+                        owner: {
+                            pid: lock.pid,
+                            nonce: lock.nonce,
+                            supervisorGeneration: lock.supervisorGeneration,
+                        },
+                    });
+                    requestShutdown({
+                        kind: "quiescent_stop",
+                        stop,
+                    });
+                    return;
+                }
                 const request = readMatchingStopRequest(
                     ownedConfig.paths.stopRequestPath,
                     lock,
@@ -1640,6 +2565,13 @@ export async function runSupervisor(input, dependencies = {}) {
                     requestShutdown({ kind: "stop_request", request });
                 }
             } catch (error) {
+                controlChannelHealth = Object.freeze({
+                    healthy: false,
+                    lastPollAt: clock.isoNow(),
+                    stopState: null,
+                    errorCode:
+                        error?.code ?? RUNTIME_ERROR_CODES.RUNTIME_FAILURE,
+                });
                 if (isOwnershipLostError(error)) {
                     requestOwnershipLoss("control_poll", error);
                 } else {
@@ -1660,8 +2592,16 @@ export async function runSupervisor(input, dependencies = {}) {
                 preservedCount: scavenging?.preserved?.length ?? 0,
             },
         });
+        const startupStop = readPersistedStop();
+        if (isActiveQuiescentStop(startupStop)) {
+            return await reconcileQuiescentStop(startupStop);
+        }
         for (let launchNumber = 1; ; launchNumber += 1) {
             assertOwnership("supervisor control loop");
+            const pendingStop = readPersistedStop();
+            if (isActiveQuiescentStop(pendingStop)) {
+                return await reconcileQuiescentStop(pendingStop);
+            }
             if (shutdownRequest !== null) {
                 if (shutdownRequest.kind === "ownership_lost") {
                     return {
@@ -1671,6 +2611,16 @@ export async function runSupervisor(input, dependencies = {}) {
                         shutdown: shutdownRequest,
                     };
                 }
+                if (shutdownRequest.kind === "quiescent_stop") {
+                    return await reconcileQuiescentStop(
+                        shutdownRequest.stop ?? readPersistedStop(),
+                    );
+                }
+                const shutdownStop =
+                    persistShutdownBarrier(shutdownRequest);
+                if (shutdownStop !== null) {
+                    return await reconcileQuiescentStop(shutdownStop);
+                }
                 writeStatus("stopped", { shutdown: shutdownRequest });
                 return { kind: "STOPPED", status };
             }
@@ -1678,6 +2628,12 @@ export async function runSupervisor(input, dependencies = {}) {
             let launchConfig = ownedConfig;
             try {
                 assertOwnership(restartCount === 0 ? "runner launch" : "runner restart");
+                const stopBeforeIncarnation = readPersistedStop();
+                if (isActiveQuiescentStop(stopBeforeIncarnation)) {
+                    return await reconcileQuiescentStop(
+                        stopBeforeIncarnation,
+                    );
+                }
                 const runnerIncarnationFactory =
                     dependencies.runnerIncarnationFactory ?? (() => randomUUID());
                 const runnerIncarnation = requireString(
@@ -1692,12 +2648,19 @@ export async function runSupervisor(input, dependencies = {}) {
                     { max: 256 },
                 );
                 assertOwnership("runner incarnation persistence");
+                await verifyRuntimeClosure("runner_process_launch");
                 authorityHandle.repository.issueRunnerIncarnation({
                     investigationId: config.runner.investigationId,
                     supervisorGeneration: lock.supervisorGeneration,
                     supervisorNonce: lock.nonce,
                     runnerIncarnation,
                 });
+                try {
+                    claimBrokerAuthority(runnerIncarnation);
+                } catch (error) {
+                    error.resourceBrokerFailure = true;
+                    throw error;
+                }
                 assertOwnership("runner incarnation launch binding");
                 currentRunnerIncarnation = runnerIncarnation;
                 launchConfig = Object.freeze({
@@ -1715,6 +2678,10 @@ export async function runSupervisor(input, dependencies = {}) {
                     lock,
                     runnerIncarnation,
                 );
+                const stopBeforeSpawn = readPersistedStop();
+                if (isActiveQuiescentStop(stopBeforeSpawn)) {
+                    return await reconcileQuiescentStop(stopBeforeSpawn);
+                }
                 launched = await spawnRunner(launchConfig, {
                     launchNumber,
                     restartCount,
@@ -1723,10 +2690,41 @@ export async function runSupervisor(input, dependencies = {}) {
                     supervisorNonce: lock.nonce,
                     runnerIncarnation,
                     assertOwnership,
+                    runtimeGuard: verifyRuntimeClosure,
                 });
             } catch (error) {
                 if (isOwnershipLostError(error)) {
                     throw error;
+                }
+                if (error?.code === RUNTIME_ERROR_CODES.RUNTIME_DRIFT) {
+                    return persistRuntimeDrift(
+                        error,
+                        "runner_process_launch",
+                    );
+                }
+                if (error?.resourceBrokerFailure === true) {
+                    recordSupervisorNonResult({
+                        code: RUNTIME_ERROR_CODES.RESOURCE_UNAVAILABLE,
+                        reason:
+                            "The global resource broker refused runner authority admission.",
+                        restartCount,
+                        details: {
+                            cause: error?.message ?? String(error),
+                            scientificConclusion: false,
+                        },
+                    });
+                    writeStatus("non_result", {
+                        non_result_code:
+                            RUNTIME_ERROR_CODES.RESOURCE_UNAVAILABLE,
+                    });
+                    return {
+                        kind: "NON_RESULT",
+                        status,
+                        terminalAvailable: false,
+                        nonResultCode:
+                            RUNTIME_ERROR_CODES.RESOURCE_UNAVAILABLE,
+                        error,
+                    };
                 }
                 launched = {
                     error,
@@ -1759,6 +2757,22 @@ export async function runSupervisor(input, dependencies = {}) {
                     shutdownPromise.then((request) => ({ kind: "shutdown", request })),
                 ]);
                 if (completed.kind === "shutdown") {
+                    if (completed.request.kind === "quiescent_stop") {
+                        stopHeartbeat();
+                        return await reconcileQuiescentStop(
+                            completed.request.stop ?? readPersistedStop(),
+                        );
+                    }
+                    if (completed.request.kind !== "ownership_lost") {
+                        const shutdownStop =
+                            persistShutdownBarrier(completed.request);
+                        if (shutdownStop !== null) {
+                            stopHeartbeat();
+                            return await reconcileQuiescentStop(
+                                shutdownStop,
+                            );
+                        }
+                    }
                     const exitedRunnerPid = currentChildPid;
                     const exitedRunnerIncarnation = currentRunnerIncarnation;
                     const exit = await terminateCurrentChild();
@@ -1801,6 +2815,14 @@ export async function runSupervisor(input, dependencies = {}) {
                 currentChildPid = null;
                 stopHeartbeat();
                 assertOwnership("runner result processing");
+                const stopAfterChildExit = readPersistedStop();
+                if (isActiveQuiescentStop(stopAfterChildExit)) {
+                    await reapRunnerOwnedPaths(
+                        exitedRunnerIncarnation,
+                        exitedRunnerPid,
+                    );
+                    return await reconcileQuiescentStop(stopAfterChildExit);
+                }
                 const reapExitedRunner = () => reapRunnerOwnedPaths(
                     exitedRunnerIncarnation,
                     exitedRunnerPid,
@@ -1818,6 +2840,13 @@ export async function runSupervisor(input, dependencies = {}) {
                         throw error;
                     }
                     envelopeError = error;
+                }
+                const stopBeforeEnvelopeCommit = readPersistedStop();
+                if (isActiveQuiescentStop(stopBeforeEnvelopeCommit)) {
+                    await reapExitedRunner();
+                    return await reconcileQuiescentStop(
+                        stopBeforeEnvelopeCommit,
+                    );
                 }
 
                 if (envelope?.ok === true) {
@@ -1839,6 +2868,32 @@ export async function runSupervisor(input, dependencies = {}) {
                             status,
                             terminalAvailable: false,
                             nonResultCode: RUNTIME_ERROR_CODES.RESULT_MISSING,
+                        };
+                    }
+                    if (finalState === "quiesced") {
+                        await reapExitedRunner();
+                        const stop = readPersistedStop();
+                        if (isActiveQuiescentStop(stop)) {
+                            return await reconcileQuiescentStop(stop);
+                        }
+                        const reason =
+                            "Runner reported quiescence without a persisted stop barrier";
+                        recordSupervisorNonResult({
+                            code: RUNTIME_ERROR_CODES.RESULT_MISSING,
+                            reason,
+                            restartCount,
+                            details: { exit, recoverable: false },
+                        });
+                        writeStatus("failed", {
+                            non_result_code:
+                                RUNTIME_ERROR_CODES.RESULT_MISSING,
+                        });
+                        return {
+                            kind: "FAILED",
+                            status,
+                            terminalAvailable: false,
+                            nonResultCode:
+                                RUNTIME_ERROR_CODES.RESULT_MISSING,
                         };
                     }
                     await reapExitedRunner();
@@ -1960,6 +3015,16 @@ export async function runSupervisor(input, dependencies = {}) {
                         shutdown: completed.request,
                     };
                 }
+                if (completed.request.kind === "quiescent_stop") {
+                    return await reconcileQuiescentStop(
+                        completed.request.stop ?? readPersistedStop(),
+                    );
+                }
+                const shutdownStop =
+                    persistShutdownBarrier(completed.request);
+                if (shutdownStop !== null) {
+                    return await reconcileQuiescentStop(shutdownStop);
+                }
                 writeStatus("stopped", { shutdown: completed.request });
                 return { kind: "STOPPED", status };
             }
@@ -2024,7 +3089,8 @@ export async function runSupervisor(input, dependencies = {}) {
                     );
                 }
             }
-            if (typeof processTreeAdapter.close === "function") {
+            if (!processAdapterCloseAttempted
+                && typeof processTreeAdapter.close === "function") {
                 const closed = await settleWithin(
                     () => processTreeAdapter.close({
                         timeoutMs: shutdownPolicy.finalMs,
@@ -2065,7 +3131,11 @@ export async function runSupervisor(input, dependencies = {}) {
             }
         } finally {
             try {
-                closeSupervisorAuthorityRepository(authorityHandle);
+                try {
+                    resourceBroker?.close?.();
+                } finally {
+                    closeSupervisorAuthorityRepository(authorityHandle);
+                }
             } finally {
                 if (!retainAuthority) {
                     releaseSupervisorLock(lock);

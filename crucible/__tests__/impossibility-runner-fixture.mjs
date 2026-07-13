@@ -720,20 +720,28 @@ export function setupImpossibilityRunnerFixture(
 
 export async function runImpossibilityRunnerFixture(
     setup,
-    { sandbox = sandboxIdentity() } = {},
+    {
+        sandbox = sandboxIdentity(),
+        workerPool = new WorkerPool(),
+        ...dependencies
+    } = {},
 ) {
-    const workerPool = new WorkerPool();
     const result = await runAutonomousInvestigation(setup.config, {
+        ...dependencies,
         workerPool,
-        idFactory: (() => {
+        idFactory: dependencies.idFactory ?? (() => {
             let next = 0;
             return () => `fixture-id-${++next}`;
         })(),
-        processAdapter: scoreProcessAdapter(),
+        processAdapter:
+            dependencies.processAdapter ?? scoreProcessAdapter(),
         sandboxProvider: containmentProvider(
             sandbox,
             setup.sandboxPolicyDigest,
         ),
+        runtimeIdentityVerifier:
+            dependencies.runtimeIdentityVerifier
+            ?? (async () => null),
     });
     return { result, workerPool };
 }

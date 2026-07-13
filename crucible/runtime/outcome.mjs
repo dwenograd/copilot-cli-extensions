@@ -5,7 +5,12 @@ import {
 } from "./errors.mjs";
 import { isPlainObject } from "./utils.mjs";
 
-const SUCCESS_STATES = new Set(["terminal", "non_result", "pause"]);
+const SUCCESS_STATES = new Set([
+    "terminal",
+    "non_result",
+    "pause",
+    "quiesced",
+]);
 
 function codeOrNull(value) {
     return typeof value === "string" && value.length > 0 ? value : null;
@@ -26,6 +31,10 @@ export function projectRunnerOutcome(result) {
             break;
         case "PAUSE":
             state = "pause";
+            nonResultCode = codeOrNull(result.code) ?? "INVESTIGATION_PAUSED";
+            break;
+        case "QUIESCED":
+            state = "quiesced";
             nonResultCode = codeOrNull(result.code) ?? "INVESTIGATION_PAUSED";
             break;
         default:

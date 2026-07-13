@@ -1,9 +1,25 @@
 import {
+    DEFAULT_RUNTIME_IDENTITY_POLICY,
     DEFAULT_SEARCH_POLICY,
+    RUNTIME_IDENTITY_ASSUMPTIONS_HASH_ALGORITHM,
+    RUNTIME_IDENTITY_CLI_IDENTITY_ALGORITHM,
+    RUNTIME_IDENTITY_COMMANDS_IDENTITY_ALGORITHM,
+    RUNTIME_IDENTITY_ENVIRONMENT_IDENTITY_ALGORITHM,
+    RUNTIME_IDENTITY_FILE_HASH_ALGORITHM,
+    RUNTIME_IDENTITY_FILE_IDENTITY_ALGORITHM,
+    RUNTIME_IDENTITY_KIND,
+    RUNTIME_IDENTITY_SANDBOX_IDENTITY_ALGORITHM,
+    RUNTIME_IDENTITY_TREE_IDENTITY_ALGORITHM,
+    RUNTIME_IDENTITY_TREE_MERKLE_ALGORITHM,
+    RUNTIME_IDENTITY_VERSION,
     STATISTICAL_POLICY_VERSION,
     hashCanonical,
+    immutableCanonical,
     normalizeEnumerandManifest,
+    normalizeRuntimeIdentity,
     resolveControlEnumerand,
+    runtimeIdentityPolicyIdentity,
+    runtimeIdentityRoot,
     statisticalEvaluationRequirements,
 } from "../domain/index.mjs";
 import {
@@ -38,6 +54,132 @@ function tagged(label) {
         "sha256:crucible-v4-contract-fixture-v1",
     );
 }
+
+const FIXTURE_RUNTIME_IDENTITY_POLICY = DEFAULT_RUNTIME_IDENTITY_POLICY;
+
+function runtimeFile(pathname, label) {
+    const core = {
+        kind: "file",
+        path: pathname,
+        size: 1,
+        contentHash: hashCanonical(
+            { label },
+            RUNTIME_IDENTITY_FILE_HASH_ALGORITHM,
+        ),
+    };
+    return {
+        ...core,
+        identity: hashCanonical(
+            core,
+            RUNTIME_IDENTITY_FILE_IDENTITY_ALGORITHM,
+        ),
+    };
+}
+
+function runtimeTree(rootPath, label) {
+    const core = {
+        kind: "tree",
+        rootPath,
+        fileCount: 1,
+        totalBytes: 1,
+        merkleRoot: hashCanonical(
+            { label },
+            RUNTIME_IDENTITY_TREE_MERKLE_ALGORITHM,
+        ),
+    };
+    return {
+        ...core,
+        identity: hashCanonical(
+            core,
+            RUNTIME_IDENTITY_TREE_IDENTITY_ALGORITHM,
+        ),
+    };
+}
+
+export function fakeRuntimeIdentity() {
+    const cliCore = {
+        kind: "cli",
+        launcher: runtimeFile("C:\\fixture\\copilot.exe", "cli-launcher"),
+        package: runtimeTree("C:\\fixture\\copilot-package", "cli-package"),
+    };
+    const sandboxCore = { kind: "sandbox", required: false };
+    const commandCore = {
+        kind: "command_templates",
+        templates: { fixture: true },
+    };
+    const environmentCore = {
+        kind: "environment",
+        variables: FIXTURE_RUNTIME_IDENTITY_POLICY.environmentKeys.map((name) => ({
+            name,
+            present: false,
+            valueHash: null,
+        })),
+    };
+    const assumptions = immutableCanonical({
+        os: { platform: "fixture" },
+        hardware: { logicalCpuCount: 1 },
+    });
+    const components = {
+        crucibleSource: runtimeTree(
+            "C:\\fixture\\crucible",
+            "crucible-source",
+        ),
+        nodeExecutable: runtimeFile(
+            "C:\\fixture\\node.exe",
+            "node-executable",
+        ),
+        copilotCli: {
+            ...cliCore,
+            identity: hashCanonical(
+                cliCore,
+                RUNTIME_IDENTITY_CLI_IDENTITY_ALGORITHM,
+            ),
+        },
+        copilotSdk: runtimeTree("C:\\fixture\\copilot-sdk", "copilot-sdk"),
+        sandbox: {
+            ...sandboxCore,
+            identity: hashCanonical(
+                sandboxCore,
+                RUNTIME_IDENTITY_SANDBOX_IDENTITY_ALGORITHM,
+            ),
+        },
+        commandTemplates: {
+            ...commandCore,
+            identity: hashCanonical(
+                commandCore,
+                RUNTIME_IDENTITY_COMMANDS_IDENTITY_ALGORITHM,
+            ),
+        },
+        environment: {
+            ...environmentCore,
+            identity: hashCanonical(
+                environmentCore,
+                RUNTIME_IDENTITY_ENVIRONMENT_IDENTITY_ALGORITHM,
+            ),
+        },
+    };
+    const core = {
+        version: RUNTIME_IDENTITY_VERSION,
+        kind: RUNTIME_IDENTITY_KIND,
+        policy: FIXTURE_RUNTIME_IDENTITY_POLICY,
+        policyIdentity: runtimeIdentityPolicyIdentity(
+            FIXTURE_RUNTIME_IDENTITY_POLICY,
+        ),
+        components,
+    };
+    return normalizeRuntimeIdentity({
+        ...core,
+        assumptions,
+        assumptionsHash: hashCanonical(
+            assumptions,
+            RUNTIME_IDENTITY_ASSUMPTIONS_HASH_ALGORITHM,
+        ),
+        root: runtimeIdentityRoot(core),
+    });
+}
+
+const FIXTURE_RUNTIME_IDENTITY = fakeRuntimeIdentity();
+const FIXTURE_RUNTIME_IDENTITY_ROOT = FIXTURE_RUNTIME_IDENTITY.root;
 
 const DEFAULT_CASES = Object.freeze({
     calibration: Object.freeze([
@@ -470,6 +612,11 @@ export function makeV4ContractInput(overrides = {}) {
         hypothesisTopology: topology,
         criticality: "standard",
         policyVersion: "crucible-policy-1",
+        runtimeIdentityPolicy: FIXTURE_RUNTIME_IDENTITY_POLICY,
+        runtimeIdentityPolicyIdentity: runtimeIdentityPolicyIdentity(
+            FIXTURE_RUNTIME_IDENTITY_POLICY,
+        ),
+        runtimeIdentityRoot: FIXTURE_RUNTIME_IDENTITY_ROOT,
         workerModels: ["worker-a"],
         candidatesPerRound,
         maxRounds,

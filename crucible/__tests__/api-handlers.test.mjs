@@ -57,9 +57,14 @@ function makeReadDeps({
     requestStop = () => {
         throw new Error("unexpected stop request");
     },
+    waitForStopAcknowledgement = undefined,
     verifyAuthority = () => {},
+    quiescentStop = null,
 } = {}) {
-    const repository = { close() {} };
+    const repository = {
+        close() {},
+        getQuiescentStop: () => quiescentStop,
+    };
     const adapter = {
         replay: () => ({ aggregate: replayAggregate }),
         verifyTerminalArtifactClosure: () => ({
@@ -80,6 +85,9 @@ function makeReadDeps({
         verifyExperimentAuthority: verifyAuthority,
         assessPersistedTerminalReadiness: () => readiness,
         requestStop,
+        ...(waitForStopAcknowledgement === undefined
+            ? {}
+            : { waitForStopAcknowledgement }),
         readStatus: () => null,
         readSupervisorLock: () => null,
         isPidAlive: () => false,
@@ -196,8 +204,8 @@ describe("compact handler safety guarantees", () => {
         expect(JSON.stringify(status)).not.toContain("evidence-secret");
     });
 
-    it("claims resumability only after the pause transition is durable", () => {
-        const pending = stopInvestigation(
+    it("claims resumability only after pause and quiescence are durable", async () => {
+        const pending = await stopInvestigation(
             { investigation_id: INVESTIGATION_ID },
             makeReadDeps({
                 requestStop: () => ({
@@ -205,6 +213,12 @@ describe("compact handler safety guarantees", () => {
                     pausePersisted: false,
                     aggregate: aggregate(),
                     operationalNonResult: null,
+                    stop: {
+                        state: "STOP_BARRIER_PERSISTED",
+                        quiescent: false,
+                        interventionRequired: false,
+                        nonResultCode: null,
+                    },
                 }),
             }),
         );
@@ -213,10 +227,11 @@ describe("compact handler safety guarantees", () => {
             pause_requested: true,
             pause_in_flight: true,
             pause_persisted: false,
+            quiescent: false,
             resumable: false,
         });
 
-        const persisted = stopInvestigation(
+        const persisted = await stopInvestigation(
             { investigation_id: INVESTIGATION_ID },
             makeReadDeps({
                 requestStop: () => ({
@@ -227,6 +242,12 @@ describe("compact handler safety guarantees", () => {
                         pause: { reason: "operator pause" },
                     }),
                     operationalNonResult: null,
+                    stop: {
+                        state: "PAUSED_QUIESCENT",
+                        quiescent: true,
+                        interventionRequired: false,
+                        nonResultCode: null,
+                    },
                 }),
             }),
         );
@@ -234,7 +255,78 @@ describe("compact handler safety guarantees", () => {
             stop_state: "pause_persisted",
             pause_in_flight: false,
             pause_persisted: true,
+            quiescent: true,
             resumable: true,
+        });
+    });
+
+    it("reports pause-pending status as non-quiescent and non-resumable", () => {
+        const status = statusInvestigation(
+            { investigation_id: INVESTIGATION_ID },
+            makeReadDeps({
+                replayAggregate: aggregate({
+                    contract: null,
+                    status: "paused",
+                    pause: { reason: "stop requested" },
+                }),
+                quiescentStop: {
+                    state: "PAUSE_PENDING",
+                    quiescent: false,
+                    interventionRequired: true,
+                },
+            }),
+        );
+
+        expect(status).toMatchObject({
+            paused: true,
+            quiescent: false,
+            resumable: false,
+            stop_state: "PAUSE_PENDING",
+            intervention_required: true,
+        });
+    });
+
+    it("reports bounded acknowledgement timeout as non-quiescent and non-resumable", async () => {
+        const stopped = await stopInvestigation(
+            { investigation_id: INVESTIGATION_ID },
+            makeReadDeps({
+                requestStop: () => ({
+                    appended: true,
+                    pausePersisted: false,
+                    aggregate: aggregate(),
+                    operationalNonResult: null,
+                    stop: {
+                        requestId: "stop-timeout",
+                        state: "STOP_BARRIER_PERSISTED",
+                        quiescent: false,
+                        interventionRequired: false,
+                        nonResultCode: null,
+                    },
+                }),
+                waitForStopAcknowledgement: async () => ({
+                    acknowledged: true,
+                    timedOut: true,
+                    stop: {
+                        requestId: "stop-timeout",
+                        state: "PAUSE_PENDING",
+                        quiescent: false,
+                        interventionRequired: true,
+                        nonResultCode:
+                            "CRUCIBLE_RUNTIME_NON_QUIESCENT",
+                    },
+                }),
+            }),
+        );
+
+        expect(stopped).toMatchObject({
+            stop_state: "pause_pending",
+            pause_in_flight: true,
+            pause_persisted: false,
+            quiescent: false,
+            resumable: false,
+            intervention_required: true,
+            acknowledgement_timed_out: true,
+            non_result_code: "CRUCIBLE_RUNTIME_NON_QUIESCENT",
         });
     });
 

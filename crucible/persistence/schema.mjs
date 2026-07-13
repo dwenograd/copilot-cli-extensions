@@ -22,7 +22,7 @@ import {
     StorageError,
 } from "./errors.mjs";
 
-export const SCHEMA_VERSION = 5;
+export const SCHEMA_VERSION = 6;
 export const EVENT_HASH_VERSION = 2;
 
 export const TERMINAL_KINDS = Object.freeze(["verified_result", "target_unreachable"]);
@@ -41,6 +41,56 @@ const COMMAND_ATTEMPT_INDEX_DDL = `
 CREATE UNIQUE INDEX ux_active_reservation
     ON command_attempts(investigation_id, command)
     WHERE state NOT IN ('committed', 'abandoned');`;
+const QUIESCENT_STOPS_TABLE_DDL = `
+CREATE TABLE quiescent_stops (
+    investigation_id           TEXT    PRIMARY KEY REFERENCES investigations(investigation_id),
+    request_id                 TEXT    NOT NULL,
+    reason                     TEXT    NOT NULL,
+    pause_requested            INTEGER NOT NULL,
+    state                      TEXT    NOT NULL,
+    target_supervisor_generation INTEGER,
+    target_supervisor_nonce    TEXT,
+    target_supervisor_pid      INTEGER,
+    target_runner_incarnation  TEXT,
+    target_runner_pid          INTEGER,
+    target_lease_id            TEXT,
+    target_fencing_token       INTEGER,
+    fenced_attempts            TEXT    NOT NULL,
+    requested_at               TEXT    NOT NULL,
+    barrier_at                 TEXT    NOT NULL,
+    acknowledged_at            TEXT,
+    completed_at               TEXT,
+    quiescent                  INTEGER NOT NULL DEFAULT 0,
+    intervention_required      INTEGER NOT NULL DEFAULT 0,
+    non_result_code            TEXT,
+    details                    TEXT    NOT NULL,
+    updated_at                 TEXT    NOT NULL,
+    CHECK (pause_requested IN (0, 1)),
+    CHECK (state IN (
+        'STOP_BARRIER_PERSISTED',
+        'STOP_RECONCILING',
+        'STOP_SUPERSEDED',
+        'PAUSE_PENDING',
+        'PAUSED_QUIESCENT'
+    )),
+    CHECK (quiescent IN (0, 1)),
+    CHECK (intervention_required IN (0, 1)),
+    CHECK (
+        target_supervisor_generation IS NULL
+        OR target_supervisor_generation > 0
+    ),
+    CHECK (target_supervisor_pid IS NULL OR target_supervisor_pid > 0),
+    CHECK (target_runner_pid IS NULL OR target_runner_pid > 0),
+    CHECK (target_fencing_token IS NULL OR target_fencing_token > 0),
+    CHECK (
+        (target_supervisor_generation IS NULL)
+        = (target_supervisor_nonce IS NULL)
+    ),
+    CHECK (
+        (target_lease_id IS NULL)
+        = (target_fencing_token IS NULL)
+    )
+);`;
 
 function runnerLeasesTableDdl(name, {
     supervisorGeneration = true,
@@ -174,6 +224,8 @@ CREATE TABLE supervisor_authority (
     updated_at                TEXT    NOT NULL,
     CHECK (supervisor_generation > 0)
 );
+
+${QUIESCENT_STOPS_TABLE_DDL}
 
 CREATE TABLE artifacts (
     artifact_id      TEXT    PRIMARY KEY,
@@ -587,6 +639,9 @@ function expectedManifestForVariant(variant) {
     const db = new DatabaseSync(":memory:");
     try {
         db.exec(DDL);
+        if (variant !== "v6-current") {
+            db.exec("DROP TABLE quiescent_stops;");
+        }
         if (variant === "v2") {
             db.exec("DROP TABLE supervisor_authority; DROP TABLE runner_incarnations;");
             replaceExpectedRunnerTables(db, {
@@ -614,7 +669,9 @@ function expectedManifestForVariant(variant) {
                 runnerIncarnation: true,
                 generationCheck: false,
             });
-        } else if (variant !== "v4-current" && variant !== "v5-current") {
+        } else if (variant !== "v4-current"
+            && variant !== "v5-current"
+            && variant !== "v6-current") {
             throw new Error(`unknown expected schema variant '${variant}'`);
         }
         return buildSchemaManifest(db);
@@ -628,6 +685,7 @@ const EXPECTED_VARIANTS = Object.freeze({
     3: Object.freeze(["v3-migrated", "v3-current"]),
     4: Object.freeze(["v4-migrated", "v4-current"]),
     5: Object.freeze(["v5-current"]),
+    6: Object.freeze(["v6-current"]),
 });
 
 const EXPECTED_MANIFESTS = new Map();
@@ -640,12 +698,22 @@ function getExpectedManifest(variant) {
 }
 
 export const SCHEMA_FINGERPRINT = schemaFingerprint(
-    getExpectedManifest("v5-current"),
+    getExpectedManifest("v6-current"),
     {
         ...EXPECTED_CONNECTION_PRAGMAS,
         userVersion: SCHEMA_VERSION,
     },
     SCHEMA_VERSION,
+    EVENT_HASH_VERSION,
+);
+
+export const SCHEMA_V5_FINGERPRINT = schemaFingerprint(
+    getExpectedManifest("v5-current"),
+    {
+        ...EXPECTED_CONNECTION_PRAGMAS,
+        userVersion: 5,
+    },
+    5,
     EVENT_HASH_VERSION,
 );
 
@@ -1048,7 +1116,7 @@ function migrateVersion3To4(db) {
     }
 }
 
-function migrateVersion4To5(db) {
+function migrateVersion4ToCurrent(db) {
     db.exec("PRAGMA foreign_keys = OFF;");
     if (Number(pragmaScalar(db, "foreign_keys")) !== 0) {
         throw new StorageError("failed to suspend foreign keys for canonical schema rebuild", null);
@@ -1066,6 +1134,7 @@ function migrateVersion4To5(db) {
                 rebuildRunnerTablesToCurrent(db);
             }
             rehashEventsToVersion2(db);
+            db.exec(QUIESCENT_STOPS_TABLE_DDL);
             db.prepare("UPDATE schema_meta SET value = ? WHERE key = 'schema_version'")
                 .run(String(SCHEMA_VERSION));
             db.prepare(`
@@ -1087,6 +1156,45 @@ function migrateVersion4To5(db) {
         if (Number(pragmaScalar(db, "foreign_keys")) !== 1) {
             throw new StorageError("failed to restore SQLite foreign key enforcement", null);
         }
+    }
+}
+
+function migrateVersion5ToCurrent(db) {
+        db.exec("BEGIN IMMEDIATE;");
+        try {
+            assertVersionPair(db, 5);
+            const matched = assertKnownSchemaStructure(db, 5);
+            verifyDatabaseIntegrity(db);
+            if (matched.variant !== "v5-current") {
+                throw new SchemaIntegrityError(
+                    "schema-5 database does not match the canonical v5 layout",
+                    { variant: matched.variant },
+                );
+            }
+            const storedFingerprint = readMetaValue(db, "schema_fingerprint");
+            const storedHashVersion = readMetaValue(db, "event_hash_version");
+            if (storedFingerprint !== SCHEMA_V5_FINGERPRINT
+                || storedHashVersion !== String(EVENT_HASH_VERSION)) {
+                throw new SchemaIntegrityError(
+                    "schema-5 integrity metadata does not match the canonical predecessor",
+                    {
+                        expectedFingerprint: SCHEMA_V5_FINGERPRINT,
+                        storedFingerprint,
+                        expectedEventHashVersion: String(EVENT_HASH_VERSION),
+                        storedEventHashVersion: storedHashVersion,
+                    },
+                );
+            }
+            db.exec(QUIESCENT_STOPS_TABLE_DDL);
+            db.prepare("UPDATE schema_meta SET value = ? WHERE key = 'schema_version'")
+                .run(String(SCHEMA_VERSION));
+            db.prepare("UPDATE schema_meta SET value = ? WHERE key = 'schema_fingerprint'")
+                .run(SCHEMA_FINGERPRINT);
+            db.exec(`PRAGMA user_version = ${SCHEMA_VERSION};`);
+            db.exec("COMMIT;");
+        } catch (err) {
+            rollbackQuietly(db);
+            throw err;
     }
 }
 
@@ -1210,7 +1318,7 @@ export function applySchema(db, {
             fingerprint: SCHEMA_FINGERPRINT,
         };
     }
-    if (![2, 3, 4].includes(pair.userVersion)) {
+    if (![2, 3, 4, 5].includes(pair.userVersion)) {
         throw new SchemaVersionError(
             `schema version mismatch: file has user_version=${pair.userVersion}, schema_meta=${pair.metaValue ?? "<none>"}, expected ${SCHEMA_VERSION}`,
             {
@@ -1226,7 +1334,9 @@ export function applySchema(db, {
         expectedVersion: pair.userVersion,
     });
     verifyDatabaseIntegrity(db, { adapter: integrityCheckAdapter });
-    assertLegacyMetadata(db);
+    if (pair.userVersion < 5) {
+        assertLegacyMetadata(db);
+    }
     assertKnownSchemaStructure(db, pair.userVersion);
     validateLegacyEventLog(db);
 
@@ -1237,7 +1347,10 @@ export function applySchema(db, {
         migrateVersion3To4(db);
     }
     if (readUserVersion(db) === 4) {
-        migrateVersion4To5(db);
+        migrateVersion4ToCurrent(db);
+    }
+    if (readUserVersion(db) === 5) {
+        migrateVersion5ToCurrent(db);
     }
 
     verifySchema(db, { busyTimeoutMs, integrityCheckAdapter });

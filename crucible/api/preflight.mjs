@@ -22,6 +22,7 @@ import {
     assertPromptContractCoreFits,
     buildRuntimeConfigAuthority,
     deriveRunnerExecutionLimits,
+    deriveRuntimeResourceAdmission,
     normalizeStartDeadline,
     resolveNodeExecutable,
     supervisorConfigFromRuntimeAuthority,
@@ -29,11 +30,16 @@ import {
     verifyRuntimeConfigAuthority,
 } from "../runtime/index.mjs";
 import {
+    buildRuntimeIdentity,
+} from "../runtime/runtime-identity.mjs";
+import {
     buildSupervisorConfigInput,
     createPreflightWorkspace,
     deriveInvestigationId,
     removePreflightWorkspace,
     resolveInvestigationPaths,
+    resolveRuntimeCommandTemplates,
+    resolveRuntimeIdentityBuildInput,
     resolveStateRoot,
     resolveStartEnvironment,
 } from "./environment.mjs";
@@ -64,6 +70,7 @@ import {
     ExperimentAuthorityMismatchApiError,
     ExperimentRegistryApiError,
     SandboxUnavailableApiError,
+    RuntimeDriftApiError,
     StartFailedError,
     StartPreflightError,
 } from "./errors.mjs";
@@ -84,6 +91,26 @@ function authorityMismatch(error, message, details = {}) {
         ...details,
         cause: error?.code ?? null,
     }, { cause: error });
+}
+
+function runtimeDrift(error, message, details = {}) {
+    throw new RuntimeDriftApiError(message, {
+        ...details,
+        cause: error?.code ?? null,
+        drift: error?.details ?? null,
+    }, { cause: error });
+}
+
+function runtimeVerificationFailure(error, message, details = {}) {
+    if ([
+        RUNTIME_ERROR_CODES.RUNTIME_DRIFT,
+        RUNTIME_ERROR_CODES.INTEGRITY_FAILURE,
+        RUNTIME_ERROR_CODES.INVALID_CONFIG,
+        "INVALID_CONTRACT",
+    ].includes(error?.code)) {
+        runtimeDrift(error, message, details);
+    }
+    authorityMismatch(error, message, details);
 }
 
 function throwLegacyIncompatible(error, investigationId) {
@@ -775,6 +802,20 @@ function reattachPlan({
     runtimeConfigAuthority,
     selection = null,
 }) {
+    if (runtimeConfigAuthority.runtimeIdentity.root
+        !== current.aggregate.contract.runtimeIdentityRoot
+        || runtimeConfigAuthority.runtimeIdentity.policyIdentity
+            !== current.aggregate.contract.runtimeIdentityPolicyIdentity) {
+        runtimeDrift(
+            null,
+            "persisted runtime authority is not bound to the signed contract runtime identity",
+            {
+                investigationId: args.investigation_id,
+                contractRoot: current.aggregate.contract.runtimeIdentityRoot,
+                authorityRoot: runtimeConfigAuthority.runtimeIdentity.root,
+            },
+        );
+    }
     const suiteVerification = verifyHarnessSuite(
         allowlist,
         current.aggregate.contract.harnessSuite.id,
@@ -790,9 +831,12 @@ function reattachPlan({
             expectedArtifactRoot: paths.artifactRoot,
             nodeExecutable: supervisorAdmission.nodeExecutable,
             sandbox,
+            commandTemplates: resolveRuntimeCommandTemplates({
+                sandboxRequired: sandbox?.required === true,
+            }),
         });
     } catch (error) {
-        authorityMismatch(
+        runtimeVerificationFailure(
             error,
             `current runtime identity differs from the immutable opening state: ${
                 error?.message ?? String(error)
@@ -983,7 +1027,7 @@ function preflightReattachInvestigation(args, deps, selection = null) {
             nodeExecutable: supervisorAdmission.nodeExecutable,
         });
     } catch (error) {
-        authorityMismatch(
+        runtimeVerificationFailure(
             error,
             `immutable runtime configuration verification failed: ${
                 error?.message ?? String(error)
@@ -1116,6 +1160,58 @@ function createPlan(input) {
     return plan;
 }
 
+function buildContractRuntimeIdentity({
+    deps,
+    environment,
+    contract,
+    nodeExecutable,
+    sandbox,
+}) {
+    let identity;
+    try {
+        const input = resolveRuntimeIdentityBuildInput({
+            env: deps.env,
+            sdkPath: environment.sdkPath,
+            cliPath: environment.cliPath,
+            cliPackagePath: environment.cliPackagePath,
+            nodeExecutablePath: nodeExecutable,
+            sandbox,
+        });
+        identity = (deps.buildRuntimeIdentity ?? buildRuntimeIdentity)(
+            {
+                ...input,
+                policy: contract.runtimeIdentityPolicy,
+            },
+            {
+                cache: deps.runtimeIdentityHashCache,
+            },
+        );
+    } catch (error) {
+        runtimeDrift(
+            error,
+            `runtime identity verification failed: ${
+                error?.message ?? String(error)
+            }`,
+            { expectedRoot: contract.runtimeIdentityRoot },
+        );
+    }
+    if (identity.policyIdentity !== contract.runtimeIdentityPolicyIdentity
+        || identity.root !== contract.runtimeIdentityRoot) {
+        runtimeDrift(
+            null,
+            "current runtime closure differs from the operator-signed initial root",
+            {
+                expectedRoot: contract.runtimeIdentityRoot,
+                actualRoot: identity.root,
+                expectedPolicyIdentity:
+                    contract.runtimeIdentityPolicyIdentity,
+                actualPolicyIdentity: identity.policyIdentity,
+            },
+        );
+    }
+    return identity;
+}
+
 function finalizePreflight({
     args,
     deps,
@@ -1207,9 +1303,17 @@ function finalizePreflight({
             { investigationId },
         );
     }
+    const runtimeIdentity = buildContractRuntimeIdentity({
+        deps,
+        environment,
+        contract,
+        nodeExecutable: supervisorAdmission.nodeExecutable,
+        sandbox,
+    });
     const runtimeConfigAuthority = buildRuntimeConfigAuthority({
         supervisorConfig,
         nodeExecutable: supervisorAdmission.nodeExecutable,
+        runtimeIdentity,
         sandbox,
         env: deps.env,
     });
@@ -1252,6 +1356,7 @@ function finalizePreflight({
             sandboxLauncherBinaryHash: sandbox?.launcherBinaryHash ?? null,
             sandboxLauncherScriptHash: sandbox?.launcherScriptHash ?? null,
             runtimeConfigFingerprint: runtimeConfigAuthority.fingerprint,
+            runtimeIdentityRoot: runtimeIdentity.root,
         }),
         harnessVerification,
         sandbox,
@@ -1342,6 +1447,10 @@ export function preflightStartInvestigation(rawArgs, deps) {
     const paths = resolveInvestigationPaths(environment.stateRoot, investigationId);
     const deadline = normalizeDeadline(args, deps);
     const executionLimits = deriveRunnerExecutionLimits(preapproved.contract);
+    const runtimeResources = deriveRuntimeResourceAdmission({
+        executionLimits,
+        deadlineMs: deadline.deadlineMs,
+    });
     const supervisorInput = buildSupervisorConfigInput({
         investigationId,
         stateDir: paths.stateDir,
@@ -1351,6 +1460,14 @@ export function preflightStartInvestigation(rawArgs, deps) {
         cliPath: environment.cliPath,
         deadlineIso: deadline.deadlineIso,
         executionLimits,
+        resourceBroker: {
+            stateRoot: environment.stateRoot,
+            config: runtimeResources.config,
+            configFingerprint: runtimeResources.configFingerprint,
+            investigationLimits: runtimeResources.investigationLimits,
+            limitsFingerprint: runtimeResources.limitsFingerprint,
+        },
+        sdkRetryPolicy: runtimeResources.sdkRetryPolicy,
     });
     const supervisorAdmission = validateSupervisorAdmission(
         normalizeSupervisor(supervisorInput, deps),
@@ -1620,31 +1737,50 @@ function applyContractPlan(plan, adapter, verifiedExperimentAuthority) {
 }
 
 function compensateFailedReattach(plan, adapter, cause) {
-    const current = adapter.replay();
+    let current = adapter.replay();
+    const recordRuntimeDrift =
+        cause?.code === RUNTIME_ERROR_CODES.RUNTIME_DRIFT
+        && adapter.latestOperationalNonResult()?.payload?.code
+            !== RUNTIME_ERROR_CODES.RUNTIME_DRIFT;
     if (current.aggregate.terminal !== null
-        || current.aggregate.nonResults.length > 0
-        || current.aggregate.pause !== null) {
+        || current.aggregate.nonResults.length > 0) {
         return current.aggregate;
     }
-    adapter.requestStop({
-        requestId: `resume-compensation-${current.aggregate.lastSeq + 1}`,
-        reason:
-            `Resume admission failed after persistence (${cause?.code ?? "START_FAILED"}); `
-            + "the investigation was returned to a durable pause.",
-        pauseRequested: true,
-    });
-    const paused = adapter.appendKernelDecision();
-    if (paused.aggregate.pause === null) {
-        throw new StartFailedError(
-            "failed resume could not be compensated with a durable pause",
-            {
-                investigationId: plan.investigationId,
-                cause: cause?.code ?? null,
-            },
-            { cause },
-        );
+    if (current.aggregate.pause === null) {
+        adapter.requestStop({
+            requestId: `resume-compensation-${current.aggregate.lastSeq + 1}`,
+            reason:
+                `Resume admission failed after persistence (${cause?.code ?? "START_FAILED"}); `
+                + "the investigation was returned to a durable pause.",
+            pauseRequested: true,
+        });
+        current = adapter.appendKernelDecision();
+        if (current.aggregate.pause === null) {
+            throw new StartFailedError(
+                "failed resume could not be compensated with a durable pause",
+                {
+                    investigationId: plan.investigationId,
+                    cause: cause?.code ?? null,
+                },
+                { cause },
+            );
+        }
     }
-    return paused.aggregate;
+    if (recordRuntimeDrift) {
+        adapter.recordOperationalNonResult({
+            attemptId:
+                `runtime-drift-${current.aggregate.lastSeq + 1}`,
+            code: RUNTIME_ERROR_CODES.RUNTIME_DRIFT,
+            reason:
+                "Runtime identity drifted after durable start admission; no supervisor effect was launched.",
+            details: {
+                cause: cause?.message ?? String(cause),
+                runtimeIdentityRoot:
+                    plan.runtimeConfigAuthority?.runtimeIdentity?.root ?? null,
+            },
+        });
+    }
+    return adapter.replay().aggregate;
 }
 
 function supervisorStartAccepted(supervisor) {
@@ -1757,6 +1893,15 @@ export function applyStartPreflight(plan, deps) {
         }
         closeRepository();
         if (error instanceof CrucibleApiError) throw error;
+        if (error?.code === RUNTIME_ERROR_CODES.RUNTIME_DRIFT) {
+            runtimeDrift(
+                error,
+                `runtime identity drifted after durable start admission: ${
+                    error?.message ?? String(error)
+                }`,
+                { investigationId: plan.investigationId },
+            );
+        }
         throw new StartFailedError(
             `crucible_start apply failed: ${error?.message ?? String(error)}`,
             { cause: error?.code ?? null },
@@ -1809,9 +1954,12 @@ export function applyStartPreflight(plan, deps) {
                 expectedArtifactRoot: plan.paths.artifactRoot,
                 nodeExecutable: admission.nodeExecutable,
                 sandbox: plan.sandbox,
+                commandTemplates: resolveRuntimeCommandTemplates({
+                    sandboxRequired: plan.sandbox?.required === true,
+                }),
             });
         } catch (error) {
-            authorityMismatch(
+            runtimeVerificationFailure(
                 error,
                 `runtime configuration changed after preflight: ${
                     error?.message ?? String(error)
@@ -1888,6 +2036,37 @@ export function applyStartPreflight(plan, deps) {
             }
             return Object.freeze({ opened, supervisor });
         };
+        try {
+            const admission = validateSupervisorAdmission(
+                plan.supervisorConfig,
+                deps,
+            );
+            verifyRuntimeConfigAuthority(plan.runtimeConfigAuthority, {
+                env: deps.env,
+                deadlineMs: plan.deadline.deadlineMs,
+                expectedInvestigationId: plan.investigationId,
+                expectedStateDir: plan.paths.stateDir,
+                expectedArtifactRoot: plan.paths.artifactRoot,
+                nodeExecutable: admission.nodeExecutable,
+                sandbox: plan.sandbox,
+                commandTemplates: resolveRuntimeCommandTemplates({
+                    sandboxRequired: plan.sandbox?.required === true,
+                }),
+            });
+        } catch (error) {
+            runtimeVerificationFailure(
+                error,
+                `runtime identity drifted before supervisor launch: ${
+                    error?.message ?? String(error)
+                }`,
+                {
+                    investigationId: plan.investigationId,
+                    runtimeIdentityRoot:
+                        plan.runtimeConfigAuthority?.runtimeIdentity?.root
+                        ?? null,
+                },
+            );
+        }
         const ensured = deps.ensureSupervisor(plan.supervisorConfig, {
             env: deps.env,
             resetOperationalState:

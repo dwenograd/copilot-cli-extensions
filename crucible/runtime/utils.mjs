@@ -287,6 +287,32 @@ export function taggedHash(tag, bytes) {
     return `${tag}:${sha256Hex(bytes)}`;
 }
 
+export function deterministicFraction(value) {
+    const digest = sha256Hex(Buffer.from(String(value), "utf8"));
+    const mantissa = Number.parseInt(digest.slice(0, 13), 16);
+    return mantissa / 0x10_0000_0000_0000;
+}
+
+export function checkedSafeIntegerSum(values, field = "integer sum") {
+    if (!Array.isArray(values)) {
+        throw new RuntimeConfigError(`${field} must be an array`, { field });
+    }
+    let total = 0;
+    for (const value of values) {
+        if (!Number.isSafeInteger(value) || value < 0) {
+            throw new RuntimeConfigError(`${field} contains an invalid non-negative integer`, {
+                field,
+                value,
+            });
+        }
+        total += value;
+        if (!Number.isSafeInteger(total)) {
+            throw new RuntimeConfigError(`${field} exceeds safe integer capacity`, { field });
+        }
+    }
+    return total;
+}
+
 export function snapshotObjectHex(snapshotId) {
     if (typeof snapshotId !== "string" || !/^sha256:[a-f0-9]{64}$/u.test(snapshotId)) {
         throw new RuntimeConfigError("snapshot id must be sha256:<64hex>", { snapshotId });

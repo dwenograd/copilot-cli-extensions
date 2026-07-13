@@ -5,6 +5,7 @@ import {
     hashCanonical,
     immutableCanonical,
     normalizeRuntimeConfigAuthority,
+    normalizeRuntimeIdentity,
     runtimeConfigAuthorityFingerprint,
     RUNTIME_CONFIG_AUTHORITY_KIND,
     RUNTIME_CONFIG_AUTHORITY_VERSION,
@@ -23,6 +24,11 @@ import {
     RuntimeConfigError,
     RuntimeIntegrityError,
 } from "./errors.mjs";
+import {
+    assertRuntimeIdentityVerified,
+    reverifyRuntimeIdentity,
+    verifyRuntimeIdentity,
+} from "./runtime-identity.mjs";
 
 const WORKER_CONTEXT_HASH_ALGORITHM =
     "sha256:crucible-worker-additional-context-v1";
@@ -166,6 +172,7 @@ function verifyIdentityFile(identity, algorithm, label) {
 export function buildRuntimeConfigAuthority({
     supervisorConfig,
     nodeExecutable,
+    runtimeIdentity,
     sandbox,
     env = process.env,
 }) {
@@ -176,6 +183,17 @@ export function buildRuntimeConfigAuthority({
         );
     }
     const securityConfig = securityConfigDocument(config);
+    let normalizedRuntimeIdentity;
+    try {
+        normalizedRuntimeIdentity = normalizeRuntimeIdentity(runtimeIdentity);
+    } catch (error) {
+        throw new RuntimeConfigError(
+            `Runtime config authority requires a canonical runtime identity: ${
+                error?.message ?? String(error)
+            }`,
+            { cause: error?.code ?? null },
+        );
+    }
     const sdkEntryPath = path.join(config.runner.sdkPath, "index.js");
     const allowlist = fileIdentity(
         config.runner.allowlistPath,
@@ -227,6 +245,7 @@ export function buildRuntimeConfigAuthority({
                 ),
             },
         },
+        runtimeIdentity: normalizedRuntimeIdentity,
         workerAdditionalContextHash: workerContextHash(securityConfig),
         sandbox: sandboxIdentity(sandbox),
     };
@@ -294,6 +313,8 @@ export function verifyRuntimeConfigAuthority(
         expectedArtifactRoot = null,
         nodeExecutable = null,
         sandbox = null,
+        runtimeIdentityInput = null,
+        commandTemplates = null,
         verifyFiles = true,
     } = {},
 ) {
@@ -328,7 +349,19 @@ export function verifyRuntimeConfigAuthority(
             path.join(config.runner.sdkPath, "index.js"),
         )
         || !samePath(identities.copilotCli.path, config.runner.cliPath)
-        || !samePath(identities.runnerCli.path, config.runnerCliPath)) {
+        || !samePath(identities.runnerCli.path, config.runnerCliPath)
+        || !samePath(
+            authority.runtimeIdentity.components.nodeExecutable.path,
+            identities.nodeRuntime.path,
+        )
+        || !samePath(
+            authority.runtimeIdentity.components.copilotCli.launcher.path,
+            identities.copilotCli.path,
+        )
+        || !samePath(
+            authority.runtimeIdentity.components.copilotSdk.rootPath,
+            identities.sdk.path,
+        )) {
         throw new RuntimeIntegrityError(
             "Runtime executable/path identities do not match the immutable supervisor config",
         );
@@ -366,6 +399,28 @@ export function verifyRuntimeConfigAuthority(
         }
     }
     if (verifyFiles) {
+        const sandboxExpectedHashes = sandbox?.required === true
+            ? {
+                expectedHelperSourceHash: sandbox.helperSourceHash,
+                expectedHelperBinaryHash: sandbox.helperBinaryHash,
+                expectedLauncherBinaryHash: sandbox.launcherBinaryHash,
+                expectedLauncherScriptHash: sandbox.launcherScriptHash,
+            }
+            : null;
+        const runtimeVerification = runtimeIdentityInput === null
+            ? reverifyRuntimeIdentity(authority.runtimeIdentity, {
+                env,
+                commandTemplates,
+                sandboxExpectedHashes,
+            })
+            : verifyRuntimeIdentity(
+                authority.runtimeIdentity,
+                runtimeIdentityInput,
+            );
+        assertRuntimeIdentityVerified(
+            runtimeVerification,
+            "Current runtime closure differs from the immutable opening identity",
+        );
         verifyIdentityFile(
             identities.allowlist,
             ALLOWLIST_HASH_ALGORITHM,

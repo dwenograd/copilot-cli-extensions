@@ -1102,6 +1102,15 @@ export function createWindowsJobProcessAdapter(options = {}) {
                 : 5_000;
             return terminateOwnedChild(record, timeoutMs);
         },
+        async closeJobObject(pid, termination = {}) {
+            const record = active.get(pid);
+            if (record === undefined) return false;
+            const timeoutMs = Number.isSafeInteger(termination?.timeoutMs)
+                && termination.timeoutMs > 0
+                ? Math.min(termination.timeoutMs, 60_000)
+                : 5_000;
+            return terminateOwnedChild(record, timeoutMs);
+        },
         async close(termination = {}) {
             closed = true;
             const timeoutMs = Number.isSafeInteger(termination?.timeoutMs)

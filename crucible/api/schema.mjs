@@ -1088,7 +1088,7 @@ export const crucibleStatusSpec = defineTool({
 export const crucibleStopSpec = defineTool({
     name: "crucible_stop",
     description:
-        "Request a Crucible PAUSE through the runtime. Reports resumable:true only after the kernel-owned pause transition is durably persisted; terminal/non-result calls remain non-resumable. It never manufactures a terminal decision.",
+        "Request a Crucible PAUSE through the runtime. Reports resumable:true only after the kernel-owned pause and a zero-active-resource quiescence proof are durably persisted; timeout/non-quiescent calls retain authority and remain non-resumable. It never manufactures a terminal decision.",
     args: object({
         investigation_id: investigationIdField,
         reason: string({

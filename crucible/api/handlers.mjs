@@ -50,6 +50,7 @@ import {
     readSupervisorLock,
     readStatus,
     requestStop,
+    waitForStopAcknowledgement,
     supervisorPaths,
     supervisorConfigFromRuntimeAuthority,
     verifyRuntimeConfigAuthority,
@@ -110,6 +111,7 @@ export function makeDefaultDeps(env = process.env, log = () => {}) {
         ensureSupervisor,
         readStatus,
         requestStop,
+        waitForStopAcknowledgement,
         normalizeSupervisorConfig,
         loadSupervisorConfig,
         readSupervisorLock,
@@ -171,9 +173,14 @@ function openInvestigationForRead(
             });
         }
         const operationalNonResult = adapter.latestOperationalNonResult();
+        const quiescentStop =
+            typeof repository.getQuiescentStop === "function"
+                ? repository.getQuiescentStop(investigationId)
+                : null;
         return {
             aggregate: replay.aggregate,
             operationalNonResult,
+            quiescentStop,
             artifactClosureReport: replay.artifactClosureReport ?? null,
         };
     } finally {
@@ -379,6 +386,9 @@ function buildSupervisorHealth(status, lock, isPidAlive, now = Date.now(), stale
             alive: false,
             heartbeat_at: null,
             restart_count: null,
+            runtime_identity: null,
+            resource_broker: null,
+            control_channel: null,
         };
     }
     const heartbeatAgeMs = now - Date.parse(status.heartbeatAt);
@@ -396,6 +406,9 @@ function buildSupervisorHealth(status, lock, isPidAlive, now = Date.now(), stale
         alive: ownershipMatches && isPidAlive(status.pid) === true,
         heartbeat_at: status.heartbeatAt ?? null,
         restart_count: status.restartCount ?? null,
+        runtime_identity: status.runtimeIdentity ?? null,
+        resource_broker: status.resourceBroker ?? null,
+        control_channel: status.controlChannel ?? null,
     };
 }
 
@@ -595,7 +608,11 @@ export function statusInvestigation(args, deps) {
                 "Legacy state is read-only and restart-required; start a new v4 investigation.",
         };
     }
-    const { aggregate, operationalNonResult } = verifiedRead.read;
+    const {
+        aggregate,
+        operationalNonResult,
+        quiescentStop,
+    } = verifiedRead.read;
     if (aggregate.terminal !== null) {
         const readiness = (
             deps.assessPersistedTerminalReadiness
@@ -652,6 +669,16 @@ export function statusInvestigation(args, deps) {
             ?? aggregate.nonResults.at(-1)?.code
             ?? null,
         paused: aggregate.pause !== null,
+        quiescent: quiescentStop?.state === "PAUSED_QUIESCENT"
+            && quiescentStop.quiescent === true,
+        resumable: aggregate.pause !== null
+            && quiescentStop?.state === "PAUSED_QUIESCENT"
+            && quiescentStop.quiescent === true
+            && operationalNonResult === null
+            && aggregate.nonResults.length === 0,
+        stop_state: quiescentStop?.state ?? null,
+        intervention_required:
+            quiescentStop?.interventionRequired === true,
         status: aggregate.status,
         progress: buildProgress(aggregate),
         supervisor_health: { ...health, ensure_action: ensureAction },
@@ -661,7 +688,10 @@ export function statusInvestigation(args, deps) {
                 : aggregate.nonResults.length > 0
                     ? `A persisted non-result (${aggregate.nonResults.at(-1)?.code ?? "unknown"}) is recorded; this status is not a result.`
                     : aggregate.pause !== null
-                        ? "The investigation is paused and resumable; this status is not a result."
+                        ? quiescentStop?.state === "PAUSED_QUIESCENT"
+                            && quiescentStop.quiescent === true
+                            ? "The investigation is paused, quiescent, and resumable; this status is not a result."
+                            : "A pause is persisted without a quiescence proof; resumability is not claimed."
                         : "The investigation is in progress; this status is not a result.",
     };
 }
@@ -679,6 +709,13 @@ export function stopInvestigation(args, deps) {
             investigationId,
         });
     }
+    if (typeof deps.openRepository === "function") {
+        const migrationRepository = deps.openRepository({
+            file: paths.eventsDbPath,
+            env: deps.env,
+        });
+        migrationRepository.close();
+    }
     const verifiedRead = readInvestigationOrIntegrityBlock(
         deps,
         investigationId,
@@ -693,7 +730,9 @@ export function stopInvestigation(args, deps) {
             pause_requested: false,
             pause_in_flight: false,
             pause_persisted: false,
+            quiescent: false,
             resumable: false,
+            intervention_required: false,
             appended: false,
             paused: false,
             status: "integrity_blocked",
@@ -707,7 +746,9 @@ export function stopInvestigation(args, deps) {
             pause_requested: false,
             pause_in_flight: false,
             pause_persisted: false,
+            quiescent: false,
             resumable: false,
+            intervention_required: false,
             appended: false,
             paused: false,
             status: "legacy_incompatible",
@@ -733,74 +774,141 @@ export function stopInvestigation(args, deps) {
             : "Pause requested via crucible_stop.",
         pauseRequested: true,
     });
-    const aggregate = result?.aggregate ?? null;
-    const alreadyTerminal = aggregate?.terminal != null;
-    if (alreadyTerminal) {
-        const terminalRead = readInvestigationOrIntegrityBlock(
-            deps,
-            investigationId,
-            paths,
-            { verifyTerminalArtifacts: true },
-        );
-        if (terminalRead.blocked !== null) {
-            return {
-                ...terminalRead.blocked,
-                terminal_available: false,
-            };
+    const finishStop = (acknowledgement) => {
+        let aggregate = result?.aggregate ?? null;
+        let operationalNonResult =
+            result?.operationalNonResult ?? null;
+        if (acknowledgement !== null) {
+            const afterStop = readInvestigationOrIntegrityBlock(
+                deps,
+                investigationId,
+                paths,
+                { verifyTerminalArtifacts: true },
+            );
+            if (afterStop.blocked !== null) {
+                return {
+                    ...afterStop.blocked,
+                    terminal_available: false,
+                    stop_state: "integrity_blocked",
+                    pause_requested: false,
+                    pause_in_flight: false,
+                    pause_persisted: false,
+                    quiescent: false,
+                    resumable: false,
+                    intervention_required: false,
+                    appended: result?.appended === true,
+                    paused: false,
+                    status: "integrity_blocked",
+                    already_terminal: false,
+                };
+            }
+            aggregate = afterStop.read.aggregate;
+            operationalNonResult =
+                afterStop.read.operationalNonResult;
         }
-        const readiness = (
-            deps.assessPersistedTerminalReadiness
-            ?? assessPersistedTerminalReadiness
-        )(terminalRead.read.aggregate);
-        return readiness.ready
-            ? terminalAvailable(investigationId)
-            : scientificBlockedPayload(investigationId, readiness);
-    }
-    const domainNonResult = (aggregate?.nonResults?.length ?? 0) > 0;
-    const operationalNonResult = result?.operationalNonResult ?? null;
-    const pausePersisted = result?.pausePersisted === true || aggregate?.pause !== null;
-    const resumable = pausePersisted
-        && !domainNonResult
-        && operationalNonResult === null;
-    const stopState = operationalNonResult !== null
-        ? "operational_non_result"
-        : domainNonResult
-            ? "domain_non_result"
-            : pausePersisted
-                ? "pause_persisted"
-                : "pause_requested";
-    const pauseRequested = result?.appended === true
-        && !domainNonResult
-        && operationalNonResult === null;
-    const pauseInFlight = stopState === "pause_requested";
-    const nonResultCode = operationalNonResult?.payload?.code
-        ?? aggregate?.nonResults?.at(-1)?.code
-        ?? null;
-    const messages = {
-        operational_non_result:
-            "A persisted operational non-result blocks resumability; reattach by investigation_id with any required later deadline/reset policy.",
-        domain_non_result:
-            "A persisted domain non-result is final for this investigation identity and is not resumable.",
-        pause_persisted:
-            "Pause is durably persisted; the investigation is resumable by investigation_id.",
-        pause_requested:
-            "Pause was requested but is not yet durably persisted; resumability is not claimed.",
+        const alreadyTerminal = aggregate?.terminal != null;
+        if (alreadyTerminal) {
+            const terminalRead = readInvestigationOrIntegrityBlock(
+                deps,
+                investigationId,
+                paths,
+                { verifyTerminalArtifacts: true },
+            );
+            if (terminalRead.blocked !== null) {
+                return {
+                    ...terminalRead.blocked,
+                    terminal_available: false,
+                };
+            }
+            const readiness = (
+                deps.assessPersistedTerminalReadiness
+                ?? assessPersistedTerminalReadiness
+            )(terminalRead.read.aggregate);
+            return readiness.ready
+                ? terminalAvailable(investigationId)
+                : scientificBlockedPayload(investigationId, readiness);
+        }
+        const domainNonResult =
+            (aggregate?.nonResults?.length ?? 0) > 0;
+        const pausePersisted = result?.pausePersisted === true
+            || aggregate?.pause !== null;
+        const stop = acknowledgement?.stop ?? result?.stop ?? null;
+        const quiescent = stop?.state === "PAUSED_QUIESCENT"
+            && stop.quiescent === true;
+        const interventionRequired =
+            stop?.interventionRequired === true;
+        const resumable = quiescent
+            && pausePersisted
+            && !domainNonResult
+            && operationalNonResult === null;
+        const stopState = operationalNonResult !== null
+            ? "operational_non_result"
+            : domainNonResult
+                ? "domain_non_result"
+                : stop?.state === "PAUSED_QUIESCENT"
+                    ? "pause_persisted"
+                    : stop?.state === "PAUSE_PENDING"
+                        ? "pause_pending"
+                        : "pause_requested";
+        const pauseRequested = result?.appended === true
+            && !domainNonResult
+            && operationalNonResult === null;
+        const pauseInFlight = [
+            "pause_requested",
+            "pause_pending",
+        ].includes(stopState);
+        const nonResultCode = operationalNonResult?.payload?.code
+            ?? aggregate?.nonResults?.at(-1)?.code
+            ?? stop?.nonResultCode
+            ?? null;
+        const messages = {
+            operational_non_result:
+                "A persisted operational non-result blocks resumability; reattach by investigation_id with any required later deadline/reset policy.",
+            domain_non_result:
+                "A persisted domain non-result is final for this investigation identity and is not resumable.",
+            pause_persisted:
+                "Pause and zero-active-resource proof are durably persisted; the investigation is resumable by investigation_id.",
+            pause_pending:
+                "The stop barrier is durable, but zero active resources could not be proved within the bound; authority is retained and intervention is required.",
+            pause_requested:
+                "The stop barrier is durable and reconciliation is in flight; resumability is not claimed.",
+        };
+
+        return {
+            is_result: false,
+            investigation_id: investigationId,
+            stop_state: stopState,
+            pause_requested: pauseRequested,
+            pause_in_flight: pauseInFlight,
+            pause_persisted: pausePersisted,
+            quiescent,
+            resumable,
+            intervention_required: interventionRequired,
+            acknowledgement_timed_out:
+                acknowledgement?.timedOut === true,
+            appended: result?.appended === true,
+            status: aggregate?.status ?? "pause_requested",
+            non_result:
+                domainNonResult || operationalNonResult !== null,
+            non_result_code: nonResultCode,
+            message: messages[stopState],
+        };
     };
 
-    return {
-        is_result: false,
-        investigation_id: investigationId,
-        stop_state: stopState,
-        pause_requested: pauseRequested,
-        pause_in_flight: pauseInFlight,
-        pause_persisted: pausePersisted,
-        resumable,
-        appended: result?.appended === true,
-        status: aggregate?.status ?? "pause_requested",
-        non_result: domainNonResult || operationalNonResult !== null,
-        non_result_code: nonResultCode,
-        message: messages[stopState],
-    };
+    const shouldWait = result?.stop !== null
+        && result?.stop !== undefined
+        && !["PAUSED_QUIESCENT", "PAUSE_PENDING"].includes(
+            result.stop.state,
+        )
+        && typeof deps.waitForStopAcknowledgement === "function";
+    if (!shouldWait) {
+        return finishStop(null);
+    }
+    return Promise.resolve(deps.waitForStopAcknowledgement({
+        stateDir: paths.stateDir,
+        investigationId,
+        requestId: result.stop.requestId,
+    })).then(finishStop);
 }
 
 // --- crucible_result ----------------------------------------------------------

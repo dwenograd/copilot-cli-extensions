@@ -15,6 +15,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
 import { assertLocalDatabasePath } from "../persistence/index.mjs";
 import {
@@ -34,8 +35,14 @@ const DEFAULT_ROOT_DIRNAME = "Crucible";
 const DEFAULT_ALLOWLIST_FILENAME = "harnesses.json";
 const DEFAULT_CASE_STORE_DIRNAME = "operator-corpus";
 const DEFAULT_INVESTIGATIONS_DIRNAME = "investigations";
+const DEFAULT_RUNTIME_CACHE_DIRNAME = "runtime-cache";
 const IDENTIFIER_RE = /^[A-Za-z0-9][A-Za-z0-9._@-]{0,127}$/u;
+const TAGGED_SHA256 = /^sha256:[a-z0-9][a-z0-9._-]*:[a-f0-9]{64}$/u;
 const PREFLIGHT_WORKSPACES = new WeakSet();
+const CRUCIBLE_SOURCE_ROOT = path.resolve(
+    path.dirname(fileURLToPath(import.meta.url)),
+    "..",
+);
 
 function hasText(value) {
     return typeof value === "string" && value.trim().length > 0;
@@ -132,15 +139,195 @@ export function resolveCliPath(env) {
     return requireAbsoluteLocalPath(raw, "CRUCIBLE_CLI_PATH", env);
 }
 
+export function resolveNodePath(env) {
+    let raw = hasText(env?.CRUCIBLE_NODE_PATH)
+        ? env.CRUCIBLE_NODE_PATH
+        : null;
+    if (!hasText(raw) && /^node(?:\.exe)?$/iu.test(path.basename(process.execPath))) {
+        raw = process.execPath;
+    }
+    if (!hasText(raw)) {
+        try {
+            const output = execFileSync(
+                process.platform === "win32" ? "where.exe" : "which",
+                [process.platform === "win32" ? "node.exe" : "node"],
+                {
+                    encoding: "utf8",
+                    windowsHide: true,
+                    stdio: ["ignore", "pipe", "ignore"],
+                    env,
+                },
+            );
+            raw = output.split(/\r?\n/u).map((line) => line.trim()).find(Boolean);
+        } catch {
+            raw = null;
+        }
+    }
+    if (!hasText(raw)) {
+        throw new EnvironmentError(
+            "Node executable path is required (set CRUCIBLE_NODE_PATH or place node on PATH)",
+            { variable: "CRUCIBLE_NODE_PATH" },
+        );
+    }
+    return requireAbsoluteLocalPath(raw, "CRUCIBLE_NODE_PATH", env);
+}
+
+export function resolveCliPackagePath(env, sdkPath = resolveSdkPath(env)) {
+    const raw = hasText(env?.CRUCIBLE_CLI_PACKAGE_PATH)
+        ? env.CRUCIBLE_CLI_PACKAGE_PATH
+        : path.dirname(sdkPath);
+    return requireAbsoluteLocalPath(
+        raw,
+        "CRUCIBLE_CLI_PACKAGE_PATH",
+        env,
+    );
+}
+
+export function resolveRuntimeCacheRoot(env) {
+    const raw = hasText(env?.CRUCIBLE_RUNTIME_CACHE_ROOT)
+        ? env.CRUCIBLE_RUNTIME_CACHE_ROOT
+        : hasText(env?.LOCALAPPDATA)
+            ? path.join(
+                env.LOCALAPPDATA,
+                DEFAULT_ROOT_DIRNAME,
+                DEFAULT_RUNTIME_CACHE_DIRNAME,
+            )
+            : path.join(
+                path.dirname(resolveStateRoot(env)),
+                DEFAULT_RUNTIME_CACHE_DIRNAME,
+            );
+    return requireAbsoluteLocalPath(
+        raw,
+        "CRUCIBLE_RUNTIME_CACHE_ROOT",
+        env,
+    );
+}
+
+function requireTaggedHash(value, label) {
+    if (typeof value !== "string" || !TAGGED_SHA256.test(value)) {
+        throw new EnvironmentError(
+            `${label} must be an algorithm-tagged SHA-256`,
+            { label, value },
+        );
+    }
+    return value;
+}
+
+export function resolveRuntimeCommandTemplates({ sandboxRequired = false } = {}) {
+    return Object.freeze({
+        supervisor: Object.freeze({
+            executable: "component:nodeExecutable",
+            argv: Object.freeze([
+                "component:crucibleSource/runtime/supervisor-cli.mjs",
+                "--config",
+                "<supervisor-config>",
+            ]),
+            shell: false,
+        }),
+        runner: Object.freeze({
+            executable: "component:nodeExecutable",
+            argv: Object.freeze([
+                "component:crucibleSource/runtime/runner-cli.mjs",
+                "--config",
+                "<runner-config>",
+            ]),
+            shell: false,
+        }),
+        copilotCli: Object.freeze({
+            executable: "component:copilotCli.launcher",
+            argv: Object.freeze(["<copilot-worker-command>"]),
+            shell: false,
+        }),
+        copilotSdk: Object.freeze({
+            module: "component:copilotSdk/index.js",
+            operation: "createSession",
+        }),
+        sandbox: sandboxRequired
+            ? Object.freeze({
+                executable: "component:sandbox.launcher",
+                argv: Object.freeze(["<sandbox-helper-launch-script>"]),
+                shell: false,
+            })
+            : null,
+    });
+}
+
+function resolveSandboxRuntimeIdentityInput(env, sandbox) {
+    if (sandbox?.required !== true) {
+        return Object.freeze({ required: false });
+    }
+    const required = [
+        ["CRUCIBLE_SANDBOX_HELPER_SOURCE_PATH", "helperSourcePath"],
+        ["CRUCIBLE_SANDBOX_HELPER_BINARY_PATH", "helperBinaryPath"],
+        ["CRUCIBLE_SANDBOX_LAUNCHER_PATH", "launcherPath"],
+    ];
+    const resolved = {};
+    for (const [variable, field] of required) {
+        resolved[field] = requireAbsoluteLocalPath(
+            env?.[variable],
+            variable,
+            env,
+        );
+    }
+    resolved.launcherScriptHash = requireTaggedHash(
+        env?.CRUCIBLE_SANDBOX_LAUNCHER_SCRIPT_HASH,
+        "CRUCIBLE_SANDBOX_LAUNCHER_SCRIPT_HASH",
+    );
+    return Object.freeze({
+        required: true,
+        ...resolved,
+        ...(sandbox?.helperSourceHash === undefined
+            ? {}
+            : { expectedHelperSourceHash: sandbox.helperSourceHash }),
+        ...(sandbox?.helperBinaryHash === undefined
+            ? {}
+            : { expectedHelperBinaryHash: sandbox.helperBinaryHash }),
+        ...(sandbox?.launcherBinaryHash === undefined
+            ? {}
+            : { expectedLauncherBinaryHash: sandbox.launcherBinaryHash }),
+        ...(sandbox?.launcherScriptHash === undefined
+            ? {}
+            : { expectedLauncherScriptHash: sandbox.launcherScriptHash }),
+    });
+}
+
+export function resolveRuntimeIdentityBuildInput({
+    env,
+    sdkPath = resolveSdkPath(env),
+    cliPath = resolveCliPath(env),
+    cliPackagePath = resolveCliPackagePath(env, sdkPath),
+    nodeExecutablePath = resolveNodePath(env),
+    sandbox = Object.freeze({ required: false }),
+} = {}) {
+    const sandboxInput = resolveSandboxRuntimeIdentityInput(env, sandbox);
+    return Object.freeze({
+        crucibleSourceRoot: CRUCIBLE_SOURCE_ROOT,
+        nodeExecutablePath,
+        copilotCliLauncherPath: cliPath,
+        copilotCliPackageRoot: cliPackagePath,
+        copilotSdkPackageRoot: sdkPath,
+        sandbox: sandboxInput,
+        commandTemplates: resolveRuntimeCommandTemplates({
+            sandboxRequired: sandboxInput.required,
+        }),
+        env,
+    });
+}
+
 // Resolve every runtime path crucible_start needs in one place, failing clearly
 // if any required environment configuration is unavailable.
 export function resolveStartEnvironment(env) {
+    const sdkPath = resolveSdkPath(env);
+    const cliPath = resolveCliPath(env);
     return Object.freeze({
         allowlistPath: resolveAllowlistPath(env),
         caseStorePath: resolveCaseStorePath(env),
         stateRoot: resolveStateRoot(env),
-        sdkPath: resolveSdkPath(env),
-        cliPath: resolveCliPath(env),
+        sdkPath,
+        cliPath,
+        cliPackagePath: resolveCliPackagePath(env, sdkPath),
+        nodePath: resolveNodePath(env),
+        runtimeCacheRoot: resolveRuntimeCacheRoot(env),
     });
 }
 
@@ -383,6 +570,8 @@ export function buildSupervisorConfigInput({
     deadlineIso,
     runnerEpochId = deriveRunnerEpochId(investigationId),
     executionLimits = null,
+    resourceBroker = null,
+    sdkRetryPolicy = null,
 }) {
     return {
         runner: {
@@ -394,11 +583,15 @@ export function buildSupervisorConfigInput({
             copilotCliPath: cliPath,
             runnerEpochId,
             ...(hasText(deadlineIso) ? { deadline: deadlineIso } : {}),
+            ...(resourceBroker === null ? {} : { resourceBroker }),
             ...(executionLimits === null
                 ? {}
                 : {
                     options: {
                         maxLoopIterations: executionLimits.maxLoopIterations,
+                        ...(sdkRetryPolicy === null
+                            ? {}
+                            : { sdkRetryPolicy }),
                     },
                 }),
         },

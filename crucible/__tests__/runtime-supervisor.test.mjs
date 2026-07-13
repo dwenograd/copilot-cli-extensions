@@ -12,6 +12,8 @@ import {
     normalizeStartDeadline,
     normalizeRunnerConfig,
     normalizeSupervisorConfig,
+    persistQuiescentStopBarrier,
+    QUIESCENT_STOP_STATES,
     releaseSupervisorLock,
     runSupervisor,
     startSupervisor,
@@ -1532,6 +1534,147 @@ describe("Crucible supervisor", () => {
             expect(result.kind).toBe("STOPPED");
             expect(terminated).toEqual([6543]);
             expect(fs.existsSync(config.paths.lockPath)).toBe(false);
+    });
+
+    it("continues a crash-persisted stop barrier before any runner launch", async () => {
+        const root = makeRoot("stop-restart-reconciliation");
+        const config = normalizeSupervisorConfig(rawConfig(root));
+        fs.mkdirSync(config.runner.stateDir, { recursive: true });
+        const repository = openRepository({
+            file: path.join(config.runner.stateDir, "events.sqlite"),
+        });
+        repository.ensureInvestigation({
+            investigationId: config.runner.investigationId,
+            metadata: {
+                role: "crucible-domain",
+                domainVersion: 4,
+            },
+        });
+        const persisted = persistQuiescentStopBarrier({
+            repository,
+            investigationId: config.runner.investigationId,
+            requestId: "restart-stop",
+            reason: "requester crashed after persisting the barrier",
+        });
+        repository.close();
+
+        let launches = 0;
+        const result = await runSupervisor(config, {
+            pid: 5051,
+            idFactory: () => "restart-reconciler",
+            isPidAlive: () => false,
+            ensureStopDomainIntent() {},
+            persistPausedQuiescent({
+                repository: authorityRepository,
+                stop,
+                proof,
+            }) {
+                expect(proof.quiescent).toBe(true);
+                return authorityRepository.completeQuiescentStop({
+                    investigationId: config.runner.investigationId,
+                    requestId: stop.requestId,
+                    state: QUIESCENT_STOP_STATES.PAUSED_QUIESCENT,
+                    quiescent: true,
+                    interventionRequired: false,
+                    details: { proof: "injected-domain-finalizer" },
+                    quiescenceProof: proof,
+                });
+            },
+            spawnRunner() {
+                launches += 1;
+                throw new Error("runner must not launch across a stop barrier");
+            },
+            processTreeAdapter: {
+                activeOwnedPids: () => [],
+                close: async () => true,
+            },
+        });
+
+        expect(persisted.state)
+            .toBe(QUIESCENT_STOP_STATES.BARRIER_PERSISTED);
+        expect(launches).toBe(0);
+        expect(result).toMatchObject({
+            kind: "PAUSE",
+            quiescent: true,
+            interventionRequired: false,
+            stop: { state: QUIESCENT_STOP_STATES.PAUSED_QUIESCENT },
+        });
+        expect(fs.existsSync(config.paths.lockPath)).toBe(false);
+    });
+
+    it("retains authority when the exact runner PID refuses quiescent stop", async () => {
+        const root = makeRoot("quiescent-child-refusal");
+        const config = normalizeSupervisorConfig(rawConfig(root));
+        const child = new EventEmitter();
+        child.pid = 7655;
+        const terminated = [];
+        let stopPersisted = false;
+        const result = await runSupervisor(config, {
+            pid: 5061,
+            idFactory: () => "quiescent-refusal-owner",
+            isPidAlive: (pid) => pid === child.pid,
+            shutdownPolicy: {
+                drainMs: 10,
+                escalationMs: 10,
+                finalMs: 30,
+            },
+            ensureStopDomainIntent() {},
+            spawnRunner: async (_runnerConfig, context) => {
+                const repository = openRepository({
+                    file: path.join(config.runner.stateDir, "events.sqlite"),
+                });
+                try {
+                    persistQuiescentStopBarrier({
+                        repository,
+                        investigationId: config.runner.investigationId,
+                        requestId: "child-refusal-stop",
+                        reason: "child must stop",
+                        owner: {
+                            pid: 5061,
+                            nonce: context.supervisorNonce,
+                            supervisorGeneration:
+                                context.supervisorGeneration,
+                        },
+                        runnerPid: child.pid,
+                    });
+                    stopPersisted = true;
+                } finally {
+                    repository.close();
+                }
+                return { child, resultPath: config.paths.childResultPath };
+            },
+            processTreeAdapter: {
+                terminateTree(pid, options) {
+                    terminated.push({ pid, phase: options.phase });
+                    return false;
+                },
+                closeJobObject(pid) {
+                    terminated.push({ pid, phase: "job_object_close" });
+                    return false;
+                },
+                activeOwnedPids: () => [child.pid],
+                close: async () => true,
+            },
+        });
+
+        expect(stopPersisted).toBe(true);
+        expect(result).toMatchObject({
+            kind: "PAUSE_PENDING",
+            quiescent: false,
+            interventionRequired: true,
+            nonResultCode: RUNTIME_ERROR_CODES.NON_QUIESCENT,
+            stop: {
+                state: QUIESCENT_STOP_STATES.PAUSE_PENDING,
+                quiescent: false,
+                interventionRequired: true,
+            },
+        });
+        expect(terminated).toEqual([
+            { pid: child.pid, phase: "drain" },
+            { pid: child.pid, phase: "escalation" },
+            { pid: child.pid, phase: "job_object_close" },
+        ]);
+        expect(fs.existsSync(config.paths.lockPath)).toBe(true);
     });
 
     it("retains fenced authority when child shutdown cannot be proven", async () => {

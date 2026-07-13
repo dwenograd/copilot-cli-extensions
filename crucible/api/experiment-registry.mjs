@@ -21,11 +21,13 @@ import {
     verifyLocalRegularFile,
 } from "../measurement/index.mjs";
 import { assertLocalDatabasePath } from "../persistence/index.mjs";
+import { buildRuntimeIdentity } from "../runtime/runtime-identity.mjs";
 import {
     CRITICALITY,
     POLICY_VERSION,
     canonicalObjective,
     resolveAllowlistPath,
+    resolveRuntimeIdentityBuildInput,
 } from "./environment.mjs";
 import { operatorExperimentConfigSpec } from "./schema.mjs";
 import {
@@ -396,6 +398,26 @@ function prepareExperimentCore(rawConfig, options = {}) {
             },
         );
     }
+    const sandboxRequired = Object.values(harnessSuite.roles)
+        .some((role) => role.sandboxIdentity.required);
+    let runtimeIdentity;
+    try {
+        runtimeIdentity = buildRuntimeIdentity(
+            resolveRuntimeIdentityBuildInput({
+                env,
+                sandbox: { required: sandboxRequired },
+            }),
+        );
+    } catch (error) {
+        fail(
+            EXPERIMENT_REGISTRY_ERROR_CODES.CONFIG_INVALID,
+            `runtime identity preparation failed: ${
+                error?.message ?? String(error)
+            }`,
+            { cause: error?.code ?? null, details: error?.details ?? null },
+            { cause: error },
+        );
+    }
     const enumerandManifest = normalizeAuthoringManifest(config);
     let contract;
     try {
@@ -407,6 +429,9 @@ function prepareExperimentCore(rawConfig, options = {}) {
             hypothesisTopology: config.hypothesis_topology,
             criticality: CRITICALITY,
             policyVersion: POLICY_VERSION,
+            runtimeIdentityPolicy: runtimeIdentity.policy,
+            runtimeIdentityPolicyIdentity: runtimeIdentity.policyIdentity,
+            runtimeIdentityRoot: runtimeIdentity.root,
             workerModels: config.worker_models,
             candidatesPerRound: config.candidates_per_round,
             maxRounds: config.max_rounds,
@@ -446,6 +471,7 @@ function prepareExperimentCore(rawConfig, options = {}) {
         harnessSuiteIdentity,
         contractHash: digest,
         contract,
+        runtimeIdentity,
         investigationId: manifest.investigationId,
         manifest,
         manifestIdentity: experimentAuthorityManifestIdentity(manifest),
@@ -466,6 +492,9 @@ export function prepareExperimentManifest(rawConfig, options = {}) {
             prepared.manifest.statisticalPolicyIdentity,
         hypothesisPolicyIdentity:
             prepared.manifest.hypothesisPolicyIdentity,
+        runtimeIdentityPolicyIdentity:
+            prepared.contract.runtimeIdentityPolicyIdentity,
+        runtimeIdentityRoot: prepared.contract.runtimeIdentityRoot,
         investigationId: prepared.investigationId,
         trustFingerprint: prepared.manifest.trustFingerprint,
         manifest: prepared.manifest,

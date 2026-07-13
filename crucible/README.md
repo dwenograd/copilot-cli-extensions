@@ -225,7 +225,8 @@ The signed manifest contains the complete canonical experiment payload
 (`experiment_id`, canonical project identity, suite id, and sealed contract),
 plus the contract hash, HarnessSuiteV4 identity, enumerand Merkle root (or
 `null`), statistical-policy identity, hypothesis-policy identity, exact trusted
-public-key fingerprint, and the deterministically derived investigation id.
+public-key fingerprint, canonical runtime-identity policy plus its initial
+Merkle root, and the deterministically derived investigation id.
 Registry entry/registry self-hashes are integrity checks only and cannot
 substitute for the Ed25519 signature.
 
@@ -306,11 +307,17 @@ crucible_stop({
 ```
 
 The response distinguishes `already_terminal`, `operational_non_result`,
-`domain_non_result`, `pause_persisted`, and `pause_requested`.
-`resumable:true` means the kernel-owned pause event is durable. It does **not**
-by itself prove that every worker/session/process has already quiesced.
-Supervisor status may separately retain fenced `pause_pending` or
-`failed_non_quiescent` authority when cleanup cannot be proven.
+`domain_non_result`, `pause_persisted`, `pause_pending`, and
+`pause_requested`. `resumable:true` requires both the kernel-owned pause and
+the durable `PAUSED_QUIESCENT` zero-active proof. A bounded cleanup or
+acknowledgement timeout reports `pause_pending`, `quiescent:false`, and
+`intervention_required:true`; fenced authority is retained.
+
+The runtime exports `QUIESCENT_STOP_*` protocol helpers plus
+`QUIESCENT_STOP_INTEGRATION_NOTES`. Production stop reconciliation now probes
+the state-root resource broker, aborts SDK sessions, closes owned process/Job
+trees, and persists `PAUSED_QUIESCENT` only after runner leases, command
+attempts, broker leases, SDK sessions, and owned PIDs are all zero.
 
 ### `crucible_result`
 
@@ -350,20 +357,57 @@ consumes only the validated preflight plan.
 | `CRUCIBLE_CASE_STORE_PATH`, or `operator-corpus` beside the default allowlist | yes | no; frozen snapshots are already copied into the investigation CAS |
 | `COPILOT_SDK_PATH` absolute local path | yes | persisted path must still validate |
 | `CRUCIBLE_CLI_PATH`, `COPILOT_CLI_PATH`, or `copilot` on `PATH` | yes | persisted path must still validate |
+| `CRUCIBLE_CLI_PACKAGE_PATH`, or the parent of `COPILOT_SDK_PATH` | yes | persisted real path/tree must still validate |
+| `CRUCIBLE_NODE_PATH`, or resolved local Node | yes | persisted executable bytes/path must still validate |
+| Stable sandbox source/binary/launcher paths and launcher-script hash when sandboxing is required | yes | exact files and current sandbox policy must still validate |
 | Existing absolute-local `project_dir` | yes | no |
 | Event DB, artifact store, frozen contract, supervisor config | no | yes |
 | Current allowlist/suite role bytes still match the frozen suite identity | yes | yes |
 | Current sandbox admission for every role that executes candidate code | yes | yes |
 
-The opening event persists a canonical runtime-config authority and fingerprint:
-supervisor/runner options, worker additional context plus its hash, state/
-artifact/allowlist paths, runner CLI path/hash, SDK entry identity, Copilot CLI
-identity, Node runtime identity, and sandbox identity. Reattach treats the
+The signed contract freezes a runtime-identity policy and initial root. The root
+binds resolved real paths and content/Merkle identities for the Crucible source
+closure, Node executable, Copilot CLI launcher/package, Copilot SDK package
+tree, sandbox helper source/binary/launcher, launch templates, and selected
+decision-relevant environment values. Symlinks, junctions/reparse redirection,
+network/cloud paths, special files, and closures over the frozen file/byte/depth
+caps fail admission. OS release and hardware inventory are recorded separately
+as assumptions and do not silently become identity evidence.
+
+The opening event persists that complete identity inside the canonical
+runtime-config authority and fingerprint, together with supervisor/runner
+options, worker additional context plus its hash, state/artifact/allowlist
+paths, runner CLI path/hash, and sandbox policy. Reattach treats the
 supervisor config file as a deadline carrier only: every other field must match
 the opening authority, and the launch config is reconstructed from that
-immutable source. Tampering leaves a paused investigation paused. Terminal and
+immutable source. New-start preflight verifies the signed initial root;
+reattach/recovery rehashes it; apply verifies it again immediately before the
+supervisor launch. Any mismatch returns `RUNTIME_DRIFT`, forbids in-place
+repinning, and requires a new or explicitly forked investigation. Tampering
+leaves a paused investigation paused. Terminal and
 domain-non-result investigations require a new identity; operational recovery
 may require a later deadline or explicit reset policy.
+
+Candidate-code suites additionally configure:
+
+```text
+CRUCIBLE_SANDBOX_HELPER_SOURCE_PATH=<stable absolute local source path>
+CRUCIBLE_SANDBOX_HELPER_BINARY_PATH=<stable absolute local helper path>
+CRUCIBLE_SANDBOX_LAUNCHER_PATH=<stable absolute local launcher path>
+CRUCIBLE_SANDBOX_LAUNCHER_SCRIPT_HASH=sha256:<domain>:<64hex>
+```
+
+The runtime identity reader hashes these files in place; it never copies
+binaries. Its optional in-memory hash cache accepts only sealed records produced
+after content hashing, detects cache-record tampering, and full verification
+rehashes bytes before accepting an unchanged closure.
+
+`runtime/runtime-identity.mjs` exports pure build/verify/root helpers plus
+`reverifyRuntimeIdentity` and `assertRuntimeIdentityVerified`. The API,
+supervisor, runner, SDK worker pool, and measurement launch lifecycle reverify
+the immutable authority immediately before supervisor/runner/CLI/SDK/harness/
+sandbox launch and before durable recovery or commitment. Drift records the
+operational `RUNTIME_DRIFT` outcome and pause before any later science effect.
 
 Default locations:
 
@@ -376,7 +420,19 @@ Default locations:
   state\supervisor\<id>.config.json
   state\supervisor\<id>.status.json
   artifacts\
+%LOCALAPPDATA%\Crucible\investigations\resource-catalog.sqlite
 ```
+
+`runtime/resource-broker.mjs` owns the state-root catalog. It freezes global
+capacities and per-investigation limits, then issues fenced, expiring leases
+for SDK/sandbox/CPU/GPU concurrency and storage/model-cost reservations.
+Admission `throttle`/`pause` outcomes are operational only and never scientific
+conclusions. The supervisor claims each generation/incarnation before launch;
+the runner reserves worst-case output/receipt/CAS/model cost before effects,
+renews leases, reconciles SDK usage, and releases observed usage after cleanup.
+SDK proposals use a durable first-valid-submission journal with stable logical
+ids, frozen retry/deadline/cost policy, and quarantine for late, duplicate, or
+ambiguous responses.
 
 The persisted supervisor config contains runtime configuration for the
 supervisor process:

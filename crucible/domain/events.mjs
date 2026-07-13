@@ -1163,6 +1163,14 @@ export function createInvestigationOpenedEvent(
                 "runtime config authority belongs to a different investigation",
             );
         }
+        if (runtimeAuthority.runtimeIdentity.root
+                !== normalizedContract.runtimeIdentityRoot
+            || runtimeAuthority.runtimeIdentity.policyIdentity
+                !== normalizedContract.runtimeIdentityPolicyIdentity) {
+            throw new Error(
+                "runtime config authority is not bound to the signed contract runtime identity",
+            );
+        }
     } catch (error) {
         throw new TransitionError(
             ERROR_CODES.INVALID_CONTRACT,

@@ -75,6 +75,12 @@ describe("runner-supervised impossibility verification", () => {
 
         const replay = replayImpossibilityRunnerFixture(setup);
         try {
+            expect(replay.aggregate.pause).toBeNull();
+            expect(replay.aggregate.stopRequests).toEqual([]);
+            expect(replay.adapter.latestOperationalNonResult()).toBeNull();
+            expect(replay.repository.getQuiescentStop(
+                setup.config.investigationId,
+            )).toBeNull();
             const observation =
                 impossibilityObservation(replay.aggregate);
             const execution = observation.verifierExecution;

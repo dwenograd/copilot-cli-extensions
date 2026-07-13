@@ -27,6 +27,7 @@ export const API_ERROR_CODES = Object.freeze({
     EXPERIMENT_NOT_FOUND: "CRUCIBLE_API_EXPERIMENT_NOT_FOUND",
     EXPERIMENT_AUTHORITY_MISMATCH:
         "CRUCIBLE_API_EXPERIMENT_AUTHORITY_MISMATCH",
+    RUNTIME_DRIFT: "RUNTIME_DRIFT",
 });
 
 export class CrucibleApiError extends Error {
@@ -157,5 +158,18 @@ export class ExperimentAuthorityMismatchApiError extends CrucibleApiError {
             ...details,
         }, options);
         this.name = "ExperimentAuthorityMismatchApiError";
+    }
+}
+
+export class RuntimeDriftApiError extends CrucibleApiError {
+    constructor(message, details = null, options = {}) {
+        super(API_ERROR_CODES.RUNTIME_DRIFT, message, {
+            restartRequired: true,
+            forkRequired: true,
+            inPlaceRepinAllowed: false,
+            requiredAction: "start_new_or_forked_investigation",
+            ...details,
+        }, options);
+        this.name = "RuntimeDriftApiError";
     }
 }

@@ -57,6 +57,18 @@ import {
 } from "./schema.mjs";
 
 const DEFAULT_BUSY_TIMEOUT_MS = 5000;
+const QUIESCENT_STOP_STATES = Object.freeze({
+    BARRIER_PERSISTED: "STOP_BARRIER_PERSISTED",
+    RECONCILING: "STOP_RECONCILING",
+    SUPERSEDED: "STOP_SUPERSEDED",
+    PAUSE_PENDING: "PAUSE_PENDING",
+    PAUSED_QUIESCENT: "PAUSED_QUIESCENT",
+});
+const ACTIVE_QUIESCENT_STOP_STATES = new Set([
+    QUIESCENT_STOP_STATES.BARRIER_PERSISTED,
+    QUIESCENT_STOP_STATES.RECONCILING,
+    QUIESCENT_STOP_STATES.PAUSE_PENDING,
+]);
 
 const NEXT_STATE = Object.freeze({
     reserved: "dispatched",
@@ -126,6 +138,31 @@ function normalizeRunnerAuthority(supervisorGeneration, runnerIncarnation) {
         );
     }
     return { supervisorGeneration: generation, runnerIncarnation: incarnation };
+}
+
+function normalizeOptionalPositiveInteger(value, field) {
+    if (value === undefined || value === null) return null;
+    if (!Number.isSafeInteger(value) || value < 1) {
+        throw new InvalidArgumentError(
+            `${field} must be a positive safe integer or null`,
+            { [field]: value },
+        );
+    }
+    return value;
+}
+
+function normalizeOptionalString(value, field, maximum = 4096) {
+    if (value === undefined || value === null) return null;
+    if (typeof value !== "string"
+        || value.length === 0
+        || value.length > maximum
+        || value.includes("\0")) {
+        throw new InvalidArgumentError(
+            `${field} must be a non-empty bounded string or null`,
+            { [field]: value },
+        );
+    }
+    return value;
 }
 
 function isSqliteError(err) {
@@ -1038,6 +1075,671 @@ export class EventRepository {
         return row ? this.#rowToSupervisorAuthority(row) : null;
     }
 
+    getQuiescentStop(investigationId) {
+        requireNonEmptyString(investigationId, "investigationId");
+        const row = this.#db
+            .prepare("SELECT * FROM quiescent_stops WHERE investigation_id = ?")
+            .get(investigationId);
+        return row ? this.#rowToQuiescentStop(row) : null;
+    }
+
+    persistQuiescentStopBarrier({
+        investigationId,
+        requestId,
+        reason,
+        pauseRequested = true,
+        expectedSupervisorGeneration = null,
+        expectedSupervisorNonce = null,
+        targetSupervisorPid = null,
+        targetRunnerPid = null,
+        details = {},
+    } = {}) {
+        requireNonEmptyString(investigationId, "investigationId");
+        requireNonEmptyString(requestId, "requestId");
+        requireNonEmptyString(reason, "reason");
+        if (typeof pauseRequested !== "boolean") {
+            throw new InvalidArgumentError("pauseRequested must be boolean", {
+                pauseRequested,
+            });
+        }
+        const expectedGeneration = normalizeSupervisorGeneration(
+            expectedSupervisorGeneration,
+        );
+        const expectedNonce = normalizeOptionalString(
+            expectedSupervisorNonce,
+            "expectedSupervisorNonce",
+            256,
+        );
+        if ((expectedGeneration === null) !== (expectedNonce === null)) {
+            throw new InvalidArgumentError(
+                "expected supervisor generation and nonce must be provided together",
+                {
+                    expectedSupervisorGeneration: expectedGeneration,
+                    expectedSupervisorNonce: expectedNonce,
+                },
+            );
+        }
+        const supervisorPid = normalizeOptionalPositiveInteger(
+            targetSupervisorPid,
+            "targetSupervisorPid",
+        );
+        const runnerPid = normalizeOptionalPositiveInteger(
+            targetRunnerPid,
+            "targetRunnerPid",
+        );
+        const detailsCanonical = canonicalize(details ?? {});
+
+        return this.#tx(() => {
+            this.#requireInvestigation(investigationId);
+            const existing = this.#db
+                .prepare("SELECT * FROM quiescent_stops WHERE investigation_id = ?")
+                .get(investigationId);
+            if (existing !== undefined
+                && ACTIVE_QUIESCENT_STOP_STATES.has(existing.state)) {
+                return this.#rowToQuiescentStop(existing);
+            }
+
+            const authority = this.#db
+                .prepare("SELECT * FROM supervisor_authority WHERE investigation_id = ?")
+                .get(investigationId);
+            if (expectedGeneration !== null
+                && (authority === undefined
+                    || Number(authority.supervisor_generation) !== expectedGeneration
+                    || authority.supervisor_nonce !== expectedNonce)) {
+                throw new FenceRejectedError(
+                    "supervisor generation changed before the stop barrier persisted",
+                    {
+                        investigationId,
+                        expectedSupervisorGeneration: expectedGeneration,
+                        actualSupervisorGeneration:
+                            authority === undefined
+                                ? null
+                                : Number(authority.supervisor_generation),
+                    },
+                );
+            }
+
+            const activeLease = this.#db.prepare(`
+                SELECT *
+                FROM runner_leases
+                WHERE investigation_id = ?
+                  AND released_at IS NULL
+                ORDER BY fencing_token DESC
+                LIMIT 1
+            `).get(investigationId);
+            const targetGeneration = authority === undefined
+                ? null
+                : Number(authority.supervisor_generation);
+            const targetNonce = authority?.supervisor_nonce ?? null;
+            const targetRunnerIncarnation =
+                authority?.current_runner_incarnation
+                ?? activeLease?.runner_incarnation
+                ?? null;
+            if (activeLease !== undefined
+                && (activeLease.supervisor_generation !== null
+                    && Number(activeLease.supervisor_generation) !== targetGeneration)) {
+                throw new FenceRejectedError(
+                    "active runner lease does not match supervisor authority",
+                    {
+                        investigationId,
+                        targetGeneration,
+                        leaseGeneration: Number(activeLease.supervisor_generation),
+                    },
+                );
+            }
+
+            const barrierAt = this.#timestamp("quiescentStop.barrierAt");
+            const activeAttempts = activeLease === undefined
+                ? []
+                : this.#db.prepare(`
+                    SELECT *
+                    FROM command_attempts
+                    WHERE investigation_id = :inv
+                      AND lease_id = :lease
+                      AND fencing_token = :token
+                      AND state NOT IN ('committed', 'abandoned')
+                    ORDER BY reserved_at ASC, attempt_id ASC
+                `).all({
+                    inv: investigationId,
+                    lease: activeLease.lease_id,
+                    token: Number(activeLease.fencing_token),
+                });
+            const fencedAttempts = activeAttempts.map((attempt) => ({
+                attemptId: attempt.attempt_id,
+                previousState: attempt.state,
+                command: attempt.command,
+                fencingToken: Number(attempt.fencing_token),
+                runnerIncarnation: attempt.runner_incarnation ?? null,
+            }));
+
+            if (activeLease !== undefined) {
+                this.#db.prepare(`
+                    UPDATE command_attempts
+                    SET state = 'abandoned',
+                        abandoned_at = COALESCE(abandoned_at, :at),
+                        updated_at = :at
+                    WHERE investigation_id = :inv
+                      AND lease_id = :lease
+                      AND fencing_token = :token
+                      AND state NOT IN ('committed', 'abandoned')
+                `).run({
+                    at: barrierAt,
+                    inv: investigationId,
+                    lease: activeLease.lease_id,
+                    token: Number(activeLease.fencing_token),
+                });
+                const released = this.#db.prepare(`
+                    UPDATE runner_leases
+                    SET released_at = :at
+                    WHERE lease_id = :lease
+                      AND investigation_id = :inv
+                      AND fencing_token = :token
+                      AND released_at IS NULL
+                `).run({
+                    at: barrierAt,
+                    lease: activeLease.lease_id,
+                    inv: investigationId,
+                    token: Number(activeLease.fencing_token),
+                });
+                if (Number(released.changes) !== 1) {
+                    throw new FenceRejectedError(
+                        "runner lease changed before the stop fence committed",
+                        {
+                            investigationId,
+                            leaseId: activeLease.lease_id,
+                            fencingToken: Number(activeLease.fencing_token),
+                        },
+                    );
+                }
+            }
+            if (targetRunnerIncarnation !== null) {
+                this.#db.prepare(`
+                    UPDATE runner_incarnations
+                    SET revoked_at = COALESCE(revoked_at, :at)
+                    WHERE runner_incarnation = :incarnation
+                      AND investigation_id = :inv
+                `).run({
+                    at: barrierAt,
+                    incarnation: targetRunnerIncarnation,
+                    inv: investigationId,
+                });
+                this.#db.prepare(`
+                    UPDATE supervisor_authority
+                    SET current_runner_incarnation = NULL,
+                        updated_at = :at
+                    WHERE investigation_id = :inv
+                      AND current_runner_incarnation = :incarnation
+                `).run({
+                    at: barrierAt,
+                    inv: investigationId,
+                    incarnation: targetRunnerIncarnation,
+                });
+            }
+
+            const requestedAt = barrierAt;
+            const params = {
+                inv: investigationId,
+                requestId,
+                reason,
+                pauseRequested: pauseRequested ? 1 : 0,
+                state: QUIESCENT_STOP_STATES.BARRIER_PERSISTED,
+                targetGeneration,
+                targetNonce,
+                targetSupervisorPid: supervisorPid,
+                targetRunnerIncarnation,
+                targetRunnerPid: runnerPid,
+                targetLeaseId: activeLease?.lease_id ?? null,
+                targetFencingToken:
+                    activeLease === undefined
+                        ? null
+                        : Number(activeLease.fencing_token),
+                fencedAttempts: canonicalize(fencedAttempts),
+                requestedAt,
+                barrierAt,
+                details: detailsCanonical,
+                updatedAt: barrierAt,
+            };
+            if (existing === undefined) {
+                this.#db.prepare(`
+                    INSERT INTO quiescent_stops(
+                        investigation_id, request_id, reason, pause_requested,
+                        state, target_supervisor_generation,
+                        target_supervisor_nonce, target_supervisor_pid,
+                        target_runner_incarnation, target_runner_pid,
+                        target_lease_id, target_fencing_token, fenced_attempts,
+                        requested_at, barrier_at, acknowledged_at, completed_at,
+                        quiescent, intervention_required, non_result_code,
+                        details, updated_at)
+                    VALUES(
+                        :inv, :requestId, :reason, :pauseRequested,
+                        :state, :targetGeneration,
+                        :targetNonce, :targetSupervisorPid,
+                        :targetRunnerIncarnation, :targetRunnerPid,
+                        :targetLeaseId, :targetFencingToken, :fencedAttempts,
+                        :requestedAt, :barrierAt, NULL, NULL,
+                        0, 0, NULL, :details, :updatedAt)
+                `).run(params);
+            } else {
+                this.#db.prepare(`
+                    UPDATE quiescent_stops
+                    SET request_id = :requestId,
+                        reason = :reason,
+                        pause_requested = :pauseRequested,
+                        state = :state,
+                        target_supervisor_generation = :targetGeneration,
+                        target_supervisor_nonce = :targetNonce,
+                        target_supervisor_pid = :targetSupervisorPid,
+                        target_runner_incarnation = :targetRunnerIncarnation,
+                        target_runner_pid = :targetRunnerPid,
+                        target_lease_id = :targetLeaseId,
+                        target_fencing_token = :targetFencingToken,
+                        fenced_attempts = :fencedAttempts,
+                        requested_at = :requestedAt,
+                        barrier_at = :barrierAt,
+                        acknowledged_at = NULL,
+                        completed_at = NULL,
+                        quiescent = 0,
+                        intervention_required = 0,
+                        non_result_code = NULL,
+                        details = :details,
+                        updated_at = :updatedAt
+                    WHERE investigation_id = :inv
+                `).run(params);
+            }
+            return this.#rowToQuiescentStop(
+                this.#db
+                    .prepare("SELECT * FROM quiescent_stops WHERE investigation_id = ?")
+                    .get(investigationId),
+            );
+        });
+    }
+
+    markQuiescentStopReconciling({
+        investigationId,
+        requestId,
+        supervisorGeneration,
+        supervisorNonce,
+        supervisorPid,
+        details = {},
+    } = {}) {
+        requireNonEmptyString(investigationId, "investigationId");
+        requireNonEmptyString(requestId, "requestId");
+        const generation = normalizeSupervisorGeneration(supervisorGeneration);
+        if (generation === null) {
+            throw new InvalidArgumentError("supervisorGeneration is required");
+        }
+        requireNonEmptyString(supervisorNonce, "supervisorNonce");
+        const pid = normalizeOptionalPositiveInteger(supervisorPid, "supervisorPid");
+        if (pid === null) {
+            throw new InvalidArgumentError("supervisorPid is required");
+        }
+        const detailsCanonical = canonicalize(details ?? {});
+        return this.#tx(() => {
+            const current = this.#db
+                .prepare("SELECT * FROM quiescent_stops WHERE investigation_id = ?")
+                .get(investigationId);
+            if (current === undefined || current.request_id !== requestId) {
+                throw new FenceRejectedError(
+                    "stop request changed before reconciliation acknowledgement",
+                    { investigationId, requestId },
+                );
+            }
+            if (current.state === QUIESCENT_STOP_STATES.PAUSED_QUIESCENT
+                || current.state === QUIESCENT_STOP_STATES.PAUSE_PENDING) {
+                return this.#rowToQuiescentStop(current);
+            }
+            const authority = this.#db
+                .prepare("SELECT * FROM supervisor_authority WHERE investigation_id = ?")
+                .get(investigationId);
+            if (authority === undefined
+                || Number(authority.supervisor_generation) !== generation
+                || authority.supervisor_nonce !== supervisorNonce) {
+                throw new FenceRejectedError(
+                    "stop reconciler does not own the current supervisor generation",
+                    { investigationId, requestId, supervisorGeneration: generation },
+                );
+            }
+            const acknowledgedAt = this.#timestamp(
+                "quiescentStop.acknowledgedAt",
+            );
+            this.#db.prepare(`
+                UPDATE quiescent_stops
+                SET state = :state,
+                    acknowledged_at = COALESCE(acknowledged_at, :at),
+                    target_supervisor_generation =
+                        COALESCE(target_supervisor_generation, :generation),
+                    target_supervisor_nonce =
+                        COALESCE(target_supervisor_nonce, :nonce),
+                    target_supervisor_pid =
+                        COALESCE(target_supervisor_pid, :pid),
+                    details = :details,
+                    updated_at = :at
+                WHERE investigation_id = :inv
+                  AND request_id = :requestId
+            `).run({
+                state: QUIESCENT_STOP_STATES.RECONCILING,
+                at: acknowledgedAt,
+                generation,
+                nonce: supervisorNonce,
+                pid,
+                details: detailsCanonical,
+                inv: investigationId,
+                requestId,
+            });
+            return this.#rowToQuiescentStop(
+                this.#db
+                    .prepare("SELECT * FROM quiescent_stops WHERE investigation_id = ?")
+                    .get(investigationId),
+            );
+        });
+    }
+
+    completeQuiescentStop({
+        investigationId,
+        requestId,
+        state,
+        quiescent,
+        interventionRequired,
+        nonResultCode = null,
+        details = {},
+        quiescenceProof = null,
+    } = {}) {
+        requireNonEmptyString(investigationId, "investigationId");
+        requireNonEmptyString(requestId, "requestId");
+        if (![QUIESCENT_STOP_STATES.SUPERSEDED,
+            QUIESCENT_STOP_STATES.PAUSE_PENDING,
+            QUIESCENT_STOP_STATES.PAUSED_QUIESCENT].includes(state)) {
+            throw new InvalidArgumentError(
+                "quiescent stop completion state is invalid",
+                { state },
+            );
+        }
+        if (typeof quiescent !== "boolean"
+            || typeof interventionRequired !== "boolean"
+            || quiescent !== (state === QUIESCENT_STOP_STATES.PAUSED_QUIESCENT)
+            || interventionRequired !== (state === QUIESCENT_STOP_STATES.PAUSE_PENDING)) {
+            throw new InvalidArgumentError(
+                "quiescent stop completion flags are inconsistent",
+                { state, quiescent, interventionRequired },
+            );
+        }
+        const code = normalizeOptionalString(
+            nonResultCode,
+            "nonResultCode",
+            256,
+        );
+        let verifiedProof = null;
+        if (state === QUIESCENT_STOP_STATES.PAUSED_QUIESCENT) {
+            if (quiescenceProof === null
+                || typeof quiescenceProof !== "object"
+                || Array.isArray(quiescenceProof)
+                || quiescenceProof.verified !== true
+                || quiescenceProof.quiescent !== true
+                || !Array.isArray(quiescenceProof.missingVerifications)
+                || quiescenceProof.missingVerifications.length !== 0
+                || quiescenceProof.supervisorStatus?.verified !== true
+                || quiescenceProof.processes?.verified !== true
+                || quiescenceProof.sdkSessions?.verified !== true
+                || quiescenceProof.runnerChild?.verified !== true
+                || quiescenceProof.runnerChild?.active !== false
+                || quiescenceProof.resourceBroker?.verified !== true
+                || quiescenceProof.resourceBroker?.authorityRetired !== true
+                || quiescenceProof.activeRunnerLease !== null
+                || !Array.isArray(quiescenceProof.committableAttempts)
+                || quiescenceProof.committableAttempts.length !== 0
+                || !Array.isArray(quiescenceProof.activePids)
+                || quiescenceProof.activePids.length !== 0
+                || quiescenceProof.activeSdkSessions !== 0
+                || !Array.isArray(quiescenceProof.activeResourceLeases)
+                || quiescenceProof.activeResourceLeases.length !== 0
+                || !Array.isArray(
+                    quiescenceProof.resourceBroker?.activeLeases,
+                )
+                || quiescenceProof.resourceBroker.activeLeases.length !== 0) {
+                throw new InvalidArgumentError(
+                    "PAUSED_QUIESCENT requires a verified quiescence proof",
+                );
+            }
+            const proofGeneration = normalizeSupervisorGeneration(
+                quiescenceProof.supervisorStatus.supervisorGeneration,
+            );
+            if (proofGeneration === null) {
+                throw new InvalidArgumentError(
+                    "quiescence proof supervisor generation is required",
+                );
+            }
+            const proofNonce = requireNonEmptyString(
+                quiescenceProof.supervisorStatus.supervisorNonce,
+                "quiescenceProof.supervisorNonce",
+            );
+            const proofRunnerIncarnation = normalizeRunnerIncarnation(
+                quiescenceProof.runnerChild.runnerIncarnation,
+            );
+            verifiedProof = {
+                supervisorGeneration: proofGeneration,
+                supervisorNonce: proofNonce,
+                runnerIncarnation: proofRunnerIncarnation,
+            };
+        }
+        const detailsCanonical = canonicalize(details ?? {});
+        return this.#tx(() => {
+            const current = this.#db
+                .prepare("SELECT * FROM quiescent_stops WHERE investigation_id = ?")
+                .get(investigationId);
+            if (current === undefined || current.request_id !== requestId) {
+                throw new FenceRejectedError(
+                    "stop request changed before completion persisted",
+                    { investigationId, requestId },
+                );
+            }
+            if (current.state === QUIESCENT_STOP_STATES.PAUSED_QUIESCENT) {
+                return this.#rowToQuiescentStop(current);
+            }
+            if (verifiedProof !== null) {
+                const authority = this.#db.prepare(`
+                    SELECT *
+                    FROM supervisor_authority
+                    WHERE investigation_id = ?
+                `).get(investigationId);
+                const activeLeaseCount = Number(this.#db.prepare(`
+                    SELECT COUNT(*) AS count
+                    FROM runner_leases
+                    WHERE investigation_id = ?
+                      AND released_at IS NULL
+                `).get(investigationId).count);
+                const activeAttemptCount = Number(this.#db.prepare(`
+                    SELECT COUNT(*) AS count
+                    FROM command_attempts
+                    WHERE investigation_id = ?
+                      AND state NOT IN ('committed', 'abandoned')
+                `).get(investigationId).count);
+                const targetGeneration =
+                    current.target_supervisor_generation === null
+                        ? null
+                        : Number(current.target_supervisor_generation);
+                const targetRunnerIncarnation =
+                    current.target_runner_incarnation ?? null;
+                if (authority === undefined
+                    || Number(authority.supervisor_generation)
+                        !== verifiedProof.supervisorGeneration
+                    || authority.supervisor_nonce
+                        !== verifiedProof.supervisorNonce
+                    || authority.current_runner_incarnation !== null
+                    || targetGeneration !== verifiedProof.supervisorGeneration
+                    || current.target_supervisor_nonce
+                        !== verifiedProof.supervisorNonce
+                    || targetRunnerIncarnation
+                        !== verifiedProof.runnerIncarnation
+                    || activeLeaseCount !== 0
+                    || activeAttemptCount !== 0) {
+                    throw new FenceRejectedError(
+                        "quiescence changed before PAUSED_QUIESCENT could commit",
+                        {
+                            investigationId,
+                            requestId,
+                            activeLeaseCount,
+                            activeAttemptCount,
+                            targetGeneration,
+                            proofGeneration:
+                                verifiedProof.supervisorGeneration,
+                            currentRunnerIncarnation:
+                                authority?.current_runner_incarnation ?? null,
+                            targetRunnerIncarnation,
+                            proofRunnerIncarnation:
+                                verifiedProof.runnerIncarnation,
+                        },
+                    );
+                }
+            }
+            const completedAt = this.#timestamp("quiescentStop.completedAt");
+            this.#db.prepare(`
+                UPDATE quiescent_stops
+                SET state = :state,
+                    acknowledged_at = COALESCE(acknowledged_at, :at),
+                    completed_at = :at,
+                    quiescent = :quiescent,
+                    intervention_required = :interventionRequired,
+                    non_result_code = :nonResultCode,
+                    details = :details,
+                    updated_at = :at
+                WHERE investigation_id = :inv
+                  AND request_id = :requestId
+            `).run({
+                state,
+                at: completedAt,
+                quiescent: quiescent ? 1 : 0,
+                interventionRequired: interventionRequired ? 1 : 0,
+                nonResultCode: code,
+                details: detailsCanonical,
+                inv: investigationId,
+                requestId,
+            });
+            return this.#rowToQuiescentStop(
+                this.#db
+                    .prepare("SELECT * FROM quiescent_stops WHERE investigation_id = ?")
+                    .get(investigationId),
+            );
+        });
+    }
+
+    listCommittableAttempts(investigationId) {
+        requireNonEmptyString(investigationId, "investigationId");
+        return this.#db.prepare(`
+            SELECT attempts.*
+            FROM command_attempts AS attempts
+            JOIN runner_leases AS leases
+              ON leases.lease_id = attempts.lease_id
+            LEFT JOIN supervisor_authority AS authority
+              ON authority.investigation_id = attempts.investigation_id
+            WHERE attempts.investigation_id = :inv
+              AND attempts.state NOT IN ('committed', 'abandoned')
+              AND leases.released_at IS NULL
+              AND (
+                    attempts.supervisor_generation IS NULL
+                    OR (
+                        authority.supervisor_generation
+                            = attempts.supervisor_generation
+                        AND authority.current_runner_incarnation
+                            = attempts.runner_incarnation
+                    )
+              )
+            ORDER BY attempts.reserved_at ASC, attempts.attempt_id ASC
+        `).all({ inv: investigationId }).map((row) => this.#rowToAttempt(row));
+    }
+
+    #rowToQuiescentStop(row) {
+        const fencedAttempts = parseCanonicalJson(
+            row.fenced_attempts,
+            "quiescent stop fenced attempts",
+        );
+        const details = parseCanonicalJson(
+            row.details,
+            "quiescent stop details",
+        );
+        if (!Array.isArray(fencedAttempts)
+            || details === null
+            || typeof details !== "object"
+            || Array.isArray(details)) {
+            throw new CruciblePersistenceError(
+                ERROR_CODES.INTEGRITY_VIOLATION,
+                "quiescent stop control contains malformed canonical JSON",
+                { investigationId: row.investigation_id },
+            );
+        }
+        return Object.freeze({
+            investigationId: row.investigation_id,
+            requestId: row.request_id,
+            reason: row.reason,
+            pauseRequested: Number(row.pause_requested) === 1,
+            state: row.state,
+            targetSupervisorGeneration:
+                row.target_supervisor_generation == null
+                    ? null
+                    : Number(row.target_supervisor_generation),
+            targetSupervisorNonce: row.target_supervisor_nonce ?? null,
+            targetSupervisorPid:
+                row.target_supervisor_pid == null
+                    ? null
+                    : Number(row.target_supervisor_pid),
+            targetRunnerIncarnation: row.target_runner_incarnation ?? null,
+            targetRunnerPid:
+                row.target_runner_pid == null
+                    ? null
+                    : Number(row.target_runner_pid),
+            targetLeaseId: row.target_lease_id ?? null,
+            targetFencingToken:
+                row.target_fencing_token == null
+                    ? null
+                    : Number(row.target_fencing_token),
+            fencedAttempts: Object.freeze(fencedAttempts.map((item) =>
+                Object.freeze({ ...item }))),
+            requestedAt: row.requested_at,
+            barrierAt: row.barrier_at,
+            acknowledgedAt: row.acknowledged_at ?? null,
+            completedAt: row.completed_at ?? null,
+            quiescent: Number(row.quiescent) === 1,
+            interventionRequired:
+                Number(row.intervention_required) === 1,
+            nonResultCode: row.non_result_code ?? null,
+            details: Object.freeze({ ...details }),
+            updatedAt: row.updated_at,
+        });
+    }
+
+    #assertStopBarrierAllowsRunnerInTransaction(
+        investigationId,
+        supervisorGeneration,
+        details = {},
+    ) {
+        const stop = this.#db
+            .prepare("SELECT * FROM quiescent_stops WHERE investigation_id = ?")
+            .get(investigationId);
+        if (stop === undefined) return;
+        const targetGeneration = stop.target_supervisor_generation == null
+            ? null
+            : Number(stop.target_supervisor_generation);
+        const blocked = ACTIVE_QUIESCENT_STOP_STATES.has(stop.state)
+            || (
+                stop.state === QUIESCENT_STOP_STATES.PAUSED_QUIESCENT
+                && targetGeneration !== null
+                && (supervisorGeneration === null
+                    || supervisorGeneration <= targetGeneration)
+            );
+        if (blocked) {
+            throw new FenceRejectedError(
+                "persisted quiescent-stop barrier rejects runner authority",
+                {
+                    ...details,
+                    investigationId,
+                    stopRequestId: stop.request_id,
+                    stopState: stop.state,
+                    targetSupervisorGeneration: targetGeneration,
+                    supervisorGeneration,
+                },
+            );
+        }
+    }
+
     claimSupervisorGeneration({
         investigationId,
         supervisorGeneration,
@@ -1166,6 +1868,14 @@ export class EventRepository {
                     },
                 );
             }
+            this.#assertStopBarrierAllowsRunnerInTransaction(
+                investigationId,
+                generation,
+                {
+                    action: "issue_runner_incarnation",
+                    runnerIncarnation: incarnation,
+                },
+            );
             const existing = this.#db
                 .prepare("SELECT 1 AS present FROM runner_incarnations WHERE runner_incarnation = ?")
                 .get(incarnation);
@@ -1252,6 +1962,14 @@ export class EventRepository {
         supervisorGeneration,
         runnerIncarnation,
     }) {
+        this.#assertStopBarrierAllowsRunnerInTransaction(
+            investigationId,
+            supervisorGeneration,
+            {
+                action: "acquire_runner_lease",
+                runnerIncarnation,
+            },
+        );
         const authority = this.#db
             .prepare("SELECT * FROM supervisor_authority WHERE investigation_id = ?")
             .get(investigationId);
@@ -1602,6 +2320,15 @@ export class EventRepository {
         lease,
         details,
     }) {
+        this.#assertStopBarrierAllowsRunnerInTransaction(
+            investigationId,
+            supervisorGeneration,
+            {
+                ...details,
+                action: "runner_attempt_transition",
+                runnerIncarnation,
+            },
+        );
         const authority = this.#db
             .prepare("SELECT * FROM supervisor_authority WHERE investigation_id = ?")
             .get(investigationId);

@@ -24,6 +24,7 @@ import {
     normalizeRuntimeConfigAuthority,
     runtimeConfigAuthorityFingerprint,
 } from "../domain/index.mjs";
+import { fakeRuntimeIdentity } from "./v4-contract-fixture.mjs";
 
 export function createExperimentAuthorityFixture() {
     const { publicKey, privateKey } = generateKeyPairSync("ed25519");
@@ -116,6 +117,7 @@ export function createRuntimeConfigAuthorityFixture(
         kind: RUNTIME_CONFIG_AUTHORITY_KIND,
         securityConfig,
         identities: overrides.identities ?? {},
+        runtimeIdentity: overrides.runtimeIdentity ?? fakeRuntimeIdentity(),
         workerAdditionalContextHash:
             overrides.workerAdditionalContextHash
             ?? hashCanonical(

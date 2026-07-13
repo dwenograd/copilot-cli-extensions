@@ -2675,7 +2675,7 @@ describe("crucible_start", () => {
             .toBe(aggregate.experimentAuthority.identity);
         expect(aggregate.runtimeConfigAuthority).toMatchObject({
             fingerprint: expect.stringMatching(
-                /^sha256:crucible-runtime-config-authority-v1:[a-f0-9]{64}$/u,
+                /^sha256:crucible-runtime-config-authority-v2:[a-f0-9]{64}$/u,
             ),
             securityConfig: {
                 runner: {

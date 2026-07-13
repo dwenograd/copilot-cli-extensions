@@ -814,6 +814,11 @@ export function decideNext(aggregate) {
         };
     }
 
+    const stopRequest = latestUnhandledStopRequest(aggregate);
+    if (stopRequest !== null) {
+        return pauseRecommendation(stopRequest);
+    }
+
     const pendingObservation = uncommittedObservation(aggregate);
     if (pendingObservation !== null) {
         return {
@@ -838,11 +843,6 @@ export function decideNext(aggregate) {
                 : { kind: "await_observation", reservedCommand: active.command },
             event: null,
         };
-    }
-
-    const stopRequest = latestUnhandledStopRequest(aggregate);
-    if (stopRequest !== null) {
-        return pauseRecommendation(stopRequest);
     }
 
     const validationEvidence = qualifyingValidationEvidence(aggregate);

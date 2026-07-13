@@ -97,6 +97,39 @@ describe("Windows process adapter termination protocol", () => {
         expect(adapter.activeOwnedPids()).toEqual([]);
     });
 
+    it("closes only the exact owned Windows Job Object PID", async () => {
+        const calls = [];
+        const adapter = createDefaultProcessAdapter({
+            platform: "win32",
+            jobProcessAdapter: {
+                owns: (pid) => pid === 8123,
+                activePids: () => [],
+                spawn() {
+                    throw new Error("spawn is not part of this protocol test");
+                },
+                terminate() {
+                    throw new Error("closeJobObject should use its narrow interface");
+                },
+                closeJobObject(pid, options) {
+                    calls.push({ pid, options });
+                    return true;
+                },
+                close() {
+                    return true;
+                },
+            },
+        });
+
+        await expect(adapter.closeJobObject(8124, { timeoutMs: 50 }))
+            .resolves.toBe(false);
+        await expect(adapter.closeJobObject(8123, { timeoutMs: 50 }))
+            .resolves.toBe(true);
+        expect(calls).toEqual([{
+            pid: 8123,
+            options: { timeoutMs: 50 },
+        }]);
+    });
+
     it("fails close when a Job adapter still reports an owned PID", async () => {
         const adapter = createDefaultProcessAdapter({
             platform: "win32",

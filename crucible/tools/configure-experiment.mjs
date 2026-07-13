@@ -175,6 +175,9 @@ export function configureExperiment(options = {}) {
         experimentId: entry.experimentId,
         experimentIdentity: entry.experimentIdentity,
         contractHash: entry.contractHash,
+        runtimeIdentityPolicyIdentity:
+            entry.contract.runtimeIdentityPolicyIdentity,
+        runtimeIdentityRoot: entry.contract.runtimeIdentityRoot,
         investigationId: entry.investigationId,
         harnessSuiteId: entry.harnessSuiteId,
         harnessSuiteIdentity: entry.harnessSuiteIdentity,
@@ -243,6 +246,9 @@ export function prepareUnsignedExperimentManifest(options = {}) {
         enumerandRoot: prepared.enumerandRoot,
         statisticalPolicyIdentity: prepared.statisticalPolicyIdentity,
         hypothesisPolicyIdentity: prepared.hypothesisPolicyIdentity,
+        runtimeIdentityPolicyIdentity:
+            prepared.runtimeIdentityPolicyIdentity,
+        runtimeIdentityRoot: prepared.runtimeIdentityRoot,
         bytes: Buffer.byteLength(prepared.canonicalManifest, "utf8"),
     });
 }

@@ -38,6 +38,7 @@ import {
     searchProgress,
 } from "../domain/index.mjs";
 import {
+    ERROR_CODES as PERSISTENCE_ERROR_CODES,
     openArtifactStore,
     openRepository,
 } from "../persistence/index.mjs";
@@ -62,6 +63,14 @@ import {
 import { MEASUREMENT_LIFECYCLE_ADAPTER } from "../measurement/private-adapters.mjs";
 import { normalizeRunnerConfig } from "./config.mjs";
 import { deriveRunnerExecutionLimits } from "./config-validation.mjs";
+import {
+    verifyRuntimeConfigAuthority,
+} from "./config-authority.mjs";
+import {
+    consumeRunnerStopSignal,
+    isActiveQuiescentStop,
+    stopControlPaths,
+} from "./control-channel.mjs";
 import { createDomainRepositoryAdapter, formatAttemptCommand } from "./domain-adapter.mjs";
 import { projectRunnerOutcome } from "./outcome.mjs";
 import {
@@ -70,6 +79,10 @@ import {
     RuntimeConfigError,
     RuntimeIntegrityError,
 } from "./errors.mjs";
+import {
+    openResourceBroker,
+    sdkUsageToModelCostUnits,
+} from "./resource-broker.mjs";
 import {
     DEFAULT_PARENT_READ_LIMITS,
     buildProposalPrompt,
@@ -94,6 +107,7 @@ import {
     RUNTIME_TEMP_OWNER_MARKER,
     assertPathInside,
     atomicWriteJson,
+    delay,
     deadlineReached,
     ensureDirectory,
     makeUniqueDirectory,
@@ -503,6 +517,11 @@ export class AutonomousRunner {
     #sandboxIdentity = Object.freeze({ required: false });
     #executor = null;
     #workerPool = null;
+    #runtimeAuthority = null;
+    #resourceBroker = null;
+    #activeResourceLeases = new Map();
+    #runtimeDriftPersisting = false;
+    #sdkSubmissionCommits = new Map();
     #parentReadController = null;
     #parentReadLimits;
     #lease = null;
@@ -514,6 +533,7 @@ export class AutonomousRunner {
     #attemptCommands = new Map();
     #effectEvidenceBuffers = new Map();
     #capturedOutputs = new Map();
+    #quarantinedEffectAttempts = new Set();
     #recoveredDeadlineStopRequestSeqs = new Set();
     #byteBudgets;
     #byteBudgetOverride;
@@ -527,6 +547,11 @@ export class AutonomousRunner {
     #domainDeadlineGuardDepth = 0;
     #domainDeadlineStage = null;
     #clock;
+    #stopRecord = null;
+    #stopControlPaths = null;
+    #stopControlTimer = null;
+    #executorClosePromise = null;
+    #workerPoolClosePromise = null;
 
     constructor(config, dependencies = {}) {
         this.#config = normalizeRunnerConfig(config, { env: dependencies.env ?? process.env });
@@ -557,7 +582,16 @@ export class AutonomousRunner {
             await this.#initialize();
             result = await this.#runLoop();
         } catch (error) {
-            if (this.#isDeadlineError(error) && this.#adapter !== null) {
+            if (this.#isQuiescentStopError(error)) {
+                result = {
+                    kind: "QUIESCED",
+                    code: NON_RESULT_CODES.INVESTIGATION_PAUSED,
+                    reason:
+                        this.#stopRecord?.reason
+                        ?? "Quiescent stop barrier interrupted the runner.",
+                    requestId: this.#stopRecord?.requestId ?? null,
+                };
+            } else if (this.#isDeadlineError(error) && this.#adapter !== null) {
                 try {
                     result = this.#recordDeadlineNonResult(
                         this.#adapter.replay().aggregate,
@@ -637,6 +671,7 @@ export class AutonomousRunner {
 
     #pauseResultAfterOperationalError(error) {
         if (this.#adapter === null
+            || this.#isQuiescentStopError(error)
             || error?.code === RUNTIME_ERROR_CODES.INTEGRITY_FAILURE
             || error?.code === RUNTIME_ERROR_CODES.INVALID_CONFIG) {
             return null;
@@ -660,6 +695,279 @@ export class AutonomousRunner {
             };
         } catch {
             return null;
+        }
+    }
+
+    #stopBarrierError(stage, cause = null) {
+        const error = new CrucibleRuntimeError(
+            RUNTIME_ERROR_CODES.PAUSED,
+            `Persisted quiescent-stop barrier interrupted ${stage}`,
+            {
+                stage,
+                requestId: this.#stopRecord?.requestId ?? null,
+                stopState: this.#stopRecord?.state ?? null,
+                barrierAt: this.#stopRecord?.barrierAt ?? null,
+            },
+            cause === null ? undefined : { cause },
+        );
+        error.pauseBarrier = true;
+        error.quiescentStopBarrier = true;
+        return error;
+    }
+
+    #isQuiescentStopError(error) {
+        if (error?.quiescentStopBarrier === true) return true;
+        if (this.#stopRecord === null
+            && error?.code === PERSISTENCE_ERROR_CODES.FENCE_REJECTED) {
+            try {
+                this.#readStopBarrier();
+            } catch {
+                return false;
+            }
+        }
+        if (this.#stopRecord === null) return false;
+        return error?.code === PERSISTENCE_ERROR_CODES.FENCE_REJECTED
+            || error?.code === RUNTIME_ERROR_CODES.PAUSED
+            || error?.details?.stopRequestId === this.#stopRecord.requestId;
+    }
+
+    #beginExecutorClose() {
+        if (this.#executorClosePromise === null
+            && this.#executor !== null
+            && typeof this.#executor.close === "function") {
+            this.#executorClosePromise = Promise.resolve().then(() =>
+                this.#executor.close({
+                    timeoutMs: this.#config.options.shutdownTimeoutMs,
+                }));
+            this.#executorClosePromise.catch(() => {});
+        }
+        return this.#executorClosePromise;
+    }
+
+    #beginWorkerPoolClose() {
+        if (this.#workerPoolClosePromise === null
+            && this.#workerPool !== null
+            && typeof this.#workerPool.close === "function") {
+            this.#workerPoolClosePromise = Promise.resolve().then(() =>
+                this.#workerPool.close());
+            this.#workerPoolClosePromise.catch(() => {});
+        }
+        return this.#workerPoolClosePromise;
+    }
+
+    #activateStopBarrier(stop) {
+        if (!isActiveQuiescentStop(stop)) return null;
+        this.#stopRecord = stop;
+        this.#beginWorkerPoolClose();
+        this.#beginExecutorClose();
+        return stop;
+    }
+
+    #readStopBarrier() {
+        if (this.#repository === null
+            || typeof this.#repository.getQuiescentStop !== "function") {
+            return null;
+        }
+        const stop = this.#repository.getQuiescentStop(
+            this.#config.investigationId,
+        );
+        return this.#activateStopBarrier(stop);
+    }
+
+    #pollStopControl() {
+        const stop = this.#readStopBarrier();
+        if (stop === null
+            || this.#stopControlPaths === null
+            || this.#config.supervisorGeneration === null
+            || this.#config.supervisorNonce === null
+            || this.#config.runnerIncarnation === null
+            || stop.targetSupervisorPid === null
+            || stop.targetRunnerPid === null) {
+            return stop;
+        }
+        consumeRunnerStopSignal({
+            paths: this.#stopControlPaths,
+            stop,
+            owner: {
+                pid: stop.targetSupervisorPid,
+                nonce: this.#config.supervisorNonce,
+                supervisorGeneration: this.#config.supervisorGeneration,
+            },
+            runner: {
+                pid: stop.targetRunnerPid,
+                runnerIncarnation: this.#config.runnerIncarnation,
+            },
+        });
+        return stop;
+    }
+
+    #startStopControlMonitor() {
+        if (this.#stopControlTimer !== null) return;
+        this.#stopControlPaths = stopControlPaths(
+            this.#config.stateDir,
+            this.#config.investigationId,
+        );
+        this.#pollStopControl();
+        const timers = this.#dependencies.timers ?? globalThis;
+        const pollMs = this.#dependencies.stopControlPollMs ?? 25;
+        this.#stopControlTimer = timers.setInterval(() => {
+            try {
+                this.#pollStopControl();
+            } catch {
+                // Persistence fencing remains authoritative if advisory polling fails.
+            }
+        }, pollMs);
+        this.#stopControlTimer?.unref?.();
+    }
+
+    #stopStopControlMonitor() {
+        if (this.#stopControlTimer === null) return;
+        const timers = this.#dependencies.timers ?? globalThis;
+        timers.clearInterval(this.#stopControlTimer);
+        this.#stopControlTimer = null;
+    }
+
+    #assertStopOpen(stage) {
+        const stop = this.#readStopBarrier();
+        if (stop !== null) {
+            throw this.#stopBarrierError(stage);
+        }
+    }
+
+    #persistRuntimeDrift(error, stage) {
+        if (this.#runtimeDriftPersisting
+            || this.#adapter === null
+            || this.#lease === null) {
+            return;
+        }
+        this.#runtimeDriftPersisting = true;
+        try {
+            let { aggregate } = this.#adapter.replay();
+            if (aggregate.pause === null) {
+                this.#requestStopFenced({
+                    requestId: `runtime-drift-${stableHex({
+                        investigationId: this.#config.investigationId,
+                        stage,
+                    }).slice(0, 32)}`,
+                    reason:
+                        "Runtime identity drift requires a durable operational pause.",
+                    pauseRequested: true,
+                });
+                ({ aggregate } = this.#adapter.replay());
+                const recommendation = decideNext(aggregate);
+                if (recommendation.event?.type
+                    === EVENT_TYPES.INVESTIGATION_PAUSED) {
+                    this.#appendKernelDecisionFenced({
+                        deadlineExempt: true,
+                    });
+                }
+            }
+            const existing = this.#adapter.latestOperationalNonResult();
+            if (existing?.payload?.code !== RUNTIME_ERROR_CODES.RUNTIME_DRIFT) {
+                this.#recordOperationalNonResultFenced({
+                    scope: "runtime-drift",
+                    code: RUNTIME_ERROR_CODES.RUNTIME_DRIFT,
+                    reason:
+                        "The current runtime closure differs from the signed opening identity.",
+                    details: {
+                        stage,
+                        cause: error?.message ?? String(error),
+                        expectedRoot:
+                            this.#runtimeAuthority?.runtimeIdentity?.root ?? null,
+                        scientificConclusion: false,
+                    },
+                });
+            }
+        } finally {
+            this.#runtimeDriftPersisting = false;
+        }
+    }
+
+    async #verifyRuntimeClosure(stage) {
+        if (this.#runtimeAuthority === null) return null;
+        try {
+            const verified = typeof this.#dependencies.runtimeIdentityVerifier
+                === "function"
+                ? await this.#dependencies.runtimeIdentityVerifier({
+                    stage,
+                    config: this.#config,
+                    authority: this.#runtimeAuthority,
+                })
+                : verifyRuntimeConfigAuthority(this.#runtimeAuthority, {
+                    env: this.#dependencies.env ?? process.env,
+                    deadlineMs: this.#config.deadlineMs,
+                    expectedInvestigationId:
+                        this.#config.investigationId,
+                    expectedStateDir: this.#config.stateDir,
+                    expectedArtifactRoot: this.#config.artifactRoot,
+                    nodeExecutable: process.execPath,
+                });
+            const authorityConfig = verified?.config ?? null;
+            if (authorityConfig !== null) {
+                const {
+                    supervisorAuthority: _currentAuthority,
+                    ...currentOptions
+                } = this.#config.options;
+                const {
+                    supervisorAuthority: _frozenAuthority,
+                    ...authorityOptions
+                } = authorityConfig.runner.options;
+                const currentSecurityConfig = {
+                    investigationId: this.#config.investigationId,
+                    stateDir: this.#config.stateDir,
+                    artifactRoot: this.#config.artifactRoot,
+                    allowlistPath: this.#config.allowlistPath,
+                    sdkPath: this.#config.sdkPath,
+                    cliPath: this.#config.cliPath,
+                    runnerEpochId: this.#config.runnerEpochId,
+                    deadlineMs: this.#config.deadlineMs,
+                    resourceBroker: this.#config.resourceBroker,
+                    options: currentOptions,
+                };
+                const authoritySecurityConfig = {
+                    investigationId:
+                        authorityConfig.runner.investigationId,
+                    stateDir: authorityConfig.runner.stateDir,
+                    artifactRoot: authorityConfig.runner.artifactRoot,
+                    allowlistPath:
+                        authorityConfig.runner.allowlistPath,
+                    sdkPath: authorityConfig.runner.sdkPath,
+                    cliPath: authorityConfig.runner.cliPath,
+                    runnerEpochId:
+                        authorityConfig.runner.runnerEpochId,
+                    deadlineMs: authorityConfig.runner.deadlineMs,
+                    resourceBroker:
+                        authorityConfig.runner.resourceBroker,
+                    options: authorityOptions,
+                };
+                if (!canonicalEqual(
+                    currentSecurityConfig,
+                    authoritySecurityConfig,
+                )) {
+                    throw new CrucibleRuntimeError(
+                        RUNTIME_ERROR_CODES.RUNTIME_DRIFT,
+                        "Runner launch configuration differs from the immutable runtime authority",
+                        { stage },
+                    );
+                }
+            }
+            return verified;
+        } catch (error) {
+            const drift = error?.code === RUNTIME_ERROR_CODES.RUNTIME_DRIFT
+                ? error
+                : new CrucibleRuntimeError(
+                    RUNTIME_ERROR_CODES.RUNTIME_DRIFT,
+                    `Runtime identity verification failed during ${stage}`,
+                    {
+                        stage,
+                        cause: error?.code ?? null,
+                        message: error?.message ?? String(error),
+                    },
+                    { cause: error },
+                );
+            drift.pauseBarrier = true;
+            this.#persistRuntimeDrift(drift, stage);
+            throw drift;
         }
     }
 
@@ -694,6 +1002,7 @@ export class AutonomousRunner {
                 }
             },
         });
+        this.#startStopControlMonitor();
         const opened = this.#adapter.replay();
         if (opened.domainEvents.length === 0 || opened.aggregate.contract === null) {
             throw new CrucibleRuntimeError(
@@ -703,6 +1012,15 @@ export class AutonomousRunner {
             );
         }
         this.#contract = opened.aggregate.contract;
+        this.#runtimeAuthority = opened.aggregate.runtimeConfigAuthority;
+        if (this.#config.resourceBroker !== null
+            && this.#runtimeAuthority === null) {
+            throw new CrucibleRuntimeError(
+                RUNTIME_ERROR_CODES.RUNTIME_DRIFT,
+                "Runner resource-broker configuration has no persisted runtime authority",
+            );
+        }
+        this.#assertStopOpen("runner initialization");
         this.#executionLimits = deriveRunnerExecutionLimits(this.#contract);
         const frozenByteBudgets = normalizeRuntimeByteBudgets(
             this.#executionLimits.byteBudgets,
@@ -782,6 +1100,51 @@ export class AutonomousRunner {
         });
         this.#lease = acquired.lease;
         this.#recovery = acquired.recovery;
+        if (this.#config.resourceBroker !== null) {
+            this.#resourceBroker = (
+                this.#dependencies.resourceBrokerFactory
+                ?? openResourceBroker
+            )({
+                stateRoot: this.#config.resourceBroker.stateRoot,
+                config: this.#config.resourceBroker.config,
+                env: this.#dependencies.env ?? process.env,
+            });
+            if (this.#resourceBroker.configFingerprint
+                !== this.#config.resourceBroker.configFingerprint) {
+                throw new RuntimeConfigError(
+                    "Runner resource broker fingerprint differs from the immutable configuration",
+                );
+            }
+            const brokerInvestigation = this.#resourceBroker.getInvestigation(
+                this.#config.investigationId,
+            );
+            if (brokerInvestigation === null) {
+                this.#resourceBroker.registerInvestigation({
+                    investigationId: this.#config.investigationId,
+                    limits: this.#config.resourceBroker.investigationLimits,
+                    supervisorGeneration:
+                        this.#config.supervisorGeneration,
+                    supervisorNonce: this.#config.supervisorNonce,
+                    runnerIncarnation: this.#config.runnerIncarnation,
+                });
+            } else if (brokerInvestigation.supervisorGeneration
+                    !== this.#config.supervisorGeneration
+                || brokerInvestigation.runnerIncarnation
+                    !== this.#config.runnerIncarnation) {
+                throw new CrucibleRuntimeError(
+                    RUNTIME_ERROR_CODES.RESOURCE_UNAVAILABLE,
+                    "Runner resource authority does not match the supervisor-issued incarnation",
+                    {
+                        brokerInvestigation,
+                        supervisorGeneration:
+                            this.#config.supervisorGeneration,
+                        runnerIncarnation:
+                            this.#config.runnerIncarnation,
+                    },
+                );
+            }
+        }
+        await this.#verifyRuntimeClosure("runner_recovery");
         const unresolvedEffects = this.#unresolvedExternalEffects();
         if (unresolvedEffects.length > 0) {
             this.#recordOperationalNonResultFenced({
@@ -896,6 +1259,9 @@ export class AutonomousRunner {
                     stderr,
                     launchPath,
                 }) => {
+                    if (this.#quarantinedEffectAttempts.has(attemptId)) {
+                        return;
+                    }
                     this.#capturedOutputs.set(attemptId, {
                         stdout: [stdout],
                         stderr: [stderr],
@@ -904,6 +1270,10 @@ export class AutonomousRunner {
                 [MEASUREMENT_LIFECYCLE_ADAPTER]:
                     this.#measurementLifecycleAdapter(),
             });
+        if (this.#stopRecord !== null) {
+            this.#beginExecutorClose();
+            throw this.#stopBarrierError("measurement executor initialization");
+        }
 
     }
 
@@ -923,8 +1293,12 @@ export class AutonomousRunner {
         return Object.freeze({
             afterHarnessStaging: (details) =>
                 invoke("after_harness_staging", details),
-            beforeHarnessLaunch: (details) =>
-                invoke("before_harness_launch", details),
+            beforeHarnessLaunch: async (details) => {
+                await invoke("before_harness_launch", details);
+                await this.#verifyRuntimeClosure(
+                    "harness_sandbox_process_launch",
+                );
+            },
             afterHarnessLaunch: (details) =>
                 invoke("after_harness_launch", details),
             afterHarnessExit: (details) =>
@@ -1134,6 +1508,7 @@ export class AutonomousRunner {
     }
 
     #reserveAttempt(attemptId, command) {
+        this.#assertStopOpen("attempt reservation");
         const reserved = this.#adapter.reserveAttempt({
             attemptId,
             command,
@@ -1155,6 +1530,7 @@ export class AutonomousRunner {
     }
 
     #ingestOperationalEvidence(input) {
+        this.#assertStopOpen("operational evidence persistence");
         const buffer = this.#effectEvidenceBuffers.get(input.attemptId);
         if (buffer !== undefined) {
             buffer.push(input);
@@ -1205,6 +1581,7 @@ export class AutonomousRunner {
         append,
         deadlineExempt = false,
     }) {
+        this.#assertStopOpen(`${scope} domain commitment`);
         const factHash = this.#adapter.domainFactIdentity(domainEvent);
         const command = formatAttemptCommand("domain-event", {
             scope,
@@ -1373,6 +1750,151 @@ export class AutonomousRunner {
         }, LOGICAL_EFFECT_KEY_ALGORITHM);
     }
 
+    #sdkOperationIdentity(command) {
+        const basis = {
+            investigationId: this.#config.investigationId,
+            commandId: command.commandId,
+            round: command.round,
+            slotIndex: command.slotIndex,
+            candidateId: command.candidateId,
+            model: command.model,
+            operator: command.operator,
+        };
+        return Object.freeze({
+            proposalSlotId: `slot-${command.round}-${command.slotIndex}-${
+                stableHex(basis).slice(0, 24)
+            }`,
+            commandId: command.commandId,
+            logicalEffectId: `sdk-effect-${stableHex({
+                ...basis,
+                kind: "sdk-proposal",
+            }).slice(0, 40)}`,
+        });
+    }
+
+    #findSdkSubmissionCommit(operationIdentity) {
+        const cached = this.#sdkSubmissionCommits.get(
+            operationIdentity.operationHash,
+        );
+        if (cached !== undefined) return cached;
+        let accepted = null;
+        for (const event of this.#adapter.listOperationalEvidence()) {
+            if (event.kind !== "runtime:sdk_submission_commit") continue;
+            const record = event.payload?.record;
+            if (record?.operationHash !== operationIdentity.operationHash
+                || record.logicalEffectId
+                    !== operationIdentity.logicalEffectId) {
+                continue;
+            }
+            if (accepted !== null
+                && accepted.commitHash !== record.commitHash) {
+                throw new RuntimeIntegrityError(
+                    "Multiple durable SDK submissions exist for one logical effect",
+                    {
+                        operationHash: operationIdentity.operationHash,
+                        firstCommitHash: accepted.commitHash,
+                        conflictingCommitHash: record.commitHash ?? null,
+                    },
+                );
+            }
+            accepted = record;
+        }
+        this.#sdkSubmissionCommits.set(
+            operationIdentity.operationHash,
+            accepted,
+        );
+        return accepted;
+    }
+
+    async #persistSdkJournalRecord(kind, record) {
+        this.#assertStopOpen(`SDK ${kind} persistence`);
+        const identity = record.commitHash
+            ?? record.evidenceHash
+            ?? hashCanonical(record, "sha256:crucible-sdk-journal-record-v1");
+        const evidenceKind = `sdk-${kind}:${identity}`;
+        if (this.#adapter.listOperationalEvidence().some((event) =>
+            event.evidenceKind === evidenceKind)) {
+            return { deduplicated: true };
+        }
+        const attemptId = this.#stableAttemptId(`sdk-${kind}`, {
+            operationHash: record.operationHash ?? null,
+            identity,
+        });
+        const command = formatAttemptCommand(`sdk-${kind}`, {
+            operationHash: record.operationHash ?? null,
+            identity,
+        });
+        this.#reserveAttempt(attemptId, command);
+        this.#adapter.dispatchAttempt(attemptId, this.#lease);
+        this.#adapter.observeAttempt(attemptId, this.#lease);
+        const persisted = this.#adapter.ingestOperationalEvidenceBatchFenced([{
+            attemptId,
+            evidenceKind,
+            kind: `runtime:sdk_${kind}`,
+            payload: { record },
+        }], {
+            attemptId,
+            command,
+            lease: this.#lease,
+            fromState: "observed",
+            toState: "committed",
+        });
+        this.#attemptCommands.delete(attemptId);
+        await this.#fault(`after_sdk_${kind}_persistence`, {
+            operationHash: record.operationHash ?? null,
+            identity,
+        });
+        return persisted;
+    }
+
+    #sdkSubmissionJournal() {
+        return Object.freeze({
+            durable: true,
+            recover: async ({ operationIdentity }) => {
+                await this.#verifyRuntimeClosure(
+                    "sdk_submission_recovery",
+                );
+                return this.#findSdkSubmissionCommit(operationIdentity);
+            },
+            commit: async (record) => {
+                await this.#verifyRuntimeClosure(
+                    "sdk_submission_commit",
+                );
+                const existing = this.#findSdkSubmissionCommit(record);
+                if (existing !== null) {
+                    return { status: "existing", record: existing };
+                }
+                await this.#persistSdkJournalRecord(
+                    "submission_commit",
+                    record,
+                );
+                this.#sdkSubmissionCommits.set(
+                    record.operationHash,
+                    record,
+                );
+                return { status: "committed", record };
+            },
+            quarantine: async (record) => {
+                await this.#verifyRuntimeClosure(
+                    "sdk_response_quarantine",
+                );
+                await this.#persistSdkJournalRecord(
+                    "response_quarantine",
+                    record,
+                );
+            },
+            recordEvidence: async (record) => {
+                await this.#verifyRuntimeClosure(
+                    "sdk_operational_evidence",
+                );
+                await this.#persistSdkJournalRecord(
+                    "operational_evidence",
+                    record,
+                );
+            },
+        });
+    }
+
     #unresolvedExternalEffects() {
         const uncertain = Array.isArray(this.#recovery?.uncertain)
             ? this.#recovery.uncertain
@@ -1414,6 +1936,17 @@ export class AutonomousRunner {
             seen.add(logicalEffectKey);
             if (this.#readEffectRecoveryCapsule(logicalEffectKey, command) !== null) {
                 continue;
+            }
+            if (command.kind === "sdk-proposal") {
+                const operationIdentity = this.#sdkOperationIdentity(command);
+                const committed = this.#adapter.listOperationalEvidence()
+                    .find((event) =>
+                        event.kind === "runtime:sdk_submission_commit"
+                        && event.payload?.record?.logicalEffectId
+                            === operationIdentity.logicalEffectId);
+                if (committed !== undefined) {
+                    continue;
+                }
             }
             unresolved.push(Object.freeze({
                 attemptId: attempt.attemptId,
@@ -1457,6 +1990,7 @@ export class AutonomousRunner {
     }
 
     #assertDeadlineOpen(stage) {
+        this.#assertStopOpen(stage);
         if (this.#deadlineReached()) {
             throw this.#deadlineError(stage);
         }
@@ -1563,6 +2097,7 @@ export class AutonomousRunner {
             this.#executionLimits?.maxLoopIterations ?? 0,
         );
         for (let iteration = 0; iteration < maxLoopIterations; iteration += 1) {
+            this.#assertStopOpen("runner control loop");
             const { aggregate } = this.#adapter.replay();
             if (aggregate.terminal !== null) {
                 return terminalResult(aggregate);
@@ -2139,6 +2674,7 @@ export class AutonomousRunner {
     }
 
     #assertEffectLaunchAllowed(command) {
+        this.#assertStopOpen("external effect launch");
         const { aggregate } = this.#adapter.replay();
         if (aggregate.pause === null) {
             const stopRequest = latestUnhandledStopRequest(aggregate);
@@ -2166,6 +2702,352 @@ export class AutonomousRunner {
         throw error;
     }
 
+    #resourceReservation(command) {
+        const reservation = {
+            outputBytes: this.#byteBudgets.perAttemptOutputBytes,
+            receiptBytes: this.#byteBudgets.perAttemptReceiptBytes,
+            casBytes: this.#byteBudgets.perAttemptCasBytes,
+        };
+        if (command.kind === "sdk-proposal") {
+            reservation.sdkSessions = 1;
+            reservation.modelCostUnits =
+                this.#config.options.sdkRetryPolicy.maxCostUnits
+                ?? this.#config.options.sdkRetryPolicy
+                    .reservedCostUnitsPerAttempt;
+        } else {
+            reservation.sandboxProcesses = 1;
+            reservation.cpuSlots = { general: 1 };
+        }
+        return reservation;
+    }
+
+    #resourceEffectId(command, logicalEffectKey) {
+        if (command.kind === "sdk-proposal"
+            && typeof command.sdkLogicalEffectId === "string") {
+            return command.sdkLogicalEffectId;
+        }
+        return `resource-effect-${logicalEffectKey
+            .slice(logicalEffectKey.lastIndexOf(":") + 1)
+            .slice(0, 48)}`;
+    }
+
+    #hasDurableSdkSubmission(command) {
+        if (command.kind !== "sdk-proposal"
+            || typeof command.sdkLogicalEffectId !== "string") {
+            return false;
+        }
+        return this.#adapter.listOperationalEvidence().some((event) =>
+            event.kind === "runtime:sdk_submission_commit"
+            && event.payload?.record?.logicalEffectId
+                === command.sdkLogicalEffectId);
+    }
+
+    #pauseForResourceUnavailable(command, outcome) {
+        const error = new CrucibleRuntimeError(
+            RUNTIME_ERROR_CODES.RESOURCE_UNAVAILABLE,
+            "The global resource broker could not admit the external effect",
+            {
+                commandKind: command.kind ?? null,
+                commandId: command.commandId ?? null,
+                outcome,
+                scientificConclusion: false,
+            },
+        );
+        error.pauseBarrier = true;
+        let { aggregate } = this.#adapter.replay();
+        if (aggregate.pause === null) {
+            this.#requestStopFenced({
+                requestId: `resource-pause-${stableHex({
+                    command,
+                    outcome,
+                }).slice(0, 32)}`,
+                reason:
+                    "Resource admission requires a durable operational pause.",
+                pauseRequested: true,
+            });
+            ({ aggregate } = this.#adapter.replay());
+            if (decideNext(aggregate).event?.type
+                === EVENT_TYPES.INVESTIGATION_PAUSED) {
+                this.#appendKernelDecisionFenced({
+                    deadlineExempt: true,
+                });
+            }
+        }
+        const existing = this.#adapter.latestOperationalNonResult();
+        if (existing?.payload?.code
+            !== RUNTIME_ERROR_CODES.RESOURCE_UNAVAILABLE) {
+            this.#recordOperationalNonResultFenced({
+                scope: "resource-unavailable",
+                code: RUNTIME_ERROR_CODES.RESOURCE_UNAVAILABLE,
+                reason:
+                    "Resource admission is unavailable; this is operational and not a scientific conclusion.",
+                details: error.details,
+            });
+        }
+        throw error;
+    }
+
+    #loseResourceLeaseAuthority(context, stage, renewal) {
+        if (context === null || context.authorityError !== null) {
+            return context?.authorityError ?? null;
+        }
+        const outcome = {
+            status: "lease_authority_lost",
+            stage,
+            leaseId: context.lease.leaseId,
+            fencingToken: context.lease.fencingToken,
+            renewal: renewal instanceof Error
+                ? {
+                    status: "error",
+                    code: renewal.code ?? null,
+                    message: renewal.message ?? String(renewal),
+                }
+                : {
+                    status: renewal?.status ?? null,
+                    renewed: renewal?.renewed === true,
+                    leaseStatus: renewal?.lease?.status ?? null,
+                },
+            outputQuarantined: true,
+            scientificConclusion: false,
+        };
+        try {
+            this.#pauseForResourceUnavailable(context.command, outcome);
+        } catch (error) {
+            if (error?.code === RUNTIME_ERROR_CODES.RESOURCE_UNAVAILABLE) {
+                context.authorityError = error;
+            } else {
+                context.authorityError = new CrucibleRuntimeError(
+                    RUNTIME_ERROR_CODES.RESOURCE_UNAVAILABLE,
+                    "External-effect resource lease authority was lost",
+                    {
+                        ...outcome,
+                        pausePersistenceError: {
+                            code: error?.code ?? null,
+                            message: error?.message ?? String(error),
+                        },
+                    },
+                    { cause: error },
+                );
+                context.authorityError.pauseBarrier = true;
+            }
+        }
+        if (context.authorityError === null) {
+            context.authorityError = new CrucibleRuntimeError(
+                RUNTIME_ERROR_CODES.RESOURCE_UNAVAILABLE,
+                "External-effect resource lease authority was lost",
+                outcome,
+            );
+            context.authorityError.pauseBarrier = true;
+        }
+        context.authorityError.leaveAttemptActive = true;
+        context.authorityError.resourceLeaseAuthorityLost = true;
+        const timers = this.#dependencies.timers ?? globalThis;
+        if (context.heartbeat !== null) {
+            timers.clearInterval(context.heartbeat);
+            context.heartbeat = null;
+        }
+        this.#quarantinedEffectAttempts.add(context.attemptId);
+        this.#capturedOutputs.delete(context.attemptId);
+        if (!context.abortController.signal.aborted) {
+            context.abortController.abort(context.authorityError);
+        }
+        this.#beginExecutorClose();
+        this.#beginWorkerPoolClose();
+        return context.authorityError;
+    }
+
+    #renewResourceLease(context, stage) {
+        if (context === null || this.#resourceBroker === null) return null;
+        if (context.authorityError !== null) {
+            throw context.authorityError;
+        }
+        let renewal;
+        try {
+            renewal = this.#resourceBroker.renew({
+                lease: context.lease,
+            });
+        } catch (error) {
+            throw this.#loseResourceLeaseAuthority(context, stage, error);
+        }
+        if (renewal?.renewed !== true || renewal.status !== "active") {
+            throw this.#loseResourceLeaseAuthority(context, stage, renewal);
+        }
+        if (renewal.lease !== null
+            && typeof renewal.lease === "object") {
+            context.lease = renewal.lease;
+        }
+        return renewal;
+    }
+
+    async #acquireResourceLease({
+        attemptId,
+        command,
+        logicalEffectKey,
+    }) {
+        if (this.#resourceBroker === null
+            || this.#hasDurableSdkSubmission(command)) {
+            return null;
+        }
+        const logicalEffectId = this.#resourceEffectId(
+            command,
+            logicalEffectKey,
+        );
+        const admissionDeadlineMs = this.#config.deadlineMs
+            ?? (this.#clock.now()
+                + Math.min(this.#config.options.sessionTimeoutMs, 30_000));
+        let backoffMs = 25;
+        for (;;) {
+            this.#assertStopOpen("resource admission");
+            const outcome = this.#resourceBroker.acquire({
+                investigationId: this.#config.investigationId,
+                ownerId: `runner-${this.#config.runnerIncarnation}`,
+                ownerProcessId: process.pid,
+                ownerProcessStartId:
+                    this.#config.runnerIncarnation,
+                supervisorGeneration:
+                    this.#config.supervisorGeneration,
+                runnerIncarnation:
+                    this.#config.runnerIncarnation,
+                attemptId,
+                logicalEffectId,
+                reservation: this.#resourceReservation(command),
+            });
+            if (outcome.status === "acquired") {
+                const context = {
+                    lease: outcome.lease,
+                    logicalEffectId,
+                    beforeUsage: {
+                        ...this.#investigationByteUsage,
+                    },
+                    modelCostUnits: null,
+                    attemptId,
+                    command,
+                    authorityError: null,
+                    abortController: new AbortController(),
+                    heartbeat: null,
+                };
+                const timers = this.#dependencies.timers ?? globalThis;
+                const heartbeatMs = Math.max(
+                    1,
+                    Math.floor(
+                        this.#config.resourceBroker.config.lease
+                            .defaultTtlMs / 3,
+                    ),
+                );
+                context.heartbeat = timers.setInterval(() => {
+                    try {
+                        this.#renewResourceLease(
+                            context,
+                            "resource_lease_heartbeat",
+                        );
+                    } catch {
+                        // Authority loss is persisted and cancellation begins in
+                        // #loseResourceLeaseAuthority.
+                    }
+                }, heartbeatMs);
+                context.heartbeat?.unref?.();
+                this.#activeResourceLeases.set(
+                    context.lease.leaseId,
+                    context,
+                );
+                return context;
+            }
+            if (outcome.status === "already_finalized"
+                && this.#hasDurableSdkSubmission(command)) {
+                return null;
+            }
+            if (outcome.status !== "throttle") {
+                return this.#pauseForResourceUnavailable(
+                    command,
+                    outcome,
+                );
+            }
+            const remaining = admissionDeadlineMs - this.#clock.now();
+            if (remaining <= 0) {
+                return this.#pauseForResourceUnavailable(
+                    command,
+                    outcome,
+                );
+            }
+            await delay(
+                Math.min(backoffMs, remaining),
+                this.#dependencies.timers ?? globalThis,
+            );
+            backoffMs = Math.min(1_000, backoffMs * 2);
+        }
+    }
+
+    #releaseResourceLease(context) {
+        if (context === null || this.#resourceBroker === null) return null;
+        const timers = this.#dependencies.timers ?? globalThis;
+        if (context.heartbeat !== null) {
+            timers.clearInterval(context.heartbeat);
+            context.heartbeat = null;
+        }
+        const usage = {
+            outputBytes: Math.max(
+                0,
+                this.#investigationByteUsage.outputBytes
+                    - context.beforeUsage.outputBytes,
+            ),
+            receiptBytes: Math.max(
+                0,
+                this.#investigationByteUsage.receiptBytes
+                    - context.beforeUsage.receiptBytes,
+            ),
+            casBytes: Math.max(
+                0,
+                this.#investigationByteUsage.casBytes
+                    - context.beforeUsage.casBytes,
+            ),
+            ...(context.modelCostUnits === null
+                ? {}
+                : { modelCostUnits: context.modelCostUnits }),
+        };
+        try {
+            return this.#resourceBroker.release({
+                lease: context.lease,
+                usage,
+                releaseId: `release-${context.logicalEffectId}`,
+            });
+        } finally {
+            this.#activeResourceLeases.delete(
+                context.lease.leaseId,
+            );
+        }
+    }
+
+    #reportSdkUsage(report) {
+        if (this.#resourceBroker === null) return;
+        const context = [...this.#activeResourceLeases.values()]
+            .find((candidate) =>
+                candidate.logicalEffectId
+                    === report.operationIdentity.logicalEffectId);
+        if (context === undefined) {
+            if (report.recovered === true) return;
+            throw new RuntimeIntegrityError(
+                "SDK usage arrived without its active resource lease",
+                {
+                    logicalEffectId:
+                        report.operationIdentity.logicalEffectId,
+                },
+            );
+        }
+        context.modelCostUnits = report.accounting.chargedCostUnits;
+        this.#resourceBroker.reconcileUsage({
+            lease: context.lease,
+            usage: {
+                modelCostUnits: report.accounting.chargedCostUnits,
+            },
+            reconciliationId: `sdk-usage-${stableHex({
+                operationHash:
+                    report.operationIdentity.operationHash,
+                accounting: report.accounting,
+            }).slice(0, 40)}`,
+            source: "copilot_sdk_usage",
+        });
+    }
+
     async #executeEffect(command, operation, persist = null, recover = null) {
         this.#effectAttemptCount += 1;
         if (this.#executionLimits !== null
@@ -2180,6 +3062,7 @@ export class AutonomousRunner {
             );
         }
         const logicalEffectKey = this.#logicalEffectKey(command);
+        await this.#verifyRuntimeClosure("external_effect_recovery");
         const committed = this.#findCommittedEffect(logicalEffectKey, command);
         if (committed !== null) {
             if (recover === null) {
@@ -2244,16 +3127,51 @@ export class AutonomousRunner {
         });
 
         let result;
+        let resourceContext = null;
         try {
             this.#assertEffectLaunchAllowed(command);
-            result = await operation(attemptId);
+            await this.#verifyRuntimeClosure("external_effect_launch");
+            resourceContext = await this.#acquireResourceLease({
+                attemptId,
+                command,
+                logicalEffectKey,
+            });
+            result = await operation(attemptId, Object.freeze({
+                signal: resourceContext?.abortController.signal ?? null,
+            }));
             await this.#fault("after_effect_operation", {
                 attemptId,
                 command,
                 logicalEffectKey,
             });
+            this.#renewResourceLease(
+                resourceContext,
+                "external_effect_output_acceptance",
+            );
             this.#assertDeadlineOpen("external effect output acceptance");
         } catch (error) {
+            if (resourceContext?.authorityError !== null
+                && resourceContext?.authorityError !== undefined) {
+                error = resourceContext.authorityError;
+            }
+            try {
+                this.#releaseResourceLease(resourceContext);
+            } catch (releaseError) {
+                error.resourceReleaseError = {
+                    code: releaseError?.code ?? null,
+                    message: releaseError?.message ?? String(releaseError),
+                };
+            }
+            resourceContext = null;
+            if (this.#stopRecord !== null
+                || error?.quiescentStopBarrier === true
+                || error?.code === PERSISTENCE_ERROR_CODES.FENCE_REJECTED) {
+                this.#effectEvidenceBuffers.delete(attemptId);
+                throw this.#stopBarrierError(
+                    "external effect receipt acceptance",
+                    error,
+                );
+            }
             if (error?.leaveAttemptActive === true) {
                 throw error;
             }
@@ -2301,18 +3219,23 @@ export class AutonomousRunner {
                 : await persist(result, attemptId, logicalEffectKey);
             const evidence = this.#effectEvidenceBuffers.get(attemptId);
             this.#assertDeadlineOpen("effect artifact persistence");
+            await this.#fault("after_effect_artifact_persistence", {
+                attemptId,
+                command,
+                logicalEffectKey,
+            });
+            await this.#verifyRuntimeClosure("external_effect_commit");
+            this.#assertDeadlineOpen("effect commitment");
+            this.#renewResourceLease(
+                resourceContext,
+                "external_effect_commit",
+            );
             this.#persistEffectRecoveryCapsule({
                 attemptId,
                 command,
                 logicalEffectKey,
                 evidence,
             });
-            await this.#fault("after_effect_artifact_persistence", {
-                attemptId,
-                command,
-                logicalEffectKey,
-            });
-            this.#assertDeadlineOpen("effect commitment");
             if (evidence.length === 0) {
                 this.#adapter.commitAttempt(attemptId, this.#lease);
             } else {
@@ -2326,7 +3249,9 @@ export class AutonomousRunner {
             }
         } finally {
             this.#effectEvidenceBuffers.delete(attemptId);
+            this.#releaseResourceLease(resourceContext);
         }
+        this.#quarantinedEffectAttempts.delete(attemptId);
         this.#attemptCommands.delete(attemptId);
         await this.#fault("after_effect_commit", {
             attemptId,
@@ -3074,11 +3999,12 @@ export class AutonomousRunner {
             try {
                 const effect = await this.#executeEffect(
                     effectCommand,
-                    async (attemptId) => {
+                    async (attemptId, { signal }) => {
                         return this.#runHarnessMeasurement({
                             harnessRole: series.role,
                             candidateSnapshot: materialized.candidateSnapshot,
                             attemptId,
+                            signal,
                             runnerEpochId: this.#config.runnerEpochId,
                             measurementBinding: {
                                 role: series.role,
@@ -3718,11 +4644,12 @@ export class AutonomousRunner {
                     requestHash: command.requestHash,
                     snapshot: requestSnapshot.snapshot,
                 },
-                async (attemptId) => {
+                async (attemptId, { signal }) => {
                     const executed = await this.#runHarnessMeasurement({
                         harnessRole: "impossibility_verifier",
                         candidateSnapshot: materialized.candidateSnapshot,
                         attemptId,
+                        signal,
                         runnerEpochId: this.#config.runnerEpochId,
                         measurementBinding,
                         resultParserContext: {
@@ -4221,10 +5148,11 @@ export class AutonomousRunner {
                     };
                     const effect = await this.#executeEffect(
                         effectCommand,
-                        async (attemptId) => this.#runHarnessMeasurement({
+                        async (attemptId, { signal }) => this.#runHarnessMeasurement({
                             harnessRole,
                             candidateSnapshot: materialized.candidateSnapshot,
                             attemptId,
+                            signal,
                             runnerEpochId: this.#config.runnerEpochId,
                             measurementBinding,
                             captureInvalid: true,
@@ -4712,12 +5640,14 @@ export class AutonomousRunner {
                         model: command.model,
                         operator: command.operator,
                         sessionId: request.sessionId,
+                        proposalSlotId: request.proposalSlotId,
+                        sdkLogicalEffectId: request.logicalEffectId,
                         candidateId: command.candidateId,
                         seed: command.seed,
                     },
-                    async (attemptId) => {
+                    async (attemptId, { signal }) => {
                         const proposal = validateWorkerProposal(
-                            await workerPool.propose(request),
+                            await workerPool.propose(request, { signal }),
                             request,
                             { limits: this.#config.options.candidateLimits },
                         );
@@ -5356,6 +6286,10 @@ export class AutonomousRunner {
             seed: command.seed,
             sessionId,
         });
+        const sdkOperationIdentity = this.#sdkOperationIdentity({
+            ...command,
+            commandId,
+        });
         const prompt = buildProposalPrompt({
             objective: contract.objective,
             candidateId: command.candidateId,
@@ -5401,6 +6335,9 @@ export class AutonomousRunner {
             deadlineMs: this.#config.deadlineMs,
             remainingBudgetMs: this.#remainingDeadlineMs(),
             sessionId,
+            proposalSlotId: sdkOperationIdentity.proposalSlotId,
+            commandId: sdkOperationIdentity.commandId,
+            logicalEffectId: sdkOperationIdentity.logicalEffectId,
             challengeNonce,
             allowedCandidateIds: Object.freeze([command.candidateId]),
             ...(enumerandPlan === null
@@ -5785,6 +6722,10 @@ export class AutonomousRunner {
         }
         if (this.#dependencies.workerPool !== undefined) {
             this.#workerPool = this.#dependencies.workerPool;
+            if (this.#stopRecord !== null) {
+                this.#beginWorkerPoolClose();
+                throw this.#stopBarrierError("worker-pool initialization");
+            }
             return this.#workerPool;
         }
         const existingCandidateIds = harnessCandidateEvidenceItems(aggregate)
@@ -5807,7 +6748,23 @@ export class AutonomousRunner {
             client: this.#dependencies.sdkClient,
             sdkLoader: this.#dependencies.sdkLoader,
             clientFactory: this.#dependencies.sdkClientFactory,
+            sdkRetryPolicy: this.#config.options.sdkRetryPolicy,
+            sdkSubmissionJournal: this.#sdkSubmissionJournal(),
+            sdkUsageToCostUnits: this.#resourceBroker === null
+                ? null
+                : (usage) => sdkUsageToModelCostUnits(
+                    usage,
+                    this.#config.resourceBroker.config.costPolicy,
+                ),
+            sdkUsageReporter: (report) =>
+                this.#reportSdkUsage(report),
+            runtimeGuard: ({ stage }) =>
+                this.#verifyRuntimeClosure(stage),
         });
+        if (this.#stopRecord !== null) {
+            this.#beginWorkerPoolClose();
+            throw this.#stopBarrierError("worker-pool initialization");
+        }
         return this.#workerPool;
     }
 
@@ -6446,6 +7403,15 @@ export class AutonomousRunner {
                 contentType,
             });
             this.#repository.markArtifactDurable(artifactId);
+            if (contentType
+                === "application/vnd.crucible.measurement-stdout"
+                || contentType
+                    === "application/vnd.crucible.measurement-stderr") {
+                this.#investigationByteUsage.outputBytes += size;
+            } else if (contentType
+                === "application/vnd.crucible.measurement-receipt+json") {
+                this.#investigationByteUsage.receiptBytes += size;
+            }
         } else {
             if (existing.hashValue !== snapshotObjectHex(objectId)
                 || existing.investigationId !== this.#config.investigationId
@@ -6520,14 +7486,15 @@ export class AutonomousRunner {
     async #cleanup() {
         let firstError = null;
         const nonQuiescentFailures = [];
+        this.#stopStopControlMonitor();
         this.#capturedOutputs.clear();
+        this.#quarantinedEffectAttempts.clear();
         this.#effectEvidenceBuffers.clear();
         this.#attemptCommands.clear();
         if (this.#executor !== null && typeof this.#executor.close === "function") {
+            const closing = this.#beginExecutorClose();
             const outcome = await settleWithin(
-                () => this.#executor.close({
-                    timeoutMs: this.#config.options.shutdownTimeoutMs,
-                }),
+                () => closing,
                 this.#config.options.shutdownTimeoutMs,
                 { timers: this.#dependencies.timers ?? globalThis },
             );
@@ -6553,8 +7520,9 @@ export class AutonomousRunner {
             }
         }
         if (this.#workerPool !== null && typeof this.#workerPool.close === "function") {
+            const closing = this.#beginWorkerPoolClose();
             const outcome = await settleWithin(
-                () => this.#workerPool.close(),
+                () => closing,
                 this.#config.options.shutdownTimeoutMs,
                 { timers: this.#dependencies.timers ?? globalThis },
             );
@@ -6578,6 +7546,31 @@ export class AutonomousRunner {
                     error: error.message,
                 });
             }
+        }
+        for (const context of [...this.#activeResourceLeases.values()]) {
+            try {
+                this.#releaseResourceLease(context);
+            } catch (error) {
+                firstError ??= error;
+                nonQuiescentFailures.push({
+                    component: "resourceBroker.release",
+                    status: "rejected",
+                    error: error?.message ?? String(error),
+                });
+            }
+        }
+        if (this.#resourceBroker !== null) {
+            try {
+                this.#resourceBroker.close();
+            } catch (error) {
+                firstError ??= error;
+                nonQuiescentFailures.push({
+                    component: "resourceBroker.close",
+                    status: "rejected",
+                    error: error?.message ?? String(error),
+                });
+            }
+            this.#resourceBroker = null;
         }
         this.#parentReadController?.close();
         if (this.#repository !== null) {

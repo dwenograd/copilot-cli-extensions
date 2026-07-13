@@ -19,6 +19,7 @@ import {
     verifyDatabaseIntegrity,
 } from "../persistence/index.mjs";
 import { computeLegacyEventHash } from "../persistence/canonical.mjs";
+import { SCHEMA_V5_FINGERPRINT } from "../persistence/schema.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 
@@ -30,6 +31,7 @@ const TABLES = [
     "command_attempts",
     "runner_incarnations",
     "supervisor_authority",
+    "quiescent_stops",
     "artifacts",
     "artifact_refs",
     "projection_metadata",
@@ -124,6 +126,8 @@ describe("read-only queries do not mutate state", () => {
         repo.listCommandAttempts("inv-1");
         repo.getActiveLease("inv-1");
         repo.getSupervisorAuthority("inv-1");
+        repo.getQuiescentStop("inv-1");
+        repo.listCommittableAttempts("inv-1");
         repo.getArtifact("art1");
         repo.getInlineArtifact("art1");
         repo.getArtifact("art2");
@@ -219,6 +223,28 @@ describe("local-file-only path rejection", () => {
 });
 
 describe("explicit schema versioning", () => {
+    it("migrates schema 5 databases to durable quiescent-stop control", () => {
+        repo.ensureInvestigation({ investigationId: "legacy-v5" });
+        const file = repo.databaseFile;
+        repo.close();
+        repo = null;
+
+        const raw = new DatabaseSync(file);
+        raw.exec("DROP TABLE quiescent_stops;");
+        raw.prepare(
+            "UPDATE schema_meta SET value = '5' WHERE key = 'schema_version'",
+        ).run();
+        raw.prepare(
+            "UPDATE schema_meta SET value = ? WHERE key = 'schema_fingerprint'",
+        ).run(SCHEMA_V5_FINGERPRINT);
+        raw.exec("PRAGMA user_version = 5;");
+        raw.close();
+
+        repo = openRepository({ file });
+        expect(repo.schemaVersion).toBe(SCHEMA_VERSION);
+        expect(repo.getQuiescentStop("legacy-v5")).toBeNull();
+    });
+
     it("migrates generation-only schema 3 databases to incarnation authority", () => {
         const legacyFile = path.join(dir, "schema-3.sqlite");
         const legacy = openRepository({ file: legacyFile });
@@ -228,6 +254,7 @@ describe("explicit schema versioning", () => {
         const raw = new DatabaseSync(legacyFile);
         raw.exec(`
             PRAGMA foreign_keys = OFF;
+            DROP TABLE quiescent_stops;
             DROP TABLE supervisor_authority;
             DROP TABLE runner_incarnations;
             ALTER TABLE command_attempts DROP COLUMN runner_incarnation;
@@ -296,6 +323,7 @@ describe("explicit schema versioning", () => {
         raw.prepare("UPDATE events SET event_hash = ? WHERE investigation_id = ? AND seq = 1")
             .run(legacyHash, "legacy-v4");
         raw.exec(`
+            DROP TABLE quiescent_stops;
             DELETE FROM schema_meta
                 WHERE key IN ('schema_fingerprint', 'event_hash_version');
             UPDATE schema_meta SET value = '4' WHERE key = 'schema_version';

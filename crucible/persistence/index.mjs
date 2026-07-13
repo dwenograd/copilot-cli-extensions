@@ -43,6 +43,20 @@ export {
     verifyDatabaseIntegrity,
 } from "./schema.mjs";
 
+export {
+    ResourceCatalogRepository,
+    openResourceCatalog,
+    openResourceCatalogReadOnly,
+} from "./resource-catalog.mjs";
+export {
+    RESOURCE_CATALOG_SCHEMA_VERSION,
+    RESOURCE_CATALOG_SCHEMA_FINGERPRINT,
+    RESOURCE_CATALOG_SCHEMA_HASH_ALGORITHM,
+    RESOURCE_CATALOG_CONFIG_HASH_ALGORITHM,
+    RESOURCE_LIMITS_HASH_ALGORITHM,
+    verifyResourceCatalogSchema,
+} from "./resource-catalog-schema.mjs";
+
 // Immutable content-addressed artifact store (filesystem CAS).
 export {
     ArtifactStore,

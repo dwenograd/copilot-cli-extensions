@@ -44,6 +44,11 @@ import {
     StatisticsError,
     statisticalAcceptanceClaimSet,
 } from "./statistics.mjs";
+import {
+    RUNTIME_IDENTITY_ROOT_ALGORITHM,
+    normalizeRuntimeIdentityPolicy,
+    runtimeIdentityPolicyIdentity,
+} from "./runtime-authority.mjs";
 
 const COMPARISON_OPERATORS = Object.freeze(["<", "<=", "==", ">=", ">"]);
 const VALIDATION_EXPECTATIONS = Object.freeze(["accept", "reject"]);
@@ -160,6 +165,9 @@ const CONTRACT_INPUT_REQUIRED_KEYS = Object.freeze([
     "objective",
     "observableRegistry",
     "policyVersion",
+    "runtimeIdentityPolicy",
+    "runtimeIdentityPolicyIdentity",
+    "runtimeIdentityRoot",
     "searchPolicy",
     "statisticalPolicy",
     "workerModels",
@@ -189,6 +197,9 @@ const CONTRACT_OUTPUT_REQUIRED_KEYS = Object.freeze([
     "observableRegistryIdentity",
     "parserVersion",
     "policyVersion",
+    "runtimeIdentityPolicy",
+    "runtimeIdentityPolicyIdentity",
+    "runtimeIdentityRoot",
     "searchPolicy",
     "scientificTerminalPolicy",
     "statisticalPolicy",
@@ -2185,6 +2196,9 @@ export function createInvestigationContract(input) {
             hypothesisTopology: input.hypothesisTopology,
             criticality: input.criticality,
             policyVersion: input.policyVersion,
+            runtimeIdentityPolicy: input.runtimeIdentityPolicy,
+            runtimeIdentityPolicyIdentity: input.runtimeIdentityPolicyIdentity,
+            runtimeIdentityRoot: input.runtimeIdentityRoot,
             workerModels: input.workerModels,
             candidatesPerRound: input.candidatesPerRound,
             maxRounds: input.maxRounds,
@@ -2288,6 +2302,31 @@ export function createInvestigationContract(input) {
         input.impossibilityPolicy,
         input.hypothesisTopology,
     );
+    const runtimeIdentityPolicy = normalizeRuntimeIdentityPolicy(
+        input.runtimeIdentityPolicy,
+    );
+    const normalizedRuntimeIdentityPolicyIdentity =
+        runtimeIdentityPolicyIdentity(runtimeIdentityPolicy);
+    if (input.runtimeIdentityPolicyIdentity
+        !== normalizedRuntimeIdentityPolicyIdentity) {
+        throw new ContractError(
+            "runtimeIdentityPolicyIdentity does not match the frozen runtime identity policy",
+            {
+                expected: normalizedRuntimeIdentityPolicyIdentity,
+                actual: input.runtimeIdentityPolicyIdentity ?? null,
+            },
+        );
+    }
+    const runtimeIdentityRoot = requireTaggedSha256(
+        input.runtimeIdentityRoot,
+        "runtimeIdentityRoot",
+    );
+    if (!runtimeIdentityRoot.startsWith(`${RUNTIME_IDENTITY_ROOT_ALGORITHM}:`)) {
+        throw new ContractError(
+            `runtimeIdentityRoot must use ${RUNTIME_IDENTITY_ROOT_ALGORITHM}`,
+            { actual: runtimeIdentityRoot },
+        );
+    }
     const parserVersion = requireIdentifier(
         harness.suite.roles.search.parser.version,
         "harnessSuite.roles.search.parser.version",
@@ -2337,6 +2376,10 @@ export function createInvestigationContract(input) {
         hypothesisTopology: input.hypothesisTopology,
         criticality: requireNonEmptyString(input.criticality, "criticality", 64),
         policyVersion: requireIdentifier(input.policyVersion, "policyVersion"),
+        runtimeIdentityPolicy,
+        runtimeIdentityPolicyIdentity:
+            normalizedRuntimeIdentityPolicyIdentity,
+        runtimeIdentityRoot,
         parserVersion,
         workerModels: search.workerModels,
         candidatesPerRound: search.candidatesPerRound,

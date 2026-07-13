@@ -3,7 +3,7 @@
 // A tiny process-lifecycle adapter for the measurement executor.
 //
 // The executor MUST NOT talk to `child_process` directly. Instead it goes
-// through this adapter, which exposes exactly two operations:
+// through this adapter, whose stop-facing operations are:
 //
 //   - spawn(executable, argv, options): start a child process with an explicit
 //     cwd/env and no shell. On Windows a native owner creates the child
@@ -16,6 +16,11 @@
 //     Object owner; exact-PID taskkill remains the bounded fallback for
 //     externally supplied PIDs. Other platforms target the detached process
 //     group with SIGTERM/SIGKILL.
+//
+//   - closeJobObject(pid, policy): close only the Job Object owner for an
+//     adapter-owned exact PID. It never falls back to a name or unrelated PID.
+//
+//   - activeOwnedPids()/close(): prove and drain all adapter-owned process trees.
 //
 // Tests pass a fake adapter to the executor to observe termination calls
 // without actually spawning processes. Production code uses the real
@@ -147,6 +152,27 @@ export function createDefaultProcessAdapter(options = {}) {
         }
     };
 
+    const closeJobObject = async (pid, termination = {}) => {
+        if (!Number.isSafeInteger(pid) || pid < 1 || jobAdapter === null) {
+            return false;
+        }
+        if (!jobAdapter.owns(pid)) return false;
+        const timeoutMs = Number.isSafeInteger(termination?.timeoutMs)
+            && termination.timeoutMs > 0
+            ? Math.min(termination.timeoutMs, 60_000)
+            : defaultTerminationTimeoutMs;
+        if (typeof jobAdapter.closeJobObject === "function") {
+            return jobAdapter.closeJobObject(pid, {
+                ...termination,
+                timeoutMs,
+            });
+        }
+        return jobAdapter.terminate(pid, {
+            ...termination,
+            timeoutMs,
+        });
+    };
+
     const adapter = {
         platform,
         spawn(executable, argv, launchOptions) {
@@ -204,6 +230,7 @@ export function createDefaultProcessAdapter(options = {}) {
             return child;
         },
         terminateTree,
+        closeJobObject,
         activeOwnedPids() {
             const jobPids = typeof jobAdapter?.activePids === "function"
                 ? jobAdapter.activePids()

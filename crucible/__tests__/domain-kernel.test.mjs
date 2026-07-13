@@ -1162,6 +1162,30 @@ describe("Crucible v4 fast domain kernel", () => {
         });
     });
 
+    it("lets a persisted stop barrier preempt an active command", () => {
+        const context = validateInvestigation(openInvestigation());
+        const active = reserveAndDispatch(context, "search_candidate");
+        append(context, createExternalEvent(
+            context.aggregate,
+            EVENT_TYPES.STOP_REQUESTED,
+            {
+                requestId: "preempt-active-command",
+                reason: "operator requires a quiescent pause",
+                pauseRequested: true,
+            },
+        ));
+
+        expect(decideNext(context.aggregate)).toMatchObject({
+            kind: "NON_RESULT",
+            code: NON_RESULT_CODES.INVESTIGATION_PAUSED,
+            event: {
+                type: EVENT_TYPES.INVESTIGATION_PAUSED,
+            },
+        });
+        expect(context.aggregate.commands[active.commandId].status)
+            .toBe("dispatched");
+    });
+
     it("keeps pause, non-result, and terminal states absorbing", () => {
         const paused = openInvestigation();
         append(paused, createExternalEvent(

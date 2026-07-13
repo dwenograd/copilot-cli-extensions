@@ -34,6 +34,19 @@ import {
     requireString,
     settleWithin,
 } from "./utils.mjs";
+import {
+    SDK_RETRY_DISABLED_POLICY,
+    classifySdkFailure,
+    createRetryingSdkClient,
+    createSdkOperationalEvidence,
+    createSdkRetryBudget,
+    createSdkSubmissionGate,
+    createSdkUsageAccumulator,
+    normalizeSdkOperationIdentity,
+    normalizeSdkRetryPolicy,
+    normalizeSdkSubmissionJournal,
+    withSdkFailureContext,
+} from "./retry-policy.mjs";
 
 export const SUBMIT_CANDIDATE_TOOL_NAME = "crucible_submit_candidate";
 export const READ_PARENT_ARTIFACT_TOOL_NAME = "crucible_read_parent_artifact";
@@ -1787,6 +1800,7 @@ export class SdkWorkerPool {
     #sdk = null;
     #startPromise = null;
     #claimedCandidateIds;
+    #sdkOperationalEvidence = [];
     #activeSessions = new Set();
     #pendingSessionCreations = new Set();
     #closing = false;
@@ -1823,6 +1837,18 @@ export class SdkWorkerPool {
             deadlineMs: parseDeadline(options.deadlineMs, "deadlineMs"),
             clock: options.clock ?? { now: () => Date.now() },
             timers: options.timers ?? globalThis,
+            sdkRetryPolicy: options.sdkRetryPolicy === undefined
+                ? normalizeSdkRetryPolicy(SDK_RETRY_DISABLED_POLICY)
+                : normalizeSdkRetryPolicy(options.sdkRetryPolicy),
+            sdkSubmissionJournal: options.sdkSubmissionJournal === undefined
+                || options.sdkSubmissionJournal === null
+                ? null
+                : normalizeSdkSubmissionJournal(options.sdkSubmissionJournal),
+            sdkRetrySleep: options.sdkRetrySleep ?? null,
+            sdkOperationalEvidenceSink: options.sdkOperationalEvidenceSink ?? null,
+            sdkUsageToCostUnits: options.sdkUsageToCostUnits ?? null,
+            sdkUsageReporter: options.sdkUsageReporter ?? null,
+            runtimeGuard: options.runtimeGuard ?? null,
         };
         if (this.#options.parentReader !== null) {
             requireParentReader(this.#options.parentReader);
@@ -1852,7 +1878,35 @@ export class SdkWorkerPool {
         if (typeof this.#options.timers?.setTimeout !== "function") {
             throw new RuntimeConfigError("timers must expose setTimeout()");
         }
-        this.#claimedCandidateIds = new Set(options.existingCandidateIds ?? []);
+        for (const [value, field] of [
+            [this.#options.sdkRetrySleep, "sdkRetrySleep"],
+            [this.#options.sdkOperationalEvidenceSink, "sdkOperationalEvidenceSink"],
+            [this.#options.sdkUsageToCostUnits, "sdkUsageToCostUnits"],
+            [this.#options.sdkUsageReporter, "sdkUsageReporter"],
+            [this.#options.runtimeGuard, "runtimeGuard"],
+        ]) {
+            if (value !== null && typeof value !== "function") {
+                throw new RuntimeConfigError(`${field} must be a function or null`);
+            }
+        }
+        if (this.#options.sdkSubmissionJournal !== null
+            && this.#options.sdkSubmissionJournal.durable !== true) {
+            throw new RuntimeConfigError(
+                "Injected SDK submission journals must provide durable commit authority",
+            );
+        }
+        if (this.#options.sdkRetryPolicy.maxAttempts > 1
+            && this.#options.sdkSubmissionJournal === null) {
+            throw new RuntimeConfigError(
+                "Retryable SDK worker pools require a durable submission journal",
+            );
+        }
+        this.#claimedCandidateIds = new Map(
+            (options.existingCandidateIds ?? []).map((candidateId) => [
+                candidateId,
+                null,
+            ]),
+        );
     }
 
     get candidateLimits() {
@@ -1861,6 +1915,14 @@ export class SdkWorkerPool {
 
     get parentReadLimits() {
         return this.#options.parentReadLimits;
+    }
+
+    get sdkRetryPolicy() {
+        return this.#options.sdkRetryPolicy;
+    }
+
+    get sdkOperationalEvidence() {
+        return Object.freeze([...this.#sdkOperationalEvidence]);
     }
 
     #normalizeVisibleEvidenceIds(value) {
@@ -1890,6 +1952,14 @@ export class SdkWorkerPool {
         return remainingDeadlineMs(deadlineMs, this.#options.clock.now());
     }
 
+    async #guardRuntime(stage, details = {}) {
+        if (this.#options.runtimeGuard === null) return;
+        await this.#options.runtimeGuard(Object.freeze({
+            stage,
+            ...details,
+        }));
+    }
+
     #assertDeadline(deadlineMs, stage) {
         if (this.#remaining(deadlineMs) === 0) {
             throw deadlineError(deadlineMs, stage, this.#options.clock.now());
@@ -1900,6 +1970,16 @@ export class SdkWorkerPool {
         return settleWithin(operation, timeoutMs, {
             timers: this.#options.timers,
         });
+    }
+
+    async #recordSdkEvidence(event) {
+        this.#sdkOperationalEvidence.push(event);
+        if (this.#options.sdkSubmissionJournal !== null) {
+            await this.#options.sdkSubmissionJournal.recordEvidence(event);
+        }
+        if (this.#options.sdkOperationalEvidenceSink !== null) {
+            await this.#options.sdkOperationalEvidenceSink(event);
+        }
     }
 
     #beginSessionCreation(sessionConfig, { sessionId, model }) {
@@ -1916,7 +1996,13 @@ export class SdkWorkerPool {
             settlement: null,
         };
         const creation = Promise.resolve()
-            .then(() => this.#client.createSession(sessionConfig));
+            .then(async () => {
+                await this.#guardRuntime("sdk_session_create", {
+                    sessionId,
+                    model,
+                });
+                return this.#client.createSession(sessionConfig);
+            });
         record.settlement = creation.then(
             async (session) => {
                 this.#activeSessions.add(session);
@@ -1977,6 +2063,9 @@ export class SdkWorkerPool {
                 if (this.#options.client !== null) {
                     client = this.#options.client;
                 } else {
+                    await this.#guardRuntime("sdk_module_load", {
+                        sdkPath: this.#options.sdkPath,
+                    });
                     sdk = await this.#options.sdkLoader(this.#options.sdkPath);
                     const { CopilotClient, RuntimeConnection } = sdk;
                     if (typeof CopilotClient !== "function"
@@ -2005,6 +2094,9 @@ export class SdkWorkerPool {
                     throw new RuntimeConfigError("SDK client must expose createSession()");
                 }
                 if (typeof client.start === "function") {
+                    await this.#guardRuntime("copilot_cli_launch", {
+                        cliPath: this.#options.cliPath,
+                    });
                     await client.start();
                 }
                 if (this.#closing) {
@@ -2169,7 +2261,7 @@ export class SdkWorkerPool {
         this.#sdk = null;
     }
 
-    async propose(input) {
+    async #proposeOnce(input, retryContext = null) {
         requirePlainObject(input, "proposal request");
         const assignedEnumerand = workerEnumerandBinding(
             input.enumerandBinding,
@@ -2200,7 +2292,12 @@ export class SdkWorkerPool {
             { timers: this.#options.timers },
         );
         if (startup.status === "rejected") {
-            throw startup.error;
+            throw retryContext === null
+                ? startup.error
+                : withSdkFailureContext(startup.error, {
+                    stage: "worker-pool startup",
+                    sdkEvents: [],
+                });
         }
         if (startup.status === "timed_out") {
             if (this.#remaining(deadlineMs) === 0) {
@@ -2216,7 +2313,12 @@ export class SdkWorkerPool {
                 { startupTimeoutMs, deadlineMs },
             );
             error.recoverable = true;
-            throw error;
+            throw retryContext === null
+                ? error
+                : withSdkFailureContext(error, {
+                    stage: "worker-pool startup",
+                    sdkEvents: [],
+                });
         }
         this.#assertDeadline(deadlineMs, "worker-pool startup");
         const model = requireString(input.model, "model", { max: 128 });
@@ -2297,6 +2399,8 @@ export class SdkWorkerPool {
         let callCount = 0;
         let claimedByThisSession = null;
         let acceptingSubmissions = true;
+        const durableSubmission = retryContext?.gate?.durable === true;
+        const claimOwner = retryContext?.operationIdentity?.logicalEffectId ?? sessionId;
 
         const recordFailure = (error) => {
             if (protocolFailure === null) {
@@ -2322,6 +2426,22 @@ export class SdkWorkerPool {
             handler: async (args, invocation) => {
                 callCount += 1;
                 if (!acceptingSubmissions || this.#closing) {
+                    if (durableSubmission) {
+                        await retryContext.gate.quarantine({
+                            attempt: retryContext.attempt,
+                            reason: "late_tool_callback",
+                            details: {
+                                sessionId,
+                                callCount,
+                                toolCallId: invocation?.toolCallId ?? null,
+                            },
+                        });
+                        return {
+                            resultType: "rejected",
+                            textResultForLlm:
+                                "Candidate submission was quarantined after the proposal closed.",
+                        };
+                    }
                     return recordFailure(protocolError(
                         RUNTIME_ERROR_CODES.STOPPED,
                         "Proposal submission arrived after the session was closed",
@@ -2334,6 +2454,22 @@ export class SdkWorkerPool {
                     return recordFailure(error);
                 }
                 if (callCount > 1) {
+                    if (durableSubmission) {
+                        await retryContext.gate.quarantine({
+                            attempt: retryContext.attempt,
+                            reason: "duplicate_tool_callback",
+                            details: {
+                                sessionId,
+                                callCount,
+                                toolCallId: invocation?.toolCallId ?? null,
+                            },
+                        });
+                        return {
+                            resultType: "rejected",
+                            textResultForLlm:
+                                "Duplicate candidate submission was quarantined.",
+                        };
+                    }
                     return recordFailure(protocolError(
                         RUNTIME_ERROR_CODES.WORKER_MULTIPLE_SUBMISSIONS,
                         "A proposal session may submit exactly one candidate",
@@ -2376,13 +2512,11 @@ export class SdkWorkerPool {
                 } catch (error) {
                     return recordFailure(error);
                 }
-                this.#claimedCandidateIds.add(candidate.candidateId);
-                claimedByThisSession = candidate.candidateId;
                 const payloadHash = hashCanonical(
                     candidate,
                     WORKER_PAYLOAD_HASH_ALGORITHM,
                 );
-                submission = immutableCanonical({
+                const proposedSubmission = immutableCanonical({
                     ...candidate,
                     identity: {
                         invocationSessionId: invocation.sessionId,
@@ -2413,6 +2547,41 @@ export class SdkWorkerPool {
                             }),
                     },
                 });
+                if (retryContext !== null) {
+                    const sealed = await retryContext.gate.seal({
+                        submission: proposedSubmission,
+                        attempt: retryContext.attempt,
+                        invocation: {
+                            sessionId: invocation.sessionId,
+                            toolCallId: invocation.toolCallId ?? null,
+                            toolName: invocation.toolName ?? tool.name,
+                        },
+                    });
+                    if (sealed.status === "quarantined") {
+                        return {
+                            resultType: "rejected",
+                            textResultForLlm:
+                                "Candidate submission was quarantined by durable retry authority.",
+                        };
+                    }
+                    submission = sealed.submission;
+                    await this.#recordSdkEvidence(createSdkOperationalEvidence({
+                        eventType: "submission_sealed",
+                        operationIdentity: retryContext.operationIdentity,
+                        attempt: retryContext.attempt,
+                        observedAtMs: Math.max(0, Math.floor(this.#options.clock.now())),
+                        reason: sealed.status,
+                        details: {
+                            budgetHash: retryContext.retryBudget.budgetHash,
+                            submissionHash: sealed.record.submissionHash,
+                            commitHash: sealed.record.commitHash,
+                        },
+                    }));
+                } else {
+                    submission = proposedSubmission;
+                }
+                this.#claimedCandidateIds.set(candidate.candidateId, claimOwner);
+                claimedByThisSession = candidate.candidateId;
                 return {
                     resultType: "success",
                     textResultForLlm: "Candidate accepted for trusted measurement. No verdict was produced.",
@@ -2453,6 +2622,8 @@ export class SdkWorkerPool {
         let sessionError = null;
         let abortError = null;
         let disconnectError = null;
+        let sdkStage = "proposal session creation";
+        const sdkUnsubscribers = [];
         try {
             const sessionConfig = {
                 sessionId,
@@ -2525,7 +2696,33 @@ export class SdkWorkerPool {
                 throw creation.error;
             }
             session = creation.session;
+            if (retryContext !== null && typeof session?.on === "function") {
+                for (const eventType of ["session.error", "model.call_failure"]) {
+                    const unsubscribe = session.on(eventType, (event) => {
+                        retryContext.sdkEvents.push(event);
+                    });
+                    if (typeof unsubscribe === "function") {
+                        sdkUnsubscribers.push(unsubscribe);
+                    }
+                }
+                const unsubscribeUsage = session.on("assistant.usage", (event) => {
+                    retryContext.usageAccumulator.observe(event);
+                    if (event?.data?.contentFilterTriggered === true
+                        || event?.data?.finishReason === "content_filter") {
+                        retryContext.sdkEvents.push(event);
+                    }
+                });
+                if (typeof unsubscribeUsage === "function") {
+                    sdkUnsubscribers.push(unsubscribeUsage);
+                }
+            }
+            sdkStage = "proposal session sendAndWait";
             this.#assertDeadline(deadlineMs, "proposal session dispatch");
+            await this.#guardRuntime("sdk_request_dispatch", {
+                sessionId,
+                model,
+                attempt: retryContext?.attempt ?? 1,
+            });
             const remaining = this.#remaining(deadlineMs);
             const sessionTimeoutMs = Math.max(
                 1,
@@ -2554,9 +2751,15 @@ export class SdkWorkerPool {
                 error.recoverable = true;
                 throw error;
             }
+            sdkStage = "proposal output acceptance";
             this.#assertDeadline(deadlineMs, "proposal output acceptance");
         } catch (error) {
-            sessionError = error;
+            sessionError = retryContext === null
+                ? error
+                : withSdkFailureContext(error, {
+                    stage: sdkStage,
+                    sdkEvents: retryContext.sdkEvents,
+                });
             acceptingSubmissions = false;
             if (session !== undefined && typeof session.abort === "function") {
                 const aborted = await this.#settleSessionOperation(
@@ -2573,6 +2776,13 @@ export class SdkWorkerPool {
             }
         } finally {
             acceptingSubmissions = false;
+            for (const unsubscribe of sdkUnsubscribers.splice(0)) {
+                try {
+                    unsubscribe();
+                } catch {
+                    // A failed listener detach cannot reopen submission authority.
+                }
+            }
             if (session !== undefined && typeof session.disconnect === "function") {
                 const disconnected = await this.#settleSessionOperation(
                 () => session.disconnect(),
@@ -2593,8 +2803,91 @@ export class SdkWorkerPool {
         }
 
         if (sessionError !== null || abortError !== null || disconnectError !== null) {
+            const injectedSubmissionCrash =
+                sessionError?.code === RUNTIME_ERROR_CODES.INJECTED_CRASH
+                || sessionError?.cause?.code === RUNTIME_ERROR_CODES.INJECTED_CRASH
+                || sessionError?.originalError?.code
+                    === RUNTIME_ERROR_CODES.INJECTED_CRASH;
+            if (durableSubmission
+                && submission === null
+                && protocolFailure !== null) {
+                throw protocolFailure;
+            }
+            if (durableSubmission
+                && !injectedSubmissionCrash
+                && submission === null
+                && callCount > 0) {
+                const recovered = await retryContext.gate.recover();
+                await retryContext.gate.quarantine({
+                    attempt: retryContext.attempt,
+                    reason: recovered === null
+                        ? "ambiguous_callback_before_submission_seal"
+                        : "ambiguous_callback_recovered_submission",
+                    details: {
+                        callCount,
+                        recoveredSubmissionHash:
+                            recovered?.record?.submissionHash ?? null,
+                    },
+                });
+                if (recovered !== null) {
+                    submission = recovered.submission;
+                    this.#claimedCandidateIds.set(
+                        submission.candidateId,
+                        claimOwner,
+                    );
+                    return submission;
+                }
+                throw new CrucibleRuntimeError(
+                    RUNTIME_ERROR_CODES.UNCERTAIN_EXTERNAL_EFFECT,
+                    "SDK session failed while a tool submission callback was unresolved",
+                    {
+                        sessionId,
+                        attempt: retryContext.attempt,
+                        callCount,
+                    },
+                    { cause: sessionError ?? abortError ?? disconnectError },
+                );
+            }
+            if (durableSubmission && submission !== null) {
+                const classification = sessionError === null
+                    ? null
+                    : classifySdkFailure(sessionError, {
+                        ...(sessionError.sdkFailureContext ?? {}),
+                        nowMs: this.#options.clock.now(),
+                    });
+                await retryContext.gate.quarantine({
+                    attempt: retryContext.attempt,
+                    reason: "ambiguous_send_and_wait_after_submission",
+                    classification: classification?.classification ?? null,
+                    details: {
+                        sessionErrorCode: sessionError?.code
+                            ?? sessionError?.cause?.code
+                            ?? null,
+                        abortErrorCode: abortError?.code ?? null,
+                        disconnectErrorCode: disconnectError?.code ?? null,
+                        abortCleanupFailed: abortError !== null,
+                        disconnectCleanupFailed: disconnectError !== null,
+                    },
+                });
+                return submission;
+            }
             if (claimedByThisSession !== null) {
                 this.#claimedCandidateIds.delete(claimedByThisSession);
+            }
+            if (retryContext !== null
+                && (abortError !== null || disconnectError !== null)) {
+                throw new CrucibleRuntimeError(
+                    RUNTIME_ERROR_CODES.UNCERTAIN_EXTERNAL_EFFECT,
+                    "SDK session cleanup failed before a submission was durably sealed",
+                    {
+                        sessionId,
+                        attempt: retryContext.attempt,
+                        sessionError: sessionError?.message ?? null,
+                        abortError: abortError?.message ?? null,
+                        disconnectError: disconnectError?.message ?? null,
+                    },
+                    { cause: sessionError ?? abortError ?? disconnectError },
+                );
             }
             if (sessionError !== null
                 && typeof sessionError === "object"
@@ -2616,6 +2909,17 @@ export class SdkWorkerPool {
             }
             throw protocolFailure;
         }
+        if (retryContext !== null
+            && submission === null
+            && retryContext.sdkEvents.length > 0) {
+            throw withSdkFailureContext(
+                new Error("SDK session ended without a valid tool submission"),
+                {
+                    stage: "proposal output acceptance",
+                    sdkEvents: retryContext.sdkEvents,
+                },
+            );
+        }
         if (callCount === 0 || submission === null) {
             throw protocolError(
                 RUNTIME_ERROR_CODES.WORKER_NO_SUBMISSION,
@@ -2623,7 +2927,7 @@ export class SdkWorkerPool {
                 { sessionId, model },
             );
         }
-        if (callCount !== 1) {
+        if (!durableSubmission && callCount !== 1) {
             throw protocolError(
                 RUNTIME_ERROR_CODES.WORKER_MULTIPLE_SUBMISSIONS,
                 "Proposal session called crucible_submit_candidate more than once",
@@ -2631,6 +2935,154 @@ export class SdkWorkerPool {
             );
         }
         return submission;
+    }
+
+    async propose(input) {
+        requirePlainObject(input, "proposal request");
+        if (this.#options.sdkSubmissionJournal === null
+            && this.#options.sdkRetryPolicy.maxAttempts === 1) {
+            return this.#proposeOnce(input);
+        }
+
+        const sessionId = requireString(
+            input.sessionId ?? this.#options.idFactory(),
+            "sessionId",
+            { max: 256 },
+        );
+        const stableInput = Object.freeze({ ...input, sessionId });
+        const deadlineMs = this.#requestDeadline(stableInput.deadlineMs);
+        const operationIdentity = normalizeSdkOperationIdentity({
+            proposalSlotId: stableInput.proposalSlotId ?? sessionId,
+            commandId: stableInput.commandId ?? sessionId,
+            logicalEffectId: stableInput.logicalEffectId ?? sessionId,
+        });
+        const retryBudget = createSdkRetryBudget({
+            policy: this.#options.sdkRetryPolicy,
+            operationIdentity,
+            deadlineMs,
+        });
+        const journal = this.#options.sdkSubmissionJournal;
+        if (journal === null) {
+            throw new RuntimeConfigError(
+                "SDK retry execution requires an injected submission journal",
+            );
+        }
+        const gateJournal = {
+            durable: journal.durable,
+            recover: journal.recover,
+            commit: journal.commit,
+            recordEvidence: journal.recordEvidence,
+            quarantine: async (record) => {
+                await journal.quarantine(record);
+                this.#sdkOperationalEvidence.push(record);
+                await journal.recordEvidence(record);
+                if (this.#options.sdkOperationalEvidenceSink !== null) {
+                    await this.#options.sdkOperationalEvidenceSink(record);
+                }
+            },
+        };
+        const gate = createSdkSubmissionGate({
+            operationIdentity,
+            retryBudget,
+            journal: gateJournal,
+            validateSubmission: (submission) => validateWorkerProposal(
+                submission,
+                stableInput,
+                { limits: this.#options.candidateLimits },
+            ),
+            clock: this.#options.clock,
+        });
+        const usageAccumulator = createSdkUsageAccumulator({
+            model: stableInput.model,
+        });
+        const sdkReportedCostUnits = () => {
+            if (this.#options.sdkUsageToCostUnits === null) return [];
+            return usageAccumulator.snapshot().calls.map((report) => {
+                const units = this.#options.sdkUsageToCostUnits(report);
+                if (!Number.isSafeInteger(units) || units < 0) {
+                    throw new RuntimeConfigError(
+                        "sdkUsageToCostUnits must return a non-negative safe integer",
+                        { units, model: report.model },
+                    );
+                }
+                return units;
+            });
+        };
+        const claimRecovered = (recovered) => {
+            const proposal = recovered.submission;
+            const priorClaim = this.#claimedCandidateIds.get(proposal.candidateId);
+            if (this.#claimedCandidateIds.has(proposal.candidateId)
+                && priorClaim !== operationIdentity.logicalEffectId) {
+                throw protocolError(
+                    RUNTIME_ERROR_CODES.WORKER_DUPLICATE_CANDIDATE,
+                    "Recovered candidate id is claimed by a different logical effect",
+                    {
+                        candidateId: proposal.candidateId,
+                        logicalEffectId: operationIdentity.logicalEffectId,
+                    },
+                );
+            }
+            this.#claimedCandidateIds.set(
+                proposal.candidateId,
+                operationIdentity.logicalEffectId,
+            );
+            return proposal;
+        };
+        const retrying = createRetryingSdkClient(this, {
+            policy: this.#options.sdkRetryPolicy,
+            clock: this.#options.clock,
+            timers: this.#options.timers,
+            sleep: this.#options.sdkRetrySleep,
+            evidenceSink: (event) => this.#recordSdkEvidence(event),
+        });
+        try {
+            const result = await retrying.execute({
+                operationIdentity,
+                deadlineMs,
+                recover: async () => {
+                    await this.#guardRuntime("sdk_submission_recovery", {
+                        operationHash: operationIdentity.operationHash,
+                        logicalEffectId: operationIdentity.logicalEffectId,
+                    });
+                    const recovered = await gate.recover();
+                    return recovered === null
+                        ? null
+                        : {
+                            recovered: true,
+                            value: claimRecovered(recovered),
+                            attemptedCount: recovered.record.attempt,
+                        };
+                },
+                operation: async (_client, { attempt }) => this.#proposeOnce(
+                    stableInput,
+                    {
+                        attempt,
+                        operationIdentity,
+                        retryBudget,
+                        gate,
+                        usageAccumulator,
+                        sdkEvents: [],
+                    },
+                ),
+                classifyFailure: classifySdkFailure,
+                getSdkReportedCostUnits: sdkReportedCostUnits,
+                priorChargedCostUnits:
+                    stableInput.sdkPriorChargedCostUnits ?? 0,
+            });
+            if (this.#options.sdkUsageReporter !== null) {
+                await this.#options.sdkUsageReporter(Object.freeze({
+                    operationIdentity,
+                    retryBudget,
+                    attempts: result.attempts,
+                    recovered: result.recovered,
+                    usage: usageAccumulator.snapshot(),
+                    accounting: result.accounting,
+                }));
+            }
+            return result.value;
+        } finally {
+            gate.close();
+        }
     }
 
     async proposeBatch(requests) {

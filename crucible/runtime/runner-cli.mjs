@@ -20,7 +20,7 @@ export async function mainRunnerCli(argv = process.argv.slice(2), dependencies =
     try {
         const configPath = parseConfigArgv(argv, "runner-cli.mjs");
         config = loadRunnerConfig(configPath, { env: dependencies.env ?? process.env });
-        const runner = new AutonomousRunner({
+        const runnerConfig = {
             investigationId: config.investigationId,
             stateDir: config.stateDir,
             artifactRoot: config.artifactRoot,
@@ -28,10 +28,17 @@ export async function mainRunnerCli(argv = process.argv.slice(2), dependencies =
             copilotSdkPath: config.sdkPath,
             copilotCliPath: config.cliPath,
             runnerEpochId: config.runnerEpochId,
+            supervisorGeneration: config.supervisorGeneration,
+            supervisorNonce: config.supervisorNonce,
+            runnerIncarnation: config.runnerIncarnation,
             deadline: config.deadlineMs,
+            resourceBroker: config.resourceBroker,
             resultPath: config.resultPath,
             options: config.options,
-        }, dependencies);
+        };
+        const runner = dependencies.runnerFactory === undefined
+            ? new AutonomousRunner(runnerConfig, dependencies)
+            : dependencies.runnerFactory(runnerConfig, dependencies);
         const result = await runner.run();
         const envelope = projectRunnerOutcome(result);
         if (config.resultPath !== null) {

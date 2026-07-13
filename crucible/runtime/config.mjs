@@ -7,7 +7,17 @@ import {
     sha256Hex,
 } from "../persistence/index.mjs";
 import { RuntimeConfigError } from "./errors.mjs";
-import { validateSupervisorTimingConstraints } from "./config-validation.mjs";
+import {
+    investigationResourceLimitsFingerprint,
+    normalizeInvestigationResourceLimits,
+    normalizeResourceBrokerConfig,
+    resourceBrokerConfigFingerprint,
+    validateSupervisorTimingConstraints,
+} from "./config-validation.mjs";
+import {
+    SDK_RETRY_DISABLED_POLICY,
+    normalizeSdkRetryPolicy,
+} from "./retry-policy.mjs";
 import { MAX_TRUSTED_OPERATOR_CONTEXT_BYTES } from "./worker-pool.mjs";
 import {
     assertPathInside,
@@ -38,6 +48,7 @@ const RUNNER_KEYS = new Set([
     "supervisorNonce",
     "runnerIncarnation",
     "deadline",
+    "resourceBroker",
     "options",
     "resultPath",
 ]);
@@ -51,6 +62,7 @@ const RUNNER_OPTION_KEYS = new Set([
     "workerAdditionalContext",
     "tempRoot",
     "supervisorAuthority",
+    "sdkRetryPolicy",
 ]);
 
 const SUPERVISOR_AUTHORITY_KEYS = new Set([
@@ -74,6 +86,14 @@ const CANDIDATE_LIMIT_MAXIMA = Object.freeze({
     maxFileBytes: 256 * 1024,
     maxTotalBytes: 1024 * 1024,
 });
+
+const RESOURCE_BROKER_RUNTIME_KEYS = new Set([
+    "stateRoot",
+    "config",
+    "configFingerprint",
+    "investigationLimits",
+    "limitsFingerprint",
+]);
 
 const SUPERVISOR_KEYS = new Set([
     "runner",
@@ -134,6 +154,75 @@ function requireLocalAbsolutePath(value, field, env) {
             reason: error?.details?.reason ?? null,
         });
     }
+}
+
+function samePath(left, right) {
+    const a = path.resolve(left);
+    const b = path.resolve(right);
+    return process.platform === "win32"
+        ? a.toLowerCase() === b.toLowerCase()
+        : a === b;
+}
+
+function normalizeRunnerResourceBroker(value, stateDir, env) {
+    if (value === undefined || value === null) {
+        return null;
+    }
+    const input = requirePlainObject(value, "resourceBroker");
+    rejectUnknownKeys(
+        input,
+        RESOURCE_BROKER_RUNTIME_KEYS,
+        "resourceBroker",
+    );
+    const stateRoot = requireLocalAbsolutePath(
+        input.stateRoot,
+        "resourceBroker.stateRoot",
+        env,
+    );
+    const expectedStateRoot = path.dirname(path.dirname(stateDir));
+    if (!samePath(stateRoot, expectedStateRoot)) {
+        throw new RuntimeConfigError(
+            "resourceBroker.stateRoot must own the investigation directory",
+            { stateRoot, expectedStateRoot },
+        );
+    }
+    const config = normalizeResourceBrokerConfig(input.config);
+    const configFingerprint = resourceBrokerConfigFingerprint(config);
+    if (input.configFingerprint !== undefined
+        && input.configFingerprint !== configFingerprint) {
+        throw new RuntimeConfigError(
+            "resourceBroker.configFingerprint does not match its config",
+            {
+                expected: configFingerprint,
+                actual: input.configFingerprint,
+            },
+        );
+    }
+    const investigationLimits = normalizeInvestigationResourceLimits(
+        input.investigationLimits,
+        config,
+    );
+    const limitsFingerprint = investigationResourceLimitsFingerprint(
+        investigationLimits,
+        config,
+    );
+    if (input.limitsFingerprint !== undefined
+        && input.limitsFingerprint !== limitsFingerprint) {
+        throw new RuntimeConfigError(
+            "resourceBroker.limitsFingerprint does not match its limits",
+            {
+                expected: limitsFingerprint,
+                actual: input.limitsFingerprint,
+            },
+        );
+    }
+    return Object.freeze({
+        stateRoot,
+        config,
+        configFingerprint,
+        investigationLimits,
+        limitsFingerprint,
+    });
 }
 
 function normalizeCandidateLimits(value) {
@@ -232,6 +321,11 @@ export function normalizeRunnerConfig(input, { env = process.env } = {}) {
     const supervisorGeneration = supervisorAuthority?.supervisorGeneration ?? null;
     const supervisorNonce = supervisorAuthority?.supervisorNonce ?? null;
     const runnerIncarnation = supervisorAuthority?.runnerIncarnation ?? null;
+    const resourceBroker = normalizeRunnerResourceBroker(
+        input.resourceBroker,
+        stateDir,
+        env,
+    );
     if (isPathInside(stateDir, artifactRoot)) {
         throw new RuntimeConfigError(
             "stateDir cannot be equal to or nested inside artifactRoot",
@@ -280,6 +374,7 @@ export function normalizeRunnerConfig(input, { env = process.env } = {}) {
         supervisorGeneration,
         supervisorNonce,
         runnerIncarnation,
+        resourceBroker,
         deadlineMs: parseDeadline(input.deadline),
         resultPath,
         options: Object.freeze({
@@ -310,6 +405,9 @@ export function normalizeRunnerConfig(input, { env = process.env } = {}) {
                 || options.workerAdditionalContext === null
                 ? null
                 : normalizeTrustedOperatorContext(options.workerAdditionalContext),
+            sdkRetryPolicy: normalizeSdkRetryPolicy(
+                options.sdkRetryPolicy ?? SDK_RETRY_DISABLED_POLICY,
+            ),
             tempRoot,
             ...(supervisorAuthority === null
                 ? {}
@@ -349,6 +447,9 @@ export function supervisorConfigDocument(input, options = {}) {
             copilotCliPath: config.runner.cliPath,
             runnerEpochId: config.runner.runnerEpochId,
             deadline: config.runner.deadlineMs,
+            ...(config.runner.resourceBroker === null
+                ? {}
+                : { resourceBroker: config.runner.resourceBroker }),
             options: config.runner.options,
         },
         runnerCliPath: config.runnerCliPath,
@@ -455,6 +556,7 @@ export function coerceSupervisorConfig(input, options = {}) {
             copilotCliPath: input.runner.cliPath,
             runnerEpochId: input.runner.runnerEpochId,
             deadline: input.runner.deadlineMs,
+            resourceBroker: input.runner.resourceBroker ?? undefined,
             resultPath: input.runner.resultPath ?? undefined,
             options: input.runner.options,
         },

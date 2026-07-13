@@ -5,7 +5,7 @@ import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 
-import { EVENT_TYPES, decideNext } from "../domain/index.mjs";
+import { EVENT_TYPES } from "../domain/index.mjs";
 import {
     coerceSupervisorConfig,
     supervisorConfigDocument,
@@ -15,9 +15,18 @@ import {
 import { createDomainRepositoryAdapter } from "./domain-adapter.mjs";
 import {
     openArtifactStore,
+    openArtifactStoreReadOnly,
     openRepository,
     openRepositoryReadOnly,
 } from "../persistence/index.mjs";
+import {
+    openResourceBroker,
+} from "./resource-broker.mjs";
+import {
+    assertSupervisorConfigMatchesRuntimeAuthority,
+    supervisorConfigFromRuntimeAuthority,
+    verifyRuntimeConfigAuthority,
+} from "./config-authority.mjs";
 import {
     isExactPidAlive,
     readSupervisorLock,
@@ -29,9 +38,19 @@ import {
     RUNTIME_ERROR_CODES,
 } from "./errors.mjs";
 import {
+    buildQuiescenceSnapshot,
+    ensureStopDomainIntent,
+    persistPausePending,
+    persistQuiescentStopBarrier,
+    stopControlPaths,
+    waitForQuiescentStopAcknowledgement,
+    writeSupervisorStopSignal,
+} from "./control-channel.mjs";
+import {
     atomicWriteJson,
     delay,
     ensureDirectory,
+    sha256Hex,
 } from "./utils.mjs";
 
 const ACKNOWLEDGED_ACTIVE_STATES = new Set(["running"]);
@@ -91,6 +110,89 @@ export function validateSupervisorAdmission(input, dependencies = {}) {
     return Object.freeze({ config, nodeExecutable });
 }
 
+function verifyPersistedSupervisorRuntime(config, nodeExecutable, dependencies) {
+    if (typeof dependencies.verifySupervisorRuntimeAuthority === "function") {
+        return dependencies.verifySupervisorRuntimeAuthority({
+            config,
+            nodeExecutable,
+        });
+    }
+    if (config.runner.resourceBroker === null) {
+        return null;
+    }
+    const eventsDbPath = path.join(config.runner.stateDir, "events.sqlite");
+    if (!fs.existsSync(eventsDbPath)) {
+        if (config.runner.resourceBroker !== null) {
+            throw new CrucibleRuntimeError(
+                RUNTIME_ERROR_CODES.RUNTIME_DRIFT,
+                "Supervisor launch requires the persisted runtime authority",
+                { eventsDbPath },
+            );
+        }
+        return null;
+    }
+    const repository = openRepositoryReadOnly({ file: eventsDbPath });
+    try {
+        const adapter = createDomainRepositoryAdapter({
+            repository,
+            artifactStore: openArtifactStoreReadOnly({
+                root: config.runner.artifactRoot,
+            }),
+            investigationId: config.runner.investigationId,
+            ensure: false,
+        });
+        const aggregate = adapter.replay().aggregate;
+        const authority = aggregate.runtimeConfigAuthority;
+        if (authority === null
+            || authority.fingerprint !== aggregate.runtimeConfigFingerprint) {
+            throw new CrucibleRuntimeError(
+                RUNTIME_ERROR_CODES.RUNTIME_DRIFT,
+                "Supervisor launch has no valid persisted runtime authority",
+                { investigationId: config.runner.investigationId },
+            );
+        }
+        assertSupervisorConfigMatchesRuntimeAuthority(config, authority, {
+            env: dependencies.env ?? process.env,
+        });
+        const verified = verifyRuntimeConfigAuthority(authority, {
+            env: dependencies.env ?? process.env,
+            deadlineMs: config.runner.deadlineMs,
+            expectedInvestigationId: config.runner.investigationId,
+            expectedStateDir: config.runner.stateDir,
+            expectedArtifactRoot: config.runner.artifactRoot,
+            nodeExecutable,
+        });
+        return Object.freeze({
+            authority: verified.authority,
+            runtimeIdentityRoot: verified.authority.runtimeIdentity.root,
+            runtimeConfigFingerprint: verified.authority.fingerprint,
+        });
+    } finally {
+        repository.close();
+    }
+}
+
+function prepareResourceBroker(config, dependencies) {
+    if (config.runner.resourceBroker === null) return null;
+    const factory = dependencies.resourceBrokerFactory ?? openResourceBroker;
+    const broker = factory({
+        stateRoot: config.runner.resourceBroker.stateRoot,
+        config: config.runner.resourceBroker.config,
+        env: dependencies.env ?? process.env,
+    });
+    try {
+        broker.verifyIntegrity?.();
+        return Object.freeze({
+            configFingerprint: broker.configFingerprint,
+            limitsFingerprint:
+                config.runner.resourceBroker.limitsFingerprint,
+            databaseFile: broker.databaseFile ?? null,
+        });
+    } finally {
+        broker.close?.();
+    }
+}
+
 export function startSupervisor(input, dependencies = {}) {
     const admission = validateSupervisorAdmission(input, dependencies);
     const { config, nodeExecutable } = admission;
@@ -102,6 +204,17 @@ export function startSupervisor(input, dependencies = {}) {
         "supervisor-cli.mjs",
     );
     const spawnProcess = dependencies.spawnProcess ?? spawn;
+    dependencies.beforeSupervisorLaunch?.({
+        config,
+        nodeExecutable,
+        supervisorCliPath,
+    });
+    const runtime = verifyPersistedSupervisorRuntime(
+        config,
+        nodeExecutable,
+        dependencies,
+    );
+    const broker = prepareResourceBroker(config, dependencies);
     const child = spawnProcess(
         nodeExecutable,
         [supervisorCliPath, "--config", config.paths.configPath],
@@ -121,6 +234,8 @@ export function startSupervisor(input, dependencies = {}) {
         lockPath: config.paths.lockPath,
         configFingerprint,
         deadlineMs: config.runner.deadlineMs,
+        runtime,
+        broker,
     };
 }
 
@@ -149,6 +264,26 @@ function readAcknowledgementAuthority(config, status, dependencies) {
             config.runner.investigationId,
         );
         const lease = repository.getActiveLease(config.runner.investigationId);
+        const stop = typeof repository.getQuiescentStop === "function"
+            ? repository.getQuiescentStop(config.runner.investigationId)
+            : null;
+        if (status.state === "pause"
+            && status.quiescent === true
+            && stop?.state === "PAUSED_QUIESCENT"
+            && stop.quiescent === true
+            && authority !== null
+            && authority.supervisorGeneration
+                === status.supervisorGeneration
+            && authority.supervisorNonce === status.nonce
+            && lease === null
+            && (
+                typeof repository.listCommittableAttempts !== "function"
+                || repository.listCommittableAttempts(
+                    config.runner.investigationId,
+                ).length === 0
+            )) {
+            return { authority, lease: null, stop };
+        }
         if (authority === null
             || lease === null
             || authority.supervisorGeneration !== status.supervisorGeneration
@@ -224,8 +359,13 @@ export async function waitForSupervisorAcknowledgement(
             const exactConfig = status.version >= 4
                 && status.configFingerprint === expectedConfigFingerprint
                 && status.deadlineMs === expectedDeadlineMs;
-            const exactIncarnation = typeof status.runnerIncarnation === "string"
-                && status.runnerIncarnation.length > 0;
+            const exactIncarnation = (
+                typeof status.runnerIncarnation === "string"
+                && status.runnerIncarnation.length > 0
+            ) || (
+                status.state === "pause"
+                && status.quiescent === true
+            );
             const heartbeatAgeMs = clock.now() - Date.parse(status.heartbeatAt);
             const fresh = Number.isFinite(heartbeatAgeMs)
                 && heartbeatAgeMs >= -config.staleLockMs
@@ -295,8 +435,9 @@ export async function waitForSupervisorAcknowledgement(
                             acknowledgement: Object.freeze({
                                 supervisorGeneration: status.supervisorGeneration,
                                 runnerIncarnation: status.runnerIncarnation,
-                                leaseId: persisted.lease.leaseId,
-                                fencingToken: persisted.lease.fencingToken,
+                                leaseId: persisted.lease?.leaseId ?? null,
+                                fencingToken:
+                                    persisted.lease?.fencingToken ?? null,
                                 configFingerprint: expectedConfigFingerprint,
                                 deadlineMs: expectedDeadlineMs,
                             }),
@@ -338,6 +479,15 @@ export function requestStop({
     requestId = null,
     repositoryFactory = openRepository,
     artifactStoreFactory = openArtifactStore,
+    readLock = readSupervisorLock,
+    readSupervisorState = readSupervisorStatus,
+    isPidAlive = isExactPidAlive,
+    env = process.env,
+    resourceBrokerFactory = openResourceBroker,
+    clock = {
+        now: () => Date.now(),
+        isoNow: () => new Date().toISOString(),
+    },
 } = {}) {
     const repository = repositoryFactory({
         file: path.join(stateDir, "events.sqlite"),
@@ -352,29 +502,297 @@ export function requestStop({
             }),
             investigationId,
         });
-        const result = adapter.requestStop({
-            requestId: requestId ?? `stop-${randomUUID()}`,
+        const resolvedRequestId = requestId ?? `stop-${randomUUID()}`;
+        const operationalNonResult = adapter.latestOperationalNonResult();
+        const initial = adapter.replay();
+        const existingStop = repository.getQuiescentStop(investigationId);
+        if (initial.aggregate.terminal !== null
+            || initial.aggregate.nonResults.length > 0
+            || operationalNonResult !== null
+            || (
+                initial.aggregate.pause !== null
+                && existingStop?.state === "PAUSED_QUIESCENT"
+            )) {
+            return {
+                appended: false,
+                aggregate: initial.aggregate,
+                domainEvent: null,
+                pausePersisted: initial.aggregate.pause !== null,
+                operationalNonResult,
+                stop: existingStop,
+                signal: null,
+                quiescent: existingStop?.quiescent === true,
+                interventionRequired:
+                    existingStop?.interventionRequired === true,
+            };
+        }
+
+        const paths = supervisorPaths(stateDir, investigationId);
+        let lock = null;
+        let status = null;
+        try {
+            lock = readLock(paths.lockPath);
+            status = readSupervisorState(stateDir, investigationId);
+        } catch {
+            lock = null;
+            status = null;
+        }
+        const exactLiveOwner = lock !== null
+            && status !== null
+            && lock.pid === status.pid
+            && lock.nonce === status.nonce
+            && lock.supervisorGeneration === status.supervisorGeneration
+            && isPidAlive(lock.pid)
+            ? {
+                pid: lock.pid,
+                nonce: lock.nonce,
+                supervisorGeneration: lock.supervisorGeneration,
+            }
+            : null;
+        let stop = persistQuiescentStopBarrier({
+            repository,
+            investigationId,
+            requestId: resolvedRequestId,
             reason,
             pauseRequested,
+            owner: exactLiveOwner,
+            runnerPid:
+                Number.isSafeInteger(status?.childPid)
+                && status.childPid > 0
+                    ? status.childPid
+                    : null,
+            details: {
+                source: "extension-adapter",
+                statusState: status?.state ?? null,
+            },
         });
-        const operationalNonResult = adapter.latestOperationalNonResult();
-        let final = result;
-        if (operationalNonResult === null
-            && result.aggregate.terminal === null
-            && result.aggregate.pause === null
-            && result.aggregate.nonResults.length === 0) {
-            const recommendation = decideNext(result.aggregate);
-            if (recommendation.event?.type === EVENT_TYPES.INVESTIGATION_PAUSED) {
-                final = adapter.appendKernelDecision();
+        const result = ensureStopDomainIntent(adapter, stop);
+        let signal = null;
+        if (exactLiveOwner !== null
+            && stop.targetSupervisorGeneration
+                === exactLiveOwner.supervisorGeneration
+            && stop.targetSupervisorNonce === exactLiveOwner.nonce) {
+            signal = writeSupervisorStopSignal({
+                paths: stopControlPaths(stateDir, investigationId),
+                stop,
+                owner: exactLiveOwner,
+                clock,
+            });
+        } else {
+            let brokerProbe = {
+                verified: false,
+                reason:
+                    "resource broker authority could not be reconstructed",
+            };
+            try {
+                const runtimeAuthority =
+                    initial.aggregate.runtimeConfigAuthority;
+                const repositoryAuthority =
+                    repository.getSupervisorAuthority(investigationId);
+                if (runtimeAuthority !== null
+                    && repositoryAuthority !== null) {
+                    const runtimeConfig = supervisorConfigFromRuntimeAuthority(
+                        runtimeAuthority,
+                        { deadlineMs: null, env },
+                    );
+                    const resourceBroker =
+                        runtimeConfig.runner.resourceBroker;
+                    if (resourceBroker === null) {
+                        brokerProbe = {
+                            verified: true,
+                            configured: false,
+                            authorityRetired: true,
+                            activeLeases: [],
+                        };
+                    } else {
+                        const broker = resourceBrokerFactory({
+                            stateRoot: resourceBroker.stateRoot,
+                            config: resourceBroker.config,
+                            env,
+                        });
+                        try {
+                            const drainIncarnation = `extension-drain-g${
+                                repositoryAuthority.supervisorGeneration
+                            }-${sha256Hex(Buffer.from(
+                                stop.requestId,
+                                "utf8",
+                            )).slice(0, 32)}`;
+                            const brokerInvestigation =
+                                broker.getInvestigation(investigationId);
+                            if (brokerInvestigation === null) {
+                                broker.registerInvestigation({
+                                    investigationId,
+                                    limits:
+                                        resourceBroker.investigationLimits,
+                                    supervisorGeneration:
+                                        repositoryAuthority
+                                            .supervisorGeneration,
+                                    supervisorNonce:
+                                        repositoryAuthority.supervisorNonce,
+                                    runnerIncarnation: drainIncarnation,
+                                });
+                            } else {
+                                broker.claimAuthority({
+                                    investigationId,
+                                    supervisorGeneration:
+                                        repositoryAuthority
+                                            .supervisorGeneration,
+                                    supervisorNonce:
+                                        repositoryAuthority.supervisorNonce,
+                                    runnerIncarnation: drainIncarnation,
+                                });
+                            }
+                            const retired =
+                                broker.getInvestigation(investigationId);
+                            if (retired === null
+                                || retired.supervisorGeneration
+                                    !== repositoryAuthority
+                                        .supervisorGeneration
+                                || retired.supervisorNonce
+                                    !== repositoryAuthority.supervisorNonce
+                                || retired.runnerIncarnation
+                                    !== drainIncarnation) {
+                                throw new Error(
+                                    "resource broker retirement did not persist exact authority",
+                                );
+                            }
+                            const activeLeases = broker.listActiveLeases({
+                                investigationId,
+                            });
+                            if (!Array.isArray(activeLeases)) {
+                                throw new Error(
+                                    "resource broker active lease probe did not return an array",
+                                );
+                            }
+                            brokerProbe = {
+                                verified: true,
+                                configured: true,
+                                authorityRetired: true,
+                                supervisorGeneration:
+                                    repositoryAuthority
+                                        .supervisorGeneration,
+                                supervisorNonce:
+                                    repositoryAuthority.supervisorNonce,
+                                runnerIncarnation: drainIncarnation,
+                                activeLeases,
+                            };
+                        } finally {
+                            broker.close?.();
+                        }
+                    }
+                }
+            } catch (error) {
+                brokerProbe = {
+                    verified: false,
+                    reason: error?.message ?? String(error),
+                };
             }
+            const proof = buildQuiescenceSnapshot({
+                repository,
+                investigationId,
+                supervisorStatus: {
+                    verified: false,
+                    reason:
+                        status === null
+                            ? "supervisor status is missing"
+                            : "supervisor status/lock ownership is not exact and live",
+                },
+                processes: {
+                    verified: false,
+                    reason:
+                        "extension adapter cannot enumerate exact supervisor-owned process trees",
+                },
+                sdkSessions: {
+                    verified: false,
+                    reason:
+                        "extension adapter cannot prove exact SDK session ownership",
+                },
+                runnerChild: {
+                    verified: false,
+                    reason:
+                        Number.isSafeInteger(status?.childPid)
+                        && status.childPid > 0
+                        && isPidAlive(status.childPid)
+                            ? "recorded runner child is still live"
+                            : "runner child generation/incarnation is unverified",
+                },
+                resourceBroker: brokerProbe,
+            });
+            stop = persistPausePending({
+                repository,
+                stop,
+                proof,
+                reason:
+                    "No exact live supervisor could prove and atomically commit quiescence.",
+            });
         }
+        const final = adapter.replay();
         return {
-            appended: result.domainEvent !== null,
+            appended: result.domainEvents.length > initial.domainEvents.length,
             aggregate: final.aggregate,
-            domainEvent: result.domainEvent,
+            domainEvent:
+                final.domainEvents.find((event) =>
+                    event.type === EVENT_TYPES.STOP_REQUESTED
+                    && event.payload?.requestId === stop.requestId)
+                ?? null,
             pausePersisted: final.aggregate.pause !== null,
             operationalNonResult,
+            stop,
+            signal,
+            quiescent: stop.quiescent === true,
+            interventionRequired: stop.interventionRequired === true,
         };
+    } finally {
+        repository.close();
+    }
+}
+
+export async function waitForStopAcknowledgement(input, dependencies = {}) {
+    const result = await waitForQuiescentStopAcknowledgement({
+        ...input,
+        repositoryFactory:
+            dependencies.repositoryFactory
+            ?? openRepositoryReadOnly,
+        sleep: dependencies.sleep,
+        ...(dependencies.timeoutMs === undefined
+            ? {}
+            : { timeoutMs: dependencies.timeoutMs }),
+        ...(dependencies.pollMs === undefined
+            ? {}
+            : { pollMs: dependencies.pollMs }),
+    });
+    if (!result.timedOut
+        || result.stop === null
+        || !["STOP_BARRIER_PERSISTED", "STOP_RECONCILING"].includes(
+            result.stop.state,
+        )) {
+        return result;
+    }
+    const repository = (
+        dependencies.writeRepositoryFactory
+        ?? openRepository
+    )({
+        file: path.join(input.stateDir, "events.sqlite"),
+    });
+    try {
+        const stop = repository.completeQuiescentStop({
+            investigationId: input.investigationId,
+            requestId: input.requestId,
+            state: "PAUSE_PENDING",
+            quiescent: false,
+            interventionRequired: true,
+            nonResultCode: RUNTIME_ERROR_CODES.NON_QUIESCENT,
+            details: {
+                reason:
+                    "Supervisor acknowledgement exceeded the bounded stop wait.",
+                timeoutMs: dependencies.timeoutMs ?? 25_000,
+            },
+        });
+        return Object.freeze({
+            acknowledged: true,
+            timedOut: true,
+            stop,
+        });
     } finally {
         repository.close();
     }

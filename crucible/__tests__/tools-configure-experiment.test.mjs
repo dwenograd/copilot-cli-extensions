@@ -117,6 +117,19 @@ function workspace(label) {
         }),
     };
     fs.writeFileSync(allowlistPath, JSON.stringify(allowlistDocument));
+    const cliPackagePath = path.join(root, "copilot-package");
+    const sdkPath = path.join(cliPackagePath, "copilot-sdk");
+    const cliPath = path.join(root, "copilot.exe");
+    const nodePath = path.join(root, "node.exe");
+    fs.mkdirSync(sdkPath, { recursive: true });
+    fs.writeFileSync(
+        path.join(cliPackagePath, "package.json"),
+        JSON.stringify({ name: "fixture-copilot" }),
+    );
+    fs.writeFileSync(path.join(cliPackagePath, "app.js"), "export {};\n");
+    fs.writeFileSync(path.join(sdkPath, "index.js"), "export {};\n");
+    fs.writeFileSync(cliPath, "fixture copilot cli");
+    fs.writeFileSync(nodePath, "fixture node runtime");
 
     return {
         root,
@@ -129,6 +142,10 @@ function workspace(label) {
         env: {
             LOCALAPPDATA: root,
             CRUCIBLE_ALLOWLIST_PATH: allowlistPath,
+            CRUCIBLE_CLI_PACKAGE_PATH: cliPackagePath,
+            CRUCIBLE_NODE_PATH: nodePath,
+            COPILOT_CLI_PATH: cliPath,
+            COPILOT_SDK_PATH: sdkPath,
             ...authority.env,
         },
     };
@@ -488,6 +505,11 @@ describe("configure-experiment operator CLI", () => {
             enumerandRoot: prepared.enumerandRoot,
             statisticalPolicyIdentity: prepared.statisticalPolicyIdentity,
             hypothesisPolicyIdentity: prepared.hypothesisPolicyIdentity,
+        });
+        expect(manifest.experimentPayload.contract).toMatchObject({
+            runtimeIdentityPolicyIdentity:
+                prepared.runtimeIdentityPolicyIdentity,
+            runtimeIdentityRoot: prepared.runtimeIdentityRoot,
         });
         expect(() => configureExperiment({
             config,

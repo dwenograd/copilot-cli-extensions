@@ -279,6 +279,32 @@ function normalizeDeadline(value) {
     return value;
 }
 
+function normalizeAbortSignal(value) {
+    if (value === null || value === undefined) return null;
+    if (typeof value !== "object"
+        || typeof value.aborted !== "boolean"
+        || typeof value.addEventListener !== "function"
+        || typeof value.removeEventListener !== "function") {
+        throw new MeasurementError(
+            MEASUREMENT_ERROR_CODES.INVALID_ARGUMENT,
+            "run().signal must be an AbortSignal",
+        );
+    }
+    return value;
+}
+
+function throwIfAborted(signal, stage) {
+    if (signal?.aborted !== true) return;
+    if (signal.reason instanceof Error) {
+        throw signal.reason;
+    }
+    throw new MeasurementError(
+        MEASUREMENT_ERROR_CODES.SPAWN_FAILED,
+        `measurement aborted during ${stage}`,
+        { stage, aborted: true },
+    );
+}
+
 function remainingDeadlineMs(deadlineMs, clock) {
     return deadlineMs === null
         ? Number.POSITIVE_INFINITY
@@ -841,6 +867,7 @@ async function runOnce({
         ? VERIFIER_PARSER_MAX_INPUT_BYTES
         : PARSER_MAX_INPUT_BYTES;
     const deadlineMs = normalizeDeadline(runInput.deadlineMs);
+    const signal = normalizeAbortSignal(runInput.signal);
     const budgetLimits = byteLedger.snapshot(attemptId).limits;
     const casBudget = byteLedger.consumeCas(
         attemptId,
@@ -866,7 +893,9 @@ async function runOnce({
     let capability = null;
     let capabilityBinding = null;
     let capabilityCleaned = false;
+    let abortHandler = null;
     try {
+        throwIfAborted(signal, "measurement admission");
         assertDeadline(deadlineMs, clock, "measurement admission");
         // Re-open and re-hash through the issuing allowlist instance for this
         // exact run, then keep those verified handles live through staging.
@@ -1071,6 +1100,7 @@ async function runOnce({
                 stagedSnapshot.files.map((file) => file.absPath),
             ),
         }));
+        throwIfAborted(signal, "harness launch");
         reverifyStagedHarnessRun(stagedRun);
         reverifyStagedSnapshotClosure(stagedSnapshot);
 
@@ -1151,6 +1181,15 @@ async function runOnce({
             attemptId,
             byteLedger,
         });
+        if (signal !== null) {
+            abortHandler = () => {
+                capture.terminate("external-effect-authority-lost");
+            };
+            signal.addEventListener("abort", abortHandler, { once: true });
+            if (signal.aborted) {
+                abortHandler();
+            }
+        }
         try {
             await lifecycleAdapter?.afterHarnessLaunch?.(Object.freeze({
                 attemptId,
@@ -1178,6 +1217,7 @@ async function runOnce({
             throw error;
         }
         const outcome = await capture.outcome;
+        throwIfAborted(signal, "measurement output acceptance");
         await lifecycleAdapter?.afterHarnessExit?.(Object.freeze({
             attemptId,
             runnerEpochId,
@@ -1442,6 +1482,9 @@ async function runOnce({
             // result is built; raw unvetted output is not persisted here.
         });
     } finally {
+        if (signal !== null && abortHandler !== null) {
+            signal.removeEventListener("abort", abortHandler);
+        }
         try {
             if (capability !== null && !capabilityCleaned) {
                 await cleanupCapabilityWithinBound(

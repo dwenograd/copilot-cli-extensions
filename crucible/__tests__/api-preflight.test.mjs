@@ -10,9 +10,13 @@ import {
 } from "../domain/index.mjs";
 import {
     DEFAULT_PROMPT_CONTEXT_BYTE_CAP,
+    CrucibleRuntimeError,
+    RUNTIME_ERROR_CODES,
     RuntimeConfigError,
     createDomainRepositoryAdapter,
+    loadSupervisorConfig,
     normalizeSupervisorConfig,
+    supervisorConfigDocument,
 } from "../runtime/index.mjs";
 import {
     loadHarnessAllowlist,
@@ -33,6 +37,7 @@ import {
     ExperimentAuthorityMismatchApiError,
     ExperimentRegistryApiError,
     HarnessConfigurationError,
+    RuntimeDriftApiError,
     SandboxUnavailableApiError,
     StartPreflightError,
 } from "../api/errors.mjs";
@@ -158,21 +163,46 @@ function makeWorkspace(label, entryOverrides = {}) {
 
     const stateRoot = path.join(root, "state-root");
     const experimentRegistryPath = path.join(root, "experiments.json");
+    const cliPackagePath = path.join(root, "copilot-package");
+    const sdkPath = path.join(cliPackagePath, "copilot-sdk");
+    const nodePath = path.join(root, "node.exe");
+    const sandboxRuntime = path.join(root, "sandbox-runtime");
+    const sandboxSource = path.join(sandboxRuntime, "helper.cs");
+    const sandboxBinary = path.join(sandboxRuntime, "helper.exe");
+    const sandboxLauncher = path.join(sandboxRuntime, "launcher.exe");
     const env = {
         CRUCIBLE_ALLOWLIST_PATH: allowlistPath,
         CRUCIBLE_CASE_STORE_PATH: fixtureStoreRoot,
         CRUCIBLE_EXPERIMENT_REGISTRY_PATH: experimentRegistryPath,
         CRUCIBLE_STATE_ROOT: stateRoot,
-        COPILOT_SDK_PATH: path.join(root, "sdk"),
+        CRUCIBLE_CLI_PACKAGE_PATH: cliPackagePath,
+        CRUCIBLE_NODE_PATH: nodePath,
+        COPILOT_SDK_PATH: sdkPath,
         COPILOT_CLI_PATH: path.join(root, "copilot.exe"),
+        CRUCIBLE_SANDBOX_HELPER_SOURCE_PATH: sandboxSource,
+        CRUCIBLE_SANDBOX_HELPER_BINARY_PATH: sandboxBinary,
+        CRUCIBLE_SANDBOX_LAUNCHER_PATH: sandboxLauncher,
+        CRUCIBLE_SANDBOX_LAUNCHER_SCRIPT_HASH:
+            `sha256:crucible-test-sandbox-launcher-v1:${"b".repeat(64)}`,
         ...authority.env,
     };
+    fs.mkdirSync(cliPackagePath, { recursive: true });
     fs.mkdirSync(env.COPILOT_SDK_PATH, { recursive: true });
+    fs.mkdirSync(sandboxRuntime, { recursive: true });
+    fs.writeFileSync(
+        path.join(cliPackagePath, "package.json"),
+        JSON.stringify({ name: "fixture-copilot" }),
+    );
+    fs.writeFileSync(path.join(cliPackagePath, "app.js"), "export {};\n");
     fs.writeFileSync(
         path.join(env.COPILOT_SDK_PATH, "index.js"),
         "export {};\n",
     );
     fs.writeFileSync(env.COPILOT_CLI_PATH, "fixture copilot cli");
+    fs.writeFileSync(nodePath, "fixture node runtime");
+    fs.writeFileSync(sandboxSource, "public class Fixture {}\n");
+    fs.writeFileSync(sandboxBinary, "fixture sandbox helper");
+    fs.writeFileSync(sandboxLauncher, "fixture sandbox launcher");
     return {
         root,
         projectDir,
@@ -280,6 +310,7 @@ function makeDeps(workspace, overrides = {}) {
             log: () => {},
             clock: { now: () => Date.parse("2030-01-01T00:00:00.000Z") },
             loadHarnessAllowlist,
+            loadSupervisorConfig,
             probeSandboxAvailability: () => ({ available: true }),
             normalizeSupervisorConfig,
             openArtifactStore,
@@ -289,6 +320,11 @@ function makeDeps(workspace, overrides = {}) {
             createDomainRepositoryAdapter,
             ensureSupervisor: (config, options) => {
                 calls.ensure.push({ config, options });
+                fs.mkdirSync(config.paths.directory, { recursive: true });
+                fs.writeFileSync(
+                    config.paths.configPath,
+                    JSON.stringify(supervisorConfigDocument(config)),
+                );
                 return {
                     action: "started",
                     pid: 4242,
@@ -679,6 +715,54 @@ describe("crucible_start lifecycle preflight", () => {
         );
     });
 
+    it("returns RUNTIME_DRIFT when the signed SDK closure changes before start", async () => {
+        const workspace = makeWorkspace("runtime-drift-new");
+        const args = startArgs(workspace);
+        fs.appendFileSync(
+            path.join(workspace.env.COPILOT_SDK_PATH, "index.js"),
+            "// drift\n",
+        );
+        const { deps } = makeDeps(workspace);
+
+        await expectRejectedWithoutState(
+            workspace,
+            args,
+            deps,
+            RuntimeDriftApiError,
+        );
+    });
+
+    it("requires a new or forked investigation after reattach runtime drift", async () => {
+        const workspace = makeWorkspace("runtime-drift-reattach");
+        const { deps } = makeDeps(workspace);
+        const started = await Promise.resolve(
+            startInvestigation(startArgs(workspace), deps),
+        );
+        fs.appendFileSync(
+            path.join(
+                workspace.env.CRUCIBLE_CLI_PACKAGE_PATH,
+                "app.js",
+            ),
+            "// drift\n",
+        );
+
+        let caught;
+        try {
+            await Promise.resolve(startInvestigation({
+                investigation_id: started.investigation_id,
+            }, deps));
+        } catch (error) {
+            caught = error;
+        }
+        expect(caught).toMatchObject({
+            code: "RUNTIME_DRIFT",
+            details: {
+                inPlaceRepinAllowed: false,
+                requiredAction: "start_new_or_forked_investigation",
+            },
+        });
+    });
+
     it("fails closed when a candidate-code sandbox is unavailable", async () => {
         const workspace = makeWorkspace("sandbox-unavailable", {
             executesCandidateCode: true,
@@ -725,6 +809,45 @@ describe("crucible_start lifecycle preflight", () => {
                 ensure: false,
             });
             expect(adapter.replay().aggregate.pause).not.toBeNull();
+        } finally {
+            repository.close();
+        }
+    });
+
+    it("durably records post-persistence runtime drift before pausing", async () => {
+        const workspace = makeWorkspace("apply-runtime-drift");
+        const { deps } = makeDeps(workspace, {
+            ensureSupervisor: () => {
+                throw new CrucibleRuntimeError(
+                    RUNTIME_ERROR_CODES.RUNTIME_DRIFT,
+                    "runtime changed immediately before launch",
+                );
+            },
+        });
+        await expect(Promise.resolve().then(() =>
+            startInvestigation(startArgs(workspace), deps)))
+            .rejects.toMatchObject({
+                code: RUNTIME_ERROR_CODES.RUNTIME_DRIFT,
+            });
+        const investigationDir = fs.readdirSync(workspace.stateRoot)
+            .map((name) => path.join(workspace.stateRoot, name))
+            .find((candidate) =>
+                fs.existsSync(path.join(candidate, "state", "events.sqlite")));
+        const repository = openRepositoryReadOnly({
+            file: path.join(investigationDir, "state", "events.sqlite"),
+        });
+        try {
+            const adapter = createDomainRepositoryAdapter({
+                repository,
+                investigationId: path.basename(investigationDir),
+                ensure: false,
+            });
+            expect(adapter.replay().aggregate.pause).not.toBeNull();
+            expect(adapter.latestOperationalNonResult()).toMatchObject({
+                payload: {
+                    code: RUNTIME_ERROR_CODES.RUNTIME_DRIFT,
+                },
+            });
         } finally {
             repository.close();
         }
