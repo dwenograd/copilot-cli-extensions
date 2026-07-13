@@ -100,7 +100,7 @@ const ROLE_BINDING_RULES = Object.freeze({
     impossibility_verifier: Object.freeze({
         phases: Object.freeze(["impossibility_verification"]),
         replicateIndex: "forbidden",
-        blockIndex: "forbidden",
+        blockIndex: "required",
         armIndex: "forbidden",
         armId: "forbidden",
     }),

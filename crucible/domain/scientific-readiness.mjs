@@ -10,11 +10,14 @@ import {
     replicationBlockPlan,
 } from "./replication.mjs";
 import { evaluateReplicationProgress } from "./statistical-evaluation.mjs";
-import {
-    deriveScientificConclusion,
-    scientificReplaySummary,
-} from "./scientific-replay.mjs";
 import { deriveScientificConfirmationState } from "./confirmation.mjs";
+import {
+    deriveUnreachableCoverageClosure,
+} from "./impossibility.mjs";
+import { terminalEvidenceClosureMatches } from "./terminal-closure.mjs";
+import {
+    verifiedImpossibilityExecutionFor,
+} from "./private-verifier-execution.mjs";
 
 function requiredPredictions(evidenceItems) {
     return evidenceItems.flatMap((evidence) => {
@@ -140,7 +143,8 @@ function replicatedEvidenceIntegrity(aggregate, evidence) {
             schedule,
             enumerandManifest: aggregate.contract.enumerandManifest ?? null,
             manifestOptions: {
-                topology: aggregate.contract.hypothesisTopology,
+                topology: aggregate.contract.enumerandManifest?.topology
+                    ?? aggregate.contract.hypothesisTopology,
                 observableRegistry: aggregate.contract.observableRegistry,
                 hypothesisPolicy: aggregate.contract.hypothesisPolicy,
             },
@@ -182,7 +186,8 @@ function validationEvidenceIntegrity(aggregate, evidence) {
                 enumerandManifest:
                     aggregate.contract.enumerandManifest ?? null,
                 manifestOptions: {
-                    topology: aggregate.contract.hypothesisTopology,
+                    topology: aggregate.contract.enumerandManifest?.topology
+                        ?? aggregate.contract.hypothesisTopology,
                     observableRegistry:
                         aggregate.contract.observableRegistry,
                     hypothesisPolicy:
@@ -215,52 +220,13 @@ function scientificEvidenceBindingsValid(aggregate) {
     });
 }
 
-function terminalClosureBound(aggregate, terminal, decisiveKind) {
-    let replaySummary;
-    let conclusionBound = true;
-    try {
-        replaySummary = scientificReplaySummary(
-            aggregate.scientificReplay,
+function terminalClosureBound(aggregate, terminal, decisiveEvidence) {
+    return scientificEvidenceBindingsValid(aggregate)
+        && terminalEvidenceClosureMatches(
+            aggregate,
+            terminal,
+            decisiveEvidence,
         );
-        if (decisiveKind === "winner") {
-            conclusionBound = canonicalEqual(
-                terminal?.evidenceClosure?.scientificConclusion,
-                deriveScientificConclusion(
-                    aggregate,
-                    terminal?.evidenceId,
-                ),
-            );
-        } else if (decisiveKind === "candidate_cohort") {
-            const cohort = aggregate.scientificReplay?.candidateCohort;
-            const evidenceIds = cohort?.cohort?.map(
-                (candidate) => candidate.evidenceId,
-            ) ?? [];
-            conclusionBound = canonicalEqual(
-                terminal?.evidenceClosure?.candidateCohort,
-                cohort,
-            ) && canonicalEqual(
-                terminal?.evidenceClosure?.scientificConclusions,
-                evidenceIds.map((evidenceId) =>
-                    deriveScientificConclusion(aggregate, evidenceId)),
-            ) && terminal?.evidenceClosure?.relationEvidence
-                ?.comparisonHash === cohort?.comparisonHash
-                && terminal.evidenceClosure.relationEvidence
-                    .relationEvidenceHash === cohort?.relationEvidenceHash;
-        }
-    } catch {
-        return false;
-    }
-    return terminal?.evidenceClosure !== null
-        && typeof terminal?.evidenceClosure === "object"
-        && terminal.evidenceClosure.decisive?.kind === decisiveKind
-        && isAlgorithmTaggedSha256(terminal.evidenceClosure.closureRoot)
-        && terminal.evidenceClosure.scientificReplay !== undefined
-        && canonicalEqual(
-            terminal.evidenceClosure.scientificReplay,
-            replaySummary,
-        )
-        && scientificEvidenceBindingsValid(aggregate)
-        && conclusionBound;
 }
 
 function resolvedCohortEvidence(aggregate, incumbent = null) {
@@ -491,6 +457,7 @@ export function assessVerifiedResultReadiness(aggregate, incumbent = null) {
 
 export function assessTargetUnreachableReadiness(aggregate, evidence) {
     const policy = aggregate.contract.scientificTerminalPolicy;
+    const coverage = deriveUnreachableCoverageClosure(aggregate);
     const observation = ownEntry(
         aggregate.observations,
         evidence?.observationId,
@@ -501,31 +468,173 @@ export function assessTargetUnreachableReadiness(aggregate, evidence) {
     )?.command ?? null;
     const verifierRole =
         aggregate.contract.harnessSuite.roles.impossibility_verifier ?? null;
-    const independentVerifierRoleBound = verifierRole !== null
+    const measurement = evidence?.receipt?.provenance?.measurements?.[0] ?? null;
+    const execution = observation === null
+        ? null
+        : verifiedImpossibilityExecutionFor(
+            aggregate,
+            observation.observationId,
+            observation.verifierExecution ?? null,
+        );
+    const facts = execution?.facts ?? null;
+    const securityContext =
+        execution?.executionIdentity?.sandbox?.policyIdentity?.securityContext
+            ?? null;
+    const independentVerifierRoleBound = execution !== null
+        && verifierRole !== null
         && command?.kind === "verify_impossibility"
         && command.harnessRole === "impossibility_verifier"
         && command.harnessId === verifierRole.harnessId
         && command.parserVersion === verifierRole.parser.version
+        && command.request?.verifier?.executableHash
+            === verifierRole.executableHash
+        && command.request?.verifier?.applicationEntrypointHash
+            === verifierRole.applicationEntrypointHash
+        && command.request?.verifier?.parser?.sourceHash
+            === verifierRole.parser.sourceHash
+        && command.request?.verifier?.independenceAttestation?.kind
+            === "operator_attested_separate_implementation"
         && evidence?.harnessId === verifierRole.harnessId
-        && evidence?.parserVersion === verifierRole.parser.version;
+        && evidence?.parserVersion === verifierRole.parser.version
+        && measurement?.sandboxPolicy?.kind === "sandbox"
+        && execution.executionIdentity.harnessId === verifierRole.harnessId
+        && execution.executionIdentity.harnessEntryHash
+            === verifierRole.harnessEntryHash
+        && execution.executionIdentity.executableHash
+            === verifierRole.executableHash
+        && execution.executionIdentity.stagedExecutableHash
+            === verifierRole.executableHash
+        && execution.executionIdentity.applicationEntrypointHash
+            === verifierRole.applicationEntrypointHash
+        && canonicalEqual(
+            execution.executionIdentity.parserIdentity,
+            verifierRole.parser,
+        )
+        && execution.executionIdentity.sandbox?.policyDigest
+            === verifierRole.sandboxIdentity.policyDigest
+        && securityContext?.appContainer === true
+        && securityContext?.lowIntegrity === true
+        && Array.isArray(securityContext.capabilities)
+        && securityContext.capabilities.length === 0
+        && execution.measurement.receiptHash === measurement?.receiptHash
+        && execution.effectBinding.effectAttempt.attemptId
+            === evidence?.receipt?.attemptId
+        && execution.effectBinding.runnerEpochId
+            === evidence?.receipt?.runnerEpochId
+        && isAlgorithmTaggedSha256(
+            execution.executionIdentity.identity,
+        );
+    const reevaluationFactsBound =
+        facts?.mode === "enumerand_reexecution"
+        && Array.isArray(facts.enumerandObservations)
+        && facts.enumerandObservations.length === facts.enumerandCount
+        && facts.checkedEnumerandCount === facts.enumerandCount
+        && facts.enumerandObservations.every((item, index) => {
+            const input = command?.request?.reevaluation?.enumerands?.[index];
+            return input?.ordinal === item.ordinal
+                && input.enumerandHash === item.enumerandHash
+                && input.inputRoot === item.inputRoot
+                && input.receiptBindingsRoot === item.receiptBindingsRoot
+                && item.inputArtifact?.artifactId !== undefined
+                && isAlgorithmTaggedSha256(item.observationHash)
+                && isAlgorithmTaggedSha256(
+                    item.checkerReceipt?.receiptHash,
+                )
+                && item.claimStates.every((claim) =>
+                    claim.state === "REFUTED");
+        });
+    const certificateFactsBound =
+        facts?.mode === "certificate_validation"
+        && execution?.proof?.sizeBytes > 0
+        && execution.proof.artifactHash === command?.proofArtifactHash
+        && facts.proofCheckerReceipt?.proofArtifactHash
+            === command?.proofArtifactHash
+        && facts.proofCheckerReceipt?.proofCheckerIdentity
+            === command?.request?.verifier?.proofChecker?.identity
+        && isAlgorithmTaggedSha256(
+            facts.proofCheckerReceipt?.receiptHash,
+        );
+    const independentlyDerivedVerifierFacts = facts !== null
+        && facts.status === "VERIFIED"
+        && facts.verdict === "target_unreachable"
+        && facts.complete === true
+        && facts.disagreementCount === 0
+        && isAlgorithmTaggedSha256(facts.factsRoot)
+        && (reevaluationFactsBound || certificateFactsBound);
+    const verifierClosureBound = coverage.eligible
+        && command?.request?.evidence?.coverageClosureRoot
+            === coverage.closure.closureRoot
+        && canonicalEqual(
+            command?.request?.evidence?.coverageClosure ?? null,
+            coverage.closure,
+        )
+        && command?.proposedCertificate?.coverageClosureRoot
+            === coverage.closure.closureRoot
+        && command?.proposedCertificate?.objectManifestRoot
+            === command?.request?.objectManifest?.root
+        && command?.proposedCertificate?.proofArtifactHash
+            === command?.proofArtifactHash
+        && command?.request?.proofArtifact?.artifactHash
+            === command?.proofArtifactHash
+        && command?.proofArtifactHash
+            !== command?.proposedCertificateArtifactHash
+        && evidence?.unreachableBasis?.coverageClosureRoot
+            === coverage.closure.closureRoot
+        && evidence?.unreachableBasis?.enumerandManifestRoot
+            === coverage.closure.manifest.merkleRoot
+        && evidence?.unreachableBasis?.alphaLedgerRoot
+            === coverage.closure.alphaLedgerRoot
+        && isAlgorithmTaggedSha256(
+            evidence?.unreachableBasis?.enumerandResultsRoot,
+        )
+        && evidence?.unreachableBasis?.verifierExecutionIdentity
+            === execution?.executionIdentity?.identity
+        && evidence?.unreachableBasis?.verifierFactsRoot
+            === facts?.factsRoot
+        && facts?.coverageClosureRoot === coverage.closure.closureRoot
+        && facts?.enumerandManifestRoot
+            === coverage.closure.manifest.merkleRoot
+        && facts?.alphaLedgerRoot === coverage.closure.alphaLedgerRoot
+        && independentlyDerivedVerifierFacts;
     const independentVerifierSupported = evidence !== null
         && evidence?.sourceKind === "harness"
         && evidence?.purpose === "impossibility"
         && evidence?.invalidated !== true
         && evidence?.unreachableBasis !== null
         && evidence?.unreachableBasis !== undefined
+        && evidence.unreachableBasis.kind === "v4_unreachable"
+        && evidence.unreachableBasis.checkerStatus === "VERIFIED"
         && isAlgorithmTaggedSha256(evidence?.commitEventHash)
-        && independentVerifierRoleBound;
+        && independentVerifierRoleBound
+        && verifierClosureBound;
+    const missing = [];
+    if (!coverage.eligible) {
+        missing.push(...coverage.missing);
+    }
+    if (policy.targetUnreachable.independentVerifierRequired
+        && !independentVerifierSupported) {
+        missing.push("independent_impossibility_verifier_evidence");
+    }
+    if (!independentlyDerivedVerifierFacts) {
+        missing.push("independently_derived_impossibility_verifier_facts");
+    }
     return immutableCanonical({
-        ready: !policy.targetUnreachable.independentVerifierRequired
-            || independentVerifierSupported,
+        ready: missing.length === 0,
         policyVersion: policy.version,
         independentVerifierSupported,
         independentVerifierRoleBound,
-        missing: policy.targetUnreachable.independentVerifierRequired
-                && !independentVerifierSupported
-            ? ["independent_impossibility_verifier_evidence"]
-            : [],
+        independentlyDerivedVerifierFacts,
+        verifierClosureBound,
+        coverageComplete: coverage.eligible,
+        coverageClosureRoot: coverage.closure.closureRoot,
+        independence: {
+            classification:
+                "operator_attested_separate_implementation",
+            applicationClosureSeparated:
+                independentVerifierRoleBound,
+            mathematicallyProven: false,
+        },
+        missing: [...new Set(missing)].sort(),
     });
 }
 
@@ -552,10 +661,11 @@ export function assessPersistedTerminalReadiness(aggregate) {
         const resolved = resolvedCohortEvidence(aggregate, evidence);
         const cohort = resolved.cohort;
         const cohortEvidence = resolved.evidence;
-        const modernBound = cohort?.resolved === true
+        const integrityBound = cohort?.resolved === true
             && cohortEvidence.length > 0
             && cohortEvidence.length === cohort.cohort.length
             && terminal.contractHash === aggregate.contractHash
+            && terminal.cohortStatus === cohort.status
             && Array.isArray(terminal.candidateIds)
             && canonicalEqual(
                 terminal.candidateIds,
@@ -574,21 +684,23 @@ export function assessPersistedTerminalReadiness(aggregate) {
             && terminal.cohortComparisonHash === cohort.comparisonHash
             && terminal.relationEvidenceHash
                 === cohort.relationEvidenceHash
+            && (cohort.status === "UNIQUE_BEST"
+                ? terminal.candidateId === cohortEvidence[0].candidateId
+                    && terminal.evidenceId === cohortEvidence[0].evidenceId
+                    && terminal.evidenceHash
+                        === cohortEvidence[0].commitEventHash
+                : terminal.candidateId === null
+                    && terminal.evidenceId === null
+                    && terminal.evidenceHash === null)
             && terminalClosureBound(
                 aggregate,
                 terminal,
-                "candidate_cohort",
+                cohortEvidence,
             );
-        const legacyBound = commonBound
-            && evidence.sourceKind === "harness"
-            && evidence.purpose === "candidate"
-            && terminal.candidateId === evidence.candidateId
-            && terminalClosureBound(aggregate, terminal, "winner");
-        const integrityBound = modernBound || legacyBound;
         const scientific = integrityBound
             ? assessVerifiedResultReadiness(
                 aggregate,
-                modernBound ? cohort : evidence,
+                cohort,
             )
             : null;
         return immutableCanonical({
@@ -612,7 +724,7 @@ export function assessPersistedTerminalReadiness(aggregate) {
             && terminalClosureBound(
                 aggregate,
                 terminal,
-                "impossibility_certificate",
+                evidence,
             );
         const scientific = integrityBound
             ? assessTargetUnreachableReadiness(aggregate, evidence)

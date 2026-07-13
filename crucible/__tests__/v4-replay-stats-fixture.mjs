@@ -665,6 +665,26 @@ function appendReservedAndDispatched(adapter) {
     };
 }
 
+function persistOperationalMeasurements(adapter, observation) {
+    for (const measurement of observation.receipt.provenance.measurements) {
+        adapter.ingestOperationalEvidence({
+            attemptId:
+                `fixture-${observation.commandId}-${measurement.subjectId}`,
+            evidenceKind:
+                `measurement:${observation.commandId}:${
+                    measurement.subjectId
+                }`,
+            kind: "runtime:measurement",
+            payload: {
+                commandId: observation.commandId,
+                purpose: observation.purpose,
+                measurementSubjectId: measurement.subjectId,
+                measurementProvenance: measurement,
+            },
+        });
+    }
+}
+
 export function createReplayStatsFixture(root, {
     receiptMutation = null,
 } = {}) {
@@ -789,6 +809,7 @@ export function createReplayStatsFixture(root, {
             ["known-bad", snapshotProvenance(badRef)],
         ]),
     });
+    persistOperationalMeasurements(adapter, validation);
     adapter.appendDomainEvent(
         constructHarnessObservedEvent(
             adapter.replay().aggregate,
@@ -816,6 +837,7 @@ export function createReplayStatsFixture(root, {
         controlSnapshot: snapshotProvenance(controlRef),
         receiptMutation,
     });
+    persistOperationalMeasurements(adapter, candidate);
     adapter.appendDomainEvent(
         constructHarnessObservedEvent(
             adapter.replay().aggregate,
@@ -851,6 +873,7 @@ export function createReplayStatsFixture(root, {
             candidateScore,
             receiptMutation,
         });
+        persistOperationalMeasurements(adapter, observation);
         adapter.appendDomainEvent(
             constructHarnessObservedEvent(
                 adapter.replay().aggregate,

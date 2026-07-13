@@ -1560,13 +1560,28 @@ function normalizeHarnessSuiteContract(value, identity, goalMode, topology) {
             );
         }
     }
-    const parserVersions = new Set(
-        Object.values(suite.roles).map((role) => role.parser.version),
+    const primaryParserVersions = new Set(
+        [
+            "calibration",
+            "search",
+            "confirmation",
+            "challenge",
+            "novelty",
+        ].map((role) => suite.roles[role].parser.version),
     );
-    if (parserVersions.size !== 1) {
+    if (primaryParserVersions.size !== 1) {
         throw new ContractError(
-            "HarnessSuiteV4 roles must use one trusted parser version",
-            { parserVersions: [...parserVersions].sort() },
+            "HarnessSuiteV4 primary roles must use one trusted parser version",
+            { parserVersions: [...primaryParserVersions].sort() },
+        );
+    }
+    const verifierParser =
+        suite.roles.impossibility_verifier?.parser.version ?? null;
+    if (verifierParser !== null
+        && primaryParserVersions.has(verifierParser)) {
+        throw new ContractError(
+            "HarnessSuiteV4 impossibility verifier must use a distinct parser implementation",
+            { verifierParser },
         );
     }
     return { suite, identity: actualIdentity };
@@ -2114,18 +2129,30 @@ function normalizeEnumerandContract(
     hypothesisPolicy,
 ) {
     const requiresManifest =
-        topology === "finite_enumerable" || topology === "bounded_parameterized";
+        topology === "finite_enumerable"
+        || topology === "bounded_parameterized"
+        || topology === "certified_impossibility";
     const hasManifest = input !== undefined && input !== null;
     if (requiresManifest !== hasManifest) {
         throw new ContractError(
             requiresManifest
-                ? "enumerandManifest is required for finite_enumerable and bounded_parameterized topologies"
+                ? "enumerandManifest is required for finite_enumerable, bounded_parameterized, and certified_impossibility topologies"
                 : "enumerandManifest is forbidden for non-enumerable topologies",
         );
     }
     if (!hasManifest) return null;
+    const enumerandTopology = topology === "certified_impossibility"
+        ? input?.topology
+        : topology;
+    if (topology === "certified_impossibility"
+        && enumerandTopology !== "finite_enumerable"
+        && enumerandTopology !== "bounded_parameterized") {
+        throw new ContractError(
+            "certified_impossibility enumerandManifest must declare finite_enumerable or bounded_parameterized topology",
+        );
+    }
     const manifest = normalizeEnumerandManifest(input, {
-        topology,
+        topology: enumerandTopology,
         observableRegistry,
         hypothesisPolicy,
     });

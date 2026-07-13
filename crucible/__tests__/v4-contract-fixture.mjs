@@ -8,9 +8,11 @@ import {
 } from "../domain/index.mjs";
 import {
     PARSER_VERSION,
+    VERIFIER_PARSER_VERSION,
     PARSER_SOURCE_HASH_ALGORITHM,
     PARSER_VERSION_HASH_ALGORITHM,
     computeHarnessSuiteV4Identity,
+    applicationEntrypointHashForEntry,
     hashHarnessEnvironmentV4,
     hashHarnessObservableSchemaV4,
     hashHarnessRoleConfigV4,
@@ -49,18 +51,25 @@ const DEFAULT_CASES = Object.freeze({
 });
 
 function roleIdentity(role, cases, executesCandidateCode = false) {
+    const verifier = role === "impossibility_verifier";
     const roleConfig = {
         ...ROLE_CONFIG,
-        executesCandidateCode,
+        executesCandidateCode: verifier ? true : executesCandidateCode,
     };
+    const executableHash = tagged(`${role}-executable`);
     return {
         harnessId: `${role.replaceAll("_", "-")}-harness`,
         harnessEntryHash: tagged(`${role}-entry`),
-        executableHash: tagged(`${role}-executable`),
+        executableHash,
+        applicationEntrypointHash: executableHash,
         parser: {
-            version: PARSER_VERSION,
-            versionHash: tagged("parser-version"),
-            sourceHash: tagged("parser-source"),
+            version: verifier ? VERIFIER_PARSER_VERSION : PARSER_VERSION,
+            versionHash: tagged(
+                verifier ? "verifier-parser-version" : "parser-version",
+            ),
+            sourceHash: tagged(
+                verifier ? "verifier-parser-source" : "parser-source",
+            ),
         },
         dependencies: [],
         configHash: hashHarnessRoleConfigV4(roleConfig),
@@ -74,17 +83,29 @@ function roleIdentity(role, cases, executesCandidateCode = false) {
         })),
         deterministicSeed: `seed-${role}`,
         sandboxIdentity: {
-            required: executesCandidateCode,
-            policyDigest: executesCandidateCode
+            required: verifier ? true : executesCandidateCode,
+            policyDigest: verifier || executesCandidateCode
                 ? tagged("sandbox-policy")
                 : null,
         },
+        ...(verifier
+            ? {
+                independenceAttestation: {
+                    kind: "operator_attested_separate_implementation",
+                },
+                verificationPolicy: {
+                    mode: "enumerand_reexecution",
+                    certificateFormat: null,
+                },
+            }
+            : {}),
     };
 }
 
 export function fakeHarnessSuiteV4({
     includeVerifier = false,
     executesCandidateCode = false,
+    verifierSandboxPolicyDigest = null,
     cases = DEFAULT_CASES,
     id = "fixture-suite",
 } = {}) {
@@ -103,6 +124,10 @@ export function fakeHarnessSuiteV4({
             [],
             executesCandidateCode,
         );
+        if (verifierSandboxPolicyDigest !== null) {
+            roles.impossibility_verifier.sandboxIdentity.policyDigest =
+                verifierSandboxPolicyDigest;
+        }
     }
     return {
         version: 4,
@@ -135,16 +160,30 @@ export function buildHarnessSuiteForAllowlist(
         sharedPlatformDependencies = [],
     },
 ) {
-    const parserPath = fileURLToPath(
-        new URL("../measurement/parser.mjs", import.meta.url),
-    );
-    const parser = {
-        version: PARSER_VERSION,
-        versionHash: hashCanonical(
-            { parserVersion: PARSER_VERSION },
-            PARSER_VERSION_HASH_ALGORITHM,
-        ),
-        sourceHash: sha256File(parserPath, PARSER_SOURCE_HASH_ALGORITHM),
+    const parserForRole = (role) => {
+        const verifier = role === "impossibility_verifier";
+        const parserVersion = verifier
+            ? VERIFIER_PARSER_VERSION
+            : PARSER_VERSION;
+        const parserPath = fileURLToPath(
+            new URL(
+                verifier
+                    ? "../measurement/verifier-parser.mjs"
+                    : "../measurement/parser.mjs",
+                import.meta.url,
+            ),
+        );
+        return {
+            version: parserVersion,
+            versionHash: hashCanonical(
+                { parserVersion },
+                PARSER_VERSION_HASH_ALGORITHM,
+            ),
+            sourceHash: sha256File(
+                parserPath,
+                PARSER_SOURCE_HASH_ALGORITHM,
+            ),
+        };
     };
     const sharedKeys = new Set(sharedPlatformDependencies.map((dependency) =>
         `${dependency.role}\0${dependency.sha256}`));
@@ -164,7 +203,9 @@ export function buildHarnessSuiteForAllowlist(
             harnessId: selectedHarnessId,
             harnessEntryHash: verified.entryHash,
             executableHash: verified.executableHash,
-            parser,
+            applicationEntrypointHash:
+                applicationEntrypointHashForEntry(entry),
+            parser: parserForRole(role),
             dependencies: verified.dependencies.map((dependency) => ({
                 role: dependency.role,
                 sha256: dependency.sha256,
@@ -188,6 +229,17 @@ export function buildHarnessSuiteForAllowlist(
                     ? sandboxPolicyDigest
                     : null,
             },
+            ...(role === "impossibility_verifier"
+                ? {
+                    independenceAttestation: {
+                        kind: "operator_attested_separate_implementation",
+                    },
+                    verificationPolicy: {
+                        mode: "enumerand_reexecution",
+                        certificateFormat: null,
+                    },
+                }
+                : {}),
         };
     };
     const roles = {};
@@ -351,16 +403,19 @@ export function fakeEnumerandManifest(
     topology,
     ids = ["candidate-a"],
 ) {
-    if (topology === "finite_enumerable") {
+    if (topology === "finite_enumerable"
+        || topology === "certified_impossibility") {
         return normalizeEnumerandManifest({
-            topology,
+            topology: "finite_enumerable",
             entries: ids.map((id, ordinal) => ({
                 id,
                 ordinal,
                 artifactSnapshotHash:
                     `sha256:${(ordinal + 10).toString(16).padStart(64, "0")}`,
             })),
-            control: { kind: "enumerand", ordinal: 0 },
+            control: topology === "certified_impossibility"
+                ? { kind: "reference", referenceHash: snapshot("f") }
+                : { kind: "enumerand", ordinal: 0 },
         });
     }
     if (topology === "bounded_parameterized") {
@@ -427,9 +482,9 @@ export function makeV4ContractInput(overrides = {}) {
             ? {
                 impossibilityPolicy: {
                     trigger: "search_exhausted",
-                    requestVersion: "crucible-impossibility-request-v1",
+                    requestVersion: "crucible-impossibility-request-v2",
                     certificateVersion:
-                        "crucible-impossibility-certificate-v1",
+                        "crucible-impossibility-certificate-v2",
                 },
             }
             : {}),
@@ -459,8 +514,10 @@ export function upgradeLegacyContractInput(input) {
             item.expectation,
         ])
         : DEFAULT_CASES.calibration;
-    const suite = fakeHarnessSuiteV4({
+    const suite = input.harnessSuite ?? fakeHarnessSuiteV4({
         includeVerifier: topology === "certified_impossibility",
+        verifierSandboxPolicyDigest:
+            input.verifierSandboxPolicyDigest ?? null,
         cases: {
             ...DEFAULT_CASES,
             calibration: legacyCalibration,

@@ -1,414 +1,186 @@
-import { afterEach, describe, expect, it } from "vitest";
-import fs from "node:fs";
-import path from "node:path";
-import { createHash } from "node:crypto";
-import { fileURLToPath } from "node:url";
+import { describe, expect, it } from "vitest";
 
 import {
-    artifactRefsFromProvenance,
-    canonicalJson,
-    scientificReplaySummary,
+    createInvestigationContract,
+    createRawMeasurementSeries,
+    deriveReplicationSchedule,
+    deriveStatisticalCacheDigest,
+    evaluateReplicatedStatisticalClaims,
+    evaluateReplicationProgress,
+    hashCanonical,
+    normalizeRawMeasurementSeries,
+    replicationBlockPlan,
 } from "../domain/index.mjs";
 import {
-    BUNDLE_ERROR_CODES,
-    exportBundle,
-    importBundle,
-    canonicalize,
-    openRepositoryReadOnly,
-    readBundleManifest,
-} from "../persistence/index.mjs";
-import { createDomainRepositoryAdapter } from "../runtime/index.mjs";
-import { removeTreeRobust } from "./test-cleanup.mjs";
-import { createReplayStatsFixture } from "./v4-replay-stats-fixture.mjs";
+    fakeStatisticalPolicy,
+    makeV4ContractInput,
+} from "./v4-contract-fixture.mjs";
 
-const HERE = path.dirname(fileURLToPath(import.meta.url));
-const roots = [];
-const fixtures = [];
-
-function makeRoot(label) {
-    const root = fs.mkdtempSync(
-        path.join(HERE, `.v4-replay-stats-${label}-`),
-    );
-    roots.push(root);
-    return root;
+function fixture() {
+    const contract = createInvestigationContract(makeV4ContractInput({
+        statisticalPolicy: fakeStatisticalPolicy({
+            minBlocks: 1,
+            maxBlocks: 2,
+        }),
+    }));
+    const schedule = deriveReplicationSchedule({
+        contractHash: hashCanonical(contract),
+        statisticalPolicy: contract.statisticalPolicy,
+        subject: {
+            kind: "candidate",
+            index: 0,
+            id: "candidate-fast",
+            identity: hashCanonical({
+                kind: "candidate",
+                id: "candidate-fast",
+            }),
+        },
+    });
+    return { contract, schedule };
 }
 
-function trackedFixture(label, options = {}) {
-    const fixture = createReplayStatsFixture(makeRoot(label), options);
-    fixtures.push(fixture);
-    return fixture;
+function attemptsFor(schedule, blockCount = 2) {
+    return Array.from({ length: blockCount }, (_unused, blockIndex) =>
+        replicationBlockPlan(schedule, blockIndex).arms.map((arm) => {
+            const score = arm.armId === "candidate" ? 1 : 0;
+            return {
+                ...arm,
+                attemptId: `attempt-${blockIndex}-${arm.armIndex}`,
+                parsed: {
+                    pass: score >= 0.8,
+                    metrics: { score },
+                    role: "search",
+                    phase: "search",
+                    replicateIndex: arm.replicateIndex,
+                    blockIndex: arm.blockIndex,
+                    armIndex: arm.armIndex,
+                    armId: arm.armId,
+                    deterministicSeed: arm.deterministicSeed,
+                    subjectId: arm.subjectId,
+                },
+                invalid: null,
+                receiptHash: hashCanonical({
+                    kind: "receipt",
+                    subjectId: arm.subjectId,
+                }),
+                measurementRoot: hashCanonical({
+                    kind: "measurement",
+                    subjectId: arm.subjectId,
+                }),
+            };
+        })).flat();
 }
 
-function objectPathForArtifact(manifest, artifactId) {
-    const artifact = manifest.artifacts.find(
-        (item) => item.artifactId === artifactId,
-    );
-    const object = manifest.objects.find(
-        (item) => item.id === artifact?.object,
-    );
-    if (object === undefined) {
-        throw new Error(`bundle object for ${artifactId} is missing`);
-    }
-    return object.path;
+function makeSeries(schedule, attempts = attemptsFor(schedule)) {
+    return createRawMeasurementSeries({
+        schedule,
+        attempts,
+        role: "search",
+        phase: "search",
+        caseId: null,
+    });
 }
 
-function regenerateInventory(bundleDir) {
-    const files = [];
-    const walk = (directory, prefix = "") => {
-        for (const name of fs.readdirSync(directory).sort()) {
-            const absolute = path.join(directory, name);
-            const relative = prefix === "" ? name : `${prefix}/${name}`;
-            const stat = fs.lstatSync(absolute);
-            if (stat.isDirectory()) {
-                walk(absolute, relative);
-            } else if (relative !== "inventory.sha256") {
-                files.push({ absolute, relative });
-            }
-        }
+function normalizeSeries(schedule, series) {
+    return normalizeRawMeasurementSeries(series, {
+        schedule,
+        role: "search",
+        phase: "search",
+        caseId: null,
+    });
+}
+
+function statisticalCacheCore(contract, schedule, series) {
+    const attempts = normalizeSeries(schedule, series).attempts;
+    const evaluation = evaluateReplicatedStatisticalClaims({
+        contract,
+        schedule,
+        attempts,
+    });
+    const progress = evaluateReplicationProgress({
+        contract,
+        schedule,
+        attempts,
+    });
+    const accepted = evaluation.requiredState === "SUPPORTED";
+    return {
+        version: 2,
+        purpose: "candidate",
+        replication: {
+            version: 3,
+            scheduleHash: evaluation.scheduleHash,
+            minBlocks: schedule.minBlocks,
+            maxBlocks: schedule.maxBlocks,
+            blockCount: evaluation.blockCount,
+            attemptCount: evaluation.attemptCount,
+            blockLedgerHash: evaluation.blockLedger.hash,
+            statisticalState: evaluation.requiredState,
+            evaluationHash: evaluation.evaluationHash,
+            stopping: progress.stopping,
+            stoppingDigest: progress.stoppingDigest,
+            control: null,
+            controlTolerance: evaluation.controlTolerance,
+        },
+        metrics: evaluation.metrics,
+        rankable: contract.metrics.every((metric) =>
+            Number.isFinite(evaluation.metrics[metric.key])),
+        outcomeClass: accepted ? "accepted" : "rejected",
+        acceptanceSatisfied: accepted,
+        statisticalEvaluation: evaluation,
+        predictionEvaluation: null,
     };
-    walk(bundleDir);
-    const lines = files
-        .sort((left, right) => left.relative.localeCompare(right.relative))
-        .map(({ absolute, relative }) =>
-            `${createHash("sha256").update(fs.readFileSync(absolute)).digest("hex")}  ${relative}`);
-    fs.writeFileSync(
-        path.join(bundleDir, "inventory.sha256"),
-        `${lines.join("\n")}\n`,
-    );
 }
 
-afterEach(async () => {
-    for (const fixture of fixtures.splice(0)) {
-        try {
-            fixture.close();
-        } catch {
-            // Already closed by the test.
+describe("v4 raw-block replay statistics", () => {
+    it("derives canonical raw blocks from unordered attempts", () => {
+        const { schedule } = fixture();
+        const series = makeSeries(
+            schedule,
+            attemptsFor(schedule).reverse(),
+        );
+
+        expect(series.completeBlocks.map((block) => block.blockIndex))
+            .toEqual([0, 1]);
+        for (const block of series.completeBlocks) {
+            expect(block.observations.map((item) => item.armIndex))
+                .toEqual([0, 1]);
         }
-    }
-    for (const root of roots.splice(0)) {
-        await removeTreeRobust(root, {
-            label: "v4 replay statistics test root",
-            timeoutMs: 30_000,
-        });
-    }
-});
-
-describe("v4 raw-authority replay statistics", () => {
-    it("replays through a read-only repository without mutating persisted state", () => {
-        const fixture = trackedFixture("read-only");
-        const expected = fixture.replay.scientificReplay;
-        fixture.close();
-        fixtures.splice(fixtures.indexOf(fixture), 1);
-        const beforeBytes = fs.readFileSync(fixture.dbFile);
-
-        const repository = openRepositoryReadOnly({
-            file: fixture.dbFile,
-        });
-        try {
-            const replay = createDomainRepositoryAdapter({
-                repository,
-                investigationId: fixture.investigationId,
-                ensure: false,
-            }).replayScientific();
-            expect(canonicalJson(replay.scientificReplay))
-                .toBe(canonicalJson(expected));
-            expect(scientificReplaySummary(replay.scientificReplay)).toEqual(
-                scientificReplaySummary(replay.aggregate.scientificReplay),
-            );
-        } finally {
-            repository.close();
-        }
-        expect(fs.readFileSync(fixture.dbFile)).toEqual(beforeBytes);
-        expect(fs.readFileSync(fixture.dbFile)).toEqual(beforeBytes);
+        expect(normalizeSeries(schedule, series).attempts).toHaveLength(4);
     });
 
-    it("round-trips every raw receipt artifact and reproduces scientific bytes", () => {
-        const fixture = trackedFixture("bundle");
-        const bundleDir = path.join(fixture.root, "bundle");
-        const importedDir = path.join(fixture.root, "imported");
-        const exported = exportBundle({
-            store: fixture.store,
-            dbFile: fixture.dbFile,
-            destDir: bundleDir,
-            investigationId: fixture.investigationId,
-            now: () => "2026-07-12T00:00:00.000Z",
-        });
-        const manifest = readBundleManifest(bundleDir);
-        expect(manifest.scientificReplay).toEqual(
-            scientificReplaySummary(
-                fixture.replay.scientificReplay,
-                fixture.replay.aggregate.terminal,
-            ),
+    it("changes the statistical cache digest when raw block facts change", () => {
+        const { contract, schedule } = fixture();
+        const original = makeSeries(schedule);
+        const staleDigest = deriveStatisticalCacheDigest(
+            statisticalCacheCore(contract, schedule, original),
         );
-
-        const expectedArtifactIds = new Set();
-        const receiptArtifactIds = [];
-        const scheduleArtifactIds = [];
-        for (const evidenceId of fixture.replay.aggregate.evidenceOrder) {
-            const evidence = fixture.replay.aggregate.evidence[evidenceId];
-            receiptArtifactIds.push(
-                ...evidence.receipt.provenance.measurements.map(
-                    (measurement) => measurement.receiptArtifact.artifactId,
-                ),
-            );
-            if (evidence.receipt.provenance.replicationScheduleArtifact !== null) {
-                scheduleArtifactIds.push(
-                    evidence.receipt.provenance.replicationScheduleArtifact
-                        .artifactId,
-                );
-            }
-            for (const artifact of artifactRefsFromProvenance(
-                evidence.receipt.provenance,
-            )) {
-                expectedArtifactIds.add(artifact.artifactId);
-            }
-        }
-        expect(manifest.artifacts.map((item) => item.artifactId))
-            .toEqual([...expectedArtifactIds].sort());
-        expect(receiptArtifactIds.length).toBeGreaterThan(0);
-        expect(scheduleArtifactIds.length).toBeGreaterThan(0);
-        expect(receiptArtifactIds.every((artifactId) =>
-            expectedArtifactIds.has(artifactId))).toBe(true);
-        expect(scheduleArtifactIds.every((artifactId) =>
-            expectedArtifactIds.has(artifactId))).toBe(true);
-
-        const imported = importBundle({
-            bundleDir,
-            destDir: importedDir,
-            expectedDigest: exported.digest,
-        });
-        expect(imported.scientificReplay).toEqual(
-            manifest.scientificReplay,
+        const changed = structuredClone(original);
+        const candidate = changed.completeBlocks[0].observations.find(
+            (item) => item.armId === "candidate",
         );
+        candidate.parsed.pass = false;
+        candidate.parsed.metrics.score = 0.25;
 
-        const importedRepository = openRepositoryReadOnly({
-            file: path.join(importedDir, "db", "database.sqlite"),
-        });
-        try {
-            const replay = createDomainRepositoryAdapter({
-                repository: importedRepository,
-                investigationId: fixture.investigationId,
-                ensure: false,
-            }).replayScientific();
-            const source = fixture.replay.scientificReplay;
-            const restored = replay.scientificReplay;
-            expect(Buffer.from(canonicalJson(
-                replay.aggregate.contract.statisticalPolicy,
-            ))).toEqual(Buffer.from(canonicalJson(
-                fixture.replay.aggregate.contract.statisticalPolicy,
-            )));
-            for (const evidenceId of fixture.replay.aggregate.evidenceOrder) {
-                const sourceEvidence =
-                    fixture.replay.aggregate.evidence[evidenceId];
-                if (sourceEvidence.sourceKind !== "harness"
-                    || (sourceEvidence.purpose !== "candidate"
-                        && sourceEvidence.purpose !== "validation")) {
-                    continue;
-                }
-                const restoredEvidence = replay.aggregate.evidence[evidenceId];
-                const sourceObservation = fixture.replay.aggregate.observations[
-                    sourceEvidence.observationId
-                ];
-                const restoredObservation = replay.aggregate.observations[
-                    restoredEvidence.observationId
-                ];
-                const sourceCommand = fixture.replay.aggregate.commands[
-                    sourceObservation.commandId
-                ].command;
-                const restoredCommand = replay.aggregate.commands[
-                    restoredObservation.commandId
-                ].command;
-                expect(Buffer.from(canonicalJson(restoredObservation.receipt)))
-                    .toEqual(Buffer.from(canonicalJson(sourceObservation.receipt)));
-                expect(Buffer.from(canonicalJson(restoredObservation.data)))
-                    .toEqual(Buffer.from(canonicalJson(sourceObservation.data)));
-                expect(Buffer.from(canonicalJson(restoredCommand)))
-                    .toEqual(Buffer.from(canonicalJson(sourceCommand)));
-            }
-            expect(Buffer.from(canonicalJson(restored.scientificAggregate)))
-                .toEqual(Buffer.from(canonicalJson(source.scientificAggregate)));
-            expect(Buffer.from(canonicalJson(restored.claimStates)))
-                .toEqual(Buffer.from(canonicalJson(source.claimStates)));
-            expect(Buffer.from(canonicalJson(restored.alphaLedger)))
-                .toEqual(Buffer.from(canonicalJson(source.alphaLedger)));
-            expect(restored.closureRoot).toBe(source.closureRoot);
-            expect(scientificReplaySummary(restored))
-                .toEqual(scientificReplaySummary(source));
-        } finally {
-            importedRepository.close();
-        }
+        expect(deriveStatisticalCacheDigest(
+            statisticalCacheCore(contract, schedule, changed),
+        )).not.toBe(staleDigest);
     });
 
-    it("rejects a self-checksummed bundle whose replay digest cache was tampered", () => {
-        const fixture = trackedFixture("bundle-cache-tamper");
-        const bundleDir = path.join(fixture.root, "bundle");
-        exportBundle({
-            store: fixture.store,
-            dbFile: fixture.dbFile,
-            destDir: bundleDir,
-            investigationId: fixture.investigationId,
-            now: () => "2026-07-12T00:00:00.000Z",
-        });
-        const manifestPath = path.join(bundleDir, "manifest.json");
-        const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
-        manifest.scientificReplay.scientificAggregateHash =
-            `sha256:crucible-scientific-aggregate-v1:${"0".repeat(64)}`;
-        fs.writeFileSync(
-            manifestPath,
-            `${canonicalize(manifest)}\n`,
-        );
-        regenerateInventory(bundleDir);
+    it("rejects a raw block with a missing scheduled arm", () => {
+        const { schedule } = fixture();
+        const incomplete = structuredClone(makeSeries(schedule));
+        incomplete.completeBlocks[0].observations.pop();
 
-        expect(() => importBundle({
-            bundleDir,
-            destDir: path.join(fixture.root, "tampered-import"),
-            allowUnauthenticated: true,
-        })).toThrow(expect.objectContaining({
-            code: "CRUCIBLE_BUNDLE_CLOSURE_INVALID",
-        }));
+        expect(() => normalizeSeries(schedule, incomplete))
+            .toThrow(/every scheduled arm/u);
     });
 
-    it("rejects a novelty-role receipt whose structural facts were tampered", () => {
-        const fixture = trackedFixture("bundle-novelty-tamper");
-        const bundleDir = path.join(fixture.root, "bundle");
-        exportBundle({
-            store: fixture.store,
-            dbFile: fixture.dbFile,
-            destDir: bundleDir,
-            investigationId: fixture.investigationId,
-            now: () => "2026-07-12T00:00:00.000Z",
-        });
-        const aggregate = fixture.adapter.replay().aggregate;
-        const evidence = aggregate.evidence["replay-candidate-evidence"];
-        const noveltyMeasurement = evidence.receipt.provenance.measurements.find(
-            (measurement) => measurement.role === "novelty",
-        );
-        const manifest = readBundleManifest(bundleDir);
-        const receiptPath = path.join(
-            bundleDir,
-            objectPathForArtifact(
-                manifest,
-                noveltyMeasurement.receiptArtifact.artifactId,
-            ),
-        );
-        const receipt = JSON.parse(fs.readFileSync(receiptPath, "utf8"));
-        receipt.parsed.metrics.nodeCount += 1;
-        fs.writeFileSync(receiptPath, `${canonicalize(receipt)}\n`);
-        regenerateInventory(bundleDir);
+    it("rejects non-canonical complete-block order", () => {
+        const { schedule } = fixture();
+        const reordered = structuredClone(makeSeries(schedule));
+        reordered.completeBlocks.reverse();
 
-        expect(() => importBundle({
-            bundleDir,
-            destDir: path.join(fixture.root, "tampered-novelty-import"),
-            allowUnauthenticated: true,
-        })).toThrow(expect.objectContaining({
-            code: BUNDLE_ERROR_CODES.TAMPER_DETECTED,
-        }));
-    });
-
-    it("rejects tampered, missing, or reordered statistical bundle authority", () => {
-        const fixture = trackedFixture("bundle-raw-authority");
-        const bundleDir = path.join(fixture.root, "bundle");
-        exportBundle({
-            store: fixture.store,
-            dbFile: fixture.dbFile,
-            destDir: bundleDir,
-            investigationId: fixture.investigationId,
-            now: () => "2026-07-12T00:00:00.000Z",
-        });
-        const manifest = readBundleManifest(bundleDir);
-        const candidateEvidence = fixture.replay.aggregate.evidence[
-            "replay-candidate-evidence"
-        ];
-        const receiptArtifactId =
-            candidateEvidence.receipt.provenance.measurements[0]
-                .receiptArtifact.artifactId;
-        const scheduleArtifactId =
-            candidateEvidence.receipt.provenance.replicationScheduleArtifact
-                .artifactId;
-
-        const tamperedDir = path.join(fixture.root, "tampered-receipt");
-        fs.cpSync(bundleDir, tamperedDir, { recursive: true });
-        fs.appendFileSync(
-            path.join(
-                tamperedDir,
-                ...objectPathForArtifact(
-                    manifest,
-                    receiptArtifactId,
-                ).split("/"),
-            ),
-            "\n",
-        );
-        regenerateInventory(tamperedDir);
-        expect(() => importBundle({
-            bundleDir: tamperedDir,
-            destDir: path.join(fixture.root, "tampered-import"),
-            allowUnauthenticated: true,
-        })).toThrow(expect.objectContaining({
-            code: BUNDLE_ERROR_CODES.TAMPER_DETECTED,
-        }));
-
-        const missingDir = path.join(fixture.root, "missing-schedule");
-        fs.cpSync(bundleDir, missingDir, { recursive: true });
-        fs.rmSync(path.join(
-            missingDir,
-            ...objectPathForArtifact(
-                manifest,
-                scheduleArtifactId,
-            ).split("/"),
-        ));
-        regenerateInventory(missingDir);
-        expect(() => importBundle({
-            bundleDir: missingDir,
-            destDir: path.join(fixture.root, "missing-import"),
-            allowUnauthenticated: true,
-        })).toThrow(expect.objectContaining({
-            code: BUNDLE_ERROR_CODES.CLOSURE_INVALID,
-        }));
-
-        const reorderedDir = path.join(fixture.root, "reordered-artifacts");
-        fs.cpSync(bundleDir, reorderedDir, { recursive: true });
-        const manifestPath = path.join(reorderedDir, "manifest.json");
-        const reordered = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
-        reordered.artifacts.reverse();
-        fs.writeFileSync(
-            manifestPath,
-            `${canonicalize(reordered)}\n`,
-        );
-        regenerateInventory(reorderedDir);
-        expect(() => importBundle({
-            bundleDir: reorderedDir,
-            destDir: path.join(fixture.root, "reordered-import"),
-            allowUnauthenticated: true,
-        })).toThrow(expect.objectContaining({
-            code: BUNDLE_ERROR_CODES.MANIFEST_INVALID,
-        }));
-    });
-
-    it("rejects a content-addressed receipt that disagrees with raw replay facts", () => {
-        const fixture = trackedFixture("receipt-fact-mismatch", {
-            receiptMutation({ observationId, arm, parsed }) {
-                if (observationId === "replay-candidate-observation"
-                    && arm.armId === "candidate"
-                    && parsed.role === "search") {
-                    return {
-                        ...parsed,
-                        metrics: {
-                            ...parsed.metrics,
-                            score: parsed.metrics.score - 1,
-                        },
-                    };
-                }
-                return parsed;
-            },
-        });
-        expect(() => exportBundle({
-            store: fixture.store,
-            dbFile: fixture.dbFile,
-            destDir: path.join(fixture.root, "bundle"),
-            investigationId: fixture.investigationId,
-            now: () => "2026-07-12T00:00:00.000Z",
-        })).toThrow(expect.objectContaining({
-            code: BUNDLE_ERROR_CODES.CLOSURE_INVALID,
-        }));
+        expect(() => normalizeSeries(schedule, reordered))
+            .toThrow(/strictly ordered/u);
     });
 });

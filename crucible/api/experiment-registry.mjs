@@ -304,7 +304,7 @@ function normalizeAuthoringManifest(config) {
             }
             : raw.control,
     }, {
-        topology: config.hypothesis_topology,
+        topology: raw.topology,
         observableRegistry: config.observable_registry,
         hypothesisPolicy: config.hypothesis_policy,
     });

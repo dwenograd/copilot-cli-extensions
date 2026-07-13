@@ -34,7 +34,7 @@ export function resolveCommandEnumerand(contract, command) {
     }
     try {
         const manifestOptions = {
-            topology: contract.hypothesisTopology,
+            topology: contract.enumerandManifest.topology,
             observableRegistry: contract.observableRegistry,
             hypothesisPolicy: contract.hypothesisPolicy,
         };

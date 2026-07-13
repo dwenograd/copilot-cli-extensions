@@ -629,6 +629,27 @@ function conclusionLimitations(evidence, support) {
     return limitations;
 }
 
+function heldOutConclusion(aggregate, evidenceId) {
+    const member = aggregate?.scientificReplay?.confirmationState?.members
+        ?.find((item) => item.evidenceId === evidenceId) ?? null;
+    if (member === null) {
+        return {
+            status: "NOT_FROZEN",
+            confirmation: null,
+            challenge: null,
+        };
+    }
+    return {
+        status: member.status,
+        confirmation:
+            member.roles.find((role) => role.role === "confirmation")
+            ?? null,
+        challenge:
+            member.roles.find((role) => role.role === "challenge")
+            ?? null,
+    };
+}
+
 export function deriveScientificConclusion(aggregate, evidenceId) {
     const evidence = ownEntry(aggregate?.evidence, evidenceId);
     const support = aggregate?.scientificReplay?.candidateSupport?.find(
@@ -681,6 +702,9 @@ export function deriveScientificConclusion(aggregate, evidenceId) {
                     evidence,
                     support.active,
                 ),
+                assumptions:
+                    evidence.statisticalEvaluation?.statistics?.assumptions
+                    ?? null,
             },
         },
         hypotheses: {
@@ -690,6 +714,7 @@ export function deriveScientificConclusion(aggregate, evidenceId) {
                 predictionEvaluation?.requiredState ?? "SUPPORTED",
             predictions,
         },
+        heldOut: heldOutConclusion(aggregate, evidenceId),
         limitations: conclusionLimitations(evidence, support),
     };
     return immutableCanonical({

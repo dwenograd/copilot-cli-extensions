@@ -39,7 +39,10 @@ import {
     deriveEvidencePayload,
     normalizeEvidenceProvenance,
 } from "./evidence.mjs";
-import { deriveImpossibilityVerdict } from "./impossibility.mjs";
+import {
+    deriveImpossibilityVerdict,
+    normalizeImpossibilityCheckerResult,
+} from "./impossibility.mjs";
 import { normalizeSealedHypotheses } from "./hypotheses.mjs";
 import {
     ReplicationScheduleError,
@@ -54,6 +57,10 @@ import {
     normalizeNoveltyRoleAttempt,
 } from "../measurement/novelty-role.mjs";
 import { createInitialAggregate } from "./state.mjs";
+import {
+    bindEventImpossibilityExecution,
+    readVerifiedImpossibilityExecutionCapability,
+} from "./private-verifier-execution.mjs";
 
 const RECEIPT_FIELDS = Object.freeze([
     "attemptId",
@@ -558,7 +565,8 @@ function normalizeHarnessReceipt(value, purpose, { command = null, contract = nu
                 schedule,
                 enumerandManifest: contract.enumerandManifest ?? null,
                 manifestOptions: {
-                    topology: contract.hypothesisTopology,
+                    topology: contract.enumerandManifest?.topology
+                        ?? contract.hypothesisTopology,
                     observableRegistry: contract.observableRegistry,
                     hypothesisPolicy: contract.hypothesisPolicy,
                 },
@@ -582,55 +590,42 @@ function normalizeHarnessReceipt(value, purpose, { command = null, contract = nu
     return immutableCanonical(normalized);
 }
 
-function requireBooleanOrNull(value, field) {
-    if (value !== null && typeof value !== "boolean") {
-        throw new TransitionError(
-            ERROR_CODES.INVALID_EVENT,
-            `${field} must be boolean or null`,
-            { field, value },
-        );
-    }
-    return value;
-}
-
 function normalizeImpossibilityData(value, command) {
     const data = requirePlainObject(value, "data");
-    const facts = requirePlainObject(
-        requireOwnField(data, "verifiedFacts", "data.verifiedFacts"),
-        "data.verifiedFacts",
+    let checkerResult;
+    try {
+        checkerResult = normalizeImpossibilityCheckerResult(
+            requireOwnField(data, "checkerResult", "data.checkerResult"),
+            {
+                request: command?.request ?? null,
+                requestHash: command?.requestHash ?? null,
+                binding: command?.measurementBinding ?? null,
+            },
+        );
+    } catch (error) {
+        throw new TransitionError(
+            ERROR_CODES.INVALID_EVENT,
+            `data.checkerResult is invalid: ${error?.message ?? String(error)}`,
+            error?.details ?? null,
+        );
+    }
+    const checkerStatus = requireString(
+        requireOwnField(data, "checkerStatus", "data.checkerStatus"),
+        "data.checkerStatus",
+        32,
     );
-    const normalizedFacts = {
-        pass: (() => {
-            const pass = requireOwnField(facts, "pass", "data.verifiedFacts.pass");
-            if (typeof pass !== "boolean") {
-                throw new TransitionError(
-                    ERROR_CODES.INVALID_EVENT,
-                    "data.verifiedFacts.pass must be boolean",
-                );
-            }
-
-            return pass;
-        })(),
-        searchSpaceExhausted: requireBooleanOrNull(
-            requireOwnField(
-                facts,
-                "searchSpaceExhausted",
-                "data.verifiedFacts.searchSpaceExhausted",
-            ),
-            "data.verifiedFacts.searchSpaceExhausted",
-        ),
-        parserVersion: requireString(
-            requireOwnField(facts, "parserVersion", "data.verifiedFacts.parserVersion"),
-            "data.verifiedFacts.parserVersion",
-            128,
-        ),
-    };
+    if (checkerStatus !== checkerResult.status) {
+        throw new TransitionError(
+            ERROR_CODES.INVALID_EVENT,
+            "data.checkerStatus does not match data.checkerResult.status",
+        );
+    }
     const certificateVerdict = requireOwnField(
         data,
         "certificateVerdict",
         "data.certificateVerdict",
     );
-    const expectedVerdict = deriveImpossibilityVerdict(normalizedFacts);
+    const expectedVerdict = deriveImpossibilityVerdict(checkerResult);
     if (certificateVerdict !== expectedVerdict) {
         throw new TransitionError(
             ERROR_CODES.INVALID_EVENT,
@@ -651,6 +646,7 @@ function normalizeImpossibilityData(value, command) {
     }
     return immutableCanonical({
         certificateVersion,
+        checkerStatus,
         certificateVerdict,
         certificateArtifactHash: requireAlgorithmHash(
             requireOwnField(
@@ -684,7 +680,15 @@ function normalizeImpossibilityData(value, command) {
             ),
             "data.verificationSnapshotHash",
         ),
-        verifiedFacts: normalizedFacts,
+        proposedCertificateArtifactHash: requireAlgorithmHash(
+            requireOwnField(
+                data,
+                "proposedCertificateArtifactHash",
+                "data.proposedCertificateArtifactHash",
+            ),
+            "data.proposedCertificateArtifactHash",
+        ),
+        checkerResult,
     });
 }
 
@@ -897,7 +901,29 @@ export function normalizeCommandObservedPayload(payload, aggregate = null, optio
         requireOwnField(input, "commandId", "commandId"),
         "commandId",
     );
+    const observationId = normalizeEventIdentifier(
+        requireOwnField(input, "observationId", "observationId"),
+        "observationId",
+    );
     const command = ownEntry(aggregate?.commands, commandId)?.command ?? null;
+    const verifiedExecution = purpose === "impossibility"
+        ? readVerifiedImpossibilityExecutionCapability(
+            options.verifierExecutionCapability ?? null,
+            {
+                commandId,
+                observationId,
+                reference: Object.hasOwn(input, "verifierExecution")
+                    ? input.verifierExecution
+                    : null,
+            },
+        )
+        : null;
+    if (purpose === "impossibility" && verifiedExecution === null) {
+        throw new TransitionError(
+            ERROR_CODES.INVALID_EVENT,
+            "Impossibility observations require a runner/domain-adapter verified execution capability",
+        );
+    }
     const commandHypotheses = harnessReplicated
         ? (() => {
             if (command === null || !Object.hasOwn(command, "hypotheses")) {
@@ -964,10 +990,7 @@ export function normalizeCommandObservedPayload(payload, aggregate = null, optio
     }
     return immutableCanonical({
         commandId,
-        observationId: normalizeEventIdentifier(
-            requireOwnField(input, "observationId", "observationId"),
-            "observationId",
-        ),
+        observationId,
         sourceKind,
         purpose,
         harnessId: sourceKind === "harness"
@@ -983,6 +1006,9 @@ export function normalizeCommandObservedPayload(payload, aggregate = null, optio
             )
             : null,
         receipt,
+        ...(purpose === "impossibility"
+            ? { verifierExecution: verifiedExecution.reference }
+            : {}),
         round: harnessCandidate
             ? requirePositiveInteger(round ?? command?.round, "round")
             : null,
@@ -1210,7 +1236,7 @@ export function constructHarnessObservedEvent(aggregate, payload, options = {}) 
         hypothesisPolicy: aggregate.contract.hypothesisPolicy,
         assignedParentEvidenceIds: reserved?.parentEvidenceIds ?? [],
     };
-    return makeEnvelope(
+    const event = makeEnvelope(
         aggregate,
         EVENT_TYPES.COMMAND_OBSERVED,
         normalizeCommandObservedPayload({
@@ -1220,6 +1246,12 @@ export function constructHarnessObservedEvent(aggregate, payload, options = {}) 
             parserVersion: reserved?.parserVersion ?? aggregate.contract.parserVersion,
         }, aggregate, hypothesisOptions),
     );
+    return event.payload.purpose === "impossibility"
+        ? bindEventImpossibilityExecution(
+            event,
+            options.verifierExecutionCapability,
+        )
+        : event;
 }
 
 export function constructModelObservedEvent(aggregate, payload, options = {}) {

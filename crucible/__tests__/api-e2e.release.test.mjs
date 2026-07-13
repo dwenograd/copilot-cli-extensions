@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeAll, describe, expect, it } from "vitest";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
@@ -35,10 +35,19 @@ import {
     createExperimentAuthorityFixture,
     prepareAndSignExperiment,
 } from "./experiment-authority-fixture.mjs";
-import { removeTrackedRoots } from "./test-cleanup.mjs";
+import {
+    removeStaleTestRoots,
+    removeTrackedRoots,
+} from "./test-cleanup.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const roots = [];
+
+beforeAll(async () => {
+    await removeStaleTestRoots(path.dirname(HERE), ".e-", {
+        label: "stale api-e2e test root",
+    });
+});
 
 afterEach(async () => {
     await removeTrackedRoots(roots, {
@@ -353,10 +362,12 @@ describe("joined Crucible API execution", () => {
     it("runs held-out roles before exposing a verified result", async () => {
         const workspace = makeWorkspace();
         const joined = makeDeps(workspace, () => "95\n");
+        const start = startArgs(workspace);
         const started = await startInvestigation(
-            startArgs(workspace),
+            start,
             joined.deps,
         );
+        expect(started.experiment_id).toBe(start.experiment_id);
 
         expect(await joined.waitForRunner()).toMatchObject({
             kind: "TERMINAL",
@@ -429,7 +440,7 @@ describe("joined Crucible API execution", () => {
             searchSlots: manifest.entries.length,
             manifest,
         });
-        const started = await startInvestigation(startArgs(workspace, {
+        const start = startArgs(workspace, {
             hypothesis_topology: "finite_enumerable",
             acceptance_predicate: {
                 kind: "metric_compare",
@@ -461,11 +472,21 @@ describe("joined Crucible API execution", () => {
                     tolerances: statisticalPolicy.control.tolerances,
                 },
             },
-        }), joined.deps);
+        });
+        const started = await startInvestigation(start, joined.deps);
+        expect(started.experiment_id).toBe(start.experiment_id);
 
         expect(await joined.waitForRunner()).toMatchObject({
             kind: "NON_RESULT",
             code: "INDEPENDENT_VERIFICATION_REQUIRED",
+        });
+        expect(statusInvestigation({
+            investigation_id: started.investigation_id,
+        }, joined.deps)).toMatchObject({
+            is_result: false,
+            terminal_available: false,
+            non_result: true,
+            non_result_code: "INDEPENDENT_VERIFICATION_REQUIRED",
         });
         const result = resultInvestigation({
             investigation_id: started.investigation_id,

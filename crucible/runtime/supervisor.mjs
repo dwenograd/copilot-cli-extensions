@@ -4,7 +4,10 @@ import { randomUUID } from "node:crypto";
 
 import { DOMAIN_VERSION } from "../domain/index.mjs";
 import { createDefaultProcessAdapter } from "../measurement/windows-adapter.mjs";
-import { openRepository } from "../persistence/index.mjs";
+import {
+    openArtifactStore,
+    openRepository,
+} from "../persistence/index.mjs";
 import {
     coerceSupervisorConfig,
     supervisorConfigFingerprint,
@@ -1172,6 +1175,9 @@ function persistSupervisorNonResult(
     assertOwnership("operational non-result lease acquisition");
     const adapter = createDomainRepositoryAdapter({
         repository,
+        artifactStore: (
+            dependencies.artifactStoreFactory ?? openArtifactStore
+        )({ root: config.runner.artifactRoot }),
         investigationId: config.runner.investigationId,
     });
     const { lease } = adapter.acquireRunnerLease({

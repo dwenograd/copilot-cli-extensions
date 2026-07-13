@@ -7,9 +7,17 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import {
     MEASUREMENT_ERROR_CODES,
+    VERIFIER_PARSER_VERSION,
     createMeasurementExecutor,
     loadHarnessAllowlist,
 } from "../measurement/index.mjs";
+import {
+    hashCanonical,
+    impossibilityVerifierEnumerandResultsRoot,
+    impossibilityVerifierFactsRoot,
+    impossibilityVerifierRefutationReceiptHash,
+    impossibilityVerifierRefutationRoot,
+} from "../domain/index.mjs";
 import {
     fixedIds,
     makeTempRoot,
@@ -144,7 +152,7 @@ describe("MeasurementExecutor fast component coverage", () => {
         });
 
         expect(result.receipt).toMatchObject({
-            version: 5,
+            version: 6,
             exit: { code: 0, signal: null, timedOut: false },
             candidateSnapshotMutationCheck: {
                 status: "passed",
@@ -182,9 +190,10 @@ describe("MeasurementExecutor fast component coverage", () => {
         );
 
         expect(result.receipt).toMatchObject({
-            version: 7,
+            version: 8,
             ...measurementBinding,
         });
+
         expect(process.launches).toHaveLength(1);
         const launch = process.launches[0];
         expect(launch.argv).toEqual(expect.arrayContaining([
@@ -205,6 +214,158 @@ describe("MeasurementExecutor fast component coverage", () => {
             CRUCIBLE_ARM_ID: "control",
             CRUCIBLE_DETERMINISTIC_SEED:
                 measurementBinding.deterministicSeed,
+        });
+    });
+
+    it("uses the separately pinned verifier parser and deterministic checker receipt", async () => {
+        const fixture = makeFixture("verifier-parser");
+        const tagged = (label) => hashCanonical(
+            { label },
+            "sha256:crucible-executor-verifier-test-v1",
+        );
+        const measurementBinding = {
+            role: "impossibility_verifier",
+            phase: "impossibility_verification",
+            replicateIndex: null,
+            blockIndex: 2,
+            armIndex: null,
+            armId: null,
+            deterministicSeed: tagged("seed"),
+            subjectId: "impossibility-3",
+            environmentIdentity:
+                `sha256:crucible-harness-environment-v4:${"e".repeat(64)}`,
+            suiteIdentity:
+                `sha256:crucible-harness-suite-v4:${"f".repeat(64)}`,
+        };
+        const evidenceRoots = {
+            calibration: tagged("calibration"),
+            control: tagged("control"),
+            search: tagged("search"),
+            scientificReplay: tagged("scientific-replay"),
+        };
+        const requestHash = tagged("request");
+        const proposalHash = tagged("proposal");
+        const proofArtifactHash = tagged("proof");
+        const checkerEvidenceRoot = tagged("checker");
+        const coverageClosureRoot = tagged("coverage");
+        const verifierRoleIdentity = tagged("verifier-role");
+        const claimStates = [{
+            claimId: "acceptance.score",
+            state: "REFUTED",
+        }];
+        const inputRoot = tagged("input-0");
+        const receiptBindingsRoot = tagged("receipts-0");
+        const evidenceRoot = impossibilityVerifierRefutationRoot({
+            requestHash,
+            verifierRoleIdentity,
+            ordinal: 0,
+            enumerandHash: tagged("enumerands-0"),
+            inputRoot,
+            claimStates,
+        });
+        const enumerandResults = [{
+            ordinal: 0,
+            enumerandHash: tagged("enumerands-0"),
+            claimStates,
+            inputRoot,
+            receiptBindingsRoot,
+            evidenceRoot,
+            refutationReceiptHash:
+                impossibilityVerifierRefutationReceiptHash({
+                    requestHash,
+                    verifierRoleIdentity,
+                    ordinal: 0,
+                    enumerandHash: tagged("enumerands-0"),
+                    inputRoot,
+                    receiptBindingsRoot,
+                    claimStates,
+                    evidenceRoot,
+                }),
+        }];
+        const enumerandResultsRoot =
+            impossibilityVerifierEnumerandResultsRoot(enumerandResults);
+        const independentFactsRoot = impossibilityVerifierFactsRoot({
+            mode: "enumerand_reexecution",
+            enumerandResults,
+            proofArtifactHash,
+            proofCheckerIdentity: null,
+            proofValidationReceiptHash: null,
+            validatedProofArtifactHash: null,
+        });
+        const output = {
+            version: "crucible-impossibility-verifier-output-v1",
+            status: "VERIFIED",
+            mode: "enumerand_reexecution",
+            requestHash,
+            proposedCertificateArtifactHash: proposalHash,
+            proofArtifactHash,
+            coverageClosureRoot,
+            enumerandManifestRoot: tagged("enumerands"),
+            enumerandCount: 1,
+            checkedEnumerandCount: 1,
+            enumerandResults,
+            enumerandResultsRoot,
+            evidenceRoots,
+            statisticalPolicyIdentity: tagged("statistics"),
+            alphaLedgerRoot: tagged("alpha"),
+            checkerEvidenceRoot,
+            independentFactsRoot,
+            disagreementCount: 0,
+            complete: true,
+            certificateFormat: null,
+            proofCheckerIdentity: null,
+            proofValidationReceiptHash: null,
+            validatedProofArtifactHash: null,
+            certificate: {
+                version: "crucible-impossibility-certificate-v2",
+                status: "VERIFIED",
+                verdict: "target_unreachable",
+                mode: "enumerand_reexecution",
+                requestHash,
+                proposedCertificateArtifactHash: proposalHash,
+                proofArtifactHash,
+                contractHash: tagged("contract"),
+                harnessSuiteIdentity: measurementBinding.suiteIdentity,
+                verifierRoleIdentity,
+                coverageClosureRoot,
+                enumerandManifestRoot: tagged("enumerands"),
+                enumerandResultsRoot,
+                evidenceRoots,
+                statisticalPolicyIdentity: tagged("statistics"),
+                alphaLedgerRoot: tagged("alpha"),
+                checkerEvidenceRoot,
+                independentFactsRoot,
+                certificateFormat: null,
+                proofCheckerIdentity: null,
+                proofValidationReceiptHash: null,
+                validatedProofArtifactHash: null,
+            },
+            role: measurementBinding.role,
+            phase: measurementBinding.phase,
+            blockIndex: measurementBinding.blockIndex,
+            deterministicSeed: measurementBinding.deterministicSeed,
+            subjectId: measurementBinding.subjectId,
+            environmentIdentity: measurementBinding.environmentIdentity,
+            suiteIdentity: measurementBinding.suiteIdentity,
+        };
+        const process = scriptedProcess({
+            stdout: [Buffer.from(JSON.stringify(output), "utf8")],
+        });
+
+        const result = await runFixture(
+            fixture,
+            process,
+            {},
+            { measurementBinding },
+        );
+
+        expect(result.parsed.status).toBe("VERIFIED");
+        expect(result.receipt).toMatchObject({
+            parserVersion: VERIFIER_PARSER_VERSION,
+            role: "impossibility_verifier",
+            blockIndex: 2,
+            deterministicSeed: measurementBinding.deterministicSeed,
+            subjectId: "impossibility-3",
         });
     });
 

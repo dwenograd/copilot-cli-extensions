@@ -930,7 +930,7 @@ const operatorExperimentConfigShape = object({
         }),
         hypothesis_topology: enumField(HYPOTHESIS_TOPOLOGIES, {
             description:
-                "Search topology. Finite/bounded starts require enumerand_manifest. Open generative is non-exhaustible. Certified impossibility additionally requires the suite verifier role.",
+                "Search topology. Finite, bounded, and certified-impossibility starts require enumerand_manifest. Certified impossibility additionally requires the suite verifier role.",
         }),
         enumerand_manifest: optionalEnumerandManifestField,
         observable_registry: observableRegistryField,
@@ -952,7 +952,7 @@ const operatorExperimentConfigShape = object({
         }),
         max_rounds: integer({
             description:
-                "Maximum number of frozen search rounds (>= 1). For certified_impossibility, verification is eligible only after all slots in these rounds have qualifying non-invalidated candidate evidence.",
+                "Maximum number of frozen search rounds (>= 1). For certified_impossibility, verification is eligible only after complete calibration/control/search/alpha-ledger evidence covers every frozen enumerand.",
             minimum: 1,
             maximum: CONTRACT_LIMITS.maxRounds,
         }),
@@ -962,6 +962,7 @@ const operatorExperimentConfigShape = object({
 const BOUNDED_HYPOTHESIS_TOPOLOGIES = Object.freeze([
     "finite_enumerable",
     "bounded_parameterized",
+    "certified_impossibility",
 ]);
 const boundedTopologySchemaRule = Object.freeze({
     if: {
@@ -998,16 +999,17 @@ const operatorExperimentConfigArgs = Object.freeze({
         if (requiresManifest && parsed.enumerand_manifest === undefined) {
             fail(
                 `${pathLabel}.enumerand_manifest`,
-                "is required for finite_enumerable and bounded_parameterized topologies",
+                "is required for finite_enumerable, bounded_parameterized, and certified_impossibility topologies",
             );
         }
         if (!requiresManifest && parsed.enumerand_manifest !== undefined) {
             fail(
                 `${pathLabel}.enumerand_manifest`,
-                "is only valid for finite_enumerable and bounded_parameterized topologies",
+                "is only valid for finite_enumerable, bounded_parameterized, and certified_impossibility topologies",
             );
         }
         if (parsed.enumerand_manifest !== undefined
+            && parsed.hypothesis_topology !== "certified_impossibility"
             && parsed.enumerand_manifest.topology !== parsed.hypothesis_topology) {
             fail(
                 `${pathLabel}.enumerand_manifest.topology`,

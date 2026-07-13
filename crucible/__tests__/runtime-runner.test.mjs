@@ -1,6 +1,12 @@
 import { describe, expect, it } from "vitest";
 
-import { deriveRunnerExecutionLimits } from "../runtime/index.mjs";
+import {
+    deriveRunnerExecutionLimits,
+    inspectFrozenImpossibilityVerifierExecution,
+} from "../runtime/index.mjs";
+import {
+    HARNESS_SUITE_RECEIPT_VERSION,
+} from "../measurement/index.mjs";
 import { createInvestigationContract } from "../domain/index.mjs";
 import { makeV4ContractInput } from "./v4-contract-fixture.mjs";
 
@@ -91,5 +97,82 @@ describe("Crucible runner fast component limits", () => {
             - one.requiredReplicationEvaluations).toBe(6);
         expect(two.maxLoopIterations).toBeGreaterThan(one.maxLoopIterations);
         expect(two.maxRestarts).toBeGreaterThanOrEqual(one.maxRestarts);
+    });
+
+    it("rejects wrong verifier executable, parser, and sandbox identities", () => {
+        const contract = createInvestigationContract(makeV4ContractInput({
+            hypothesisTopology: "certified_impossibility",
+        }));
+        const role = contract.harnessSuite.roles.impossibility_verifier;
+        const receipt = {
+            version: HARNESS_SUITE_RECEIPT_VERSION,
+            harnessId: role.harnessId,
+            parserVersion: role.parser.version,
+            parserIdentity: role.parser,
+            harnessEntryHash: role.harnessEntryHash,
+            executableHash: role.executableHash,
+            stagedExecutableHash: role.executableHash,
+            sandbox: {
+                policyDigest: role.sandboxIdentity.policyDigest,
+                capabilityId: "capability-1",
+                capabilityLaunchUsed: true,
+                policyIdentity: {
+                    securityContext: {
+                        appContainer: true,
+                        lowIntegrity: true,
+                        capabilities: [],
+                    },
+                },
+            },
+        };
+        expect(inspectFrozenImpossibilityVerifierExecution({
+            receipt,
+            verifierRole: role,
+            parserVersion: role.parser.version,
+        })).toEqual({ valid: true, failedBindings: [] });
+
+        for (const [field, mutate, expected] of [
+            [
+                "executable",
+                (value) => {
+                    value.executableHash =
+                        `sha256:crucible-measurement-file-v1:${
+                            "a".repeat(64)
+                        }`;
+                },
+                "executable",
+            ],
+            [
+                "parser",
+                (value) => {
+                    value.parserIdentity = {
+                        ...value.parserIdentity,
+                        sourceHash:
+                            `sha256:crucible-measurement-parser-source-v1:${
+                                "b".repeat(64)
+                            }`,
+                    };
+                },
+                "parserIdentity",
+            ],
+            [
+                "sandbox",
+                (value) => {
+                    value.sandbox.policyIdentity.securityContext.capabilities =
+                        ["internetClient"];
+                },
+                "zeroCapabilities",
+            ],
+        ]) {
+            const mutated = structuredClone(receipt);
+            mutate(mutated);
+            const report = inspectFrozenImpossibilityVerifierExecution({
+                receipt: mutated,
+                verifierRole: role,
+                parserVersion: role.parser.version,
+            });
+            expect(report.valid, field).toBe(false);
+            expect(report.failedBindings, field).toContain(expected);
+        }
     });
 });

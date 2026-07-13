@@ -840,14 +840,17 @@ export function isEnumerandSpaceExhaustible(input) {
     if (input === null || typeof input !== "object" || Array.isArray(input)) {
         return false;
     }
-    if (!MANIFEST_TOPOLOGIES.includes(input.topology)
+    const topology = input.topology === "certified_impossibility"
+        ? input.enumerandManifest?.topology
+        : input.topology;
+    if (!MANIFEST_TOPOLOGIES.includes(topology)
         || input.enumerandManifest === undefined
         || input.enumerandManifest === null) {
         return false;
     }
     try {
         normalizeEnumerandManifest(input.enumerandManifest, {
-            topology: input.topology,
+            topology,
             observableRegistry: input.observableRegistry ?? [],
             hypothesisPolicy: input.hypothesisPolicy ?? {},
         });

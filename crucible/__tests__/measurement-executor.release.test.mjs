@@ -229,7 +229,7 @@ describe("MeasurementExecutor happy path", () => {
         expect(result.stdoutBytes).toBeGreaterThan(0);
 
         const rec = result.receipt;
-        expect(rec.version).toBe(5);
+        expect(rec.version).toBe(6);
         expect(rec.harnessEntryHash).toBe(verified.entryHash);
         expect(rec.executableHash).toBe(verified.executableHash);
         expect(rec.stagedExecutableHash).toBe(verified.executableHash);

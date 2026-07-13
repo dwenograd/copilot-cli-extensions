@@ -461,7 +461,7 @@ describe("enumerand strategy and runner plans", () => {
         })).toThrow(/not bound to its frozen tuple/u);
     });
 
-    it("derives kernel exhaustion from ordinal/hash coverage rather than evidence labels", () => {
+    it("does not turn ordinal/hash labels into terminal-grade exhaustion", () => {
         const manifest = normalizeEnumerandManifest(finiteManifestInput());
         const aggregate = aggregateWithManifest(manifest);
         const evidenceItems = manifest.entries.map((entry, index) => ({
@@ -487,13 +487,7 @@ describe("enumerand strategy and runner plans", () => {
         const progress = searchProgress(aggregate);
         expect(progress.boundedComplete).toBe(true);
         expect(progress.enumerandCoverage.coveredOrdinals).toEqual([0, 1, 2]);
-        const basis = boundedSearchExhaustion(aggregate);
-        expect(basis).toMatchObject({
-            searchSpaceExhausted: true,
-            enumerandCount: 3,
-            enumerandManifestRoot: manifest.merkleRoot,
-        });
-        expect(basis).not.toHaveProperty("boundedCandidateIdsHash");
+        expect(boundedSearchExhaustion(aggregate)).toBeNull();
     });
 });
 

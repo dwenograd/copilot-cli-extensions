@@ -41,9 +41,12 @@ import {
     HARNESS_SUITE_V4_KIND,
     HARNESS_SUITE_V4_REQUIRED_ROLES,
     HARNESS_SUITE_V4_ROLES,
+    HARNESS_SUITE_V4_VERIFIER_INDEPENDENCE_ATTESTATION,
     PARSER_SOURCE_HASH_ALGORITHM,
     PARSER_VERSION,
+    VERIFIER_PARSER_VERSION,
     PARSER_VERSION_HASH_ALGORITHM,
+    applicationEntrypointHashForEntry,
     computeHarnessSuiteV4Identity,
     hashHarnessEnvironmentV4,
     hashHarnessObservableSchemaV4,
@@ -131,6 +134,8 @@ const SUITE_ROLE_KEYS = new Set([
     "caseIds",
     "deterministicSeed",
     "sandboxIdentity",
+    "independenceAttestation",
+    "verificationPolicy",
 ]);
 const SUITE_SHARED_DEPENDENCY_KEYS = new Set([
     "classification",
@@ -546,7 +551,30 @@ function normalizeSuiteConfig(rawConfig) {
                 spec.sandboxIdentity,
                 `${field}.sandboxIdentity`,
             ),
+            ...(role === "impossibility_verifier"
+                ? {
+                    independenceAttestation:
+                        spec.independenceAttestation,
+                    verificationPolicy: spec.verificationPolicy,
+                }
+                : {}),
         };
+        if (role === "impossibility_verifier"
+            && spec.independenceAttestation?.kind
+                !== HARNESS_SUITE_V4_VERIFIER_INDEPENDENCE_ATTESTATION) {
+            fail(
+                CONFIGURE_ERROR_CODES.CONFIG_INVALID,
+                `${field}.independenceAttestation must attest a separate operator implementation`,
+            );
+        }
+        if (role !== "impossibility_verifier"
+            && (spec.independenceAttestation !== undefined
+                || spec.verificationPolicy !== undefined)) {
+            fail(
+                CONFIGURE_ERROR_CODES.CONFIG_INVALID,
+                `${field} cannot declare impossibility-verifier fields`,
+            );
+        }
     }
     return {
         kind: HARNESS_SUITE_V4_KIND,
@@ -880,14 +908,23 @@ function taggedFileHash(hex) {
     return `${FILE_HASH_ALGORITHM}:${hex}`;
 }
 
-function trustedParserIdentity() {
+function trustedParserIdentity(role) {
+    const verifier = role === "impossibility_verifier";
     const parserPath = fileURLToPath(
-        new URL("../measurement/parser.mjs", import.meta.url),
+        new URL(
+            verifier
+                ? "../measurement/verifier-parser.mjs"
+                : "../measurement/parser.mjs",
+            import.meta.url,
+        ),
     );
+    const parserVersion = verifier
+        ? VERIFIER_PARSER_VERSION
+        : PARSER_VERSION;
     return {
-        version: PARSER_VERSION,
+        version: parserVersion,
         versionHash: hashCanonical(
-            { parserVersion: PARSER_VERSION },
+            { parserVersion },
             PARSER_VERSION_HASH_ALGORITHM,
         ),
         sourceHash: sha256File(
@@ -940,7 +977,6 @@ export function configureHarnessSuite(options = {}) {
         sharedPlatformDependencies.map((dependency) =>
             `${dependency.role}\0${dependency.sha256}`),
     );
-    const parser = trustedParserIdentity();
     const operatorCases = {};
     const roles = {};
 
@@ -1016,7 +1052,9 @@ export function configureHarnessSuite(options = {}) {
                 roleConfig.harnessId,
             ),
             executableHash: taggedFileHash(entry.executableSha256),
-            parser,
+            applicationEntrypointHash:
+                applicationEntrypointHashForEntry(entry),
+            parser: trustedParserIdentity(role),
             dependencies,
             configHash: hashHarnessRoleConfigV4(
                 roleConfigFromEntry(entry),
@@ -1027,6 +1065,13 @@ export function configureHarnessSuite(options = {}) {
             caseManifest,
             deterministicSeed: roleConfig.deterministicSeed,
             sandboxIdentity: roleConfig.sandboxIdentity,
+            ...(role === "impossibility_verifier"
+                ? {
+                    independenceAttestation:
+                        roleConfig.independenceAttestation,
+                    verificationPolicy: roleConfig.verificationPolicy,
+                }
+                : {}),
         };
     }
 

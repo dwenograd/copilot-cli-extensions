@@ -27,6 +27,9 @@ import {
 import {
     deriveCandidateNovelty,
 } from "./novelty.mjs";
+import {
+    verifiedImpossibilityExecutionFor,
+} from "./private-verifier-execution.mjs";
 
 export const EVIDENCE_PROVENANCE_VERSION = 2;
 export const SNAPSHOT_PROVENANCE_HASH_ALGORITHM =
@@ -43,6 +46,10 @@ export const RAW_OBSERVATION_AUTHORITY_HASH_ALGORITHM =
     "sha256:crucible-raw-observation-authority-v1";
 export const STATISTICAL_CACHE_HASH_ALGORITHM =
     "sha256:crucible-statistical-cache-v1";
+
+export function deriveStatisticalCacheDigest(cacheCore) {
+    return hashCanonical(cacheCore, STATISTICAL_CACHE_HASH_ALGORITHM);
+}
 
 const OBJECT_ID_RE = /^sha256:([a-f0-9]{64})$/u;
 const SNAPSHOT_HASH_RE =
@@ -919,7 +926,8 @@ function replicationControlBinding(
         enumerandManifest:
             aggregate.contract.enumerandManifest ?? null,
         manifestOptions: {
-            topology: aggregate.contract.hypothesisTopology,
+            topology: aggregate.contract.enumerandManifest?.topology
+                ?? aggregate.contract.hypothesisTopology,
             observableRegistry:
                 aggregate.contract.observableRegistry,
             hypothesisPolicy:
@@ -940,7 +948,8 @@ function validationControlBindings(aggregate, command) {
                 enumerandManifest:
                     aggregate.contract.enumerandManifest ?? null,
                 manifestOptions: {
-                    topology: aggregate.contract.hypothesisTopology,
+                    topology: aggregate.contract.enumerandManifest?.topology
+                        ?? aggregate.contract.hypothesisTopology,
                     observableRegistry:
                         aggregate.contract.observableRegistry,
                     hypothesisPolicy:
@@ -1363,10 +1372,7 @@ export function deriveEvidencePayload(aggregate, observation, evidenceId) {
         rawAuthorityDigest,
         statisticalCacheDigest: statisticalCacheCore === null
             ? null
-            : hashCanonical(
-                statisticalCacheCore,
-                STATISTICAL_CACHE_HASH_ALGORITHM,
-            ),
+            : deriveStatisticalCacheDigest(statisticalCacheCore),
         replication,
         boundedCandidateId: candidateEvidence ? (command.boundedCandidateId ?? null) : null,
         ...(candidateEvidence && command?.enumerand !== undefined
@@ -1417,11 +1423,34 @@ function deriveCertificateBasis(aggregate, observation) {
     const receipt = observation.receipt;
     const measurement = receipt.provenance.measurements[0];
     const certificateArtifact = receipt.provenance.impossibilityCertificateArtifact;
+    const execution = verifiedImpossibilityExecutionFor(
+        aggregate,
+        observation.observationId,
+        observation.verifierExecution ?? null,
+    );
+    const facts = execution?.facts ?? null;
     if (aggregate.contract.hypothesisTopology === "certified_impossibility"
         && command?.kind === "verify_impossibility"
+        && execution !== null
+        && data?.checkerStatus === "VERIFIED"
         && data?.certificateVerdict === "target_unreachable"
+        && facts?.status === "VERIFIED"
+        && facts?.verdict === "target_unreachable"
         && data.certificateVersion === aggregate.contract.impossibilityPolicy?.certificateVersion
         && data.verificationRequestHash === command.requestHash
+        && data.proposedCertificateArtifactHash
+            === command.proposedCertificateArtifactHash
+        && facts.requestHash === command.requestHash
+        && facts.proposedCertificateArtifactHash
+            === command.proposedCertificateArtifactHash
+        && facts.proofArtifactHash === command.proofArtifactHash
+        && command.proofArtifactHash
+            !== command.proposedCertificateArtifactHash
+        && facts.coverageClosureRoot
+            === command.request.evidence.coverageClosureRoot
+        && facts.complete === true
+        && facts.disagreementCount === 0
+        && isAlgorithmTaggedSha256(facts.factsRoot)
         && data.certificateArtifactHash === receipt?.certificateArtifactHash
         && data.measurementReceiptHash === receipt?.measurementReceiptHash
         && data.verificationSnapshotHash === receipt?.verificationSnapshotHash
@@ -1429,6 +1458,7 @@ function deriveCertificateBasis(aggregate, observation) {
         && isAlgorithmTaggedSha256(data.measurementReceiptHash)
         && isAlgorithmTaggedSha256(data.verificationRequestHash)
         && isAlgorithmTaggedSha256(data.verificationSnapshotHash)
+        && isAlgorithmTaggedSha256(data.proposedCertificateArtifactHash)
         && isAlgorithmTaggedSha256(receipt.measurementReceiptArtifactHash)
         && isAlgorithmTaggedSha256(receipt.rawStdoutArtifactHash)
         && isAlgorithmTaggedSha256(receipt.rawStderrArtifactHash)
@@ -1445,12 +1475,32 @@ function deriveCertificateBasis(aggregate, observation) {
         && objectIdMatchesTaggedHash(
             measurement.rawStderrArtifact,
             receipt.rawStderrArtifactHash,
-        )) {
+        )
+        && execution.measurement.receiptHash
+            === measurement.receiptHash
+        && execution.measurement.rawStdoutArtifact.artifactId
+            === measurement.rawStdoutArtifact.artifactId
+        && execution.measurement.rawStderrArtifact.artifactId
+            === measurement.rawStderrArtifact.artifactId
+        && execution.certificate.artifact.artifactId
+            === certificateArtifact.artifactId) {
         return {
-            kind: "verified_impossibility_certificate",
+            kind: "v4_unreachable",
             topology: "certified_impossibility",
+            checkerStatus: data.checkerStatus,
             certificateVersion: data.certificateVersion,
             certificateVerdict: data.certificateVerdict,
+            verificationMode: facts.mode,
+            verifierRoleIdentity:
+                command.request.verifier.roleIdentity,
+            independenceAttestation:
+                command.request.verifier.independenceAttestation,
+            independenceClassification:
+                "operator_attested_separate_implementation",
+            mathematicalIndependenceProven: false,
+            verifierExecutionIdentity:
+                execution.executionIdentity.identity,
+            verifierFactsRoot: facts.factsRoot,
             certificateArtifactHash: data.certificateArtifactHash,
             certificateArtifactId: certificateArtifact.artifactId,
             measurementReceiptHash: data.measurementReceiptHash,
@@ -1461,7 +1511,30 @@ function deriveCertificateBasis(aggregate, observation) {
             rawStderrArtifactHash: receipt.rawStderrArtifactHash,
             rawStderrArtifactId: measurement.rawStderrArtifact.artifactId,
             verificationRequestHash: data.verificationRequestHash,
+            proposedCertificateArtifactHash:
+                data.proposedCertificateArtifactHash,
+            proofArtifactHash: facts.proofArtifactHash,
+            proofArtifactId: execution.proof.artifact.artifactId,
+            proofCheckerIdentity:
+                facts.proofCheckerReceipt?.proofCheckerIdentity ?? null,
+            proofValidationReceiptHash:
+                facts.proofCheckerReceipt?.receiptHash ?? null,
+            validatedProofArtifactHash:
+                facts.mode === "certificate_validation"
+                    ? facts.proofArtifactHash
+                    : null,
             verificationSnapshotHash: data.verificationSnapshotHash,
+            coverageClosureRoot: facts.coverageClosureRoot,
+            enumerandManifestRoot: facts.enumerandManifestRoot,
+            enumerandCount: facts.enumerandCount,
+            checkedEnumerandCount: facts.checkedEnumerandCount,
+            evidenceRoots: facts.evidenceRoots,
+            alphaLedgerRoot: facts.alphaLedgerRoot,
+            checkerEvidenceRoot: facts.checkerEvidenceRoot,
+            enumerandResultsRoot: hashCanonical(
+                facts.enumerandObservations,
+                "sha256:crucible-verified-impossibility-enumerand-results-v1",
+            ),
             receiptRoot: measurement.measurementRoot,
             provenanceRoot: receipt.provenance.closureRoot,
         };

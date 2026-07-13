@@ -45,6 +45,7 @@ import {
     verifyLocalRegularFile,
 } from "./fs-verify.mjs";
 import { PARSER_VERSION } from "./parser.mjs";
+import { VERIFIER_PARSER_VERSION } from "./verifier-parser.mjs";
 import {
     computeHarnessSuiteV4Identity,
     hashHarnessRoleConfigV4,
@@ -372,6 +373,23 @@ function normalizeArgvDependencyRefs({
     return Object.freeze(refs);
 }
 
+function applicationEntrypointDependencyIndex({
+    argvTemplate,
+    argvDependencyRefs,
+    executable,
+}) {
+    if (!INTERPRETER_BASENAMES.has(path.basename(executable).toLowerCase())) {
+        return null;
+    }
+    for (let index = 0; index < argvTemplate.length; index += 1) {
+        const arg = argvTemplate[index];
+        if (arg === "--" || arg.startsWith("-")) continue;
+        return argvDependencyRefs.find((ref) => ref.argvIndex === index)
+            ?.dependencyIndex ?? null;
+    }
+    return null;
+}
+
 function normalizeValidationCases(validationCases, entryId) {
     if (validationCases === undefined || validationCases === null) {
         return null;
@@ -456,6 +474,12 @@ function normalizeEntry(entryId, raw) {
         cwd,
         entryId,
     });
+    const applicationEntrypointDependency =
+        applicationEntrypointDependencyIndex({
+            argvTemplate,
+            argvDependencyRefs,
+            executable,
+        });
     const allowedEnv = normalizeAllowedEnv(raw.allowedEnv, entryId);
     const timeoutMs = requirePositiveInteger(raw.timeoutMs, `entries.${entryId}.timeoutMs`, 60 * 60 * 1000);
     const maxStdoutBytes = requirePositiveInteger(raw.maxStdoutBytes, `entries.${entryId}.maxStdoutBytes`, 64 * 1024 * 1024);
@@ -469,6 +493,7 @@ function normalizeEntry(entryId, raw) {
         executableSha256,
         argvTemplate,
         argvDependencyRefs,
+        applicationEntrypointDependency,
         cwd,
         dependencies,
         allowedEnv,
@@ -503,15 +528,50 @@ function taggedFileHash(hex) {
     return `${FILE_HASH_ALGORITHM}:${hex}`;
 }
 
-function expectedSuiteParserIdentity() {
-    const parserPath = fileURLToPath(new URL("./parser.mjs", import.meta.url));
+export function applicationEntrypointHashForEntry(entry) {
+    if (entry === null || typeof entry !== "object" || Array.isArray(entry)) {
+        invalid("entry must be a normalized harness allowlist entry");
+    }
+    const dependencyIndex = entry.applicationEntrypointDependency;
+    const digest = dependencyIndex === null
+        ? entry.executableSha256
+        : entry.dependencies[dependencyIndex]?.sha256;
+    if (typeof digest !== "string") {
+        invalid("entry application entrypoint is not hash-pinned");
+    }
+    return taggedFileHash(digest);
+}
+
+function parserDescriptor(parserVersion = PARSER_VERSION) {
+    if (parserVersion === PARSER_VERSION) {
+        return {
+            version: PARSER_VERSION,
+            path: fileURLToPath(new URL("./parser.mjs", import.meta.url)),
+        };
+    }
+    if (parserVersion === VERIFIER_PARSER_VERSION) {
+        return {
+            version: VERIFIER_PARSER_VERSION,
+            path: fileURLToPath(
+                new URL("./verifier-parser.mjs", import.meta.url),
+            ),
+        };
+    }
+    invalid("trusted parser version is not recognized", { parserVersion });
+}
+
+export function trustedParserIdentity(parserVersion = PARSER_VERSION) {
+    const descriptor = parserDescriptor(parserVersion);
     return Object.freeze({
-        version: PARSER_VERSION,
+        version: descriptor.version,
         versionHash: hashCanonical(
-            { parserVersion: PARSER_VERSION },
+            { parserVersion: descriptor.version },
             PARSER_VERSION_HASH_ALGORITHM,
         ),
-        sourceHash: sha256File(parserPath, PARSER_SOURCE_HASH_ALGORITHM),
+        sourceHash: sha256File(
+            descriptor.path,
+            PARSER_SOURCE_HASH_ALGORITHM,
+        ),
     });
 }
 
@@ -524,7 +584,6 @@ function normalizeHarnessSuites(rawSuites, entries, entryHashes) {
     if (suiteIds.length > 256) {
         invalid("allowlist.suites has too many suites (max 256)");
     }
-    const parser = expectedSuiteParserIdentity();
     const suites = {};
     const identities = {};
     for (const suiteId of suiteIds) {
@@ -550,6 +609,11 @@ function normalizeHarnessSuites(rawSuites, entries, entryHashes) {
             ]),
         );
         for (const [role, roleIdentity] of Object.entries(suite.roles)) {
+            const parser = trustedParserIdentity(
+                role === "impossibility_verifier"
+                    ? VERIFIER_PARSER_VERSION
+                    : PARSER_VERSION,
+            );
             const entry = entries[roleIdentity.harnessId];
             if (entry === undefined) {
                 invalid(`allowlist.suites.${suiteId}.roles.${role} references missing harness entry ${JSON.stringify(roleIdentity.harnessId)}`);
@@ -561,6 +625,10 @@ function normalizeHarnessSuites(rawSuites, entries, entryHashes) {
             if (roleIdentity.executableHash
                 !== taggedFileHash(entry.executableSha256)) {
                 invalid(`allowlist.suites.${suiteId}.roles.${role}.executableHash does not match the referenced entry`);
+            }
+            if (roleIdentity.applicationEntrypointHash
+                !== applicationEntrypointHashForEntry(entry)) {
+                invalid(`allowlist.suites.${suiteId}.roles.${role}.applicationEntrypointHash does not match the referenced entry`);
             }
             if (!canonicalEqual(roleIdentity.parser, parser)) {
                 invalid(`allowlist.suites.${suiteId}.roles.${role}.parser does not match the trusted parser identity`);
@@ -909,16 +977,10 @@ export function verifyHarnessPreflight(
             "allowlist must be a loaded HarnessAllowlist instance",
         );
     }
-    if (parserVersion !== PARSER_VERSION) {
-        invalid("trusted parser version does not match the requested contract parser", {
-            requestedParserVersion: parserVersion,
-            trustedParserVersion: PARSER_VERSION,
-        });
-    }
+    const parser = parserDescriptor(parserVersion);
     const verifiedEntry = allowlist.verifyEntry(harnessId);
     validateHarnessValidationCases(verifiedEntry.entry, validationCases);
-    const parserPath = fileURLToPath(new URL("./parser.mjs", import.meta.url));
-    const parserSourceHash = sha256File(parserPath, PARSER_SOURCE_HASH_ALGORITHM);
+    const parserIdentity = trustedParserIdentity(parser.version);
     allowlist.reverifyAllowlistFile();
     return Object.freeze({
         verifiedEntry,
@@ -927,6 +989,8 @@ export function verifyHarnessPreflight(
         allowlistFileHash: verifiedEntry.allowlistFileHash,
         harnessEntryHash: verifiedEntry.entryHash,
         executableHash: verifiedEntry.executableHash,
+        applicationEntrypointHash:
+            applicationEntrypointHashForEntry(verifiedEntry.entry),
         dependencyHashes: Object.freeze(verifiedEntry.dependencies.map((dependency) =>
             Object.freeze({
                 path: dependency.path,
@@ -941,12 +1005,9 @@ export function verifyHarnessPreflight(
             verifiedEntry.entry.allowedEnv,
             ALLOWED_ENV_HASH_ALGORITHM,
         ),
-        parserVersion,
-        parserVersionHash: hashCanonical(
-            { parserVersion },
-            PARSER_VERSION_HASH_ALGORITHM,
-        ),
-        parserSourceHash,
+        parserVersion: parserIdentity.version,
+        parserVersionHash: parserIdentity.versionHash,
+        parserSourceHash: parserIdentity.sourceHash,
     });
 }
 

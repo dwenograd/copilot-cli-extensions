@@ -14,9 +14,19 @@ import {
 } from "node:crypto";
 import { TextDecoder } from "node:util";
 
-import { DOMAIN_VERSION } from "../domain/constants.mjs";
-import { isAlgorithmTaggedSha256 } from "../domain/canonical.mjs";
+import {
+    DOMAIN_VERSION,
+    IMPOSSIBILITY_PROOF_ARTIFACT_HASH_ALGORITHM,
+    IMPOSSIBILITY_VERIFIER_OBJECT_MANIFEST_HASH_ALGORITHM,
+} from "../domain/constants.mjs";
+import {
+    hashCanonical,
+    isAlgorithmTaggedSha256,
+} from "../domain/canonical.mjs";
 import { replayEvents } from "../domain/reducer.mjs";
+import {
+    issueVerifiedImpossibilityExecutionCapability,
+} from "../domain/private-verifier-execution.mjs";
 import {
     deriveReplicationControlBinding,
     normalizeReplicationSchedule,
@@ -27,7 +37,16 @@ import {
     materializeScientificReplayState,
     scientificReplaySummary,
 } from "../domain/scientific-replay.mjs";
-import { hashReceipt } from "../measurement/receipt.mjs";
+import {
+    HARNESS_SUITE_RECEIPT_VERSION,
+    hashReceipt,
+} from "../measurement/receipt.mjs";
+import {
+    parseImpossibilityVerifierResult,
+} from "../measurement/verifier-parser.mjs";
+import {
+    trustedParserIdentity,
+} from "../measurement/allowlist.mjs";
 import { CruciblePersistenceError, InvalidArgumentError } from "./errors.mjs";
 import { assertLocalDatabasePath } from "./paths.mjs";
 import {
@@ -68,6 +87,17 @@ const WINDOWS_RESERVED_DEVICE_RE =
     /^(?:aux|clock\$|com[1-9¹²³]|con|conin\$|conout\$|lpt[1-9¹²³]|nul|prn)(?:\..*)?$/iu;
 const HEX64_RE = /^[0-9a-f]{64}$/u;
 const UTF8 = new TextDecoder("utf-8", { fatal: true });
+const IMPOSSIBILITY_CERTIFICATE_ARTIFACT_HASH_ALGORITHM =
+    "sha256:crucible-impossibility-certificate-artifact-v2";
+const IMPOSSIBILITY_RECEIPT_ARTIFACT_HASH_ALGORITHM =
+    "sha256:crucible-impossibility-receipt-artifact-v1";
+const IMPOSSIBILITY_STDOUT_ARTIFACT_HASH_ALGORITHM =
+    "sha256:crucible-impossibility-stdout-artifact-v1";
+const IMPOSSIBILITY_STDERR_ARTIFACT_HASH_ALGORITHM =
+    "sha256:crucible-impossibility-stderr-artifact-v1";
+const IMPOSSIBILITY_REQUEST_FILENAME = "request.json";
+const IMPOSSIBILITY_PROPOSAL_FILENAME = "proposed-certificate.json";
+const IMPOSSIBILITY_PROOF_FILENAME = "proof-artifact.json";
 const QUIET_DURABILITY_CONTROL = Object.freeze({
     operation: "durability",
     faultInjector: null,
@@ -1267,7 +1297,7 @@ function assertCanonicalObjectId(value, context, ErrorClass = BundleManifestErro
     return parsed.hex;
 }
 
-function validateManifest(value, rawBytes = null) {
+export function validateBundleManifest(value, rawBytes = null) {
     if (!hasExactKeys(value, MANIFEST_KEYS)
         || value.type !== BUNDLE_TYPE
         || value.version !== BUNDLE_VERSION
@@ -1417,7 +1447,7 @@ function parseManifestBytes(bytes) {
             cause: err.message,
         });
     }
-    return validateManifest(parsed, bytes);
+    return validateBundleManifest(parsed, bytes);
 }
 
 // --- database and object closure -----------------------------------------
@@ -1563,7 +1593,17 @@ function replayV4Aggregate(repo, investigationId) {
             }
             return domainEvent;
         });
-        return replayEvents(domainEvents);
+        return replayEvents(domainEvents, {
+            verifierExecutionResolver: ({ event }) =>
+                event.type === "command_observed"
+                && event.payload?.purpose === "impossibility"
+                    ? issueVerifiedImpossibilityExecutionCapability({
+                        commandId: event.payload.commandId,
+                        observationId: event.payload.observationId,
+                        reference: event.payload.verifierExecution,
+                    })
+                    : null,
+        });
     } catch (error) {
         throw new BundleTamperError(
             "database v4 scientific replay verification failed",
@@ -1663,10 +1703,12 @@ function inspectDatabaseBinding(dbFile, requestedInvestigationId = null) {
         }
         const artifacts = [...artifactsById.values()]
             .sort((left, right) => compareStable(left.artifactId, right.artifactId));
-        const snapshotRoots = artifacts
-            .filter((artifact) => artifact.contentType === SNAPSHOT_CONTENT_TYPE)
-            .map((artifact) => artifact.object)
-            .sort(compareStable);
+        const snapshotRoots = [...new Set(
+            artifacts
+                .filter((artifact) =>
+                    artifact.contentType === SNAPSHOT_CONTENT_TYPE)
+                .map((artifact) => artifact.object),
+        )].sort(compareStable);
         return {
             investigationId,
             domainVersion,
@@ -1974,6 +2016,34 @@ function readCanonicalArtifactJson(store, artifact, label) {
     }
 }
 
+function readScientificArtifactBytes(store, artifact, label) {
+    if (artifact === null
+        || typeof artifact !== "object"
+        || typeof artifact.objectId !== "string") {
+        scientificArtifactFailure(
+            "scientific raw authority references an invalid artifact",
+            { label },
+        );
+    }
+    try {
+        return Buffer.from(store.readObject(artifact.objectId));
+    } catch (error) {
+        scientificArtifactFailure(
+            "scientific raw authority artifact is missing or corrupt",
+            {
+                label,
+                artifactId: artifact.artifactId ?? null,
+                objectId: artifact.objectId,
+            },
+            error,
+        );
+    }
+}
+
+function taggedScientificArtifactHash(algorithm, bytes) {
+    return `${algorithm}:${createHash("sha256").update(bytes).digest("hex")}`;
+}
+
 function verifyRawReceiptBinding(
     store,
     measurement,
@@ -2099,7 +2169,8 @@ function verifyCandidateAuthorityArtifacts(
         schedule: command.replicationSchedule,
         enumerandManifest: aggregate.contract.enumerandManifest ?? null,
         manifestOptions: {
-            topology: aggregate.contract.hypothesisTopology,
+            topology: aggregate.contract.enumerandManifest?.topology
+                ?? aggregate.contract.hypothesisTopology,
             observableRegistry: aggregate.contract.observableRegistry,
             hypothesisPolicy: aggregate.contract.hypothesisPolicy,
         },
@@ -2238,7 +2309,8 @@ function verifyScientificRoleAuthorityArtifacts(
         schedule: command.replicationSchedule,
         enumerandManifest: aggregate.contract.enumerandManifest ?? null,
         manifestOptions: {
-            topology: aggregate.contract.hypothesisTopology,
+            topology: aggregate.contract.enumerandManifest?.topology
+                ?? aggregate.contract.hypothesisTopology,
             observableRegistry: aggregate.contract.observableRegistry,
             hypothesisPolicy: aggregate.contract.hypothesisPolicy,
         },
@@ -2300,7 +2372,8 @@ function verifyValidationAuthorityArtifacts(
             schedule: series.replicationSchedule,
             enumerandManifest: aggregate.contract.enumerandManifest ?? null,
             manifestOptions: {
-                topology: aggregate.contract.hypothesisTopology,
+                topology: aggregate.contract.enumerandManifest?.topology
+                    ?? aggregate.contract.hypothesisTopology,
                 observableRegistry: aggregate.contract.observableRegistry,
                 hypothesisPolicy: aggregate.contract.hypothesisPolicy,
             },
@@ -2363,6 +2436,370 @@ function verifyValidationAuthorityArtifacts(
             measurement,
             rawObservation,
             evidence.evidenceId,
+        );
+    }
+}
+
+function taggedHashMatchesObjectId(tagged, objectId) {
+    return typeof tagged === "string"
+        && typeof objectId === "string"
+        && tagged.split(":").at(-1)
+            === objectId.slice("sha256:".length);
+}
+
+function generatedImpossibilityDocuments(command) {
+    const documents = new Map([
+        ["coverage-closure.json", command.request.evidence.coverageClosure],
+        ["enumerand-manifest.json", command.request.enumerands.manifest],
+        ["scientific-replay.json", command.request.statistics.scientificReplay],
+        [IMPOSSIBILITY_PROOF_FILENAME, command.proofArtifact],
+    ]);
+    if (command.request.reevaluation.calibration !== null) {
+        documents.set(
+            "reevaluation/calibration.json",
+            command.request.reevaluation.calibration,
+        );
+    }
+    for (const input of command.request.reevaluation.enumerands) {
+        documents.set(
+            `reevaluation/enumerands/${String(input.ordinal)
+                .padStart(6, "0")}.json`,
+            input,
+        );
+    }
+    return documents;
+}
+
+function verifyImpossibilityRequestSnapshot(
+    store,
+    command,
+    measurement,
+    evidenceId,
+) {
+    const manifest = command.request.objectManifest;
+    const expectedManifestRoot = hashCanonical(
+        {
+            version: manifest.version,
+            pack: manifest.pack,
+            entries: manifest.entries,
+        },
+        IMPOSSIBILITY_VERIFIER_OBJECT_MANIFEST_HASH_ALGORITHM,
+    );
+    const snapshotManifest = readCanonicalArtifactJson(
+        store,
+        measurement.snapshot.manifestArtifact,
+        `${evidenceId} verifier snapshot`,
+    );
+    const objectArtifacts = new Map(
+        measurement.snapshot.objectArtifacts.map((artifact) => [
+            artifact.objectId,
+            artifact,
+        ]),
+    );
+    const snapshotEntries = new Map(
+        snapshotManifest.entries.map((entry) => [entry.path, entry]),
+    );
+    const readEntry = (entryPath, label) => {
+        const entry = snapshotEntries.get(entryPath) ?? null;
+        const artifact = entry === null
+            ? null
+            : objectArtifacts.get(entry.object) ?? null;
+        return artifact === null
+            ? null
+            : {
+                entry,
+                bytes: readScientificArtifactBytes(store, artifact, label),
+            };
+    };
+    const requestRead = readEntry(
+        IMPOSSIBILITY_REQUEST_FILENAME,
+        `${evidenceId} verifier request`,
+    );
+    const proposalRead = readEntry(
+        IMPOSSIBILITY_PROPOSAL_FILENAME,
+        `${evidenceId} proposed certificate`,
+    );
+    const packRead = readEntry(
+        manifest.pack?.path ?? "",
+        `${evidenceId} verifier object pack`,
+    );
+    if (manifest.root !== expectedManifestRoot
+        || manifest.pack?.format
+            !== "crucible-base64-object-pack-v1"
+        || requestRead === null
+        || proposalRead === null
+        || packRead === null
+        || requestRead.bytes.toString("utf8") !== canonicalize(command.request)
+        || proposalRead.bytes.toString("utf8")
+            !== canonicalize(command.proposedCertificate)) {
+        return false;
+    }
+    let objectPack;
+    try {
+        objectPack = parseCanonicalJson(
+            decodeUtf8(
+                packRead.bytes,
+                `${evidenceId} verifier object pack`,
+                BundleTamperError,
+            ),
+            { label: `${evidenceId} verifier object pack` },
+        );
+    } catch {
+        return false;
+    }
+    if (!hasExactKeys(objectPack, ["entries", "version"])
+        || objectPack?.version !== manifest.pack.format
+        || !Array.isArray(objectPack.entries)
+        || objectPack.entries.some((entry) =>
+            !hasExactKeys(entry, [
+                "artifactIds",
+                "byteHash",
+                "contentBase64",
+                "objectId",
+                "path",
+                "semanticHashes",
+            ]))
+        || objectPack.entries.some((entry, index) =>
+            index > 0
+            && objectPack.entries[index - 1].path
+                .localeCompare(entry.path) >= 0)) {
+        return false;
+    }
+    const packedByPath = new Map(
+        objectPack.entries.map((entry) => [entry.path, entry]),
+    );
+    if (packedByPath.size !== objectPack.entries.length) return false;
+    const generated = generatedImpossibilityDocuments(command);
+    const expectedPaths = new Set([
+        IMPOSSIBILITY_REQUEST_FILENAME,
+        IMPOSSIBILITY_PROPOSAL_FILENAME,
+        manifest.pack.path,
+    ]);
+    for (const object of manifest.entries) {
+        const generatedValue = generated.get(object.path);
+        if (!hasExactKeys(object, [
+            "artifactIds",
+            "byteHash",
+            "kind",
+            "objectId",
+            "path",
+            "semanticHashes",
+        ])
+            || !Array.isArray(object.artifactIds)
+            || !taggedHashMatchesObjectId(
+                object.byteHash,
+                object.objectId,
+            )
+            || !Array.isArray(object.semanticHashes)
+            || object.semanticHashes.some((hash) =>
+                !taggedHashMatchesObjectId(hash, object.objectId))
+            || ((object.kind === "generated")
+                !== (generatedValue !== undefined))) {
+            return false;
+        }
+        if (generatedValue !== undefined) {
+            expectedPaths.add(object.path);
+            const read = readEntry(
+                object.path,
+                `${evidenceId} verifier object ${object.path}`,
+            );
+            if (read === null
+                || read.entry.object !== object.objectId
+                || read.bytes.toString("utf8")
+                    !== canonicalize(generatedValue)) {
+                return false;
+            }
+        } else {
+            const packed = packedByPath.get(object.path);
+            if (packed === undefined
+                || packed.objectId !== object.objectId
+                || packed.byteHash !== object.byteHash
+                || !canonicalEqual(
+                    packed.artifactIds,
+                    object.artifactIds,
+                )
+                || !canonicalEqual(
+                    packed.semanticHashes,
+                    object.semanticHashes,
+                )
+                || typeof packed.contentBase64 !== "string") {
+                return false;
+            }
+            const bytes = Buffer.from(packed.contentBase64, "base64");
+            if (bytes.toString("base64") !== packed.contentBase64
+                || objectIdFor(sha256Bytes(bytes)) !== object.objectId) {
+                return false;
+            }
+        }
+    }
+    return [...generated.keys()].every((entryPath) =>
+        expectedPaths.has(entryPath))
+        && packedByPath.size === manifest.entries.filter((entry) =>
+            entry.kind === "cas_object").length
+        && snapshotManifest.entries.length === expectedPaths.size
+        && snapshotManifest.entries.every((entry) =>
+            expectedPaths.has(entry.path));
+}
+
+function verifyImpossibilityAuthorityArtifacts(
+    store,
+    aggregate,
+    evidence,
+    observation,
+    command,
+) {
+    const provenance = evidence.receipt?.provenance ?? null;
+    const measurement = provenance?.measurements?.[0] ?? null;
+    const certificateArtifact =
+        provenance?.impossibilityCertificateArtifact ?? null;
+    if (command?.kind !== "verify_impossibility"
+        || provenance === null
+        || provenance.measurements.length !== 1
+        || measurement === null
+        || certificateArtifact === null) {
+        scientificArtifactFailure(
+            "impossibility evidence has an incomplete verifier closure",
+            { evidenceId: evidence.evidenceId },
+        );
+    }
+    const certificateBytes = readScientificArtifactBytes(
+        store,
+        certificateArtifact,
+        `${evidence.evidenceId} impossibility certificate`,
+    );
+    const certificate = parseCanonicalJson(
+        decodeUtf8(
+            certificateBytes,
+            `${evidence.evidenceId} impossibility certificate`,
+            BundleTamperError,
+        ),
+        { label: `${evidence.evidenceId} impossibility certificate` },
+    );
+    const receiptBytes = readScientificArtifactBytes(
+        store,
+        measurement.receiptArtifact,
+        `${evidence.evidenceId} impossibility receipt`,
+    );
+    const receipt = parseCanonicalJson(
+        decodeUtf8(
+            receiptBytes,
+            `${evidence.evidenceId} impossibility receipt`,
+            BundleTamperError,
+        ),
+        { label: `${evidence.evidenceId} impossibility receipt` },
+    );
+    const stdoutBytes = readScientificArtifactBytes(
+        store,
+        measurement.rawStdoutArtifact,
+        `${evidence.evidenceId} impossibility stdout`,
+    );
+    const stderrBytes = readScientificArtifactBytes(
+        store,
+        measurement.rawStderrArtifact,
+        `${evidence.evidenceId} impossibility stderr`,
+    );
+    const checkerResult = observation.data?.checkerResult ?? null;
+    let independentlyParsed;
+    try {
+        independentlyParsed = parseImpossibilityVerifierResult(
+            stdoutBytes.toString("utf8"),
+            {
+                request: command.request,
+                requestHash: command.requestHash,
+                expectedBinding: command.measurementBinding,
+            },
+        );
+    } catch (error) {
+        scientificArtifactFailure(
+            "impossibility raw stdout does not parse under the pinned verifier parser",
+            { evidenceId: evidence.evidenceId },
+            error,
+        );
+    }
+    const verifierRole =
+        aggregate.contract.harnessSuite.roles.impossibility_verifier;
+    const execution = observation.verifierExecution ?? null;
+    const securityContext =
+        receipt.sandbox?.policyIdentity?.securityContext ?? null;
+    if (!verifyImpossibilityRequestSnapshot(
+        store,
+        command,
+        measurement,
+        evidence.evidenceId,
+    )
+        || hashCanonical(
+            command.proofArtifact,
+            IMPOSSIBILITY_PROOF_ARTIFACT_HASH_ALGORITHM,
+        ) !== command.proofArtifactHash
+        || command.proofArtifactHash
+            === command.proposedCertificateArtifactHash
+        || !canonicalEqual(
+            certificate,
+            checkerResult?.certificate ?? null,
+        )
+        || !canonicalEqual(independentlyParsed, checkerResult)
+        || !canonicalEqual(receipt.parsed, checkerResult)
+        || receipt.version !== HARNESS_SUITE_RECEIPT_VERSION
+        || receipt.harnessId !== verifierRole.harnessId
+        || receipt.harnessEntryHash !== verifierRole.harnessEntryHash
+        || receipt.executableHash !== verifierRole.executableHash
+        || receipt.stagedExecutableHash !== verifierRole.executableHash
+        || !canonicalEqual(receipt.parserIdentity, verifierRole.parser)
+        || !canonicalEqual(
+            verifierRole.parser,
+            trustedParserIdentity(verifierRole.parser.version),
+        )
+        || observation.data?.proposedCertificateArtifactHash
+            !== command.proposedCertificateArtifactHash
+        || receipt.sandbox?.policyDigest
+            !== aggregate.contract.harnessSuite.roles
+                .impossibility_verifier.sandboxIdentity.policyDigest
+        || securityContext?.appContainer !== true
+        || securityContext?.lowIntegrity !== true
+        || !Array.isArray(securityContext?.capabilities)
+        || securityContext.capabilities.length !== 0
+        || observation.receipt.measurementReceiptHash
+            !== measurement.receiptHash
+        || observation.receipt.verificationSnapshotHash
+            !== measurement.snapshot.snapshotHash
+        || observation.receipt.verificationRequestHash
+            !== command.requestHash
+        || observation.receipt.measurementReceiptArtifactHash
+            !== taggedScientificArtifactHash(
+                IMPOSSIBILITY_RECEIPT_ARTIFACT_HASH_ALGORITHM,
+                receiptBytes,
+            )
+        || observation.receipt.rawStdoutArtifactHash
+            !== taggedScientificArtifactHash(
+                IMPOSSIBILITY_STDOUT_ARTIFACT_HASH_ALGORITHM,
+                stdoutBytes,
+            )
+        || observation.receipt.rawStderrArtifactHash
+            !== taggedScientificArtifactHash(
+                IMPOSSIBILITY_STDERR_ARTIFACT_HASH_ALGORITHM,
+                stderrBytes,
+            )
+        || observation.receipt.certificateArtifactHash
+            !== taggedScientificArtifactHash(
+                IMPOSSIBILITY_CERTIFICATE_ARTIFACT_HASH_ALGORITHM,
+                certificateBytes,
+            )
+        || execution?.measurement?.receiptHash !== measurement.receiptHash
+        || execution?.measurement?.rawStdoutArtifact?.artifactId
+            !== measurement.rawStdoutArtifact.artifactId
+        || execution?.measurement?.rawStderrArtifact?.artifactId
+            !== measurement.rawStderrArtifact.artifactId
+        || execution?.executionIdentity?.harnessEntryHash
+            !== verifierRole.harnessEntryHash
+        || execution?.executionIdentity?.executableHash
+            !== verifierRole.executableHash
+        || !canonicalEqual(
+            execution?.executionIdentity?.parserIdentity,
+            verifierRole.parser,
+        )) {
+        scientificArtifactFailure(
+            "impossibility verifier request/output/receipt/certificate closure is inconsistent",
+            { evidenceId: evidence.evidenceId },
         );
     }
 }
@@ -2446,7 +2883,8 @@ function verifyScientificAuthorityArtifacts(
                 || (evidence.purpose !== "candidate"
                     && evidence.purpose !== "confirmation"
                     && evidence.purpose !== "challenge"
-                    && evidence.purpose !== "validation")) {
+                    && evidence.purpose !== "validation"
+                    && evidence.purpose !== "impossibility")) {
                 continue;
             }
             const observation =
@@ -2482,8 +2920,16 @@ function verifyScientificAuthorityArtifacts(
                     observation,
                     command,
                 );
-            } else {
+            } else if (evidence.purpose === "validation") {
                 verifyValidationAuthorityArtifacts(
+                    store,
+                    aggregate,
+                    evidence,
+                    observation,
+                    command,
+                );
+            } else {
+                verifyImpossibilityAuthorityArtifacts(
                     store,
                     aggregate,
                     evidence,
@@ -2749,7 +3195,7 @@ function assertSameVerifiedBundle(staged, published) {
     }
 }
 
-function authenticateImport(verification, options) {
+export function authenticateBundleVerification(verification, options = {}) {
     const {
         expectedDigest = null,
         expectedSignature = options.signature ?? null,
@@ -2889,7 +3335,7 @@ export function exportBundle(options = {}) {
             }
         }
 
-        const manifest = validateManifest({
+        const manifest = validateBundleManifest({
             type: BUNDLE_TYPE,
             version: BUNDLE_VERSION,
             algo: ALGO,
@@ -3058,7 +3504,10 @@ export function importBundle(options = {}) {
             DOMAIN_VERSION,
         );
         if (publication.phase === "staged") {
-            const trustLevel = authenticateImport(verification, options);
+            const trustLevel = authenticateBundleVerification(
+                verification,
+                options,
+            );
             const postAuthentication = verifyBundleStage(
                 root,
                 null,

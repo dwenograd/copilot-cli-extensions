@@ -35,9 +35,11 @@ export {
     PARSER_SOURCE_HASH_ALGORITHM,
     PARSER_VERSION_HASH_ALGORITHM,
     SANDBOX_POLICY_IDENTITY_HASH_ALGORITHM,
+    applicationEntrypointHashForEntry,
     buildFrozenHarnessIdentity,
     isVerifiedHarnessEntry,
     loadHarnessAllowlist,
+    trustedParserIdentity,
     validateHarnessValidationCases,
     verifyFrozenHarnessIdentity,
     verifyHarnessPreflight,
@@ -49,6 +51,12 @@ export {
     normalizeHarnessResultBinding,
     parseHarnessResult,
 } from "./parser.mjs";
+
+export {
+    VERIFIER_PARSER_MAX_INPUT_BYTES,
+    VERIFIER_PARSER_VERSION,
+    parseImpossibilityVerifierResult,
+} from "./verifier-parser.mjs";
 
 export {
     NOVELTY_BINDING_SEED_ALGORITHM,
@@ -77,6 +85,8 @@ export {
     HARNESS_SUITE_V4_REQUIRED_ROLES,
     HARNESS_SUITE_V4_ROLES,
     HARNESS_SUITE_V4_VERSION,
+    HARNESS_SUITE_V4_VERIFIER_INDEPENDENCE_ATTESTATION,
+    HARNESS_SUITE_V4_VERIFIER_MODES,
     HarnessSuiteV4Error,
     computeHarnessSuiteV4Identity,
     hashHarnessEnvironmentV4,

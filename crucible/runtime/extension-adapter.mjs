@@ -14,6 +14,7 @@ import {
 } from "./config.mjs";
 import { createDomainRepositoryAdapter } from "./domain-adapter.mjs";
 import {
+    openArtifactStore,
     openRepository,
     openRepositoryReadOnly,
 } from "../persistence/index.mjs";
@@ -330,18 +331,25 @@ export async function waitForSupervisorAcknowledgement(
 
 export function requestStop({
     stateDir,
+    artifactRoot = null,
     investigationId,
     reason = "Stop requested by the Crucible extension adapter.",
     pauseRequested = true,
     requestId = null,
     repositoryFactory = openRepository,
+    artifactStoreFactory = openArtifactStore,
 } = {}) {
     const repository = repositoryFactory({
         file: path.join(stateDir, "events.sqlite"),
     });
     try {
+        const resolvedArtifactRoot = artifactRoot
+            ?? path.join(path.dirname(stateDir), "artifacts");
         const adapter = createDomainRepositoryAdapter({
             repository,
+            artifactStore: artifactStoreFactory({
+                root: resolvedArtifactRoot,
+            }),
             investigationId,
         });
         const result = adapter.requestStop({

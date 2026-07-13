@@ -53,17 +53,29 @@ const CASES = Object.freeze({
 });
 
 function roleIdentity(role, cases = CASES[role] ?? []) {
+    const verifier = role === "impossibility_verifier";
+    const executableHash = tagged(`${role}-executable`);
     return {
         harnessId: `${role.replaceAll("_", "-")}-harness`,
         harnessEntryHash: tagged(`${role}-entry`),
-        executableHash: tagged(`${role}-executable`),
+        executableHash,
+        applicationEntrypointHash: executableHash,
         parser: {
-            version: "fixture-parser-v2",
-            versionHash: tagged("parser-version"),
-            sourceHash: tagged("parser-source"),
+            version: verifier
+                ? "fixture-impossibility-parser-v1"
+                : "fixture-parser-v2",
+            versionHash: tagged(
+                verifier ? "verifier-parser-version" : "parser-version",
+            ),
+            sourceHash: tagged(
+                verifier ? "verifier-parser-source" : "parser-source",
+            ),
         },
         dependencies: [],
-        configHash: hashHarnessRoleConfigV4(ROLE_CONFIG),
+        configHash: hashHarnessRoleConfigV4({
+            ...ROLE_CONFIG,
+            executesCandidateCode: verifier,
+        }),
         observableSchemaHash: hashHarnessObservableSchemaV4({
             pass: "boolean",
             metrics: ["score"],
@@ -75,9 +87,20 @@ function roleIdentity(role, cases = CASES[role] ?? []) {
         })),
         deterministicSeed: `seed-${role}`,
         sandboxIdentity: {
-            required: false,
-            policyDigest: null,
+            required: verifier,
+            policyDigest: verifier ? tagged("sandbox-policy") : null,
         },
+        ...(verifier
+            ? {
+                independenceAttestation: {
+                    kind: "operator_attested_separate_implementation",
+                },
+                verificationPolicy: {
+                    mode: "enumerand_reexecution",
+                    certificateFormat: null,
+                },
+            }
+            : {}),
     };
 }
 
@@ -193,6 +216,11 @@ describe("HarnessSuiteV4 normalization and identity", () => {
         const parserIdentityMismatch = baseSuite({ verifier: true });
         parserIdentityMismatch.roles.impossibility_verifier.parser.versionHash =
             tagged("different-parser-version-identity");
+        parserIdentityMismatch.roles.impossibility_verifier.parser.sourceHash =
+            retagged(
+                parserIdentityMismatch.roles.search.parser.sourceHash,
+                "attacker-verifier-parser-v1",
+            );
         expect(() => normalizeHarnessSuiteV4(parserIdentityMismatch))
             .toThrow(/verifier application implementation closure overlaps/u);
 
@@ -288,6 +316,15 @@ describe("HarnessSuiteV4 normalization and identity", () => {
         expect(() => normalizeHarnessSuiteV4(parserExploit))
             .toThrow(/verifier application implementation closure overlaps/u);
 
+        const entrypointExploit = baseSuite({ verifier: true });
+        entrypointExploit.roles.impossibility_verifier
+            .applicationEntrypointHash = retagged(
+                entrypointExploit.roles.search.applicationEntrypointHash,
+                "attacker-verifier-entrypoint-v1",
+            );
+        expect(() => normalizeHarnessSuiteV4(entrypointExploit))
+            .toThrow(/verifier application implementation closure overlaps/u);
+
         const platformLaundering = baseSuite({ verifier: true });
         const primaryEntrypoint = tagged("primary-entrypoint");
         platformLaundering.roles.search.dependencies = [{
@@ -318,6 +355,55 @@ describe("HarnessSuiteV4 normalization and identity", () => {
             .toThrow(/only declared runtime\/platform dependency files/u);
     });
 
+    it("requires an operator attestation and frozen AppContainer policy for the verifier", () => {
+        const missingAttestation = baseSuite({ verifier: true });
+        delete missingAttestation.roles.impossibility_verifier
+            .independenceAttestation;
+        expect(() => normalizeHarnessSuiteV4(missingAttestation))
+            .toThrow(/plain object/u);
+
+        const hostVerifier = baseSuite({ verifier: true });
+        hostVerifier.roles.impossibility_verifier.sandboxIdentity = {
+            required: false,
+            policyDigest: null,
+        };
+        expect(() => normalizeHarnessSuiteV4(hostVerifier))
+            .toThrow(/AppContainer/u);
+    });
+
+    it("requires certificate validation to pin a separate proof checker dependency", () => {
+        const missing = baseSuite({ verifier: true });
+        missing.roles.impossibility_verifier.verificationPolicy = {
+            mode: "certificate_validation",
+            certificateFormat: {
+                version: "fixture-proof-v1",
+                schemaHash: tagged("fixture-proof-schema"),
+            },
+        };
+        expect(() => normalizeHarnessSuiteV4(missing))
+            .toThrow(/separately pinned impossibility-proof-checker/u);
+
+        const valid = clone(missing);
+        valid.roles.impossibility_verifier.dependencies.push({
+            role: "impossibility-proof-checker",
+            sha256: tagged("separate-proof-checker"),
+            kind: "application",
+        });
+        expect(normalizeHarnessSuiteV4(valid).roles
+            .impossibility_verifier.verificationPolicy.mode)
+            .toBe("certificate_validation");
+
+        const reused = clone(missing);
+        reused.roles.impossibility_verifier.dependencies.push({
+            role: "impossibility-proof-checker",
+            sha256:
+                reused.roles.impossibility_verifier.executableHash,
+            kind: "application",
+        });
+        expect(() => normalizeHarnessSuiteV4(reused))
+            .toThrow(/separately pinned from the verifier/u);
+    });
+
     it("redacts held-out/challenge case ids and snapshot ids from worker projections", () => {
         const projection = projectHarnessSuiteV4ForWorker(baseSuite());
         expect(projection).not.toHaveProperty("operatorCorpus");
@@ -334,6 +420,7 @@ describe("HarnessSuiteV4 normalization and identity", () => {
 function receiptInput(parsed, measurementBinding = undefined) {
     const hash = tagged("receipt-field");
     return {
+        harnessId: "fixture-harness",
         allowlistFileHash: hash,
         harnessEntryHash: hash,
         executableHash: hash,
@@ -372,6 +459,11 @@ function receiptInput(parsed, measurementBinding = undefined) {
             truncated: false,
         },
         parserVersion: parsed.parserVersion,
+        parserIdentity: {
+            version: parsed.parserVersion,
+            versionHash: tagged("parser-version"),
+            sourceHash: tagged("parser-source"),
+        },
         sandbox: null,
         attemptId: "attempt-1",
         runnerEpochId: "epoch-1",
@@ -414,5 +506,14 @@ describe("HarnessSuiteV4 parser/receipt binding", () => {
             ...binding,
             subjectId: "candidate-99",
         }))).toThrow(/binding disagrees/u);
+
+        const wrongParser = receiptInput(parsed);
+        wrongParser.parserIdentity = {
+            ...wrongParser.parserIdentity,
+            sourceHash: tagged("wrong-parser-source"),
+        };
+        wrongParser.parserIdentity.version = "other-parser";
+        expect(() => buildMeasurementReceipt(wrongParser))
+            .toThrow(/bind the receipt parser version/u);
     });
 });

@@ -47,6 +47,10 @@ import {
     createInitialAggregate,
     immutableAggregate,
 } from "./state.mjs";
+import {
+    bindAggregateImpossibilityExecution,
+    verifierExecutionCapabilityForEvent,
+} from "./private-verifier-execution.mjs";
 
 const EVENT_KEYS = Object.freeze(["eventHash", "payload", "prevHash", "seq", "type"]);
 const SCIENTIFIC_REPLAY_EVENT_TYPES = new Set([
@@ -133,7 +137,7 @@ function assertEventEnvelope(aggregate, event) {
     }
 }
 
-function assertCanonicalExternalPayload(aggregate, event) {
+function assertCanonicalExternalPayload(aggregate, event, options = {}) {
     if (!EXTERNAL_EVENT_TYPES.includes(event.type)
         && event.type !== EVENT_TYPES.COMMAND_OBSERVED) {
         return;
@@ -142,6 +146,7 @@ function assertCanonicalExternalPayload(aggregate, event) {
         event.type,
         event.payload,
         aggregate,
+        options,
     );
     if (!canonicalEqual(normalized, event.payload)) {
         throw new TransitionError(
@@ -394,6 +399,8 @@ function applyCommandObserved(next, event) {
         const measurement = payload.receipt.provenance.measurements[0];
         const certificateArtifact =
             payload.receipt.provenance.impossibilityCertificateArtifact;
+        const execution = payload.verifierExecution;
+        const facts = execution?.facts;
         if (command.command.kind !== "verify_impossibility"
             || next.contract.hypothesisTopology !== "certified_impossibility") {
             throw new TransitionError(
@@ -403,6 +410,31 @@ function applyCommandObserved(next, event) {
         }
         if (payload.data.certificateVersion !== command.command.certificateVersion
             || payload.data.verificationRequestHash !== command.command.requestHash
+            || payload.data.proposedCertificateArtifactHash
+                !== command.command.proposedCertificateArtifactHash
+            || payload.data.checkerResult.proofArtifactHash
+                !== command.command.proofArtifactHash
+            || payload.data.checkerResult.proofArtifactHash
+                === command.command.proposedCertificateArtifactHash
+            || execution?.commandId !== payload.commandId
+            || execution?.observationId !== payload.observationId
+            || execution?.request?.requestHash !== command.command.requestHash
+            || execution?.proof?.artifactHash
+                !== command.command.proofArtifactHash
+            || execution?.measurement?.receiptHash
+                !== measurement.receiptHash
+            || execution?.measurement?.rawStdoutArtifact?.artifactId
+                !== measurement.rawStdoutArtifact.artifactId
+            || execution?.measurement?.rawStderrArtifact?.artifactId
+                !== measurement.rawStderrArtifact.artifactId
+            || facts?.status !== payload.data.checkerStatus
+            || facts?.verdict !== payload.data.certificateVerdict
+            || facts?.requestHash !== command.command.requestHash
+            || facts?.proofArtifactHash
+                !== command.command.proofArtifactHash
+            || facts?.complete !== payload.data.checkerResult.complete
+            || facts?.disagreementCount
+                !== payload.data.checkerResult.disagreementCount
             || payload.receipt.certificateArtifactHash
                 !== payload.data.certificateArtifactHash
             || payload.receipt.measurementReceiptHash
@@ -411,7 +443,10 @@ function applyCommandObserved(next, event) {
                 !== payload.data.verificationRequestHash
             || payload.receipt.verificationSnapshotHash
                 !== payload.data.verificationSnapshotHash
-            || payload.data.verifiedFacts.parserVersion !== command.command.parserVersion
+            || payload.data.checkerResult.parserVersion
+                !== command.command.parserVersion
+            || payload.data.checkerResult.status
+                !== payload.data.checkerStatus
             || measurement.receiptHash !== payload.data.measurementReceiptHash
             || measurement.snapshot.snapshotHash
                 !== payload.data.verificationSnapshotHash
@@ -427,6 +462,7 @@ function applyCommandObserved(next, event) {
                 measurement.rawStderrArtifact.objectId,
                 payload.receipt.rawStderrArtifactHash,
             )
+            || measurement.sandboxPolicy.kind !== "sandbox"
             || certificateArtifact === null
             || !objectIdMatchesTaggedHash(
                 certificateArtifact.objectId,
@@ -538,7 +574,7 @@ function applyCommandObserved(next, event) {
         const enumerandManifest = next.contract.enumerandManifest === undefined
             ? null
             : normalizeEnumerandManifest(next.contract.enumerandManifest, {
-                topology: next.contract.hypothesisTopology,
+                topology: next.contract.enumerandManifest.topology,
                 observableRegistry: next.contract.observableRegistry,
                 hypothesisPolicy: next.contract.hypothesisPolicy,
             });
@@ -549,7 +585,7 @@ function applyCommandObserved(next, event) {
                     enumerandManifest,
                     command.command.enumerand,
                     {
-                        topology: next.contract.hypothesisTopology,
+                        topology: next.contract.enumerandManifest.topology,
                         observableRegistry: next.contract.observableRegistry,
                         hypothesisPolicy: next.contract.hypothesisPolicy,
                     },
@@ -936,7 +972,14 @@ function applyTransition(next, event) {
     }
 }
 
-export function reduceEvent(aggregate, event) {
+export function reduceEvent(aggregate, event, options = {}) {
+    const verifierExecutionCapability =
+        options.verifierExecutionCapability
+        ?? verifierExecutionCapabilityForEvent(event);
+    const reductionOptions = {
+        ...options,
+        verifierExecutionCapability,
+    };
     if (aggregate?.domainVersion !== DOMAIN_VERSION) {
         throw new DomainVersionRestartRequiredError(
             "Aggregate domain version is incompatible; start a new investigation",
@@ -967,7 +1010,7 @@ export function reduceEvent(aggregate, event) {
         );
     }
     requireOpen(aggregate, event);
-    assertCanonicalExternalPayload(aggregate, event);
+    assertCanonicalExternalPayload(aggregate, event, reductionOptions);
 
     if (KERNEL_DECISION_EVENT_TYPES.includes(event.type)
         && !decisionEventMatches(aggregate, event)) {
@@ -980,6 +1023,14 @@ export function reduceEvent(aggregate, event) {
 
     const next = cloneAggregateForMutation(aggregate);
     applyTransition(next, event);
+    if (event.type === EVENT_TYPES.COMMAND_OBSERVED
+        && event.payload?.purpose === "impossibility") {
+        bindAggregateImpossibilityExecution(
+            next,
+            event.payload.observationId,
+            verifierExecutionCapability,
+        );
+    }
     next.lastSeq = event.seq;
     next.lastEventHash = event.eventHash;
     if (SCIENTIFIC_REPLAY_EVENT_TYPES.has(event.type)) {
@@ -988,10 +1039,16 @@ export function reduceEvent(aggregate, event) {
     return immutableAggregate(next);
 }
 
-export function replayEvents(events) {
+export function replayEvents(events, options = {}) {
     let aggregate = createInitialAggregate();
     for (const event of events) {
-        aggregate = reduceEvent(aggregate, event);
+        const verifierExecutionCapability =
+            typeof options.verifierExecutionResolver === "function"
+                ? options.verifierExecutionResolver({ aggregate, event })
+                : null;
+        aggregate = reduceEvent(aggregate, event, {
+            verifierExecutionCapability,
+        });
     }
     return aggregate;
 }

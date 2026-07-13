@@ -22,7 +22,7 @@
 //   - stdoutHash / stderrHash: hashes of retained raw output bytes
 //   - outputCapture        : per-stream cap, observed/retained byte totals, and
 //                            overflow/truncation state
-//   - parserVersion        : version tag of the parser that produced facts
+//   - parserIdentity       : exact trusted parser version/version/source hashes
 //   - sandbox              : enforced capability/provider/full policy binding
 //                            (including explicit Job limits) | null
 //   - role / phase / replicateIndex / blockIndex / deterministicSeed /
@@ -47,8 +47,8 @@ import { normalizeHarnessResultBinding } from "./parser.mjs";
 export const RECEIPT_HASH_ALGORITHM = "sha256:crucible-measurement-receipt-v1";
 export const ARGV_HASH_ALGORITHM = "sha256:crucible-measurement-argv-v1";
 export const ENV_HASH_ALGORITHM = "sha256:crucible-measurement-env-v1";
-export const RECEIPT_VERSION = 5;
-export const HARNESS_SUITE_RECEIPT_VERSION = 7;
+export const RECEIPT_VERSION = 6;
+export const HARNESS_SUITE_RECEIPT_VERSION = 8;
 
 const MEASUREMENT_BINDING_KEYS = Object.freeze([
     "role",
@@ -62,12 +62,16 @@ const MEASUREMENT_BINDING_KEYS = Object.freeze([
     "environmentIdentity",
     "suiteIdentity",
 ]);
+const SAFE_ID = /^[a-z0-9][a-z0-9._-]{0,127}$/u;
+const TAGGED_SHA256 =
+    /^sha256:[a-z0-9][a-z0-9._-]*:[a-f0-9]{64}$/u;
 
 // Keys within the receipt that are input-derived (deterministic given the
 // same inputs). Timing fields are excluded so callers can prove determinism
 // across two runs that happened to take different wall-clock durations.
 export const RECEIPT_DETERMINISM_KEYS = Object.freeze([
     "version",
+    "harnessId",
     "allowlistFileHash",
     "harnessEntryHash",
     "executableHash",
@@ -86,6 +90,7 @@ export const RECEIPT_DETERMINISM_KEYS = Object.freeze([
     "stdoutHash",
     "stderrHash",
     "outputCapture",
+    "parserIdentity",
     "parserVersion",
     "sandbox",
     "attemptId",
@@ -162,6 +167,7 @@ function normalizeOutputCapture(value) {
     if (value === null || typeof value !== "object" || Array.isArray(value)) {
         throw new TypeError("outputCapture must be an object");
     }
+
     const stdout = normalizeStreamCapture(value.stdout, "outputCapture.stdout");
     const stderr = normalizeStreamCapture(value.stderr, "outputCapture.stderr");
     const overflowed = stdout.overflowed || stderr.overflowed;
@@ -174,6 +180,32 @@ function normalizeOutputCapture(value) {
         stderr,
         overflowed,
         truncated,
+    };
+}
+
+function normalizeParserIdentity(value, parserVersion) {
+    if (value === null
+        || typeof value !== "object"
+        || Array.isArray(value)
+        || Object.getPrototypeOf(value) !== Object.prototype
+        || JSON.stringify(Object.keys(value).sort())
+            !== JSON.stringify(["sourceHash", "version", "versionHash"])) {
+        throw new TypeError(
+            "parserIdentity must contain exactly version, versionHash, and sourceHash",
+        );
+    }
+    if (value.version !== parserVersion
+        || !SAFE_ID.test(value.version)
+        || !TAGGED_SHA256.test(value.versionHash)
+        || !TAGGED_SHA256.test(value.sourceHash)) {
+        throw new TypeError(
+            "parserIdentity must bind the receipt parser version and tagged source identities",
+        );
+    }
+    return {
+        version: value.version,
+        versionHash: value.versionHash,
+        sourceHash: value.sourceHash,
     };
 }
 
@@ -223,10 +255,19 @@ function normalizeReceiptBinding(input) {
 // SHA-256 strings. Timing fields are ISO strings + a numeric duration.
 export function buildMeasurementReceipt(input) {
     const measurementBinding = normalizeReceiptBinding(input);
+    if (typeof input.harnessId !== "string"
+        || !SAFE_ID.test(input.harnessId)) {
+        throw new TypeError("harnessId must be a safe identifier");
+    }
+    const parserIdentity = normalizeParserIdentity(
+        input.parserIdentity,
+        input.parserVersion,
+    );
     const receipt = {
         version: measurementBinding === null
             ? RECEIPT_VERSION
             : HARNESS_SUITE_RECEIPT_VERSION,
+        harnessId: input.harnessId,
         allowlistFileHash: input.allowlistFileHash,
         harnessEntryHash: input.harnessEntryHash,
         executableHash: input.executableHash,
@@ -270,6 +311,7 @@ export function buildMeasurementReceipt(input) {
         stderrHash: input.stderrHash,
         outputCapture: normalizeOutputCapture(input.outputCapture),
         parserVersion: input.parserVersion,
+        parserIdentity,
         sandbox: input.sandbox === null
             ? null
             : {

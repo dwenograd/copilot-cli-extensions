@@ -2,17 +2,18 @@ import { hashCanonical } from "./canonical.mjs";
 import { commandBudget } from "./contract.mjs";
 import {
     EVENT_TYPES,
-    IMPOSSIBILITY_REQUEST_HASH_ALGORITHM,
     NON_RESULT_CODES,
 } from "./constants.mjs";
-import { impossibilitySearchEvidenceHash } from "./impossibility.mjs";
+import {
+    createImpossibilityMeasurementBinding,
+    createImpossibilityVerificationPackage,
+} from "./impossibility.mjs";
 import {
     deriveReplicationSchedule,
     statisticalSubjectIndex,
 } from "./replication.mjs";
 import { DecisionError, ERROR_CODES } from "./errors.mjs";
 import { detectPlateau, buildSearchCandidateCommand } from "./strategy.mjs";
-import { buildCandidateArchive } from "./archive.mjs";
 import {
     deriveScientificConfirmationFreeze,
     deriveScientificConfirmationState,
@@ -23,9 +24,8 @@ import {
     assessVerifiedResultReadiness,
 } from "./scientific-readiness.mjs";
 import {
-    deriveScientificConclusion,
-    scientificReplaySummary,
-} from "./scientific-replay.mjs";
+    deriveTerminalEvidenceClosure,
+} from "./terminal-closure.mjs";
 import {
     activeCommand,
     boundedSearchExhaustion,
@@ -42,19 +42,6 @@ import {
     validationAttemptIndexes,
     validationEvidenceItems,
 } from "./state.mjs";
-
-const TERMINAL_RECEIPT_ROOTS_HASH_ALGORITHM =
-    "sha256:crucible-terminal-receipt-roots-v1";
-const TERMINAL_FRONTIER_HASH_ALGORITHM =
-    "sha256:crucible-terminal-frontier-v1";
-const TERMINAL_ARCHIVE_HASH_ALGORITHM =
-    "sha256:crucible-terminal-archive-v1";
-const TERMINAL_BASIS_HASH_ALGORITHM =
-    "sha256:crucible-terminal-basis-v1";
-const TERMINAL_STRATEGY_HISTORY_HASH_ALGORITHM =
-    "sha256:crucible-terminal-strategy-history-v1";
-const TERMINAL_EVIDENCE_CLOSURE_HASH_ALGORITHM =
-    "sha256:crucible-terminal-evidence-closure-v2";
 
 function nextCommandId(aggregate) {
     return `cmd-${String(aggregate.commandOrder.length + 1).padStart(6, "0")}`;
@@ -93,18 +80,45 @@ function budgetRecommendation(aggregate, reason, details = null) {
 function impossibilityNonResultRecommendation(aggregate, evidence) {
     const observation = aggregate.observations[evidence.observationId];
     const certificateVerdict = observation?.data?.certificateVerdict ?? "invalid";
+    const checkerStatus = observation?.data?.checkerStatus ?? "INVALID";
     const payload = {
         code: NON_RESULT_CODES.IMPOSSIBILITY_CERTIFICATE_INCONCLUSIVE,
-        reason: certificateVerdict === "not_proven"
-            ? "The trusted impossibility verifier did not certify that the target is unreachable."
-            : "The trusted impossibility verifier produced an invalid certificate verdict.",
+        reason: checkerStatus === "REJECTED"
+            ? "The independent impossibility verifier rejected the proposed certificate."
+            : checkerStatus === "INCONCLUSIVE"
+                ? "The independent impossibility verifier could not close the frozen evidence."
+                : "The independent impossibility verifier produced an invalid result.",
         commandCount: aggregate.commandOrder.length,
         commandBudget: commandBudget(aggregate.contract),
         maxRounds: aggregate.contract.maxRounds,
         sourceStopRequestSeq: null,
         certificateVerdict,
+        checkerStatus,
         evidenceId: evidence.evidenceId,
         evidenceHash: evidence.commitEventHash,
+    };
+    return {
+        kind: "NON_RESULT",
+        ...payload,
+        event: {
+            type: EVENT_TYPES.NON_RESULT_RECORDED,
+            payload,
+        },
+    };
+}
+
+function impossibilityEvidenceIncompleteRecommendation(aggregate, verification) {
+    const payload = {
+        code: NON_RESULT_CODES.IMPOSSIBILITY_CERTIFICATE_INCONCLUSIVE,
+        reason:
+            "The frozen calibration, control, search, or alpha-ledger evidence is incomplete; the independent verifier was not run.",
+        commandCount: aggregate.commandOrder.length,
+        commandBudget: commandBudget(aggregate.contract),
+        maxRounds: aggregate.contract.maxRounds,
+        sourceStopRequestSeq: null,
+        certificateVerdict: "inconclusive",
+        checkerStatus: "INCONCLUSIVE",
+        missing: verification.missing,
     };
     return {
         kind: "NON_RESULT",
@@ -161,6 +175,126 @@ function scientificConfirmationFailureRecommendation(
             payload,
         },
     };
+}
+
+function scientificReadinessFailureRecommendation(
+    aggregate,
+    {
+        code,
+        reason,
+        cohort = null,
+        evidence = [],
+        basis = null,
+        readiness = null,
+    },
+) {
+    const evidenceItems = Array.isArray(evidence) ? evidence : [];
+    const payload = {
+        code,
+        reason,
+        commandCount: aggregate.commandOrder.length,
+        commandBudget: commandBudget(aggregate.contract),
+        maxRounds: aggregate.contract.maxRounds,
+        sourceStopRequestSeq: null,
+        cohortStatus: cohort?.status ?? null,
+        candidateIds: evidenceItems.map((item) => item.candidateId),
+        evidenceIds: evidenceItems.map((item) => item.evidenceId),
+        evidenceHashes: evidenceItems.map((item) => item.commitEventHash),
+        cohortComparisonHash: cohort?.comparisonHash ?? null,
+        relationEvidenceHash: cohort?.relationEvidenceHash ?? null,
+        basis,
+        readiness,
+    };
+    return {
+        kind: "NON_RESULT",
+        ...payload,
+        event: {
+            type: EVENT_TYPES.NON_RESULT_RECORDED,
+            payload,
+        },
+    };
+}
+
+function predictionReadinessFailureRecommendation(
+    aggregate,
+    cohort,
+    basis,
+    readiness,
+) {
+    const state = readiness.requiredPredictionState;
+    const code = state === "REFUTED"
+        ? NON_RESULT_CODES.SCIENTIFIC_PREDICTION_REFUTED
+        : state === "INVALID"
+            ? NON_RESULT_CODES.SCIENTIFIC_PREDICTION_INVALID
+            : NON_RESULT_CODES.SCIENTIFIC_PREDICTION_UNRESOLVED;
+    const evidence = (cohort?.cohort ?? [])
+        .map((item) => aggregate.evidence[item.evidenceId] ?? null)
+        .filter((item) => item !== null);
+    return scientificReadinessFailureRecommendation(aggregate, {
+        code,
+        reason:
+            `At least one preregistered prediction required for result closure is ${state.toLowerCase()}.`,
+        cohort,
+        evidence,
+        basis,
+        readiness,
+    });
+}
+
+function blockedPredictionRecommendation(aggregate, cohort, basis) {
+    const blocked = (aggregate.scientificReplay?.candidateSupport ?? [])
+        .filter((candidate) =>
+            candidate.active === true
+            && candidate.acceptanceSatisfied === true
+            && candidate.requiredState === "SUPPORTED"
+            && candidate.predictionEvaluation?.requiredState !== undefined
+            && candidate.predictionEvaluation.requiredState !== "SUPPORTED");
+    if (blocked.length === 0) return null;
+    const states = blocked.map((candidate) =>
+        candidate.predictionEvaluation.requiredState);
+    const state = states.includes("INVALID")
+        ? "INVALID"
+        : states.includes("REFUTED")
+            ? "REFUTED"
+            : "UNRESOLVED";
+    const evidence = blocked
+        .map((candidate) =>
+            aggregate.evidence[candidate.evidenceId] ?? null)
+        .filter((item) => item !== null);
+    const code = state === "INVALID"
+        ? NON_RESULT_CODES.SCIENTIFIC_PREDICTION_INVALID
+        : state === "REFUTED"
+            ? NON_RESULT_CODES.SCIENTIFIC_PREDICTION_REFUTED
+            : NON_RESULT_CODES.SCIENTIFIC_PREDICTION_UNRESOLVED;
+    return scientificReadinessFailureRecommendation(aggregate, {
+        code,
+        reason:
+            `Search closed with statistically supported candidates whose required predictions remained ${state.toLowerCase()}.`,
+        cohort,
+        evidence,
+        basis,
+        readiness: {
+            requiredPredictionState: state,
+            blockedCandidateCount: blocked.length,
+        },
+    });
+}
+
+function unresolvedCohortRecommendation(aggregate, cohort, basis) {
+    return scientificReadinessFailureRecommendation(aggregate, {
+        code: NON_RESULT_CODES.SCIENTIFIC_COHORT_UNRESOLVED,
+        reason:
+            "The preregistered pairwise candidate relations did not resolve to a unique best candidate or supported equivalence cohort.",
+        cohort,
+        evidence: (cohort?.frontier ?? [])
+            .map((item) => aggregate.evidence[item.evidenceId] ?? null)
+            .filter((item) => item !== null),
+        basis,
+        readiness: {
+            cohortStatus: cohort?.status ?? null,
+            tieResolution: cohort?.tieResolution ?? null,
+        },
+    });
 }
 
 function freezeScientificConfirmationRecommendation(
@@ -220,177 +354,17 @@ function independentVerificationRecommendation(aggregate, basis, readiness) {
     };
 }
 
-function evidenceReference(evidence) {
-    return {
-        evidenceId: evidence.evidenceId,
-        evidenceHash: evidence.commitEventHash,
-        provenanceRoot: evidence.provenanceRoot,
-    };
-}
-
-function projectArchiveEvidence(evidence) {
-    return {
-        candidateId: evidence.candidateId,
-        evidenceId: evidence.evidenceId,
-        evidenceHash: evidence.commitEventHash,
-        provenanceRoot: evidence.provenanceRoot,
-        outcomeClass: evidence.outcomeClass,
-        rankable: evidence.rankable,
-        metrics: evidence.metrics,
-        round: evidence.round,
-        slotIndex: evidence.slotIndex,
-    };
-}
-
-export function deriveTerminalEvidenceClosure(
-    aggregate,
-    {
-        basis,
-        decisiveKind,
-        decisiveEvidence = null,
-    },
-) {
-    const decisiveEvidenceItems = Array.isArray(decisiveEvidence)
-        ? decisiveEvidence
-        : decisiveEvidence === null
-            ? []
-            : [decisiveEvidence];
-    const candidateCohort = candidateCohortState(aggregate);
-    const validation = currentValidationEvidence(aggregate);
-    const receiptRoots = aggregate.evidenceOrder.flatMap((evidenceId) => {
-        const evidence = aggregate.evidence[evidenceId];
-        if (evidence.receipt?.provenance?.measurements === undefined) {
-            return [];
-        }
-        return evidence.receipt.provenance.measurements.map((measurement) => ({
-            evidenceId,
-            evidenceHash: evidence.commitEventHash,
-            provenanceRoot: evidence.provenanceRoot,
-            subjectId: measurement.subjectId,
-            measurementRoot: measurement.measurementRoot,
-            invalidated: evidence.invalidated,
-            invalidatedSeq: evidence.invalidatedSeq,
-        }));
-    });
-    const progress = searchProgress(aggregate);
-    const frontierProjection = {
-        active: progress.candidates.map((evidence) => projectArchiveEvidence(evidence)),
-        attempted: progress.attemptedCandidates.map((evidence) => ({
-            evidenceId: evidence.evidenceId,
-            evidenceHash: evidence.commitEventHash,
-            provenanceRoot: evidence.provenanceRoot,
-            invalidated: evidence.invalidated,
-            invalidatedSeq: evidence.invalidatedSeq,
-            round: evidence.round,
-            slotIndex: evidence.slotIndex,
-        })),
-        completedRounds: progress.completedRounds,
-        nextRound: progress.nextRound,
-        nextSlot: progress.nextSlot,
-        roundsExhausted: progress.roundsExhausted,
-        boundedComplete: progress.boundedComplete,
-        boundedAttempted: progress.boundedAttempted,
-    };
-    const archive = buildCandidateArchive(aggregate);
-    const archiveProjection = {
-        accepted: archive.accepted.map(projectArchiveEvidence),
-        nearMisses: archive.nearMisses.map(projectArchiveEvidence),
-        rejected: archive.rejected.map(projectArchiveEvidence),
-        invalidMetrics: archive.invalidMetrics.map(projectArchiveEvidence),
-        mechanismGroups: archive.mechanismGroups,
-        lessonGroups: archive.lessonGroups,
-        duplicateIndex: archive.duplicateIndex,
-        incumbent: archive.incumbent === null
-            ? null
-            : projectArchiveEvidence(archive.incumbent),
-    };
-    const core = {
-        version: 1,
-        validation: evidenceReference(validation),
-        decisive: {
-            kind: decisiveKind,
-            evidence: decisiveEvidenceItems.length === 1
-                ? evidenceReference(decisiveEvidenceItems[0])
-                : null,
-            cohort: decisiveEvidenceItems.map(evidenceReference),
-        },
-        termination: {
-            kind: basis.kind,
-            basisHash: hashCanonical(basis, TERMINAL_BASIS_HASH_ALGORITHM),
-            strategyRevision: aggregate.searchStrategy.revision,
-            strategyHistoryHash: hashCanonical(
-                aggregate.searchStrategy.history,
-                TERMINAL_STRATEGY_HISTORY_HASH_ALGORITHM,
-            ),
-        },
-        receipts: {
-            count: receiptRoots.length,
-            evidenceCount: aggregate.evidenceOrder.length,
-            root: hashCanonical(
-                receiptRoots,
-                TERMINAL_RECEIPT_ROOTS_HASH_ALGORITHM,
-            ),
-        },
-        frontier: {
-            activeCandidateCount: progress.candidates.length,
-            attemptedCandidateCount: progress.attemptedCandidates.length,
-            digest: hashCanonical(
-                frontierProjection,
-                TERMINAL_FRONTIER_HASH_ALGORITHM,
-            ),
-        },
-        archive: {
-            acceptedCount: archive.accepted.length,
-            nearMissCount: archive.nearMisses.length,
-            rejectedCount: archive.rejected.length,
-            invalidMetricsCount: archive.invalidMetrics.length,
-            digest: hashCanonical(
-                archiveProjection,
-                TERMINAL_ARCHIVE_HASH_ALGORITHM,
-            ),
-        },
-        scientificReplay: scientificReplaySummary(
-            aggregate.scientificReplay,
-        ),
-        scientificConfirmation:
-            aggregate.scientificReplay?.confirmationState ?? null,
-        candidateCohort: decisiveKind === "candidate_cohort"
-            ? candidateCohort
-            : null,
-        relationEvidence: decisiveKind === "candidate_cohort"
-            ? {
-                comparisonHash: candidateCohort?.comparisonHash ?? null,
-                relationEvidenceHash:
-                    candidateCohort?.relationEvidenceHash ?? null,
-                status: candidateCohort?.status ?? null,
-                decisiveRelations:
-                    candidateCohort?.decisiveRelations ?? [],
-            }
-            : null,
-        scientificConclusion: decisiveKind === "winner"
-            && decisiveEvidenceItems.length === 1
-            ? deriveScientificConclusion(
-                aggregate,
-                decisiveEvidenceItems[0].evidenceId,
-            )
-            : null,
-        scientificConclusions: decisiveKind === "candidate_cohort"
-            ? decisiveEvidenceItems.map((evidence) =>
-                deriveScientificConclusion(
-                    aggregate,
-                    evidence.evidenceId,
-                ))
-            : [],
-    };
-    return {
-        ...core,
-        closureRoot: hashCanonical(core, TERMINAL_EVIDENCE_CLOSURE_HASH_ALGORITHM),
-    };
-}
-
 function verifiedRecommendation(aggregate, cohortEvidence, cohort, basis) {
     const readiness = assessVerifiedResultReadiness(aggregate, cohort);
     if (!readiness.ready) {
+        if (readiness.requiredPredictionState !== "SUPPORTED") {
+            return predictionReadinessFailureRecommendation(
+                aggregate,
+                cohort,
+                basis,
+                readiness,
+            );
+        }
         return scientificConfirmationFailureRecommendation(
             aggregate,
             cohortEvidence,
@@ -404,6 +378,27 @@ function verifiedRecommendation(aggregate, cohortEvidence, cohort, basis) {
     const evidenceHashes = cohortEvidence.map(
         (evidence) => evidence.commitEventHash,
     );
+    let evidenceClosure;
+    try {
+        evidenceClosure = deriveTerminalEvidenceClosure(aggregate, {
+            basis,
+            decisiveKind: "candidate_cohort",
+            decisiveEvidence: cohortEvidence,
+        });
+    } catch (error) {
+        return scientificReadinessFailureRecommendation(aggregate, {
+            code:
+                NON_RESULT_CODES.SCIENTIFIC_TERMINAL_CLOSURE_INCOMPLETE,
+            reason:
+                `The canonical scientific terminal closure could not be completed: ${
+                    error?.message ?? String(error)
+                }`,
+            cohort,
+            evidence: cohortEvidence,
+            basis,
+            readiness,
+        });
+    }
     const payload = {
         decision: "VERIFIED_RESULT",
         cohortStatus: cohort.status,
@@ -425,11 +420,7 @@ function verifiedRecommendation(aggregate, cohortEvidence, cohort, basis) {
             }),
         contractHash: aggregate.contractHash,
         basis,
-        evidenceClosure: deriveTerminalEvidenceClosure(aggregate, {
-            basis,
-            decisiveKind: "candidate_cohort",
-            decisiveEvidence: cohortEvidence,
-        }),
+        evidenceClosure,
     };
     return {
         kind: "TERMINAL",
@@ -451,13 +442,30 @@ function unreachableRecommendation(aggregate) {
     if (aggregate.contract.hypothesisTopology === "open_generative") {
         return null;
     }
-    const boundedBasis = boundedSearchExhaustion(aggregate);
-    if (boundedBasis !== null) {
-        return independentVerificationRecommendation(
-            aggregate,
-            boundedBasis,
-            assessTargetUnreachableReadiness(aggregate, null),
-        );
+    if (aggregate.contract.hypothesisTopology !== "certified_impossibility") {
+        const boundedBasis = boundedSearchExhaustion(aggregate);
+        const progress = searchProgress(aggregate);
+        const targetObserved = progress.candidates.some((evidence) =>
+            evidence.acceptanceSatisfied === true);
+        if (boundedBasis !== null
+            || (progress.roundsExhausted && !targetObserved)) {
+            const readiness = assessTargetUnreachableReadiness(
+                aggregate,
+                null,
+            );
+            return independentVerificationRecommendation(
+                aggregate,
+                boundedBasis ?? {
+                    kind: "bounded_search_exhausted_without_terminal_grade_coverage",
+                    topology: aggregate.contract.hypothesisTopology,
+                    roundsExhausted: progress.roundsExhausted,
+                    boundedComplete: progress.boundedComplete,
+                    coverageComplete: readiness.coverageComplete,
+                    missing: readiness.missing,
+                },
+                readiness,
+            );
+        }
     }
 
     const evidence = qualifyingUnreachableEvidence(aggregate);
@@ -481,14 +489,34 @@ function unreachableRecommendation(aggregate) {
         evidenceHash: evidence.commitEventHash,
         validationEvidenceId: validation.evidenceId,
         validationEvidenceHash: validation.commitEventHash,
-        candidateCount: verifierCommand.request.trigger.candidateCount,
-        candidateEvidenceHash: verifierCommand.request.trigger.candidateEvidenceHash,
+        enumerandCount: verifierCommand.request.enumerands.count,
+        enumerandManifestRoot: verifierCommand.request.enumerands.merkleRoot,
+        evidenceRoots: verifierCommand.request.evidence.roots,
+        evidenceRootsHash: verifierCommand.request.evidence.rootsHash,
+        coverageClosureRoot:
+            verifierCommand.request.evidence.coverageClosureRoot,
+        alphaLedgerRoot: verifierCommand.request.statistics.alphaLedgerRoot,
     };
-    const evidenceClosure = deriveTerminalEvidenceClosure(aggregate, {
-        basis,
-        decisiveKind: "impossibility_certificate",
-        decisiveEvidence: evidence,
-    });
+    let evidenceClosure;
+    try {
+        evidenceClosure = deriveTerminalEvidenceClosure(aggregate, {
+            basis,
+            decisiveKind: "impossibility_certificate",
+            decisiveEvidence: evidence,
+        });
+    } catch (error) {
+        return scientificReadinessFailureRecommendation(aggregate, {
+            code:
+                NON_RESULT_CODES.SCIENTIFIC_TERMINAL_CLOSURE_INCOMPLETE,
+            reason:
+                `The canonical impossibility terminal closure could not be completed: ${
+                    error?.message ?? String(error)
+                }`,
+            evidence: [evidence],
+            basis,
+            readiness,
+        });
+    }
     return {
         kind: "TERMINAL",
         decision: "TARGET_UNREACHABLE",
@@ -686,33 +714,27 @@ function reserveFrozenScientificCommand(aggregate, command) {
     };
 }
 
-function buildImpossibilityVerificationCommand(aggregate, progress) {
+function buildImpossibilityVerificationCommand(
+    aggregate,
+    progress,
+    verification = null,
+) {
     const validation = currentValidationEvidence(aggregate);
     const attemptOrdinal = impossibilityEvidenceItems(
         aggregate,
         { includeInvalidated: true },
     ).length + 1;
-    const candidateEvidenceHash = impossibilitySearchEvidenceHash(progress.candidates);
-    const request = {
-        version: aggregate.contract.impossibilityPolicy.requestVersion,
-        contract: aggregate.contract,
-        contractHash: aggregate.contractHash,
-        attemptOrdinal,
-        trigger: {
-            kind: aggregate.contract.impossibilityPolicy.trigger,
-            roundsExhausted: true,
-            completedRounds: progress.completedRounds,
-            maxRounds: aggregate.contract.maxRounds,
-            candidatesPerRound: aggregate.contract.candidatesPerRound,
-            candidateCount: progress.candidates.length,
-            acceptanceSatisfiedCount: progress.candidates.filter(
-                (evidence) => evidence.acceptanceSatisfied === true,
-            ).length,
-            candidateEvidenceHash,
-            validationEvidenceId: validation.evidenceId,
-            validationEvidenceHash: validation.commitEventHash,
-        },
-    };
+    const prepared = verification ?? createImpossibilityVerificationPackage(
+        aggregate,
+        { attemptOrdinal, progress, validation },
+    );
+    if (!prepared.eligible) {
+        throw new DecisionError(
+            ERROR_CODES.NO_DECISION_EVENT,
+            "Impossibility verification evidence is incomplete",
+            { missing: prepared.missing },
+        );
+    }
     return {
         kind: "verify_impossibility",
         harnessRole: "impossibility_verifier",
@@ -722,14 +744,28 @@ function buildImpossibilityVerificationCommand(aggregate, progress) {
             aggregate.contract.harnessSuite.roles.impossibility_verifier.parser.version,
         attemptOrdinal,
         certificateVersion: aggregate.contract.impossibilityPolicy.certificateVersion,
-        request,
-        requestHash: hashCanonical(request, IMPOSSIBILITY_REQUEST_HASH_ALGORITHM),
+        request: prepared.request,
+        requestHash: prepared.requestHash,
+        proposedCertificate: prepared.proposal,
+        proposedCertificateArtifactHash:
+            prepared.proposalArtifactHash,
+        proofArtifact: prepared.proofArtifact,
+        proofArtifactHash: prepared.proofArtifactHash,
+        measurementBinding: createImpossibilityMeasurementBinding(
+            aggregate.contract,
+            prepared.requestHash,
+            attemptOrdinal,
+        ),
     };
 }
 
-function reserveImpossibilityRecommendation(aggregate, progress) {
+function reserveImpossibilityRecommendation(aggregate, progress, verification) {
     const commandId = nextCommandId(aggregate);
-    const command = buildImpossibilityVerificationCommand(aggregate, progress);
+    const command = buildImpossibilityVerificationCommand(
+        aggregate,
+        progress,
+        verification,
+    );
     return {
         kind: "COMMAND",
         commandId,
@@ -941,59 +977,117 @@ export function decideNext(aggregate) {
     }
 
     if (budgetIsExhausted(aggregate)) {
-        return !supportedCohort
-            ? budgetRecommendation(
+        const basis = {
+            kind: "budget_exhausted_without_supported_cohort",
+            commandCount: aggregate.commandOrder.length,
+            commandBudget: commandBudget(aggregate.contract),
+        };
+        if (!supportedCohort) {
+            const predictionFailure = blockedPredictionRecommendation(
                 aggregate,
-                candidateCohort?.tieResolution?.required === true
-                    ? "Declared command budget was exhausted before the preregistered candidate relations resolved."
-                    : "Declared command budget was exhausted without a supported candidate cohort.",
                 candidateCohort,
-            )
-            : freezeScientificConfirmationRecommendation(
-                aggregate,
-                cohortEvidence,
-                candidateCohort,
-                {
-                    kind: "budget_exhausted_with_supported_cohort",
-                    commandCount: aggregate.commandOrder.length,
-                    commandBudget: commandBudget(aggregate.contract),
-                    cohortComparisonHash:
-                        candidateCohort.comparisonHash,
-                    relationEvidenceHash:
-                        candidateCohort.relationEvidenceHash,
-                },
+                basis,
             );
+            if (predictionFailure !== null) return predictionFailure;
+            if (candidateCohort?.tieResolution?.required === true) {
+                return unresolvedCohortRecommendation(
+                    aggregate,
+                    candidateCohort,
+                    basis,
+                );
+            }
+            return budgetRecommendation(
+                aggregate,
+                "Declared command budget was exhausted without a supported candidate cohort.",
+                candidateCohort,
+            );
+        }
+        return freezeScientificConfirmationRecommendation(
+            aggregate,
+            cohortEvidence,
+            candidateCohort,
+            {
+                kind: "budget_exhausted_with_supported_cohort",
+                commandCount: aggregate.commandOrder.length,
+                commandBudget: commandBudget(aggregate.contract),
+                cohortComparisonHash:
+                    candidateCohort.comparisonHash,
+                relationEvidenceHash:
+                    candidateCohort.relationEvidenceHash,
+            },
+        );
     }
 
     if (aggregate.contract.hypothesisTopology === "certified_impossibility"
         && !targetObserved
         && progress.roundsExhausted) {
-        return reserveImpossibilityRecommendation(aggregate, progress);
+        const attemptOrdinal = impossibilityEvidenceItems(
+            aggregate,
+            { includeInvalidated: true },
+        ).length + 1;
+        const verification = createImpossibilityVerificationPackage(
+            aggregate,
+            {
+                attemptOrdinal,
+                progress,
+                validation: currentValidation,
+            },
+        );
+        if (!verification.eligible) {
+            return impossibilityEvidenceIncompleteRecommendation(
+                aggregate,
+                verification,
+            );
+        }
+        return reserveImpossibilityRecommendation(
+            aggregate,
+            progress,
+            verification,
+        );
     }
 
     if (progress.roundsExhausted) {
-        return !supportedCohort
-            ? budgetRecommendation(
+        const basis = {
+            kind: "rounds_exhausted_without_supported_cohort",
+            maxRounds: aggregate.contract.maxRounds,
+        };
+        if (!supportedCohort) {
+            const predictionFailure = blockedPredictionRecommendation(
                 aggregate,
-                candidateCohort?.tieResolution?.exhausted === true
-                    ? "Frozen search and preregistered tie-resolution blocks were exhausted without a supported unique or equivalent cohort."
-                    : "Frozen search rounds were exhausted without a supported candidate cohort.",
                 candidateCohort,
-            )
-            : freezeScientificConfirmationRecommendation(
-                aggregate,
-                cohortEvidence,
-                candidateCohort,
-                {
-                    kind: "rounds_exhausted_with_supported_cohort",
-                    maxRounds: aggregate.contract.maxRounds,
-                    cohortStatus: candidateCohort.status,
-                    cohortComparisonHash:
-                        candidateCohort.comparisonHash,
-                    relationEvidenceHash:
-                        candidateCohort.relationEvidenceHash,
-                },
+                basis,
             );
+            if (predictionFailure !== null) return predictionFailure;
+            if (candidateCohort?.tieResolution?.required === true
+                || candidateCohort?.tieResolution?.exhausted === true
+                || candidateCohort?.status === "UNRESOLVED"
+                || candidateCohort?.status === "INCOMPARABLE") {
+                return unresolvedCohortRecommendation(
+                    aggregate,
+                    candidateCohort,
+                    basis,
+                );
+            }
+            return budgetRecommendation(
+                aggregate,
+                "Frozen search rounds were exhausted without a supported candidate cohort.",
+                candidateCohort,
+            );
+        }
+        return freezeScientificConfirmationRecommendation(
+            aggregate,
+            cohortEvidence,
+            candidateCohort,
+            {
+                kind: "rounds_exhausted_with_supported_cohort",
+                maxRounds: aggregate.contract.maxRounds,
+                cohortStatus: candidateCohort.status,
+                cohortComparisonHash:
+                    candidateCohort.comparisonHash,
+                relationEvidenceHash:
+                    candidateCohort.relationEvidenceHash,
+            },
+        );
     }
 
     const plateau = detectPlateau(aggregate);

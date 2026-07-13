@@ -76,6 +76,19 @@ describe("crucible API registration", () => {
             parameters: tool.parameters,
         }));
         expect(JSON.stringify(generatedSurface)).not.toMatch(/oracle/iu);
+        const start = registration.tools.find(
+            (tool) => tool.name === "crucible_start",
+        );
+        expect(start.parameters.oneOf[0].required)
+            .toEqual(["experiment_id"]);
+        expect(start.parameters.oneOf[0].properties)
+            .not.toHaveProperty("objective");
+        expect(start.description).toContain(
+            "operator-preapproved experiment_id",
+        );
+        expect(registration.tools.find(
+            (tool) => tool.name === "crucible_result",
+        ).description).toContain("scientific readiness");
     });
 
     it("rejects unknown fields through every generated schema and handler", async () => {

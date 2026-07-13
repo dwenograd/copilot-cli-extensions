@@ -138,7 +138,8 @@ function frozenRoleProtocol({
         schedule,
         enumerandManifest: aggregate.contract.enumerandManifest ?? null,
         manifestOptions: {
-            topology: aggregate.contract.hypothesisTopology,
+            topology: aggregate.contract.enumerandManifest?.topology
+                ?? aggregate.contract.hypothesisTopology,
             observableRegistry: aggregate.contract.observableRegistry,
             hypothesisPolicy: aggregate.contract.hypothesisPolicy,
         },

@@ -5,10 +5,13 @@ import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 
 import {
+    ERROR_CODES,
+    EVENT_TYPES,
     assessVerifiedResultReadiness,
     artifactRefsFromProvenance,
     buildCandidateArchive,
     canonicalJson,
+    createExternalEvent,
     decideNext,
 } from "../domain/index.mjs";
 import { removeTrackedRoots } from "./test-cleanup.mjs";
@@ -154,9 +157,27 @@ describe("v4 scientific confirmation", () => {
         }
 
         item.adapter.appendKernelDecision();
-        expect(item.adapter.replay().aggregate.terminal).toMatchObject({
+        const terminalAggregate = item.adapter.replay().aggregate;
+        expect(terminalAggregate.terminal).toMatchObject({
             decision: "VERIFIED_RESULT",
         });
+        expect(decideNext(terminalAggregate)).toMatchObject({
+            kind: "TERMINAL",
+            decision: "VERIFIED_RESULT",
+            recorded: true,
+            event: null,
+        });
+        expect(() => createExternalEvent(
+            terminalAggregate,
+            EVENT_TYPES.STOP_REQUESTED,
+            {
+                requestId: "post-terminal-supersession",
+                reason: "must remain deferred",
+                pauseRequested: true,
+            },
+        )).toThrow(expect.objectContaining({
+            code: ERROR_CODES.TERMINAL_STATE,
+        }));
         item.close();
     });
 

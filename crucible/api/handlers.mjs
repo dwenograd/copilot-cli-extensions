@@ -95,9 +95,11 @@ export function makeDefaultDeps(env = process.env, log = () => {}) {
     return {
         env,
         log,
+        assessPersistedTerminalReadiness,
         isPidAlive: isExactPidAlive,
         loadHarnessAllowlist,
         loadExperimentRegistry,
+        pathExists: fs.existsSync,
         reverifyExperimentRegistryFile,
         probeSandboxAvailability: probeWindowsSandboxAvailability,
         openRepository,
@@ -112,6 +114,7 @@ export function makeDefaultDeps(env = process.env, log = () => {}) {
         loadSupervisorConfig,
         readSupervisorLock,
         validateSupervisorAdmission,
+        verifyExperimentAuthority,
     };
 }
 
@@ -122,7 +125,7 @@ function openInvestigationForRead(
     { verifyTerminalArtifacts = false } = {},
 ) {
     const { eventsDbPath, artifactRoot } = paths;
-    if (!fs.existsSync(eventsDbPath)) {
+    if (!(deps.pathExists ?? fs.existsSync)(eventsDbPath)) {
         throw new InvestigationNotFoundError("no Crucible investigation with this id", {
             investigationId,
         });
@@ -131,9 +134,14 @@ function openInvestigationForRead(
         file: eventsDbPath,
         env: deps.env,
     });
+    const artifactStore = deps.openArtifactStoreReadOnly({
+        root: artifactRoot,
+        env: deps.env,
+    });
     try {
         const adapter = deps.createDomainRepositoryAdapter({
             repository,
+            artifactStore,
             investigationId,
             ensure: false,
         });
@@ -148,7 +156,7 @@ function openInvestigationForRead(
                 "persisted v4 investigation has no valid experiment authority",
             );
         }
-        verifyExperimentAuthority({
+        (deps.verifyExperimentAuthority ?? verifyExperimentAuthority)({
             authority,
             experimentId: payload?.experimentId,
             projectDir: payload?.projectDir,
@@ -159,10 +167,7 @@ function openInvestigationForRead(
         });
         if (verifyTerminalArtifacts && replay.aggregate.terminal !== null) {
             replay = adapter.verifyTerminalArtifactClosure({
-                artifactStore: deps.openArtifactStoreReadOnly({
-                    root: artifactRoot,
-                    env: deps.env,
-                }),
+                artifactStore,
             });
         }
         const operationalNonResult = adapter.latestOperationalNonResult();
@@ -402,7 +407,7 @@ function tryRestartSupervisor(
     aggregate,
 ) {
     const configPath = supervisorPaths(paths.stateDir, investigationId).configPath;
-    if (!fs.existsSync(configPath)) {
+    if (!(deps.pathExists ?? fs.existsSync)(configPath)) {
         return { action: "no-persisted-config" };
     }
     try {
@@ -570,6 +575,7 @@ export function statusInvestigation(args, deps) {
         deps,
         investigationId,
         paths,
+        { verifyTerminalArtifacts: true },
     );
     if (verifiedRead.blocked !== null) {
         return {
@@ -591,7 +597,10 @@ export function statusInvestigation(args, deps) {
     }
     const { aggregate, operationalNonResult } = verifiedRead.read;
     if (aggregate.terminal !== null) {
-        const readiness = assessPersistedTerminalReadiness(aggregate);
+        const readiness = (
+            deps.assessPersistedTerminalReadiness
+            ?? assessPersistedTerminalReadiness
+        )(aggregate);
         return readiness.ready
             ? terminalAvailable(investigationId)
             : scientificBlockedPayload(investigationId, readiness);
@@ -665,7 +674,7 @@ export function stopInvestigation(args, deps) {
     const stateRoot = resolveStateRoot(env);
     const paths = resolveInvestigationPaths(stateRoot, investigationId);
 
-    if (!fs.existsSync(paths.eventsDbPath)) {
+    if (!(deps.pathExists ?? fs.existsSync)(paths.eventsDbPath)) {
         throw new InvestigationNotFoundError("no Crucible investigation with this id", {
             investigationId,
         });
@@ -674,6 +683,7 @@ export function stopInvestigation(args, deps) {
         deps,
         investigationId,
         paths,
+        { verifyTerminalArtifacts: true },
     );
     if (verifiedRead.blocked !== null) {
         return {
@@ -705,9 +715,10 @@ export function stopInvestigation(args, deps) {
         };
     }
     if (verifiedRead.read.aggregate.terminal !== null) {
-        const readiness = assessPersistedTerminalReadiness(
-            verifiedRead.read.aggregate,
-        );
+        const readiness = (
+            deps.assessPersistedTerminalReadiness
+            ?? assessPersistedTerminalReadiness
+        )(verifiedRead.read.aggregate);
         return readiness.ready
             ? terminalAvailable(investigationId)
             : scientificBlockedPayload(investigationId, readiness);
@@ -715,6 +726,7 @@ export function stopInvestigation(args, deps) {
 
     const result = deps.requestStop({
         stateDir: paths.stateDir,
+        artifactRoot: paths.artifactRoot,
         investigationId,
         reason: typeof args.reason === "string" && args.reason.length > 0
             ? args.reason
@@ -724,7 +736,22 @@ export function stopInvestigation(args, deps) {
     const aggregate = result?.aggregate ?? null;
     const alreadyTerminal = aggregate?.terminal != null;
     if (alreadyTerminal) {
-        const readiness = assessPersistedTerminalReadiness(aggregate);
+        const terminalRead = readInvestigationOrIntegrityBlock(
+            deps,
+            investigationId,
+            paths,
+            { verifyTerminalArtifacts: true },
+        );
+        if (terminalRead.blocked !== null) {
+            return {
+                ...terminalRead.blocked,
+                terminal_available: false,
+            };
+        }
+        const readiness = (
+            deps.assessPersistedTerminalReadiness
+            ?? assessPersistedTerminalReadiness
+        )(terminalRead.read.aggregate);
         return readiness.ready
             ? terminalAvailable(investigationId)
             : scientificBlockedPayload(investigationId, readiness);
@@ -821,10 +848,46 @@ export function resultInvestigation(args, deps) {
     const isTerminalResult = terminal !== null && TERMINAL_DECISIONS.includes(terminal.decision);
 
     if (isTerminalResult) {
-        const readiness = assessPersistedTerminalReadiness(aggregate);
+        const readiness = (
+            deps.assessPersistedTerminalReadiness
+            ?? assessPersistedTerminalReadiness
+        )(aggregate);
         if (!readiness.ready) {
             return scientificBlockedPayload(investigationId, readiness);
         }
+        const closure =
+            terminal.evidenceClosure ?? terminal.basis?.evidenceClosure ?? null;
+        const candidateConclusions = closure?.scientificConclusions ?? [];
+        const primaryConclusion = closure?.scientificConclusion ?? null;
+        const conclusions = [
+            ...candidateConclusions,
+            ...(primaryConclusion === null
+                || candidateConclusions.some((item) =>
+                    item?.conclusionHash === primaryConclusion.conclusionHash)
+                ? []
+                : [primaryConclusion]),
+        ];
+        const performanceClaims = candidateConclusions.flatMap(
+            (conclusion) =>
+                conclusion?.candidate?.performance?.claims ?? [],
+        );
+        const predictionOutcomes = candidateConclusions.flatMap(
+            (conclusion) =>
+                conclusion?.hypotheses?.predictions ?? [],
+        );
+        const assumptions = conclusions.flatMap((conclusion) => [
+            ...(Array.isArray(conclusion?.assumptions)
+                ? conclusion.assumptions
+                : []),
+            ...(conclusion?.candidate?.performance?.assumptions === null
+                || conclusion?.candidate?.performance?.assumptions === undefined
+                ? []
+                : [conclusion.candidate.performance.assumptions]),
+        ]);
+        const limitations = conclusions.flatMap((conclusion) =>
+            Array.isArray(conclusion?.limitations)
+                ? conclusion.limitations
+                : []);
         return {
             is_result: true,
             banner: TERMINAL_BANNER,
@@ -871,15 +934,25 @@ export function resultInvestigation(args, deps) {
                             : [terminal.evidenceHash]),
                 }
                 : {}),
-            evidence_closure: terminal.evidenceClosure ?? terminal.basis?.evidenceClosure ?? null,
+            evidence_closure: closure,
             scientific_replay:
-                terminal.evidenceClosure?.scientificReplay ?? null,
+                closure?.scientificReplay ?? null,
             scientific_conclusion:
-                terminal.evidenceClosure?.scientificConclusion ?? null,
+                primaryConclusion,
             scientific_conclusions:
-                terminal.evidenceClosure?.scientificConclusions ?? [],
+                candidateConclusions,
             relation_evidence:
-                terminal.evidenceClosure?.relationEvidence ?? null,
+                closure?.relationEvidence ?? null,
+            authority_closure: closure?.authority ?? null,
+            artifact_closure: closure?.artifacts ?? null,
+            discovery_stop: closure?.termination ?? null,
+            held_out_state: closure?.scientificConfirmation ?? null,
+            unreachable_verifier:
+                closure?.unreachableVerifier ?? null,
+            performance_claims: performanceClaims,
+            prediction_outcomes: predictionOutcomes,
+            assumptions,
+            limitations,
             basis: terminal.basis ?? null,
             message: `${TERMINAL_BANNER} decision=${terminal.decision}`,
         };
@@ -924,10 +997,26 @@ export function runToolBoundary(spec, handler, rawArgs, deps) {
             spec.name === "crucible_start"
             && code === API_ERROR_CODES.INVESTIGATION_NOT_RESUMABLE
             && error?.details?.status === "terminal";
+        let verifiedTerminalAvailable = false;
+        if (terminalAvailableForStart) {
+            try {
+                const investigationId =
+                    error?.details?.investigationId ?? null;
+                verifiedTerminalAvailable =
+                    typeof investigationId === "string"
+                    && statusInvestigation({
+                        investigation_id: investigationId,
+                    }, deps).terminal_available === true;
+            } catch {
+                verifiedTerminalAvailable = false;
+            }
+        }
         return failure(error?.message ?? String(error), {
             code,
             tool: spec.name,
-            ...(terminalAvailableForStart ? { terminal_available: true } : {}),
+            ...(terminalAvailableForStart
+                ? { terminal_available: verifiedTerminalAvailable }
+                : {}),
             ...(compatibility === "legacy_incompatible"
                 ? {
                     compatibility,

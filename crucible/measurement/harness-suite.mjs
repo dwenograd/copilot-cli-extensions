@@ -9,6 +9,9 @@ import {
     hashCanonical,
     immutableCanonical,
 } from "../domain/canonical.mjs";
+import {
+    IMPOSSIBILITY_PROOF_CHECKER_ROLE,
+} from "../domain/constants.mjs";
 
 export const HARNESS_SUITE_V4_VERSION = 4;
 export const HARNESS_SUITE_V4_KIND = "HarnessSuiteV4";
@@ -45,6 +48,12 @@ export const HARNESS_SUITE_V4_HIDDEN_CASE_ROLES = Object.freeze([
     "novelty",
     "impossibility_verifier",
 ]);
+export const HARNESS_SUITE_V4_VERIFIER_MODES = Object.freeze([
+    "enumerand_reexecution",
+    "certificate_validation",
+]);
+export const HARNESS_SUITE_V4_VERIFIER_INDEPENDENCE_ATTESTATION =
+    "operator_attested_separate_implementation";
 
 const ROLE_SET = new Set(HARNESS_SUITE_V4_ROLES);
 const HIDDEN_ROLE_SET = new Set(HARNESS_SUITE_V4_HIDDEN_CASE_ROLES);
@@ -67,6 +76,7 @@ const ROLE_KEYS = new Set([
     "harnessId",
     "harnessEntryHash",
     "executableHash",
+    "applicationEntrypointHash",
     "parser",
     "dependencies",
     "configHash",
@@ -75,6 +85,8 @@ const ROLE_KEYS = new Set([
     "caseManifestHash",
     "deterministicSeed",
     "sandboxIdentity",
+    "independenceAttestation",
+    "verificationPolicy",
 ]);
 const PARSER_KEYS = new Set(["version", "versionHash", "sourceHash"]);
 const DEPENDENCY_KEYS = new Set(["role", "sha256", "kind"]);
@@ -87,6 +99,9 @@ const CASE_REF_KEYS = new Set(["id", "snapshotHash"]);
 const CORPUS_KEYS = new Set(["version", "cases", "identity"]);
 const CORPUS_CASE_KEYS = new Set(["snapshotHash", "expectation"]);
 const SANDBOX_KEYS = new Set(["required", "policyDigest"]);
+const INDEPENDENCE_ATTESTATION_KEYS = new Set(["kind"]);
+const VERIFICATION_POLICY_KEYS = new Set(["certificateFormat", "mode"]);
+const CERTIFICATE_FORMAT_KEYS = new Set(["schemaHash", "version"]);
 const ROLE_CONFIG_KEYS = new Set([
     "argvTemplate",
     "cwd",
@@ -382,6 +397,58 @@ function normalizeSandboxIdentity(value, field) {
     return { required: false, policyDigest: null };
 }
 
+function normalizeVerifierIndependenceAttestation(value, field) {
+    requireObject(value, field);
+    rejectUnknownKeys(value, INDEPENDENCE_ATTESTATION_KEYS, field);
+    if (value.kind !== HARNESS_SUITE_V4_VERIFIER_INDEPENDENCE_ATTESTATION) {
+        fail(
+            `${field}.kind must be ${
+                HARNESS_SUITE_V4_VERIFIER_INDEPENDENCE_ATTESTATION
+            }`,
+        );
+    }
+    return {
+        kind: HARNESS_SUITE_V4_VERIFIER_INDEPENDENCE_ATTESTATION,
+    };
+}
+
+function normalizeVerifierCertificateFormat(value, field) {
+    if (value === null) return null;
+    requireObject(value, field);
+    rejectUnknownKeys(value, CERTIFICATE_FORMAT_KEYS, field);
+    return {
+        version: requireString(value.version, `${field}.version`, 256),
+        schemaHash: requireTaggedHash(
+            value.schemaHash,
+            `${field}.schemaHash`,
+        ),
+    };
+}
+
+function normalizeVerifierPolicy(value, field) {
+    requireObject(value, field);
+    rejectUnknownKeys(value, VERIFICATION_POLICY_KEYS, field);
+    if (!HARNESS_SUITE_V4_VERIFIER_MODES.includes(value.mode)) {
+        fail(
+            `${field}.mode must be "enumerand_reexecution" or "certificate_validation"`,
+        );
+    }
+    const certificateFormat = normalizeVerifierCertificateFormat(
+        value.certificateFormat,
+        `${field}.certificateFormat`,
+    );
+    if ((value.mode === "certificate_validation")
+        !== (certificateFormat !== null)) {
+        fail(
+            `${field}.certificateFormat is required only for certificate_validation`,
+        );
+    }
+    return {
+        mode: value.mode,
+        certificateFormat,
+    };
+}
+
 function normalizeRole(value, role) {
     const field = `roles.${role}`;
     requireObject(value, field);
@@ -401,21 +468,72 @@ function normalizeRole(value, role) {
             actual: value.caseManifestHash,
         });
     }
+    const sandboxIdentity = normalizeSandboxIdentity(
+        value.sandboxIdentity,
+        `${field}.sandboxIdentity`,
+    );
+    if (role === "impossibility_verifier" && !sandboxIdentity.required) {
+        fail(
+            "roles.impossibility_verifier must require the frozen AppContainer sandbox policy",
+        );
+    }
+    if (role !== "impossibility_verifier"
+        && (value.independenceAttestation !== undefined
+            || value.verificationPolicy !== undefined)) {
+        fail(
+            `${field} cannot declare impossibility-verifier independence fields`,
+        );
+    }
+    const executableHash = requireTaggedHash(
+        value.executableHash,
+        `${field}.executableHash`,
+    );
+    const applicationEntrypointHash = requireTaggedHash(
+        value.applicationEntrypointHash,
+        `${field}.applicationEntrypointHash`,
+    );
+    const parser = normalizeParser(value.parser, `${field}.parser`);
+    const dependencies = normalizeDependencies(
+        value.dependencies,
+        `${field}.dependencies`,
+    );
+    const verificationPolicy = role === "impossibility_verifier"
+        ? normalizeVerifierPolicy(
+            value.verificationPolicy,
+            `${field}.verificationPolicy`,
+        )
+        : null;
+    if (verificationPolicy?.mode === "certificate_validation") {
+        const checkerDependencies = dependencies.filter((dependency) =>
+            dependency.role === IMPOSSIBILITY_PROOF_CHECKER_ROLE
+            && dependency.kind === "application");
+        if (checkerDependencies.length !== 1) {
+            fail(
+                `${field}.verificationPolicy certificate_validation requires exactly one separately pinned ${IMPOSSIBILITY_PROOF_CHECKER_ROLE} application dependency`,
+            );
+        }
+        const checkerHash = checkerDependencies[0].sha256;
+        if ([
+            executableHash,
+            applicationEntrypointHash,
+            parser.versionHash,
+            parser.sourceHash,
+        ].includes(checkerHash)) {
+            fail(
+                `${field} proof checker must be separately pinned from the verifier executable, entrypoint, and parser`,
+            );
+        }
+    }
     return {
         harnessId: requireId(value.harnessId, `${field}.harnessId`),
         harnessEntryHash: requireTaggedHash(
             value.harnessEntryHash,
             `${field}.harnessEntryHash`,
         ),
-        executableHash: requireTaggedHash(
-            value.executableHash,
-            `${field}.executableHash`,
-        ),
-        parser: normalizeParser(value.parser, `${field}.parser`),
-        dependencies: normalizeDependencies(
-            value.dependencies,
-            `${field}.dependencies`,
-        ),
+        executableHash,
+        applicationEntrypointHash,
+        parser,
+        dependencies,
         configHash: requireTaggedHash(
             value.configHash,
             `${field}.configHash`,
@@ -433,10 +551,17 @@ function normalizeRole(value, role) {
             `${field}.deterministicSeed`,
             256,
         ),
-        sandboxIdentity: normalizeSandboxIdentity(
-            value.sandboxIdentity,
-            `${field}.sandboxIdentity`,
-        ),
+        sandboxIdentity,
+        ...(role === "impossibility_verifier"
+            ? {
+                independenceAttestation:
+                    normalizeVerifierIndependenceAttestation(
+                        value.independenceAttestation,
+                        `${field}.independenceAttestation`,
+                    ),
+                verificationPolicy,
+            }
+            : {}),
     };
 }
 
@@ -638,6 +763,10 @@ function assertSharedPlatformDependencies(roles, shared) {
                 type: "parser",
                 sha256: spec.parser.sourceHash,
             },
+            {
+                type: "application_entrypoint",
+                sha256: spec.applicationEntrypointHash,
+            },
             ...spec.dependencies
                 .filter((dependency) => dependency.kind === "application")
                 .map((dependency) => ({
@@ -715,6 +844,12 @@ function closureOccurrences(spec) {
             type: "parser",
             kind: "application",
         },
+        {
+            sha256: spec.applicationEntrypointHash,
+            digest: rawSha256Digest(spec.applicationEntrypointHash),
+            type: "application_entrypoint",
+            kind: "application",
+        },
         ...spec.dependencies.map((dependency) => ({
             sha256: dependency.sha256,
             digest: rawSha256Digest(dependency.sha256),
@@ -740,15 +875,6 @@ function assertVerifierClosureSeparation(roles, shared) {
     for (const occurrence of closureOccurrences(verifier)) {
         const overlaps = primary.get(occurrence.digest);
         if (overlaps === undefined) continue;
-        const trustedParserOverlap = occurrence.type === "parser"
-            && overlaps.every((item) =>
-                item.type === "parser"
-                && roles[item.role].parser.version === verifier.parser.version
-                && roles[item.role].parser.versionHash
-                    === verifier.parser.versionHash
-                && roles[item.role].parser.sourceHash
-                    === verifier.parser.sourceHash);
-        if (trustedParserOverlap) continue;
         const verifierDeclaresPlatform = verifier.dependencies.some((dependency) =>
             dependency.kind === "platform"
             && rawSha256Digest(dependency.sha256) === occurrence.digest);

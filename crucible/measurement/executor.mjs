@@ -40,6 +40,7 @@ import {
     releaseVerifiedHarnessRun,
     reverifyStagedHarnessRun,
     stageVerifiedHarnessRun,
+    trustedParserIdentity,
 } from "./allowlist.mjs";
 import {
     MEASUREMENT_ERROR_CODES,
@@ -64,6 +65,11 @@ import {
     normalizeHarnessResultBinding,
     parseHarnessResult,
 } from "./parser.mjs";
+import {
+    VERIFIER_PARSER_MAX_INPUT_BYTES,
+    VERIFIER_PARSER_VERSION,
+    parseImpossibilityVerifierResult,
+} from "./verifier-parser.mjs";
 import { MEASUREMENT_LIFECYCLE_ADAPTER } from "./private-adapters.mjs";
 import {
     buildMeasurementReceipt,
@@ -826,6 +832,14 @@ async function runOnce({
             field: "run().measurementBinding",
             required: true,
         });
+    const verifierParser = measurementBinding?.role === "impossibility_verifier";
+    const parserVersion = verifierParser
+        ? VERIFIER_PARSER_VERSION
+        : PARSER_VERSION;
+    const parserIdentity = trustedParserIdentity(parserVersion);
+    const parserMaximumBytes = verifierParser
+        ? VERIFIER_PARSER_MAX_INPUT_BYTES
+        : PARSER_MAX_INPUT_BYTES;
     const deadlineMs = normalizeDeadline(runInput.deadlineMs);
     const budgetLimits = byteLedger.snapshot(attemptId).limits;
     const casBudget = byteLedger.consumeCas(
@@ -1210,6 +1224,7 @@ async function runOnce({
         }
         const buildReceiptFor = (parsed, timedOut = outcome.timedOut) => {
             const receipt = buildMeasurementReceipt({
+                harnessId: entry.id,
                 allowlistFileHash: stagedRun.allowlistFileHash,
                 harnessEntryHash: stagedRun.entryHash,
                 executableHash: stagedRun.executable.sourceHash,
@@ -1245,7 +1260,8 @@ async function runOnce({
                 stdoutHash,
                 stderrHash,
                 outputCapture,
-                parserVersion: PARSER_VERSION,
+                parserVersion,
+                parserIdentity,
                 sandbox,
                 measurementBinding,
                 attemptId,
@@ -1363,20 +1379,27 @@ async function runOnce({
 
         // Parse result. The parser is strict — anything wrong throws
         // ResultParseError which the caller sees directly.
-        if (stdoutBytes.length > PARSER_MAX_INPUT_BYTES) {
+        if (stdoutBytes.length > parserMaximumBytes) {
             const receipt = buildReceiptFor(null, false);
             await publishCapturedOutput();
             throw new MeasurementError(
                 MEASUREMENT_ERROR_CODES.PARSE_OVERSIZED,
-                `harness result exceeds parser maximum of ${PARSER_MAX_INPUT_BYTES} bytes`,
+                `harness result exceeds parser maximum of ${parserMaximumBytes} bytes`,
                 { bytes: stdoutBytes.length, receipt, outputCapture },
             );
         }
         const rawStdoutText = stdoutBytes.toString("utf8");
         let parsed;
         try {
-            parsed = parseHarnessResult(rawStdoutText);
-            if (measurementBinding !== null) {
+            if (verifierParser) {
+                parsed = parseImpossibilityVerifierResult(rawStdoutText, {
+                    expectedBinding: measurementBinding,
+                    ...(runInput.resultParserContext ?? {}),
+                });
+            } else {
+                parsed = parseHarnessResult(rawStdoutText);
+            }
+            if (!verifierParser && measurementBinding !== null) {
                 if (parsed.role !== null) {
                     parsed = parseHarnessResult(rawStdoutText, {
                         expectedBinding: measurementBinding,

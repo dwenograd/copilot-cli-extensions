@@ -97,15 +97,81 @@ export const DEFAULT_SCIENTIFIC_TERMINAL_POLICY = Object.freeze({
     }),
 });
 
-export const IMPOSSIBILITY_REQUEST_VERSION = "crucible-impossibility-request-v1";
-export const IMPOSSIBILITY_CERTIFICATE_VERSION = "crucible-impossibility-certificate-v1";
+export const IMPOSSIBILITY_REQUEST_VERSION = "crucible-impossibility-request-v2";
+export const IMPOSSIBILITY_PROPOSAL_VERSION =
+    "crucible-impossibility-certificate-proposal-v1";
+export const IMPOSSIBILITY_CHECKER_OUTPUT_VERSION =
+    "crucible-impossibility-verifier-output-v1";
+export const IMPOSSIBILITY_CERTIFICATE_VERSION =
+    "crucible-impossibility-certificate-v2";
 export const IMPOSSIBILITY_REQUEST_HASH_ALGORITHM =
-    "sha256:crucible-impossibility-request-v1";
+    "sha256:crucible-impossibility-request-v2";
+export const IMPOSSIBILITY_PROPOSAL_HASH_ALGORITHM =
+    "sha256:crucible-impossibility-certificate-proposal-v1";
 export const IMPOSSIBILITY_SEARCH_EVIDENCE_HASH_ALGORITHM =
-    "sha256:crucible-impossibility-search-evidence-v1";
+    "sha256:crucible-impossibility-search-evidence-v2";
+export const IMPOSSIBILITY_CALIBRATION_EVIDENCE_HASH_ALGORITHM =
+    "sha256:crucible-impossibility-calibration-evidence-v1";
+export const IMPOSSIBILITY_CONTROL_EVIDENCE_HASH_ALGORITHM =
+    "sha256:crucible-impossibility-control-evidence-v1";
+export const IMPOSSIBILITY_EVIDENCE_ROOTS_HASH_ALGORITHM =
+    "sha256:crucible-impossibility-evidence-roots-v1";
+export const IMPOSSIBILITY_VERIFIER_ROLE_HASH_ALGORITHM =
+    "sha256:crucible-impossibility-verifier-role-v1";
+export const IMPOSSIBILITY_COVERAGE_CLOSURE_VERSION =
+    "crucible-unreachable-coverage-closure-v1";
+export const IMPOSSIBILITY_COVERAGE_CLOSURE_HASH_ALGORITHM =
+    "sha256:crucible-unreachable-coverage-closure-v1";
+export const IMPOSSIBILITY_ENUMERAND_EVIDENCE_HASH_ALGORITHM =
+    "sha256:crucible-unreachable-enumerand-evidence-v1";
+export const IMPOSSIBILITY_INVALIDATION_ROOT_HASH_ALGORITHM =
+    "sha256:crucible-unreachable-invalidations-v1";
+export const IMPOSSIBILITY_RAW_BLOCK_ROOTS_HASH_ALGORITHM =
+    "sha256:crucible-unreachable-raw-block-roots-v1";
+export const IMPOSSIBILITY_ROLE_RECEIPTS_HASH_ALGORITHM =
+    "sha256:crucible-unreachable-role-receipts-v1";
+export const IMPOSSIBILITY_ALPHA_ALLOCATIONS_HASH_ALGORITHM =
+    "sha256:crucible-unreachable-alpha-allocations-v1";
+export const IMPOSSIBILITY_VERIFIER_ENUMERAND_RESULTS_HASH_ALGORITHM =
+    "sha256:crucible-impossibility-verifier-enumerand-results-v1";
+export const IMPOSSIBILITY_VERIFIER_OBJECT_MANIFEST_VERSION =
+    "crucible-impossibility-verifier-object-manifest-v1";
+export const IMPOSSIBILITY_VERIFIER_OBJECT_MANIFEST_HASH_ALGORITHM =
+    "sha256:crucible-impossibility-verifier-object-manifest-v1";
+export const IMPOSSIBILITY_VERIFIER_OBJECT_HASH_ALGORITHM =
+    "sha256:crucible-impossibility-verifier-object-v1";
+export const IMPOSSIBILITY_VERIFIER_INPUT_VERSION =
+    "crucible-impossibility-verifier-input-v1";
+export const IMPOSSIBILITY_VERIFIER_INPUT_HASH_ALGORITHM =
+    "sha256:crucible-impossibility-verifier-input-v1";
+export const IMPOSSIBILITY_VERIFIER_RECEIPT_BINDINGS_HASH_ALGORITHM =
+    "sha256:crucible-impossibility-verifier-receipt-bindings-v1";
+export const IMPOSSIBILITY_VERIFIER_REFUTATION_HASH_ALGORITHM =
+    "sha256:crucible-impossibility-verifier-refutation-v1";
+export const IMPOSSIBILITY_VERIFIER_REFUTATION_RECEIPT_HASH_ALGORITHM =
+    "sha256:crucible-impossibility-verifier-refutation-receipt-v1";
+export const IMPOSSIBILITY_VERIFIER_FACTS_HASH_ALGORITHM =
+    "sha256:crucible-impossibility-verifier-facts-v1";
+export const IMPOSSIBILITY_PROOF_ARTIFACT_VERSION =
+    "crucible-impossibility-proof-artifact-v1";
+export const IMPOSSIBILITY_PROOF_ARTIFACT_HASH_ALGORITHM =
+    "sha256:crucible-impossibility-proof-artifact-v1";
+export const IMPOSSIBILITY_PROOF_CHECKER_ROLE =
+    "impossibility-proof-checker";
+export const IMPOSSIBILITY_PROOF_CHECKER_HASH_ALGORITHM =
+    "sha256:crucible-impossibility-proof-checker-v1";
+export const IMPOSSIBILITY_PROOF_VALIDATION_RECEIPT_HASH_ALGORITHM =
+    "sha256:crucible-impossibility-proof-validation-receipt-v1";
+export const IMPOSSIBILITY_CHECKER_STATUSES = Object.freeze([
+    "VERIFIED",
+    "REJECTED",
+    "INCONCLUSIVE",
+    "INVALID",
+]);
 export const IMPOSSIBILITY_VERDICTS = Object.freeze([
     "target_unreachable",
     "not_proven",
+    "inconclusive",
     "invalid",
 ]);
 export const DEFAULT_IMPOSSIBILITY_POLICY = Object.freeze({
@@ -276,8 +342,14 @@ export const NON_RESULT_CODES = Object.freeze({
     BUDGET_EXHAUSTED_INCONCLUSIVE: "BUDGET_EXHAUSTED_INCONCLUSIVE",
     IMPOSSIBILITY_CERTIFICATE_INCONCLUSIVE: "IMPOSSIBILITY_CERTIFICATE_INCONCLUSIVE",
     INDEPENDENT_VERIFICATION_REQUIRED: "INDEPENDENT_VERIFICATION_REQUIRED",
+    SCIENTIFIC_COHORT_UNRESOLVED: "SCIENTIFIC_COHORT_UNRESOLVED",
     SCIENTIFIC_CONFIRMATION_REQUIRED: "SCIENTIFIC_CONFIRMATION_REQUIRED",
     SCIENTIFIC_CONFIRMATION_FAILED: "SCIENTIFIC_CONFIRMATION_FAILED",
+    SCIENTIFIC_PREDICTION_INVALID: "SCIENTIFIC_PREDICTION_INVALID",
+    SCIENTIFIC_PREDICTION_REFUTED: "SCIENTIFIC_PREDICTION_REFUTED",
+    SCIENTIFIC_PREDICTION_UNRESOLVED: "SCIENTIFIC_PREDICTION_UNRESOLVED",
+    SCIENTIFIC_TERMINAL_CLOSURE_INCOMPLETE:
+        "SCIENTIFIC_TERMINAL_CLOSURE_INCOMPLETE",
     VALIDATION_INCONCLUSIVE: "VALIDATION_INCONCLUSIVE",
     INVESTIGATION_PAUSED: "INVESTIGATION_PAUSED",
 });

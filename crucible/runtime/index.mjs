@@ -97,6 +97,7 @@ export {
 
 export {
     AutonomousRunner,
+    inspectFrozenImpossibilityVerifierExecution,
     runAutonomousInvestigation,
 } from "./runner.mjs";
 

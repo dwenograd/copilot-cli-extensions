@@ -199,8 +199,10 @@ The strict operator config (not a `crucible_start` argument) contains:
 }
 ```
 
-`enumerand_manifest` is required for `finite_enumerable` and
-`bounded_parameterized`, and forbidden for the other two topologies. Snapshot
+`enumerand_manifest` is required for `finite_enumerable`,
+`bounded_parameterized`, and `certified_impossibility`, and forbidden for
+`open_generative`. A certified-impossibility manifest declares either the
+finite or bounded enumerand representation that the verifier must cover. Snapshot
 ids must already exist in the durable operator corpus; preflight verifies and
 copies their complete CAS closures. Labels-only bounded candidate lists and
 `stopOnFirstAccept` are rejected. Open generative investigations are never
@@ -323,7 +325,13 @@ evidence before returning:
 - `is_result:true`, `decision`, terminal/event/contract hashes;
 - unique-candidate or supported tie-cohort identifiers when applicable;
 - the frozen-priority pairwise relation and cohort closure;
-- the kernel-sealed `basis` and `evidence_closure`.
+- the kernel-sealed `basis` and `evidence_closure`;
+- signed experiment/contract/suite/runtime authority and complete artifact-root
+  closures;
+- replay-derived performance claims, prediction outcomes, estimates/confidence
+  bounds, assumptions/limitations, and held-out confirmation/challenge state;
+- for `TARGET_UNREACHABLE`, the enumerand-coverage and independent-verifier
+  request/output/receipt/certificate closure.
 
 Every nonterminal, paused, non-result, or integrity-blocked state returns
 `is_result:false` with no winner payload.
@@ -630,12 +638,29 @@ an optional `impossibility_verifier`:
       "caseIds": ["novelty-a"],
       "deterministicSeed": "novelty-seed-v1",
       "sandboxIdentity": { "required": false, "policyDigest": null }
+    },
+    "impossibility_verifier": {
+      "harnessId": "mesh-independent-verifier",
+      "observableSchema": { "status": "verifier-status" },
+      "caseIds": [],
+      "deterministicSeed": "impossibility-verifier-seed-v1",
+      "sandboxIdentity": {
+        "required": true,
+        "policyDigest": "sha256:crucible-measurement-sandbox-policy-identity-v1:<64hex>"
+      },
+      "independenceAttestation": {
+        "kind": "operator_attested_separate_implementation"
+      },
+      "verificationPolicy": {
+        "mode": "enumerand_reexecution",
+        "certificateFormat": null
+      }
     }
   }
 }
 ```
 
-The suite identity binds each role's executable, parser, dependencies,
+The suite identity binds each role's executable, application entrypoint, parser, dependencies,
 operational config, observable-schema hash, case manifest, deterministic seed,
 and sandbox identity. Confirmation/challenge/novelty manifests must be disjoint
 from calibration/search; their case ids and snapshot ids are removed from the
@@ -644,7 +669,10 @@ implementation closure: parser identities cannot be reused as primary
 executables or application dependencies (or vice versa), and application files
 cannot be laundered as platform-shared. Separation compares the validated raw
 SHA-256 digest bytes, not the surrounding domain tag, across executables, parser
-sources, and application/entrypoint dependencies. Every shared dependency must
+sources, and application/entrypoint dependencies. The verifier parser is a
+separate runtime entrypoint, and the verifier must require the frozen
+zero-capability AppContainer policy. The independence claim is explicitly an
+operator-attested separate implementation, not a mathematical proof. Every shared dependency must
 be explicitly classified as `"platform"` or `"runtime"`; no role executable,
 parser, or application entrypoint digest may appear in that shared set. Only
 genuine declared platform/runtime dependencies may overlap. `crucible_start`
@@ -684,19 +712,22 @@ JSON, the parser requires an exact match to the trusted binding; otherwise the
 executor injects the trusted binding into the canonical parsed observation.
 Search, confirmation, challenge, novelty, and replicated calibration require
 replicate, block, and arm ordinals. Validation may execute calibration, search,
-confirmation, or challenge roles with `phase:"calibration"`. Impossibility
-verification forbids replication ordinals. `validationCases` is
+confirmation, or challenge roles with `phase:"calibration"`. The independent
+impossibility verifier uses its own strict parser, requires deterministic
+seed/block/subject binding, and forbids replicate/arm ordinals. `validationCases` is
 calibration-phase-only once a role binding is present, while
-`searchSpaceExhausted` and `impossibilityCertificateHash` are verifier-only.
+legacy `searchSpaceExhausted` and `impossibilityCertificateHash` fields have no
+verifier authority.
 Unknown top-level fields, duplicate JSON keys, non-finite metrics, trailing
 content, and output overflow are rejected. Metrics named by acceptance claims
 are required evidence; other declared metrics are ranking-only. An explicit
 `harness_pass` claim can therefore accept a statistically supported candidate
 without optional ranking metrics. Accepted-but-unrankable candidates sort
-behind rankable accepted candidates. The optional
-`impossibilityCertificateHash` is not authority for unreachability; only the
-kernel-bound verifier observation and persisted artifact/receipt closure can
-qualify.
+behind rankable accepted candidates. Primary harness output cannot create verifier success. Only a formal checker
+output parsed by the separately pinned verifier parser and bound to the
+kernel-created request can qualify. Even then, output fields such as
+`independentFactsRoot`, refutation receipts, and proof-validation receipts are
+descriptive only: they cannot authorize readiness.
 
 `observables` is an optional bounded record for registered numeric or
 categorical prediction values that are not ranking metrics. Values may be
@@ -794,12 +825,53 @@ public start schema does not expose that budget. Derived runner/effect/restart
 limits are operational and can stop the runtime without becoming a positive
 domain result.
 
-For `certified_impossibility`, verification runs only after validation and all
-frozen search slots complete without acceptance. A positive
-`pass:true + searchSpaceExhausted:true` certificate can qualify. A persisted
-`not_proven` or `invalid` certificate becomes an inconclusive domain
-non-result; it is not retried. Only **invalidated** certificate evidence is
-ignored and deterministically retried with the next attempt ordinal.
+For `certified_impossibility`, verification is possible only for a finite,
+immutable `finite_enumerable` or explicitly discretized
+`bounded_parameterized` manifest. Open-generative and non-discretized
+continuous spaces can never produce `TARGET_UNREACHABLE`. Every manifest
+ordinal/hash must have one active, terminal-grade replicated evaluation in
+which **every** acceptance claim is `REFUTED`; `SUPPORTED`, `UNRESOLVED`, or
+`INVALID` claims, missing/invalid blocks, control drift, missing role receipts,
+and duplicate/re-identified artifacts block exhaustion. Invalidation reopens
+the original slot, and a replacement creates a new closure rather than
+laundering the stale evidence.
+
+The formal coverage closure binds the manifest Merkle root, every enumerand
+identity, evidence/event/provenance roots, raw block and role-receipt roots,
+claim alpha allocations, calibration/control closure, invalidation lineage,
+scientific replay, and the alpha ledger with no ordinal gaps. The verifier
+request additionally binds the signed experiment authority/contract hash,
+suite identity, statistical policy, verifier role identity, evidence roots,
+coverage-closure root, proposed claim envelope, distinct proof artifact, and a
+canonical object manifest for every covered snapshot/parameter tuple, complete
+raw block, receipt, and artifact object. The capability-scoped checker snapshot
+is immutable/read-only and contains the request, proposal, proof, generated
+closure inputs, and a hash-bound object pack.
+
+The suite selects either `enumerand_reexecution`, whose signed output must list
+every exact ordinal/hash and independently `REFUTED` acceptance-claim state
+with receipt/input-bound observations, or
+`certificate_validation`, which must parse and validate the distinct proof
+artifact using a separately pinned `impossibility-proof-checker` application
+dependency. A proposal hash is never accepted as a proof/certificate hash. Raw checker output
+has exactly four statuses: `VERIFIED`, `REJECTED`, `INCONCLUSIVE`, or `INVALID`.
+Any disagreement or non-`VERIFIED` status is a scientific non-result. There is
+no `pass + exhausted`, stop-request, or search-budget shortcut. The runner
+revalidates the current closure before launch/recovery and persists the exact
+checker output, complete MeasurementReceiptV6 identity, AppContainer policy,
+request/proof bytes, and raw stdout/stderr. The repository adapter reparses
+stdout with the pinned parser and derives a private code-stamped execution
+reference bound to the effect attempt, lease/fencing token, supervisor
+generation/incarnation, executable/parser/dependency bytes, and CAS artifacts.
+Re-evaluation records an adapter-derived checker receipt for every enumerand;
+certificate mode records an adapter-derived receipt for the actual proof bytes.
+Public constructors and plain hashes cannot mint that capability, and replay
+rederives it from repository/CAS state. Only a fully bound `VERIFIED` closure
+derives the `v4_unreachable` basis that can terminalize
+as `TARGET_UNREACHABLE`. Budget exhaustion without that proof remains
+`BUDGET_EXHAUSTED_INCONCLUSIVE`/scientifically inconclusive. Independence is
+reported as operator-attested separate implementation, never as mathematically
+proven. Only **invalidated** verifier evidence is deterministically retried.
 
 ## Replay, result closure, and bundles
 
@@ -812,8 +884,10 @@ closure hashes. Domain decisions read the compact replay-derived
 support/calibration state,
 never an unchecked persisted summary. Operational evidence has its own verified
 event stream.
-The terminal evidence closure carries the supported cohort, pairwise relation
-hash/evidence, and one code-authored scientific conclusion per cohort member.
+The terminal evidence closure carries signed experiment/contract/suite/runtime
+authority, all artifact/provenance roots, the discovery stop/plateau basis, the
+supported cohort and pairwise relation evidence, and one code-authored
+scientific conclusion per cohort member.
 Candidate-performance status remains separate from sealed hypothesis-set
 status, and every prediction includes its estimate, confidence bounds,
 evidence/block/alpha references, and explicit limitations. Explanatory model
@@ -831,8 +905,9 @@ schedule/composite object, and a cache-only scientific replay digest. Export and
 import both replay the bundled v4 database and reject any mismatch between that
 digest and the raw schedule/policy/block history. They also canonical-compare
 schedule/composite objects and each raw parsed observation against its
-content-addressed receipt before publication or import. Authenticity is out of
-band:
+content-addressed receipt before publication or import. Impossibility bundles
+also compare the verifier request, output, receipt, sandbox identity, and
+certificate artifact against the replayed terminal. Authenticity is out of band:
 
 - export reports `trustLevel:"self-consistent"`;
 - import requires an expected digest/signature by default;
@@ -855,6 +930,8 @@ npm run test:crucible:changed
 for the inner edit loop. `test:crucible:changed` asks Vitest for tests related
 to changed Crucible files and aborts after 120 seconds; reaching that limit
 means the next run should target explicit test files.
+An explicit release phase gate may resolve release ownership with
+`npm run test:crucible:changed -- --release <source-or-release-test>`.
 
 The complete safe suite runs once at a phase gate. Hard-kill, multiprocess,
 credentialed SDK, and native AppContainer tests remain release-gate work and

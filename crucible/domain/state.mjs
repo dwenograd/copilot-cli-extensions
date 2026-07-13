@@ -1,4 +1,5 @@
 import {
+    canonicalEqual,
     canonicalClone,
     deepFreeze,
     hashCanonical,
@@ -8,13 +9,18 @@ import {
     compareCandidateEvidence,
 } from "./archive.mjs";
 import { DOMAIN_VERSION } from "./constants.mjs";
-import { impossibilitySearchEvidenceHash } from "./impossibility.mjs";
+import {
+    createImpossibilityVerificationPackage,
+    deriveUnreachableCoverageClosure,
+} from "./impossibility.mjs";
 import {
     enumerandCoverage,
-    enumerandExhaustion,
     normalizeEnumerandManifest,
 } from "./enumerands.mjs";
 import { replayDerivedCandidateEvidence } from "./scientific-replay.mjs";
+import {
+    inheritAggregateImpossibilityExecutions,
+} from "./private-verifier-execution.mjs";
 
 const BOUNDED_CANDIDATE_SET_HASH_ALGORITHM =
     "sha256:crucible-bounded-candidate-set-v1";
@@ -40,11 +46,18 @@ function restorePrototypeSafeMaps(aggregate) {
 }
 
 export function cloneAggregateForMutation(aggregate) {
-    return restorePrototypeSafeMaps(canonicalClone(aggregate));
+    return inheritAggregateImpossibilityExecutions(
+        aggregate,
+        restorePrototypeSafeMaps(canonicalClone(aggregate)),
+    );
 }
 
 export function immutableAggregate(aggregate) {
-    return deepFreeze(cloneAggregateForMutation(aggregate));
+    const cloned = cloneAggregateForMutation(aggregate);
+    return inheritAggregateImpossibilityExecutions(
+        cloned,
+        deepFreeze(cloned),
+    );
 }
 
 export function createInitialAggregate() {
@@ -338,24 +351,33 @@ function impossibilityEvidenceMatchesCurrentTrigger(aggregate, evidence) {
         : ownEntry(aggregate.commands, observation.commandId)?.command ?? null;
     const validation = currentValidationEvidence(aggregate);
     const progress = searchProgress(aggregate);
-    const trigger = command?.request?.trigger ?? null;
-    return command?.kind === "verify_impossibility"
-        && validation !== null
-        && progress.roundsExhausted
-        && trigger?.kind === aggregate.contract.impossibilityPolicy?.trigger
-        && trigger.roundsExhausted === true
-        && trigger.completedRounds === progress.completedRounds
-        && trigger.maxRounds === aggregate.contract.maxRounds
-        && trigger.candidatesPerRound === aggregate.contract.candidatesPerRound
-        && trigger.candidateCount === progress.candidates.length
-        && trigger.acceptanceSatisfiedCount === progress.candidates.filter(
-            (candidate) => candidate.acceptanceSatisfied === true,
-        ).length
-        && trigger.acceptanceSatisfiedCount === 0
-        && trigger.candidateEvidenceHash
-            === impossibilitySearchEvidenceHash(progress.candidates)
-        && trigger.validationEvidenceId === validation.evidenceId
-        && trigger.validationEvidenceHash === validation.commitEventHash;
+    if (command?.kind !== "verify_impossibility"
+        || validation === null
+        || !progress.roundsExhausted) {
+        return false;
+    }
+    try {
+        const expected = createImpossibilityVerificationPackage(
+            aggregate,
+            {
+                attemptOrdinal: command.attemptOrdinal,
+                progress,
+                validation,
+            },
+        );
+        return expected.eligible
+            && command.requestHash === expected.requestHash
+            && command.proposedCertificateArtifactHash
+                === expected.proposalArtifactHash
+            && command.proofArtifactHash
+                === expected.proofArtifactHash
+            && canonicalEqual(
+                command.proofArtifact,
+                expected.proofArtifact,
+            );
+    } catch {
+        return false;
+    }
 }
 
 export function latestApplicableImpossibilityEvidence(aggregate) {
@@ -375,7 +397,8 @@ export function searchProgress(aggregate) {
     );
     const capacity = aggregate.contract.candidatesPerRound * aggregate.contract.maxRounds;
     const manifestOptions = {
-        topology: aggregate.contract.hypothesisTopology,
+        topology: aggregate.contract.enumerandManifest?.topology
+            ?? aggregate.contract.hypothesisTopology,
         observableRegistry: aggregate.contract.observableRegistry,
         hypothesisPolicy: aggregate.contract.hypothesisPolicy,
     };
@@ -507,7 +530,8 @@ export function candidateSelectionReady(aggregate) {
 export function boundedSearchExhaustion(aggregate) {
     if (aggregate.contract.enumerandManifest !== undefined) {
         const manifestOptions = {
-            topology: aggregate.contract.hypothesisTopology,
+            topology: aggregate.contract.enumerandManifest?.topology
+                ?? aggregate.contract.hypothesisTopology,
             observableRegistry: aggregate.contract.observableRegistry,
             hypothesisPolicy: aggregate.contract.hypothesisPolicy,
         };
@@ -516,49 +540,26 @@ export function boundedSearchExhaustion(aggregate) {
             manifestOptions,
         );
         const progress = searchProgress(aggregate);
-        const attempts = progress.candidates.map((evidence) => ({
-            enumerandOrdinal: evidence.enumerandOrdinal,
-            enumerandHash: evidence.enumerandHash,
-            outcomeClass: evidence.outcomeClass,
-            acceptanceSatisfied: evidence.acceptanceSatisfied,
-        }));
-        const exhaustion = enumerandExhaustion(
-            manifest,
-            attempts,
-            manifestOptions,
-        );
-        if (!exhaustion.exhausted) {
+        const coverage = deriveUnreachableCoverageClosure(aggregate);
+        if (!coverage.eligible) {
             return null;
         }
-        const byEnumerand = new Map(
-            progress.candidates.map((evidence) => [
-                `${evidence.enumerandOrdinal}:${evidence.enumerandHash}`,
-                evidence,
-            ]),
-        );
-        const evidenceClosure = manifest.entries.map((entry) => {
-            const evidence = byEnumerand.get(
-                `${entry.ordinal}:${entry.enumerandHash}`,
-            );
-            return {
-                ordinal: entry.ordinal,
-                enumerandHash: entry.enumerandHash,
-                evidenceHash: evidence.commitEventHash,
-                provenanceRoot: evidence.provenanceRoot,
-            };
-        });
         return {
             kind: "search_space_exhausted",
             searchSpaceExhausted: true,
             topology: aggregate.contract.hypothesisTopology,
             enumerandCount: manifest.entries.length,
             enumerandManifestRoot: manifest.merkleRoot,
-            enumerandCoverageHash: exhaustion.coverage.coverageHash,
-            enumerandExhaustionHash: exhaustion.exhaustionHash,
-            evidenceClosureHash: hashCanonical(
-                evidenceClosure,
-                BOUNDED_EVIDENCE_CLOSURE_HASH_ALGORITHM,
+            enumerandCoverageHash:
+                progress.enumerandCoverage?.coverageHash ?? null,
+            enumerandExhaustionHash: hashCanonical(
+                {
+                    manifestRoot: manifest.merkleRoot,
+                    coverageClosureRoot: coverage.closure.closureRoot,
+                },
+                "sha256:crucible-enumerand-exhaustion-v2",
             ),
+            evidenceClosureHash: coverage.closure.closureRoot,
         };
     }
     const boundedCandidateIds = aggregate.contract.boundedCandidateIds;

@@ -1,6 +1,8 @@
 import {
     DOMAIN_VERSION,
     EVENT_TYPES,
+    IMPOSSIBILITY_PROOF_ARTIFACT_HASH_ALGORITHM,
+    IMPOSSIBILITY_VERIFIER_OBJECT_MANIFEST_HASH_ALGORITHM,
     OBSERVATION_STREAM_HASH_ALGORITHM,
     SNAPSHOT_EXECUTION_HASH_ALGORITHM,
     artifactRefsFromProvenance,
@@ -22,6 +24,7 @@ import {
     enumerandArtifactMeasurementHash,
     enumerandBindingHash,
     hashCanonical,
+    immutableCanonical,
     normalizeRawMeasurementSeries,
     normalizeReplicationSchedule,
     replicationBlockPlan,
@@ -45,8 +48,13 @@ import {
     RECEIPT_VERSION,
     STREAM_HASH_ALGORITHM,
     hashReceipt,
+    parseImpossibilityVerifierResult,
     sha256Bytes,
+    trustedParserIdentity,
 } from "../measurement/index.mjs";
+import {
+    issueVerifiedImpossibilityExecutionCapability,
+} from "../domain/private-verifier-execution.mjs";
 import {
     CrucibleRuntimeError,
     LegacyIncompatibleRuntimeError,
@@ -76,13 +84,28 @@ const SNAPSHOT_CLOSURE_HASH_ALGORITHM =
 const DOMAIN_FACT_IDENTITY_HASH_ALGORITHM =
     "sha256:crucible-runtime-domain-fact-v1";
 const IMPOSSIBILITY_CERTIFICATE_ARTIFACT_HASH_ALGORITHM =
-    "sha256:crucible-impossibility-certificate-artifact-v1";
+    "sha256:crucible-impossibility-certificate-artifact-v2";
 const IMPOSSIBILITY_RECEIPT_ARTIFACT_HASH_ALGORITHM =
     "sha256:crucible-impossibility-receipt-artifact-v1";
 const IMPOSSIBILITY_STDOUT_ARTIFACT_HASH_ALGORITHM =
     "sha256:crucible-impossibility-stdout-artifact-v1";
 const IMPOSSIBILITY_STDERR_ARTIFACT_HASH_ALGORITHM =
     "sha256:crucible-impossibility-stderr-artifact-v1";
+const IMPOSSIBILITY_REQUEST_FILENAME = "request.json";
+const IMPOSSIBILITY_PROPOSAL_FILENAME = "proposed-certificate.json";
+const IMPOSSIBILITY_PROOF_FILENAME = "proof-artifact.json";
+const VERIFIED_IMPOSSIBILITY_EXECUTION_VERSION =
+    "crucible-verified-impossibility-execution-v1";
+const VERIFIED_IMPOSSIBILITY_EXECUTION_IDENTITY_HASH_ALGORITHM =
+    "sha256:crucible-verified-impossibility-execution-identity-v1";
+const VERIFIED_IMPOSSIBILITY_ENUMERAND_OBSERVATION_HASH_ALGORITHM =
+    "sha256:crucible-verified-impossibility-enumerand-observation-v1";
+const VERIFIED_IMPOSSIBILITY_CHECKER_RECEIPT_HASH_ALGORITHM =
+    "sha256:crucible-verified-impossibility-checker-receipt-v1";
+const VERIFIED_IMPOSSIBILITY_FACTS_HASH_ALGORITHM =
+    "sha256:crucible-verified-impossibility-facts-v1";
+const LOGICAL_EFFECT_KEY_HASH_ALGORITHM =
+    "sha256:crucible-runtime-logical-effect-v1";
 const MEASUREMENT_RECEIPT_KEYS = Object.freeze([
     "allowlistFileHash",
     "argvHash",
@@ -98,10 +121,12 @@ const MEASUREMENT_RECEIPT_KEYS = Object.freeze([
     "envHash",
     "executableHash",
     "exit",
+    "harnessId",
     "harnessEntryHash",
     "launchFileBindings",
     "outputCapture",
     "parsed",
+    "parserIdentity",
     "parserVersion",
     "runnerEpochId",
     "sandbox",
@@ -780,9 +805,12 @@ function verifyMeasurementArtifactClosure(
         });
     }
     if (hashReceipt(receipt) !== measurement.receiptHash
+        || typeof receipt.harnessId !== "string"
+        || receipt.harnessId.length === 0
         || receipt.role !== measurement.role
         || receipt.phase !== measurement.phase
         || receipt.parserVersion !== measurement.parserVersion
+        || receipt.parserIdentity?.version !== receipt.parserVersion
         || receipt.allowlistFileHash !== measurement.allowlistFileHash
         || receipt.harnessEntryHash !== measurement.harnessEntryHash
         || receipt.executableHash !== measurement.executableHash
@@ -1066,7 +1094,8 @@ function verifyCandidateArtifacts(
         schedule,
         enumerandManifest: aggregate.contract.enumerandManifest ?? null,
         manifestOptions: {
-            topology: aggregate.contract.hypothesisTopology,
+            topology: aggregate.contract.enumerandManifest?.topology
+                ?? aggregate.contract.hypothesisTopology,
             observableRegistry: aggregate.contract.observableRegistry,
             hypothesisPolicy: aggregate.contract.hypothesisPolicy,
         },
@@ -1411,7 +1440,8 @@ function verifyScientificRoleArtifacts(
         schedule,
         enumerandManifest: aggregate.contract.enumerandManifest ?? null,
         manifestOptions: {
-            topology: aggregate.contract.hypothesisTopology,
+            topology: aggregate.contract.enumerandManifest?.topology
+                ?? aggregate.contract.hypothesisTopology,
             observableRegistry: aggregate.contract.observableRegistry,
             hypothesisPolicy: aggregate.contract.hypothesisPolicy,
         },
@@ -1524,7 +1554,8 @@ function verifyValidationArtifacts(
             schedule: series.replicationSchedule,
             enumerandManifest: aggregate.contract.enumerandManifest ?? null,
             manifestOptions: {
-                topology: aggregate.contract.hypothesisTopology,
+                topology: aggregate.contract.enumerandManifest?.topology
+                    ?? aggregate.contract.hypothesisTopology,
                 observableRegistry: aggregate.contract.observableRegistry,
                 hypothesisPolicy: aggregate.contract.hypothesisPolicy,
             },
@@ -1616,6 +1647,802 @@ function verifyValidationArtifacts(
     }
 }
 
+function taggedHashMatchesObjectId(tagged, objectId) {
+    return typeof tagged === "string"
+        && typeof objectId === "string"
+        && tagged.split(":").at(-1)
+            === objectId.slice("sha256:".length);
+}
+
+function generatedImpossibilityDocuments(command) {
+    const documents = new Map([
+        ["coverage-closure.json", command.request.evidence.coverageClosure],
+        ["enumerand-manifest.json", command.request.enumerands.manifest],
+        ["scientific-replay.json", command.request.statistics.scientificReplay],
+        [IMPOSSIBILITY_PROOF_FILENAME, command.proofArtifact],
+    ]);
+    if (command.request.reevaluation.calibration !== null) {
+        documents.set(
+            "reevaluation/calibration.json",
+            command.request.reevaluation.calibration,
+        );
+    }
+    for (const input of command.request.reevaluation.enumerands) {
+        documents.set(
+            `reevaluation/enumerands/${String(input.ordinal)
+                .padStart(6, "0")}.json`,
+            input,
+        );
+    }
+    return documents;
+}
+
+function verifyImpossibilityRequestSnapshot(
+    command,
+    measured,
+    reader,
+    evidenceId,
+) {
+    const manifest = command.request.objectManifest;
+    const expectedManifestRoot = hashCanonical(
+        {
+            version: manifest.version,
+            pack: manifest.pack,
+            entries: manifest.entries,
+        },
+        IMPOSSIBILITY_VERIFIER_OBJECT_MANIFEST_HASH_ALGORITHM,
+    );
+    const snapshotEntries = new Map(
+        measured.snapshot.manifest.entries.map((entry) => [
+            entry.path,
+            entry,
+        ]),
+    );
+    const objectArtifacts = measured.snapshot.objectArtifacts;
+    const readEntry = (path, label) => {
+        const entry = snapshotEntries.get(path) ?? null;
+        const artifact = entry === null
+            ? null
+            : objectArtifacts.get(entry.object) ?? null;
+        return artifact === null
+            ? null
+            : {
+                entry,
+                artifact,
+                bytes: reader.read(artifact, label).bytes,
+            };
+    };
+    const requestRead = readEntry(
+        IMPOSSIBILITY_REQUEST_FILENAME,
+        `impossibility ${evidenceId} verification request`,
+    );
+    const proposalRead = readEntry(
+        IMPOSSIBILITY_PROPOSAL_FILENAME,
+        `impossibility ${evidenceId} proposed certificate`,
+    );
+    const packRead = readEntry(
+        manifest.pack?.path ?? "",
+        `impossibility ${evidenceId} verifier object pack`,
+    );
+    if (manifest.root !== expectedManifestRoot
+        || manifest.pack?.format
+            !== "crucible-base64-object-pack-v1"
+        || requestRead === null
+        || proposalRead === null
+        || packRead === null
+        || requestRead.bytes.toString("utf8")
+            !== canonicalJson(command.request)
+        || proposalRead.bytes.toString("utf8")
+            !== canonicalJson(command.proposedCertificate)) {
+        return false;
+    }
+    let objectPack;
+    try {
+        objectPack = JSON.parse(packRead.bytes.toString("utf8"));
+    } catch {
+        return false;
+    }
+    if (!exactKeys(objectPack, ["entries", "version"])
+        || canonicalJson(objectPack) !== packRead.bytes.toString("utf8")
+        || objectPack?.version !== manifest.pack.format
+        || !Array.isArray(objectPack.entries)
+        || objectPack.entries.some((entry) =>
+            !exactKeys(entry, [
+                "artifactIds",
+                "byteHash",
+                "contentBase64",
+                "objectId",
+                "path",
+                "semanticHashes",
+            ]))
+        || objectPack.entries.some((entry, index) =>
+            index > 0
+            && objectPack.entries[index - 1].path
+                .localeCompare(entry.path) >= 0)) {
+        return false;
+    }
+    const packedByPath = new Map(
+        objectPack.entries.map((entry) => [entry.path, entry]),
+    );
+    if (packedByPath.size !== objectPack.entries.length) return false;
+    const generated = generatedImpossibilityDocuments(command);
+    const expectedPaths = new Set([
+        IMPOSSIBILITY_REQUEST_FILENAME,
+        IMPOSSIBILITY_PROPOSAL_FILENAME,
+        manifest.pack.path,
+    ]);
+    for (const object of manifest.entries) {
+        const generatedValue = generated.get(object.path);
+        if (!exactKeys(object, [
+            "artifactIds",
+            "byteHash",
+            "kind",
+            "objectId",
+            "path",
+            "semanticHashes",
+        ])
+            || !Array.isArray(object.artifactIds)
+            || !taggedHashMatchesObjectId(
+                object.byteHash,
+                object.objectId,
+            )
+            || !Array.isArray(object.semanticHashes)
+            || object.semanticHashes.some((hash) =>
+                !taggedHashMatchesObjectId(hash, object.objectId))
+            || ((object.kind === "generated")
+                !== (generatedValue !== undefined))) {
+            return false;
+        }
+        if (generatedValue !== undefined) {
+            expectedPaths.add(object.path);
+            const read = readEntry(
+                object.path,
+                `impossibility ${evidenceId} object ${object.path}`,
+            );
+            if (read === null
+                || read.entry.object !== object.objectId
+                || read.bytes.toString("utf8")
+                    !== canonicalJson(generatedValue)) {
+                return false;
+            }
+        } else {
+            const packed = packedByPath.get(object.path);
+            if (packed === undefined
+                || packed.objectId !== object.objectId
+                || packed.byteHash !== object.byteHash
+                || !canonicalEqual(
+                    packed.artifactIds,
+                    object.artifactIds,
+                )
+                || !canonicalEqual(
+                    packed.semanticHashes,
+                    object.semanticHashes,
+                )
+                || typeof packed.contentBase64 !== "string") {
+                return false;
+            }
+            let bytes;
+            try {
+                bytes = Buffer.from(packed.contentBase64, "base64");
+            } catch {
+                return false;
+            }
+            if (bytes.toString("base64") !== packed.contentBase64
+                || `sha256:${sha256Hex(bytes)}` !== object.objectId) {
+                return false;
+            }
+        }
+    }
+    const complete = [...generated.keys()].every((path) =>
+        expectedPaths.has(path))
+        && packedByPath.size === manifest.entries.filter((entry) =>
+            entry.kind === "cas_object").length
+        && measured.snapshot.manifest.entries.length === expectedPaths.size
+        && measured.snapshot.manifest.entries.every((entry) =>
+            expectedPaths.has(entry.path));
+    if (!complete) return false;
+    const proofRead = readEntry(
+        IMPOSSIBILITY_PROOF_FILENAME,
+        `impossibility ${evidenceId} proof artifact`,
+    );
+    if (proofRead === null) return false;
+    return {
+        request: requestRead,
+        proposal: proposalRead,
+        proof: proofRead,
+        objectPack: packRead,
+    };
+}
+
+function normalizedDependencyIdentity(dependencies) {
+    return [...dependencies].map((dependency) => ({
+        role: dependency.role,
+        sha256: dependency.sha256,
+    })).sort((left, right) =>
+        `${left.role}\0${left.sha256}`.localeCompare(
+            `${right.role}\0${right.sha256}`,
+        ));
+}
+
+function parseAttemptMetadata(attempt, label) {
+    if (attempt === null) {
+        integrityFailure(`${label} attempt is missing`);
+    }
+    let metadata;
+    try {
+        metadata = JSON.parse(attempt.command);
+    } catch (error) {
+        integrityFailure(`${label} attempt command is not canonical JSON`, {
+            attemptId: attempt.attemptId,
+        }, error);
+    }
+    if (canonicalJson(metadata) !== attempt.command) {
+        integrityFailure(`${label} attempt command is not canonical`, {
+            attemptId: attempt.attemptId,
+        });
+    }
+    return metadata;
+}
+
+function attemptAuthorityProjection(attempt) {
+    return {
+        attemptId: attempt.attemptId,
+        leaseId: attempt.leaseId,
+        fencingToken: attempt.fencingToken,
+        owner: attempt.owner,
+        supervisorGeneration: attempt.supervisorGeneration,
+        runnerIncarnation: attempt.runnerIncarnation,
+    };
+}
+
+function logicalEffectKey(investigationId, effect) {
+    return hashCanonical({
+        investigationId,
+        domainCommandId: effect.commandId ?? null,
+        phase: effect.kind ?? null,
+        round: effect.round ?? null,
+        slotIndex: effect.slotIndex ?? null,
+        candidateId: effect.candidateId ?? effect.caseId ?? null,
+        snapshotId: effect.snapshot ?? null,
+        scheduleHash: effect.scheduleHash ?? null,
+        blockIndex: effect.blockIndex ?? null,
+        replicateIndex: effect.replicateIndex ?? null,
+        armIndex: effect.armIndex ?? null,
+        armId: effect.armId ?? null,
+        deterministicSeed: effect.deterministicSeed ?? null,
+        subjectId: effect.subjectId ?? null,
+    }, LOGICAL_EFFECT_KEY_HASH_ALGORITHM);
+}
+
+function sameAttemptAuthority(left, right) {
+    return left.leaseId === right.leaseId
+        && left.fencingToken === right.fencingToken
+        && left.owner === right.owner
+        && left.supervisorGeneration === right.supervisorGeneration
+        && left.runnerIncarnation === right.runnerIncarnation;
+}
+
+function exactOperationalEvent(events, predicate, label, details = {}) {
+    const matches = events.filter(predicate);
+    if (matches.length !== 1) {
+        integrityFailure(
+            `${label} must have exactly one committed operational record`,
+            { ...details, count: matches.length },
+        );
+    }
+    return matches[0];
+}
+
+function executionArtifactProjection(artifact) {
+    return {
+        artifactId: artifact.artifactId,
+        objectId: artifact.objectId,
+    };
+}
+
+function verifierExecutionIdentity({
+    command,
+    role,
+    receipt,
+    measurement,
+    effectAttempt,
+    mainAttempt,
+    requestArtifact,
+    proofArtifact,
+}) {
+    const core = {
+        harnessRole: "impossibility_verifier",
+        harnessId: command.harnessId,
+        harnessEntryHash: receipt.harnessEntryHash,
+        allowlistFileHash: receipt.allowlistFileHash,
+        executableHash: receipt.executableHash,
+        stagedExecutableHash: receipt.stagedExecutableHash,
+        applicationEntrypointHash: role.applicationEntrypointHash,
+        dependencyHashes: receipt.dependencyHashes,
+        stagedDependencyHashes: receipt.stagedDependencyHashes,
+        launchFileBindings: receipt.launchFileBindings,
+        parserIdentity: receipt.parserIdentity,
+        argvHash: receipt.argvHash,
+        envHash: receipt.envHash,
+        sandbox: receipt.sandbox,
+        measurementReceiptHash: measurement.receiptHash,
+        measurementReceiptArtifact:
+            executionArtifactProjection(measurement.receiptArtifact),
+        rawStdoutArtifact:
+            executionArtifactProjection(measurement.rawStdoutArtifact),
+        rawStderrArtifact:
+            executionArtifactProjection(measurement.rawStderrArtifact),
+        requestArtifact: executionArtifactProjection(requestArtifact),
+        proofArtifact: executionArtifactProjection(proofArtifact),
+        effectAttempt: attemptAuthorityProjection(effectAttempt),
+        observationAttempt: attemptAuthorityProjection(mainAttempt),
+    };
+    return {
+        ...core,
+        identity: hashCanonical(
+            core,
+            VERIFIED_IMPOSSIBILITY_EXECUTION_IDENTITY_HASH_ALGORITHM,
+        ),
+    };
+}
+
+function deriveVerifierFacts({
+    parsed,
+    command,
+    measured,
+    requestClosure,
+    executionIdentity,
+}) {
+    const enumerandObservations = parsed.mode === "enumerand_reexecution"
+        ? parsed.enumerandResults.map((result) => {
+            const path = `reevaluation/enumerands/${
+                String(result.ordinal).padStart(6, "0")
+            }.json`;
+            const inputEntry = measured.snapshot.manifest.entries.find(
+                (entry) => entry.path === path,
+            ) ?? null;
+            const inputArtifact = inputEntry === null
+                ? null
+                : measured.snapshot.objectArtifacts.get(inputEntry.object)
+                    ?? null;
+            if (inputArtifact === null) {
+                integrityFailure(
+                    "Verifier enumerand result has no persisted input artifact",
+                    { ordinal: result.ordinal, path },
+                );
+            }
+            const observation = {
+                ordinal: result.ordinal,
+                enumerandHash: result.enumerandHash,
+                inputRoot: result.inputRoot,
+                receiptBindingsRoot: result.receiptBindingsRoot,
+                claimStates: result.claimStates,
+                inputArtifact: executionArtifactProjection(inputArtifact),
+            };
+            const observationHash = hashCanonical(
+                observation,
+                VERIFIED_IMPOSSIBILITY_ENUMERAND_OBSERVATION_HASH_ALGORITHM,
+            );
+            const receiptCore = {
+                executionIdentity: executionIdentity.identity,
+                measurementReceiptHash:
+                    measured.measurement.receiptHash,
+                rawStdoutHash: measured.measurement.rawStdoutHash,
+                requestHash: command.requestHash,
+                requestArtifact:
+                    executionArtifactProjection(requestClosure.request.artifact),
+                observationHash,
+                inputArtifact: observation.inputArtifact,
+            };
+            return {
+                ...observation,
+                observationHash,
+                checkerReceipt: {
+                    ...receiptCore,
+                    receiptHash: hashCanonical(
+                        receiptCore,
+                        VERIFIED_IMPOSSIBILITY_CHECKER_RECEIPT_HASH_ALGORITHM,
+                    ),
+                },
+            };
+        })
+        : [];
+    const proofCheckerReceipt = parsed.mode === "certificate_validation"
+        ? (() => {
+            const receiptCore = {
+                executionIdentity: executionIdentity.identity,
+                measurementReceiptHash:
+                    measured.measurement.receiptHash,
+                rawStdoutHash: measured.measurement.rawStdoutHash,
+                requestHash: command.requestHash,
+                requestArtifact:
+                    executionArtifactProjection(requestClosure.request.artifact),
+                proofArtifact:
+                    executionArtifactProjection(requestClosure.proof.artifact),
+                proofArtifactHash: command.proofArtifactHash,
+                proofCheckerIdentity:
+                    command.request.verifier.proofChecker.identity,
+                certificateFormat:
+                    command.request.verifier.verificationPolicy
+                        .certificateFormat,
+                status: parsed.status,
+            };
+            return {
+                ...receiptCore,
+                receiptHash: hashCanonical(
+                    receiptCore,
+                    VERIFIED_IMPOSSIBILITY_CHECKER_RECEIPT_HASH_ALGORITHM,
+                ),
+            };
+        })()
+        : null;
+    const core = {
+        status: parsed.status,
+        verdict: parsed.certificate.verdict,
+        mode: parsed.mode,
+        complete: parsed.complete,
+        disagreementCount: parsed.disagreementCount,
+        requestHash: command.requestHash,
+        proposedCertificateArtifactHash:
+            command.proposedCertificateArtifactHash,
+        proofArtifactHash: command.proofArtifactHash,
+        coverageClosureRoot: parsed.coverageClosureRoot,
+        enumerandManifestRoot: parsed.enumerandManifestRoot,
+        enumerandCount: parsed.enumerandCount,
+        checkedEnumerandCount: parsed.checkedEnumerandCount,
+        enumerandObservations,
+        evidenceRoots: parsed.evidenceRoots,
+        statisticalPolicyIdentity: parsed.statisticalPolicyIdentity,
+        alphaLedgerRoot: parsed.alphaLedgerRoot,
+        checkerEvidenceRoot: parsed.checkerEvidenceRoot,
+        proofCheckerReceipt,
+    };
+    return {
+        ...core,
+        factsRoot: hashCanonical(
+            core,
+            VERIFIED_IMPOSSIBILITY_FACTS_HASH_ALGORITHM,
+        ),
+    };
+}
+
+function deriveVerifiedImpossibilityExecutionCapability({
+    aggregate,
+    payload,
+    repository,
+    artifactStore,
+    investigationId,
+    operationalEvidence,
+    expectedObservationAttemptId = null,
+    expectedLease = null,
+}) {
+    if (artifactStore === null) {
+        integrityFailure(
+            "Impossibility execution verification requires the repository-bound ArtifactStore",
+            { commandId: payload?.commandId ?? null },
+        );
+    }
+    const commandRecord = aggregate.commands[payload?.commandId] ?? null;
+    const command = commandRecord?.command ?? null;
+    const provenance = payload?.receipt?.provenance ?? null;
+    const measurement = provenance?.measurements?.[0] ?? null;
+    const role =
+        aggregate.contract?.harnessSuite?.roles?.impossibility_verifier ?? null;
+    if (command?.kind !== "verify_impossibility"
+        || payload?.purpose !== "impossibility"
+        || provenance === null
+        || provenance.measurements.length !== 1
+        || measurement === null
+        || role === null) {
+        integrityFailure(
+            "Impossibility observation is not bound to one frozen verifier command",
+            { commandId: payload?.commandId ?? null },
+        );
+    }
+
+    verifyOperationalMeasurementClosure(
+        payload,
+        provenance,
+        operationalEvidence,
+    );
+    const reader = artifactReader(
+        repository,
+        artifactStore,
+        investigationId,
+    );
+    const measured = verifyMeasurementArtifactClosure(
+        measurement,
+        `impossibility ${payload.observationId} measurement`,
+        reader,
+        artifactStore,
+    );
+    const requestClosure = verifyImpossibilityRequestSnapshot(
+        command,
+        measured,
+        reader,
+        payload.observationId,
+    );
+    if (requestClosure === false) {
+        integrityFailure(
+            "Impossibility verifier request/proof bytes do not match the reserved command",
+            { commandId: payload.commandId },
+        );
+    }
+    const certificateArtifact =
+        provenance.impossibilityCertificateArtifact;
+    const certificateRead = reader.readJson(
+        certificateArtifact,
+        `impossibility ${payload.observationId} certificate`,
+    );
+    let parsed;
+    try {
+        parsed = parseImpossibilityVerifierResult(
+            measured.stdoutBytes.toString("utf8"),
+            {
+                request: command.request,
+                requestHash: command.requestHash,
+                expectedBinding: command.measurementBinding,
+            },
+        );
+    } catch (error) {
+        integrityFailure(
+            "Persisted raw verifier stdout does not parse under the frozen verifier parser",
+            {
+                commandId: payload.commandId,
+                parserVersion: command.parserVersion,
+            },
+            error,
+        );
+    }
+    const expectedParserIdentity = trustedParserIdentity(
+        command.parserVersion,
+    );
+    const frozenDependencies = normalizedDependencyIdentity(
+        role.dependencies,
+    );
+    const receiptDependencies = normalizedDependencyIdentity(
+        measured.receipt.dependencyHashes,
+    );
+    const stagedDependencies = normalizedDependencyIdentity(
+        measured.receipt.stagedDependencyHashes,
+    );
+    const launchHashes = new Set(
+        measured.receipt.launchFileBindings.map((file) =>
+            `${file.role}\0${file.sha256}`),
+    );
+    if (measured.receipt.version !== HARNESS_SUITE_RECEIPT_VERSION
+        || measured.receipt.harnessId !== role.harnessId
+        || measured.receipt.role !== "impossibility_verifier"
+        || measured.receipt.phase !== "impossibility_verification"
+        || measured.receipt.parserVersion !== role.parser.version
+        || !canonicalEqual(
+            measured.receipt.parserIdentity,
+            role.parser,
+        )
+        || !canonicalEqual(role.parser, expectedParserIdentity)
+        || measured.receipt.harnessEntryHash !== role.harnessEntryHash
+        || measured.receipt.executableHash !== role.executableHash
+        || measured.receipt.stagedExecutableHash !== role.executableHash
+        || !canonicalEqual(receiptDependencies, frozenDependencies)
+        || !canonicalEqual(stagedDependencies, frozenDependencies)
+        || !launchHashes.has(
+            `executable\0${measured.receipt.stagedExecutableHash}`,
+        )
+        || stagedDependencies.some((dependency) =>
+            !launchHashes.has(`${dependency.role}\0${dependency.sha256}`))
+        || measured.receipt.sandbox?.policyDigest
+            !== role.sandboxIdentity.policyDigest
+        || measured.receipt.sandbox?.capabilityLaunchUsed !== true
+        || typeof measured.receipt.sandbox?.capabilityId !== "string"
+        || measured.receipt.sandbox.capabilityId.length === 0
+        || measured.receipt.sandbox?.policyIdentity?.securityContext
+            ?.appContainer !== true
+        || measured.receipt.sandbox?.policyIdentity?.securityContext
+            ?.lowIntegrity !== true
+        || !Array.isArray(
+            measured.receipt.sandbox?.policyIdentity?.securityContext
+                ?.capabilities,
+        )
+        || measured.receipt.sandbox.policyIdentity.securityContext
+            .capabilities.length !== 0
+        || measured.receipt.attemptId !== payload.receipt.attemptId
+        || measured.receipt.runnerEpochId !== payload.receipt.runnerEpochId
+        || commandRecord.capabilityEpochId
+            !== measured.receipt.runnerEpochId
+        || !canonicalEqual(measured.receipt.parsed, parsed)
+        || !canonicalEqual(payload.data?.checkerResult, parsed)
+        || !canonicalEqual(certificateRead.value, parsed.certificate)) {
+        integrityFailure(
+            "Persisted impossibility execution does not match the frozen verifier role and MeasurementReceiptV6 closure",
+            { commandId: payload.commandId },
+        );
+    }
+
+    const measurementEvent = exactOperationalEvent(
+        operationalEvidence,
+        (event) =>
+            event.kind === "runtime:measurement"
+            && event.attemptId === measured.receipt.attemptId
+            && event.payload?.commandId === payload.commandId
+            && event.payload?.purpose === "impossibility",
+        "Impossibility measurement",
+        { commandId: payload.commandId },
+    );
+    const certificateEvent = exactOperationalEvent(
+        operationalEvidence,
+        (event) =>
+            event.kind === "runtime:impossibility_certificate"
+            && event.attemptId === measured.receipt.attemptId
+            && event.payload?.commandId === payload.commandId,
+        "Impossibility certificate",
+        { commandId: payload.commandId },
+    );
+    const requestEvent = exactOperationalEvent(
+        operationalEvidence,
+        (event) =>
+            event.kind === "runtime:impossibility_request"
+            && event.payload?.commandId === payload.commandId,
+        "Impossibility request",
+        { commandId: payload.commandId },
+    );
+    const effectAttempt = repository.getCommandAttempt(
+        measured.receipt.attemptId,
+    );
+    const mainAttempt = repository.getCommandAttempt(requestEvent.attemptId);
+    const effectMetadata = parseAttemptMetadata(
+        effectAttempt,
+        "Impossibility effect",
+    );
+    const mainMetadata = parseAttemptMetadata(
+        mainAttempt,
+        "Impossibility domain command",
+    );
+    const expectedLogicalEffectKey = logicalEffectKey(
+        investigationId,
+        effectMetadata.effect ?? {},
+    );
+    if (effectAttempt.state !== "committed"
+        || !["dispatched", "observed", "committed"].includes(
+            mainAttempt.state,
+        )
+        || effectMetadata.scope !== "external-effect"
+        || effectMetadata.logicalEffectKey !== expectedLogicalEffectKey
+        || effectMetadata.logicalEffectKey
+            !== measurementEvent.payload.logicalEffectKey
+        || effectMetadata.logicalEffectKey
+            !== certificateEvent.payload.logicalEffectKey
+        || effectMetadata.effect?.kind !== "impossibility-verification"
+        || effectMetadata.effect?.commandId !== payload.commandId
+        || effectMetadata.effect?.requestHash !== command.requestHash
+        || effectMetadata.effect?.snapshot
+            !== measurementEvent.payload.snapshotId
+        || mainMetadata.scope !== "domain-command"
+        || mainMetadata.commandId !== payload.commandId
+        || !canonicalEqual(mainMetadata.command, command)
+        || !sameAttemptAuthority(effectAttempt, mainAttempt)
+        || (expectedObservationAttemptId !== null
+            && mainAttempt.attemptId !== expectedObservationAttemptId)
+        || (expectedLease !== null
+            && (mainAttempt.leaseId !== expectedLease.leaseId
+                || mainAttempt.fencingToken !== expectedLease.fencingToken
+                || mainAttempt.owner !== expectedLease.owner
+                || mainAttempt.supervisorGeneration
+                    !== (expectedLease.supervisorGeneration ?? null)
+                || mainAttempt.runnerIncarnation
+                    !== (expectedLease.runnerIncarnation ?? null)))
+        || requestEvent.payload.requestHash !== command.requestHash
+        || requestEvent.payload.snapshotId
+            !== measurementEvent.payload.snapshotId
+        || requestEvent.payload.snapshotProvenance?.manifestArtifact?.objectId
+            !== measured.measurement.snapshot.manifestArtifact.objectId
+        || certificateEvent.payload.measurementReceiptArtifactId
+            !== measured.measurement.receiptArtifact.artifactId
+        || certificateEvent.payload.rawStdoutArtifactId
+            !== measured.measurement.rawStdoutArtifact.artifactId
+        || certificateEvent.payload.rawStderrArtifactId
+            !== measured.measurement.rawStderrArtifact.artifactId
+        || certificateEvent.payload.certificateArtifactId
+            !== certificateArtifact.artifactId) {
+        integrityFailure(
+            "Impossibility process effect is not bound to its runner attempt, lease, generation, and operational records",
+            { commandId: payload.commandId },
+        );
+    }
+
+    const executionIdentity = verifierExecutionIdentity({
+        command,
+        role,
+        receipt: measured.receipt,
+        measurement: measured.measurement,
+        effectAttempt,
+        mainAttempt,
+        requestArtifact: requestClosure.request.artifact,
+        proofArtifact: requestClosure.proof.artifact,
+    });
+    const facts = deriveVerifierFacts({
+        parsed,
+        command,
+        measured,
+        requestClosure,
+        executionIdentity,
+    });
+    const reference = immutableCanonical({
+        version: VERIFIED_IMPOSSIBILITY_EXECUTION_VERSION,
+        commandId: payload.commandId,
+        observationId: payload.observationId,
+        request: {
+            requestHash: command.requestHash,
+            artifact:
+                executionArtifactProjection(requestClosure.request.artifact),
+            snapshotManifestArtifact: executionArtifactProjection(
+                measured.measurement.snapshot.manifestArtifact,
+            ),
+        },
+        proof: {
+            artifactHash: command.proofArtifactHash,
+            artifact:
+                executionArtifactProjection(requestClosure.proof.artifact),
+            sizeBytes: requestClosure.proof.bytes.length,
+        },
+        certificate: {
+            artifact: executionArtifactProjection(certificateArtifact),
+            artifactHash: taggedHash(
+                IMPOSSIBILITY_CERTIFICATE_ARTIFACT_HASH_ALGORITHM,
+                certificateRead.bytes,
+            ),
+            sizeBytes: certificateRead.bytes.length,
+        },
+        measurement: {
+            subjectId: measured.measurement.subjectId,
+            measurementRoot: measured.measurement.measurementRoot,
+            receiptHash: measured.measurement.receiptHash,
+            receiptArtifact:
+                executionArtifactProjection(measured.measurement.receiptArtifact),
+            rawStdoutHash: measured.measurement.rawStdoutHash,
+            rawStdoutArtifact:
+                executionArtifactProjection(measured.measurement.rawStdoutArtifact),
+            rawStderrHash: measured.measurement.rawStderrHash,
+            rawStderrArtifact:
+                executionArtifactProjection(measured.measurement.rawStderrArtifact),
+            snapshotHash: measured.measurement.snapshot.snapshotHash,
+            snapshotClosureRoot:
+                measured.measurement.snapshot.closureRoot,
+        },
+        executionIdentity,
+        effectBinding: {
+            logicalEffectKey: effectMetadata.logicalEffectKey,
+            effectAttempt: attemptAuthorityProjection(effectAttempt),
+            observationAttempt: attemptAuthorityProjection(mainAttempt),
+            requestEvent: {
+                seq: requestEvent.seq,
+                eventHash: requestEvent.eventHash,
+            },
+            measurementEvent: {
+                seq: measurementEvent.seq,
+                eventHash: measurementEvent.eventHash,
+            },
+            certificateEvent: {
+                seq: certificateEvent.seq,
+                eventHash: certificateEvent.eventHash,
+            },
+            runnerEpochId: measured.receipt.runnerEpochId,
+        },
+        facts,
+    });
+    if (Object.hasOwn(payload, "verifierExecution")
+        && !canonicalEqual(payload.verifierExecution, reference)) {
+        integrityFailure(
+            "Persisted verifier execution reference does not rederive from repository-bound artifacts",
+            { commandId: payload.commandId },
+        );
+    }
+    return issueVerifiedImpossibilityExecutionCapability({
+        commandId: payload.commandId,
+        observationId: payload.observationId,
+        reference,
+    });
+}
+
 function verifyImpossibilityArtifacts(
     aggregate,
     evidence,
@@ -1636,35 +2463,33 @@ function verifyImpossibilityArtifacts(
         `impossibility ${evidence.evidenceId} certificate`,
     );
     const certificate = certificateRead.value;
-    const expectedCertificate = {
-        version: command?.certificateVersion,
-        verdict: observation.data?.certificateVerdict,
-        contractHash: aggregate.contractHash,
-        harnessId: command?.harnessId,
-        parserVersion: command?.parserVersion,
-        verificationRequestHash: command?.requestHash,
-        verificationSnapshotHash: measured.measurement.snapshot.snapshotHash,
-        measurementReceiptHash: measured.measurement.receiptHash,
-        verifiedFacts: observation.data?.verifiedFacts,
-        parsedResult: measured.receipt.parsed,
-    };
-    const requestEntry = measured.snapshot.manifest.entries.length === 1
-        ? measured.snapshot.manifest.entries[0]
-        : null;
-    const requestArtifact = requestEntry === null
-        ? null
-        : measured.snapshot.objectArtifacts.get(requestEntry.object) ?? null;
-    const requestBytes = requestArtifact === null
-        ? null
-        : reader.read(
-            requestArtifact,
-            `impossibility ${evidence.evidenceId} verification request`,
-        ).bytes;
+    const expectedCertificate = observation.data?.checkerResult?.certificate;
+    const sandboxSecurityContext =
+        measured.receipt.sandbox?.policyIdentity?.securityContext;
     if (command?.kind !== "verify_impossibility"
-        || requestEntry?.path !== "request.json"
-        || requestBytes === null
-        || requestBytes.toString("utf8") !== canonicalJson(command.request)
+        || !verifyImpossibilityRequestSnapshot(
+            command,
+            measured,
+            reader,
+            evidence.evidenceId,
+        )
+        || hashCanonical(
+            command.proofArtifact,
+            IMPOSSIBILITY_PROOF_ARTIFACT_HASH_ALGORITHM,
+        ) !== command.proofArtifactHash
+        || command.proofArtifactHash
+            === command.proposedCertificateArtifactHash
         || !canonicalEqual(certificate, expectedCertificate)
+        || !canonicalEqual(measured.receipt.parsed, observation.data.checkerResult)
+        || observation.data.proposedCertificateArtifactHash
+            !== command.proposedCertificateArtifactHash
+        || measured.receipt.sandbox?.policyDigest
+            !== aggregate.contract.harnessSuite.roles
+                .impossibility_verifier.sandboxIdentity.policyDigest
+        || sandboxSecurityContext?.appContainer !== true
+        || sandboxSecurityContext?.lowIntegrity !== true
+        || !Array.isArray(sandboxSecurityContext.capabilities)
+        || sandboxSecurityContext.capabilities.length !== 0
         || observation.receipt.measurementReceiptHash !== measured.measurement.receiptHash
         || observation.receipt.verificationSnapshotHash
             !== measured.measurement.snapshot.snapshotHash
@@ -1835,12 +2660,14 @@ function verifyOperationalMeasurementClosure(
 
 export class DomainRepositoryAdapter {
     #repository;
+    #artifactStore;
     #investigationId;
     #operationalInvestigationId;
     #beforeCasAttempt;
 
     constructor({
         repository,
+        artifactStore = null,
         investigationId,
         ensure = true,
         beforeCasAttempt = null,
@@ -1861,7 +2688,17 @@ export class DomainRepositoryAdapter {
         if (beforeCasAttempt !== null && typeof beforeCasAttempt !== "function") {
             throw new RuntimeConfigError("beforeCasAttempt must be a function or null");
         }
+        if (artifactStore !== null
+            && (typeof artifactStore !== "object"
+                || typeof artifactStore.verifyObject !== "function"
+                || typeof artifactStore.readObject !== "function"
+                || typeof artifactStore.loadManifest !== "function")) {
+            throw new RuntimeConfigError(
+                "artifactStore must expose the read-only ArtifactStore API or be null",
+            );
+        }
         this.#repository = repository;
+        this.#artifactStore = artifactStore;
         this.#beforeCasAttempt = beforeCasAttempt;
         this.#investigationId = requireIdentifier(investigationId, "investigationId");
         this.#operationalInvestigationId =
@@ -1929,7 +2766,7 @@ export class DomainRepositoryAdapter {
         return domainFactIdentity(domainEvent);
     }
 
-    replay() {
+    replay({ artifactStore = this.#artifactStore } = {}) {
         assertInvestigationDomainCompatible(
             this.#repository,
             this.#investigationId,
@@ -1965,7 +2802,25 @@ export class DomainRepositoryAdapter {
         }
         try {
             verifyEventChain(domainEvents);
-            const aggregate = replayEvents(domainEvents);
+            const operationalEvidence = domainEvents.some((event) =>
+                event.type === EVENT_TYPES.COMMAND_OBSERVED
+                && event.payload?.purpose === "impossibility")
+                ? this.listOperationalEvidence()
+                : [];
+            const aggregate = replayEvents(domainEvents, {
+                verifierExecutionResolver: ({ aggregate: current, event }) =>
+                    event.type === EVENT_TYPES.COMMAND_OBSERVED
+                    && event.payload?.purpose === "impossibility"
+                        ? deriveVerifiedImpossibilityExecutionCapability({
+                            aggregate: current,
+                            payload: event.payload,
+                            repository: this.#repository,
+                            artifactStore,
+                            investigationId: this.#investigationId,
+                            operationalEvidence,
+                        })
+                        : null,
+            });
             return {
                 aggregate,
                 scientificReplay: aggregate.scientificReplay,
@@ -1996,7 +2851,7 @@ export class DomainRepositoryAdapter {
     }
 
     verifyTerminalArtifactClosure({ artifactStore } = {}) {
-        const replay = this.replay();
+        const replay = this.replay({ artifactStore });
         const { aggregate } = replay;
         if (aggregate.terminal === null) {
             return {
@@ -2445,6 +3300,12 @@ export class DomainRepositoryAdapter {
     }
 
     appendHarnessObservation(payload) {
+        if (payload?.purpose === "impossibility") {
+            throw new RuntimeIntegrityError(
+                "Impossibility observations require the fenced runner/domain-adapter verification path",
+                { commandId: payload?.commandId ?? null },
+            );
+        }
         return this.appendFromFactory((aggregate) =>
             constructHarnessObservedEvent(aggregate, payload));
     }
@@ -2455,7 +3316,29 @@ export class DomainRepositoryAdapter {
         lease,
     } = {}) {
         return this.appendFromFactory(
-            (aggregate) => constructHarnessObservedEvent(aggregate, payload),
+            (aggregate) => {
+                const verifierExecutionCapability =
+                    payload?.purpose === "impossibility"
+                        ? deriveVerifiedImpossibilityExecutionCapability({
+                            aggregate,
+                            payload,
+                            repository: this.#repository,
+                            artifactStore: this.#artifactStore,
+                            investigationId: this.#investigationId,
+                            operationalEvidence:
+                                this.listOperationalEvidence(),
+                            expectedObservationAttemptId: attemptId,
+                            expectedLease: lease,
+                        })
+                        : null;
+                return constructHarnessObservedEvent(
+                    aggregate,
+                    payload,
+                    verifierExecutionCapability === null
+                        ? {}
+                        : { verifierExecutionCapability },
+                );
+            },
             {
                 attemptTransition: this.#attemptTransition({
                     attemptId,
@@ -2872,10 +3755,15 @@ export function createDomainRepositoryAdapter(options) {
 export function openDomainRepositoryAdapter({
     file,
     investigationId,
+    artifactStore = null,
     repositoryOptions = {},
 } = {}) {
     const repository = openRepository({ ...repositoryOptions, file });
-    const adapter = new DomainRepositoryAdapter({ repository, investigationId });
+    const adapter = new DomainRepositoryAdapter({
+        repository,
+        artifactStore,
+        investigationId,
+    });
     return { repository, adapter };
 }
 

@@ -50,7 +50,8 @@ function expectedSlotsForRound(contract, round) {
         const manifest = normalizeEnumerandManifest(
             contract.enumerandManifest,
             {
-                topology: contract.hypothesisTopology,
+                topology: contract.enumerandManifest?.topology
+                    ?? contract.hypothesisTopology,
                 observableRegistry: contract.observableRegistry,
                 hypothesisPolicy: contract.hypothesisPolicy,
             },
@@ -672,7 +673,8 @@ export function buildSearchCandidateCommand(aggregate, progress) {
         : normalizeEnumerandManifest(
             contract.enumerandManifest,
             {
-                topology: contract.hypothesisTopology,
+                topology: contract.enumerandManifest?.topology
+                    ?? contract.hypothesisTopology,
                 observableRegistry: contract.observableRegistry,
                 hypothesisPolicy: contract.hypothesisPolicy,
             },
@@ -795,7 +797,8 @@ export function buildSearchCandidateCommand(aggregate, progress) {
             ? {}
             : {
                 enumerand: enumerandBinding(manifest, assignedEnumerand, {
-                    topology: contract.hypothesisTopology,
+                    topology: contract.enumerandManifest?.topology
+                        ?? contract.hypothesisTopology,
                     observableRegistry: contract.observableRegistry,
                     hypothesisPolicy: contract.hypothesisPolicy,
                 }),

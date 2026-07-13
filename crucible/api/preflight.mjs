@@ -13,7 +13,7 @@ import {
     harnessSuiteRoleCases,
 } from "../domain/index.mjs";
 import {
-    PARSER_VERSION,
+    applicationEntrypointHashForEntry,
     verifyHarnessPreflight,
 } from "../measurement/index.mjs";
 import {
@@ -448,9 +448,14 @@ function inspectExistingInvestigation({
         file: paths.eventsDbPath,
         env: deps.env,
     });
+    const artifactStore = deps.openArtifactStoreReadOnly({
+        root: paths.artifactRoot,
+        env: deps.env,
+    });
     try {
         const adapter = deps.createDomainRepositoryAdapter({
             repository,
+            artifactStore,
             investigationId,
             ensure: false,
         });
@@ -552,10 +557,12 @@ function verifyHarnessSuite(allowlist, suiteId, expectedIdentity) {
                 ? allowlist.verifyEntry(spec.harnessId)
                 : verifyHarnessPreflight(allowlist, spec.harnessId, {
                     validationCases: cases,
-                    parserVersion: PARSER_VERSION,
+                    parserVersion: spec.parser.version,
                 }).verifiedEntry;
             if (verifiedEntry.entryHash !== spec.harnessEntryHash
-                || verifiedEntry.executableHash !== spec.executableHash) {
+                || verifiedEntry.executableHash !== spec.executableHash
+                || applicationEntrypointHashForEntry(verifiedEntry.entry)
+                    !== spec.applicationEntrypointHash) {
                 throw new Error(
                     `verified role ${role} does not match its HarnessSuiteV4 identity`,
                 );
@@ -880,11 +887,16 @@ function preflightReattachInvestigation(args, deps, selection = null) {
         file: paths.eventsDbPath,
         env: deps.env,
     });
+    const artifactStore = deps.openArtifactStoreReadOnly({
+        root: paths.artifactRoot,
+        env: deps.env,
+    });
     let current;
     let operationalNonResult;
     try {
         const adapter = deps.createDomainRepositoryAdapter({
             repository,
+            artifactStore,
             investigationId: args.investigation_id,
             ensure: false,
         });
@@ -981,10 +993,6 @@ function preflightReattachInvestigation(args, deps, selection = null) {
     }
     const supervisorConfig = supervisorAdmission.config;
 
-    const artifactStore = deps.openArtifactStoreReadOnly({
-        root: paths.artifactRoot,
-        env: deps.env,
-    });
     verifyPersistedSnapshots(current.aggregate.contract, artifactStore);
 
     const allowlist = loadAllowlistForPreflight(
@@ -1715,11 +1723,16 @@ export function applyStartPreflight(plan, deps) {
             file: plan.paths.eventsDbPath,
             env: deps.env,
         });
+        const compensationArtifactStore = deps.openArtifactStore({
+            root: plan.paths.artifactRoot,
+            env: deps.env,
+        });
         try {
             compensateFailedReattach(
                 plan,
                 deps.createDomainRepositoryAdapter({
                     repository: compensationRepository,
+                    artifactStore: compensationArtifactStore,
                     investigationId: plan.investigationId,
                 }),
                 cause,
@@ -1844,8 +1857,13 @@ export function applyStartPreflight(plan, deps) {
             file: plan.paths.eventsDbPath,
             env: deps.env,
         });
+        const artifactStore = deps.openArtifactStore({
+            root: plan.paths.artifactRoot,
+            env: deps.env,
+        });
         adapter = deps.createDomainRepositoryAdapter({
             repository,
+            artifactStore,
             investigationId: plan.investigationId,
         });
         const opened = applyContractPlan(

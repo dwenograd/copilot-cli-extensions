@@ -24,6 +24,7 @@ import {
 } from "../domain/index.mjs";
 import {
     PARSER_VERSION,
+    VERIFIER_PARSER_VERSION,
     buildFrozenHarnessIdentity,
     computeHarnessSuiteV4Identity,
     createDefaultProcessAdapter,
@@ -651,6 +652,8 @@ function setupInvestigation(label, contractOptions = {}, {
     spawnLingeringCandidateProcess = false,
     badScore = 10,
 } = {}) {
+    const includeVerifier =
+        contractOptions.hypothesisTopology === "certified_impossibility";
     const root = makeRoot(label);
     const stateDir = path.join(root, "state");
     const artifactRoot = path.join(root, "artifacts");
@@ -681,6 +684,26 @@ function setupInvestigation(label, contractOptions = {}, {
             control: { kind: "enumerand", ordinal: 0 },
         });
     }
+    if (contractOptions.hypothesisTopology === "certified_impossibility"
+        && enumerandManifest === undefined) {
+        enumerandManifest = normalizeEnumerandManifest({
+            topology: "finite_enumerable",
+            entries: [{
+                id: "certified-candidate",
+                ordinal: 0,
+                artifactSnapshotHash: seedSnapshot(
+                    store,
+                    root,
+                    "certified-enumerand",
+                    20,
+                ),
+            }],
+            control: {
+                kind: "reference",
+                referenceHash: badSnapshot,
+            },
+        });
+    }
     const harnessCounterPath = path.join(root, "harness-call-count.txt");
     const countHarnessCall = countHarnessCalls
         ? `fs.appendFileSync(${JSON.stringify(harnessCounterPath)}, "1\\n");`
@@ -689,6 +712,23 @@ function setupInvestigation(label, contractOptions = {}, {
         pass: false,
         searchSpaceExhausted: false,
     };
+    const checkerStatus = certificateResult.status
+        ?? (certificateResult.pass === false
+            ? "REJECTED"
+            : certificateResult.searchSpaceExhausted === false
+                ? "INVALID"
+                : "VERIFIED");
+    const checkerVerdict = checkerStatus === "VERIFIED"
+        ? "target_unreachable"
+        : checkerStatus === "REJECTED"
+            ? "not_proven"
+            : checkerStatus === "INCONCLUSIVE"
+                ? "inconclusive"
+                : "invalid";
+    const checkerEvidenceRoot = hashCanonical({
+        label,
+        checkerStatus,
+    }, "sha256:crucible-runtime-release-checker-evidence-v1");
     const scriptPath = writeHarnessScript(root, "score-harness", `
         if (process.argv[2] === "--crucible-owned-linger") {
             setInterval(() => {}, 1000);
@@ -697,7 +737,7 @@ function setupInvestigation(label, contractOptions = {}, {
             const candidatePath = process.argv[2];
             const impossibilityRequest = path.join(
                 candidatePath,
-                "crucible-impossibility-request.json",
+                "request.json",
             );
             if (fs.existsSync(impossibilityRequest)) {
                 process.stdout.write(JSON.stringify(${JSON.stringify(certificateResult)}));
@@ -735,7 +775,6 @@ function setupInvestigation(label, contractOptions = {}, {
         "novelty-case": roleSnapshots.novelty,
     }, executesCandidateCode);
     const verifierScript = path.join(root, "impossibility-verifier.ps1");
-    const verifierResult = JSON.stringify(certificateResult).replaceAll("'", "''");
     const countVerifierCall = countHarnessCalls
         ? `Add-Content -LiteralPath '${
             harnessCounterPath.replaceAll("'", "''")
@@ -747,11 +786,189 @@ function setupInvestigation(label, contractOptions = {}, {
 param([Parameter(Mandatory = $true)][string]$CandidatePath)
 $ErrorActionPreference = "Stop"
 ${countVerifierCall}
-$request = Join-Path -Path $CandidatePath -ChildPath "crucible-impossibility-request.json"
+$request = Join-Path -Path $CandidatePath -ChildPath "request.json"
 if (-not (Test-Path -LiteralPath $request -PathType Leaf)) {
     throw "missing Crucible impossibility request"
 }
-[Console]::Out.Write('${verifierResult}')
+$requestValue = Get-Content -LiteralPath $request -Raw | ConvertFrom-Json
+$requestDigest = (Get-FileHash -LiteralPath $request -Algorithm SHA256).Hash.ToLowerInvariant()
+$requestHash = "sha256:crucible-impossibility-request-v2:$requestDigest"
+$status = '${checkerStatus}'
+$verdict = '${checkerVerdict}'
+$mode = [string]$requestValue.verifier.verificationPolicy.mode
+$certificateFormat = $requestValue.verifier.verificationPolicy.certificateFormat
+function Get-CanonicalHash([object]$Value, [string]$Tag) {
+    $json = ConvertTo-Json -InputObject $Value -Depth 100 -Compress
+    $digest = [System.Convert]::ToHexString(
+        [System.Security.Cryptography.SHA256]::HashData(
+            [System.Text.Encoding]::UTF8.GetBytes($json)
+        )
+    ).ToLowerInvariant()
+    return "$($Tag):$digest"
+}
+$proofArtifactHash = [string]$requestValue.proofArtifact.artifactHash
+$proofCheckerIdentity = if ($mode -eq 'certificate_validation') {
+    [string]$requestValue.verifier.proofChecker.identity
+} else { $null }
+$validatedProofArtifactHash = if ($mode -eq 'certificate_validation') {
+    $proofArtifactHash
+} else { $null }
+$complete = $status -eq 'VERIFIED' -or $status -eq 'REJECTED'
+$claimState = if ($status -eq 'VERIFIED') {
+    'REFUTED'
+} elseif ($status -eq 'REJECTED') {
+    'SUPPORTED'
+} elseif ($status -eq 'INCONCLUSIVE') {
+    'UNRESOLVED'
+} else {
+    'INVALID'
+}
+$enumerandResults = if ($mode -eq 'enumerand_reexecution') {
+    @($requestValue.evidence.coverageClosure.enumerands | ForEach-Object {
+        $entry = $_
+        $input = @($requestValue.reevaluation.enumerands)[[int]$entry.ordinal]
+        $claimStates = @($entry.claims | ForEach-Object {
+            [ordered]@{
+                claimId = [string]$_.claimId
+                state = $claimState
+            }
+        })
+        $evidenceRoot = Get-CanonicalHash -Value ([ordered]@{
+            claimStates = $claimStates
+            enumerandHash = [string]$entry.enumerandHash
+            inputRoot = [string]$input.inputRoot
+            ordinal = [int]$entry.ordinal
+            requestHash = $requestHash
+            verifierRoleIdentity = [string]$requestValue.verifier.roleIdentity
+        }) -Tag 'sha256:crucible-impossibility-verifier-refutation-v1'
+        $refutationReceiptHash = Get-CanonicalHash -Value ([ordered]@{
+            claimStates = $claimStates
+            enumerandHash = [string]$entry.enumerandHash
+            evidenceRoot = $evidenceRoot
+            inputRoot = [string]$input.inputRoot
+            ordinal = [int]$entry.ordinal
+            receiptBindingsRoot = [string]$input.receiptBindingsRoot
+            requestHash = $requestHash
+            verifierRoleIdentity = [string]$requestValue.verifier.roleIdentity
+        }) -Tag 'sha256:crucible-impossibility-verifier-refutation-receipt-v1'
+        [ordered]@{
+            claimStates = $claimStates
+            enumerandHash = [string]$entry.enumerandHash
+            evidenceRoot = $evidenceRoot
+            inputRoot = [string]$input.inputRoot
+            ordinal = [int]$entry.ordinal
+            receiptBindingsRoot = [string]$input.receiptBindingsRoot
+            refutationReceiptHash = $refutationReceiptHash
+        }
+    })
+} else {
+    @()
+}
+$checkedEnumerandCount = @($enumerandResults).Count
+$disagreementCount = @($enumerandResults | Where-Object {
+    @($_.claimStates | Where-Object { $_.state -ne 'REFUTED' }).Count -gt 0
+}).Count
+$enumerandResultsJson = ConvertTo-Json -InputObject @($enumerandResults) -Depth 32 -Compress
+$enumerandResultsDigest = [System.Convert]::ToHexString(
+    [System.Security.Cryptography.SHA256]::HashData(
+        [System.Text.Encoding]::UTF8.GetBytes($enumerandResultsJson)
+    )
+).ToLowerInvariant()
+$enumerandResultsRoot = "sha256:crucible-impossibility-verifier-enumerand-results-v1:$enumerandResultsDigest"
+$coverageClosureRoot = [string]$requestValue.evidence.coverageClosureRoot
+$proofValidationReceiptHash = if ($mode -eq 'certificate_validation') {
+    Get-CanonicalHash -Value ([ordered]@{
+        certificateFormat = $certificateFormat
+        checkerEvidenceRoot = '${checkerEvidenceRoot}'
+        proofArtifactHash = $proofArtifactHash
+        proofCheckerIdentity = $proofCheckerIdentity
+        requestHash = $requestHash
+        status = $status
+    }) -Tag 'sha256:crucible-impossibility-proof-validation-receipt-v1'
+} else { $null }
+$independentFactsRoot = if ($mode -eq 'enumerand_reexecution') {
+    $refutations = @($enumerandResults | ForEach-Object {
+        [ordered]@{
+            enumerandHash = [string]$_.enumerandHash
+            evidenceRoot = [string]$_.evidenceRoot
+            inputRoot = [string]$_.inputRoot
+            ordinal = [int]$_.ordinal
+            receiptBindingsRoot = [string]$_.receiptBindingsRoot
+            refutationReceiptHash = [string]$_.refutationReceiptHash
+        }
+    })
+    Get-CanonicalHash -Value ([ordered]@{
+        mode = $mode
+        proofArtifactHash = $proofArtifactHash
+        refutations = $refutations
+    }) -Tag 'sha256:crucible-impossibility-verifier-facts-v1'
+} else {
+    Get-CanonicalHash -Value ([ordered]@{
+        mode = $mode
+        proofArtifactHash = $proofArtifactHash
+        proofCheckerIdentity = $proofCheckerIdentity
+        proofValidationReceiptHash = $proofValidationReceiptHash
+        validatedProofArtifactHash = $validatedProofArtifactHash
+    }) -Tag 'sha256:crucible-impossibility-verifier-facts-v1'
+}
+$certificate = [ordered]@{
+    version = 'crucible-impossibility-certificate-v2'
+    status = $status
+    verdict = $verdict
+    mode = $mode
+    requestHash = $requestHash
+    proposedCertificateArtifactHash = [string]$requestValue.proposedCertificate.artifactHash
+    proofArtifactHash = $proofArtifactHash
+    contractHash = [string]$requestValue.signedExperiment.contractHash
+    harnessSuiteIdentity = [string]$requestValue.harnessSuiteIdentity
+    verifierRoleIdentity = [string]$requestValue.verifier.roleIdentity
+    coverageClosureRoot = $coverageClosureRoot
+    enumerandManifestRoot = [string]$requestValue.enumerands.merkleRoot
+    enumerandResultsRoot = $enumerandResultsRoot
+    evidenceRoots = $requestValue.evidence.roots
+    statisticalPolicyIdentity = [string]$requestValue.statistics.policyIdentity
+    alphaLedgerRoot = [string]$requestValue.statistics.alphaLedgerRoot
+    checkerEvidenceRoot = '${checkerEvidenceRoot}'
+    independentFactsRoot = $independentFactsRoot
+    certificateFormat = $certificateFormat
+    proofCheckerIdentity = $proofCheckerIdentity
+    proofValidationReceiptHash = $proofValidationReceiptHash
+    validatedProofArtifactHash = $validatedProofArtifactHash
+}
+$output = [ordered]@{
+    version = 'crucible-impossibility-verifier-output-v1'
+    status = $status
+    mode = $mode
+    requestHash = $requestHash
+    proposedCertificateArtifactHash = [string]$requestValue.proposedCertificate.artifactHash
+    proofArtifactHash = $proofArtifactHash
+    coverageClosureRoot = $coverageClosureRoot
+    enumerandManifestRoot = [string]$requestValue.enumerands.merkleRoot
+    enumerandCount = [int]$requestValue.enumerands.count
+    checkedEnumerandCount = $checkedEnumerandCount
+    enumerandResults = @($enumerandResults)
+    enumerandResultsRoot = $enumerandResultsRoot
+    evidenceRoots = $requestValue.evidence.roots
+    statisticalPolicyIdentity = [string]$requestValue.statistics.policyIdentity
+    alphaLedgerRoot = [string]$requestValue.statistics.alphaLedgerRoot
+    checkerEvidenceRoot = '${checkerEvidenceRoot}'
+    independentFactsRoot = $independentFactsRoot
+    disagreementCount = $disagreementCount
+    complete = $complete
+    certificateFormat = $certificateFormat
+    proofCheckerIdentity = $proofCheckerIdentity
+    proofValidationReceiptHash = $proofValidationReceiptHash
+    validatedProofArtifactHash = $validatedProofArtifactHash
+    certificate = $certificate
+    role = [string]$env:CRUCIBLE_ROLE
+    phase = [string]$env:CRUCIBLE_PHASE
+    blockIndex = [int]$env:CRUCIBLE_BLOCK_INDEX
+    deterministicSeed = [string]$env:CRUCIBLE_DETERMINISTIC_SEED
+    subjectId = [string]$env:CRUCIBLE_SUBJECT_ID
+    environmentIdentity = [string]$env:CRUCIBLE_ENVIRONMENT_IDENTITY
+    suiteIdentity = [string]$env:CRUCIBLE_SUITE_IDENTITY
+}
+[Console]::Out.Write(($output | ConvertTo-Json -Depth 100 -Compress))
 `,
     );
     const allowlistDocument = JSON.parse(
@@ -769,7 +986,7 @@ if (-not (Test-Path -LiteralPath $request -PathType Leaf)) {
         timeoutMs: 15_000,
         maxStdoutBytes: 1024 * 1024,
         maxStderrBytes: 256 * 1024,
-        executesCandidateCode: false,
+        executesCandidateCode: true,
     };
     fs.writeFileSync(allowlistPath, JSON.stringify(allowlistDocument, null, 2));
     let allowlist = loadHarnessAllowlist(allowlistPath);
@@ -797,13 +1014,22 @@ if (-not (Test-Path -LiteralPath $request -PathType Leaf)) {
             ? runnerSandboxIdentity()
             : { required: false },
     });
+    const verifierVerification = verifyHarnessPreflight(
+        allowlist,
+        "verifier-harness",
+        { parserVersion: VERIFIER_PARSER_VERSION },
+    );
+    const verifierIdentity = buildFrozenHarnessIdentity(
+        verifierVerification,
+        { sandbox: runnerSandboxIdentity() },
+    );
     allowlistDocument.suites = {
         "score-suite": buildHarnessSuiteForAllowlist(allowlist, {
             suiteId: "score-suite",
             harnessId: "score-harness",
-            includeVerifier: true,
+            includeVerifier,
             verifierHarnessId: "verifier-harness",
-            sandboxPolicyDigest: harnessIdentity.sandbox.policyDigest,
+            sandboxPolicyDigest: verifierIdentity.sandbox.policyDigest,
             roleCaseIds: {
                 calibration: ["known-good", "known-bad"],
                 search: ["search-case"],
@@ -832,12 +1058,20 @@ if (-not (Test-Path -LiteralPath $request -PathType Leaf)) {
     });
     const adapter = createDomainRepositoryAdapter({
         repository,
+        artifactStore: store,
         investigationId: signed.investigationId,
     });
     adapter.openInvestigation(
         contract,
         signed.capability,
-        createRuntimeConfigAuthorityFixture(signed.investigationId),
+        createRuntimeConfigAuthorityFixture(signed.investigationId, {
+            sandbox: includeVerifier
+                ? {
+                    ...runnerSandboxIdentity(),
+                    policyDigest: verifierIdentity.sandbox.policyDigest,
+                }
+                : { required: false },
+        }),
     );
     repository.close();
 
@@ -869,8 +1103,10 @@ if (-not (Test-Path -LiteralPath $request -PathType Leaf)) {
 
 function replaySetup(setup) {
     const repository = openRepository({ file: path.join(setup.stateDir, "events.sqlite") });
+    const artifactStore = openArtifactStore({ root: setup.artifactRoot });
     const adapter = createDomainRepositoryAdapter({
         repository,
+        artifactStore,
         investigationId: setup.config.investigationId,
     });
     const replayed = adapter.replay();
@@ -933,6 +1169,19 @@ function runnerDependencies(workerPool, extra = {}) {
     };
 }
 
+function certifiedRunnerDependencies(workerPool, extra = {}) {
+    const calls = {
+        admissions: [],
+        cleanups: [],
+        launches: [],
+        terminations: [],
+    };
+    return runnerDependencies(workerPool, {
+        sandboxProvider: createRunnerContainmentProvider(calls),
+        ...extra,
+    });
+}
+
 function createRunnerContainmentProvider(
     calls,
     { describePolicyIdentity = runnerSandboxIdentity } = {},
@@ -950,6 +1199,11 @@ function createRunnerContainmentProvider(
                 policyId: "runner-fixture-policy",
                 policyDigest:
                     `sha256:runner-fixture-policy-v1:${"c".repeat(64)}`,
+                policyIdentity: describePolicyIdentity(),
+                policy: {
+                    version: 1,
+                    identity: describePolicyIdentity(),
+                },
                 permittedStagedRoots: request.stagedRoots,
                 launch(launchRequest) {
                     calls.launches.push(launchRequest);
@@ -1159,7 +1413,7 @@ describe("Crucible autonomous runner", () => {
             row.kind === "runtime:measurement" && row.payload.purpose === "candidate");
         expect(candidateMeasurements).toHaveLength(8);
         const persistedReceipt = candidateMeasurements[0].payload.receipt;
-        expect(persistedReceipt.version).toBe(7);
+        expect(persistedReceipt.version).toBe(8);
         expect(persistedReceipt).toMatchObject({
             role: "search",
             phase: "search",
@@ -1936,7 +2190,7 @@ describe("Crucible autonomous runner", () => {
         const pool = new ScriptedOrchestrationWorkerPool([20]);
         const result = await runAutonomousInvestigation(
             setup.config,
-            runnerDependencies(pool),
+            certifiedRunnerDependencies(pool),
         );
         expect(result).toMatchObject({
             kind: "TERMINAL",
@@ -1955,11 +2209,11 @@ describe("Crucible autonomous runner", () => {
         ]);
         const [certificateEvidence] = impossibilityEvidenceItems(replayed.aggregate);
         expect(certificateEvidence.unreachableBasis).toMatchObject({
-            kind: "verified_impossibility_certificate",
+            kind: "v4_unreachable",
             certificateVerdict: "target_unreachable",
         });
         expect(replayed.aggregate.terminal.basis).toMatchObject({
-            kind: "verified_impossibility_certificate",
+            kind: "v4_unreachable",
             certificateArtifactHash:
                 certificateEvidence.unreachableBasis.certificateArtifactHash,
         });
@@ -2027,7 +2281,9 @@ describe("Crucible autonomous runner", () => {
         );
         const result = await runAutonomousInvestigation(
             setup.config,
-            runnerDependencies(new ScriptedOrchestrationWorkerPool([20])),
+            certifiedRunnerDependencies(
+                new ScriptedOrchestrationWorkerPool([20]),
+            ),
         );
         expect(result).toMatchObject({
             kind: "NON_RESULT",
@@ -2063,7 +2319,7 @@ describe("Crucible autonomous runner", () => {
         let injected = false;
         await expect(runAutonomousInvestigation(
             setup.config,
-            runnerDependencies(new ScriptedOrchestrationWorkerPool([20]), {
+            certifiedRunnerDependencies(new ScriptedOrchestrationWorkerPool([20]), {
                 faultInjector(point, details) {
                     if (!injected
                         && point === "after_effect_commit"
@@ -2082,11 +2338,11 @@ describe("Crucible autonomous runner", () => {
         const branchB = clonePersistedSetup(setup, "certified-crash-branch-b");
         const resultA = await runAutonomousInvestigation(
             branchA.config,
-            runnerDependencies(new ScriptedOrchestrationWorkerPool([])),
+            certifiedRunnerDependencies(new ScriptedOrchestrationWorkerPool([])),
         );
         const resultB = await runAutonomousInvestigation(
             branchB.config,
-            runnerDependencies(new ScriptedOrchestrationWorkerPool([])),
+            certifiedRunnerDependencies(new ScriptedOrchestrationWorkerPool([])),
         );
         expect(resultA).toMatchObject({
             kind: "TERMINAL",

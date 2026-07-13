@@ -119,6 +119,11 @@ function candidateEligibility(contract, candidate) {
         reasons.push("missing_rankable_metric");
     }
     const predictions = predictionEvidence(candidate);
+    if (contract?.scientificTerminalPolicy?.hypotheses
+        ?.requiredForResultMustBeSupported === true
+        && predictions.requiredState !== "SUPPORTED") {
+        reasons.push("required_predictions_not_supported");
+    }
     return {
         eligible: reasons.length === 0,
         reasons,

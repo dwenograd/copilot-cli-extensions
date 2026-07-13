@@ -6,6 +6,9 @@ import {
     ANNOTATION_LIMITS,
     EVENT_TYPES,
     IMPOSSIBILITY_REQUEST_HASH_ALGORITHM,
+    IMPOSSIBILITY_PROPOSAL_HASH_ALGORITHM,
+    IMPOSSIBILITY_PROOF_ARTIFACT_HASH_ALGORITHM,
+    IMPOSSIBILITY_VERIFIER_OBJECT_MANIFEST_HASH_ALGORITHM,
     NON_RESULT_CODES,
     OBSERVATION_STREAM_HASH_ALGORITHM,
     SNAPSHOT_EXECUTION_HASH_ALGORITHM,
@@ -13,12 +16,12 @@ import {
     canonicalEqual,
     canonicalJson,
     constructInvestigationResumedEvent,
+    createImpossibilityVerificationPackage,
     createEvidenceProvenance,
     createMeasurementProvenance,
     createSnapshotProvenance,
     createExternalEvent,
     decideNext,
-    deriveImpossibilityVerdict,
     deriveReplicationControlBinding,
     detectPlateau,
     duplicateEvidenceId,
@@ -26,10 +29,13 @@ import {
     hashCanonical,
     harnessCandidateEvidenceItems,
     immutableCanonical,
+    currentValidationEvidence,
     latestUnhandledStopRequest,
     resolveControlEnumerand,
     createRawMeasurementSeries,
     statisticalSubjectIndex,
+    normalizeImpossibilityCheckerResult,
+    searchProgress,
 } from "../domain/index.mjs";
 import {
     openArtifactStore,
@@ -37,6 +43,8 @@ import {
 } from "../persistence/index.mjs";
 import {
     PARSER_VERSION,
+    VERIFIER_PARSER_VERSION,
+    trustedParserIdentity,
     RECEIPT_VERSION,
     HARNESS_SUITE_RECEIPT_VERSION,
     SANDBOX_POLICY_IDENTITY_HASH_ALGORITHM,
@@ -47,6 +55,7 @@ import {
     createWindowsSandboxProvider,
     describeSandboxProviderPolicy,
     hashReceipt,
+    applicationEntrypointHashForEntry,
     loadHarnessAllowlist,
     sha256Bytes,
 } from "../measurement/index.mjs";
@@ -104,14 +113,16 @@ const EFFECT_RECOVERY_CAPSULE_HASH_ALGORITHM =
 const EFFECT_RECOVERY_CAPSULE_VERSION = 1;
 const RUNTIME_TEMP_OWNER_VERSION = 1;
 const IMPOSSIBILITY_CERTIFICATE_ARTIFACT_HASH_ALGORITHM =
-    "sha256:crucible-impossibility-certificate-artifact-v1";
+    "sha256:crucible-impossibility-certificate-artifact-v2";
 const IMPOSSIBILITY_RECEIPT_ARTIFACT_HASH_ALGORITHM =
     "sha256:crucible-impossibility-receipt-artifact-v1";
 const IMPOSSIBILITY_STDOUT_ARTIFACT_HASH_ALGORITHM =
     "sha256:crucible-impossibility-stdout-artifact-v1";
 const IMPOSSIBILITY_STDERR_ARTIFACT_HASH_ALGORITHM =
     "sha256:crucible-impossibility-stderr-artifact-v1";
-const IMPOSSIBILITY_REQUEST_FILENAME = "crucible-impossibility-request.json";
+const IMPOSSIBILITY_REQUEST_FILENAME = "request.json";
+const IMPOSSIBILITY_PROPOSAL_FILENAME = "proposed-certificate.json";
+const IMPOSSIBILITY_PROOF_FILENAME = "proof-artifact.json";
 const SNAPSHOT_CLOSURE_HASH =
     /^sha256:crucible-measurement-snapshot-closure-v1:[a-f0-9]{64}$/u;
 export const DEFAULT_RUNTIME_BYTE_BUDGETS = Object.freeze({
@@ -119,6 +130,60 @@ export const DEFAULT_RUNTIME_BYTE_BUDGETS = Object.freeze({
     perAttemptCasBytes: 32 * 1024 * 1024,
     perInvestigationCasBytes: 2 * 1024 * 1024 * 1024,
 });
+
+function objectIdForBytes(bytes) {
+    return `sha256:${sha256Hex(bytes)}`;
+}
+
+function taggedHashMatchesObjectId(tagged, objectId) {
+    return typeof tagged === "string"
+        && typeof objectId === "string"
+        && tagged.split(":").at(-1)
+            === objectId.slice("sha256:".length);
+}
+
+function impossibilityManifestCore(manifest) {
+    return {
+        version: manifest.version,
+        pack: manifest.pack,
+        entries: manifest.entries,
+    };
+}
+
+function generatedImpossibilityDocuments(command) {
+    const documents = new Map([
+        [
+            "coverage-closure.json",
+            command.request.evidence.coverageClosure,
+        ],
+        [
+            "enumerand-manifest.json",
+            command.request.enumerands.manifest,
+        ],
+        [
+            "scientific-replay.json",
+            command.request.statistics.scientificReplay,
+        ],
+        [
+            IMPOSSIBILITY_PROOF_FILENAME,
+            command.proofArtifact,
+        ],
+    ]);
+    if (command.request.reevaluation.calibration !== null) {
+        documents.set(
+            "reevaluation/calibration.json",
+            command.request.reevaluation.calibration,
+        );
+    }
+    for (const input of command.request.reevaluation.enumerands) {
+        documents.set(
+            `reevaluation/enumerands/${String(input.ordinal)
+                .padStart(6, "0")}.json`,
+            input,
+        );
+    }
+    return documents;
+}
 
 function normalizeRuntimeByteBudgets(
     value = {},
@@ -269,6 +334,48 @@ function receiptHasVerifiedSnapshotBytes(
         && mutation.reparseStable === true
         && (!requireCompleteOutput || receiptHasCompleteOutput(receipt))
         && stagedHarnessHashesMatch(receipt);
+}
+
+export function inspectFrozenImpossibilityVerifierExecution({
+    receipt,
+    verifierRole,
+    parserVersion,
+} = {}) {
+    const securityContext =
+        receipt?.sandbox?.policyIdentity?.securityContext;
+    const checks = {
+        receiptVersion:
+            receipt?.version === HARNESS_SUITE_RECEIPT_VERSION,
+        harnessId: receipt?.harnessId === verifierRole?.harnessId,
+        parserVersion: receipt?.parserVersion === parserVersion,
+        parserIdentity: canonicalEqual(
+            receipt?.parserIdentity,
+            verifierRole?.parser,
+        ),
+        harnessEntry: receipt?.harnessEntryHash
+            === verifierRole?.harnessEntryHash,
+        executable: receipt?.executableHash
+            === verifierRole?.executableHash,
+        stagedExecutable: receipt?.stagedExecutableHash
+            === verifierRole?.executableHash,
+        sandboxPolicy: receipt?.sandbox?.policyDigest
+            === verifierRole?.sandboxIdentity?.policyDigest,
+        sandboxCapability:
+            receipt?.sandbox?.capabilityLaunchUsed === true
+            && typeof receipt?.sandbox?.capabilityId === "string"
+            && receipt.sandbox.capabilityId.length > 0,
+        appContainer: securityContext?.appContainer === true,
+        lowIntegrity: securityContext?.lowIntegrity === true,
+        zeroCapabilities: Array.isArray(securityContext?.capabilities)
+            && securityContext.capabilities.length === 0,
+    };
+    const failedBindings = Object.entries(checks)
+        .filter(([, valid]) => !valid)
+        .map(([name]) => name);
+    return immutableCanonical({
+        valid: failedBindings.length === 0,
+        failedBindings,
+    });
 }
 
 function snapshotExecutionHash(receipt) {
@@ -572,8 +679,12 @@ export class AutonomousRunner {
                 return this.#clock.isoNow();
             },
         });
+        const artifactStoreFactory =
+            this.#dependencies.artifactStoreFactory ?? openArtifactStore;
+        this.#artifactStore = artifactStoreFactory({ root: artifactRoot });
         this.#adapter = createDomainRepositoryAdapter({
             repository: this.#repository,
+            artifactStore: this.#artifactStore,
             investigationId: this.#config.investigationId,
             beforeCasAttempt: () => {
                 if (this.#domainDeadlineGuardDepth > 0) {
@@ -641,8 +752,6 @@ export class AutonomousRunner {
         this.#recoveredDeadlineStopRequestSeqs =
             this.#loadRecoveredDeadlineStopRequestSeqs();
 
-        const artifactStoreFactory = this.#dependencies.artifactStoreFactory ?? openArtifactStore;
-        this.#artifactStore = artifactStoreFactory({ root: artifactRoot });
         this.#seedByteUsage();
         if (opened.aggregate.terminal !== null
             || opened.aggregate.pause !== null
@@ -878,14 +987,30 @@ export class AutonomousRunner {
                 { role },
             );
         }
-        if (frozenRole.parser.version !== PARSER_VERSION) {
+        const expectedParserVersion = role === "impossibility_verifier"
+            ? VERIFIER_PARSER_VERSION
+            : PARSER_VERSION;
+        const currentParserIdentity =
+            trustedParserIdentity(expectedParserVersion);
+        if (frozenRole.parser.version !== expectedParserVersion) {
             throw new CrucibleRuntimeError(
                 RUNTIME_ERROR_CODES.HARNESS_CONFIGURATION_INVALID,
                 "Frozen contract parserVersion does not match the trusted measurement parser",
                 {
                     role,
                     contract: frozenRole.parser.version,
-                    runtime: PARSER_VERSION,
+                    runtime: expectedParserVersion,
+                },
+            );
+        }
+        if (!canonicalEqual(frozenRole.parser, currentParserIdentity)) {
+            throw new CrucibleRuntimeError(
+                RUNTIME_ERROR_CODES.HARNESS_CONFIGURATION_INVALID,
+                "Frozen parser identity does not match the trusted parser bytes",
+                {
+                    role,
+                    contract: frozenRole.parser,
+                    runtime: currentParserIdentity,
                 },
             );
         }
@@ -916,10 +1041,25 @@ export class AutonomousRunner {
                         },
                     );
                 }
+                if (role === "impossibility_verifier") {
+                    const securityContext =
+                        this.#sandboxIdentity?.policyIdentity?.securityContext;
+                    if (securityContext?.appContainer !== true
+                        || securityContext?.lowIntegrity !== true
+                        || !Array.isArray(securityContext.capabilities)
+                        || securityContext.capabilities.length !== 0) {
+                        throw new RuntimeIntegrityError(
+                            "Impossibility verifier requires the frozen zero-capability AppContainer policy",
+                            { role, securityContext: securityContext ?? null },
+                        );
+                    }
+                }
             }
             const verifiedEntry = this.#allowlist.verifyEntry(frozenRole.harnessId);
             if (verifiedEntry.entryHash !== frozenRole.harnessEntryHash
-                || verifiedEntry.executableHash !== frozenRole.executableHash) {
+                || verifiedEntry.executableHash !== frozenRole.executableHash
+                || applicationEntrypointHashForEntry(verifiedEntry.entry)
+                    !== frozenRole.applicationEntrypointHash) {
                 throw new RuntimeIntegrityError(
                     "Verified harness role bytes do not match HarnessSuiteV4",
                     { role, harnessId: frozenRole.harnessId },
@@ -2824,6 +2964,11 @@ export class AutonomousRunner {
         if (payload.commandId !== commandId
             || payload.attemptOrdinal !== command.attemptOrdinal
             || payload.requestHash !== command.requestHash
+            || payload.proposedCertificateArtifactHash
+                !== command.proposedCertificateArtifactHash
+            || payload.proofArtifactHash !== command.proofArtifactHash
+            || payload.objectManifestRoot
+                !== command.request.objectManifest.root
             || payload.snapshotId !== snapshotId
             || payload.verificationSnapshotHash !== measurementSnapshotHash(snapshotId)
             || payload.measurementReceiptArtifactId
@@ -2855,6 +3000,7 @@ export class AutonomousRunner {
         );
         if (!canonicalEqual(persistedCertificate, rebuilt.certificate)
             || payload.certificateArtifactHash !== rebuilt.certificateArtifactHash
+            || payload.checkerStatus !== rebuilt.checkerStatus
             || payload.certificateVerdict !== rebuilt.certificateVerdict
             || payload.measurementReceiptHash !== rebuilt.measurementReceiptHash
             || payload.measurementReceiptArtifactHash
@@ -3143,8 +3289,49 @@ export class AutonomousRunner {
             command.request,
             IMPOSSIBILITY_REQUEST_HASH_ALGORITHM,
         );
+        const expectedProposalHash = hashCanonical(
+            command.proposedCertificate,
+            IMPOSSIBILITY_PROPOSAL_HASH_ALGORITHM,
+        );
+        const expectedProofHash = hashCanonical(
+            command.proofArtifact,
+            IMPOSSIBILITY_PROOF_ARTIFACT_HASH_ALGORITHM,
+        );
+        const manifest = command.request?.objectManifest ?? null;
+        const expectedManifestRoot = manifest === null
+            ? null
+            : hashCanonical(
+                impossibilityManifestCore(manifest),
+                IMPOSSIBILITY_VERIFIER_OBJECT_MANIFEST_HASH_ALGORITHM,
+            );
         if (command.requestHash !== expectedRequestHash
-            || command.request?.contract?.hypothesisTopology !== "certified_impossibility") {
+            || command.proposedCertificateArtifactHash
+                !== expectedProposalHash
+            || command.proofArtifactHash !== expectedProofHash
+            || command.request?.contract?.hypothesisTopology
+                !== "certified_impossibility"
+            || command.request?.proposedCertificate?.artifactHash
+                !== command.proposedCertificateArtifactHash
+            || command.request?.proofArtifact?.artifactHash
+                !== command.proofArtifactHash
+            || command.request?.proofArtifact?.path
+                !== IMPOSSIBILITY_PROOF_FILENAME
+            || command.request?.proofArtifact?.objectId
+                !== objectIdForBytes(
+                    Buffer.from(canonicalJson(command.proofArtifact), "utf8"),
+                )
+            || command.proposedCertificate?.proofArtifactHash
+                !== command.proofArtifactHash
+            || manifest === null
+            || !Array.isArray(manifest.entries)
+            || manifest.pack?.path !== "object-pack.json"
+            || manifest.pack?.format
+                !== "crucible-base64-object-pack-v1"
+            || manifest.root !== expectedManifestRoot
+            || command.proposedCertificate?.objectManifestRoot
+                !== manifest.root
+            || command.proofArtifactHash
+                === command.proposedCertificateArtifactHash) {
             throw new RuntimeIntegrityError(
                 "Reserved impossibility request is not canonical or certified-impossibility scoped",
                 {
@@ -3159,17 +3346,172 @@ export class AutonomousRunner {
             `request-${command.attemptOrdinal}`,
         );
         try {
-            fs.writeFileSync(
-                path.join(sourceDir, IMPOSSIBILITY_REQUEST_FILENAME),
-                canonicalJson(command.request),
-                { encoding: "utf8", flag: "wx", mode: 0o600 },
+            const writeBytes = (relativePath, bytes) => {
+                const target = assertPathInside(
+                    path.join(sourceDir, ...relativePath.split("/")),
+                    sourceDir,
+                    "impossibility verifier input",
+                );
+                fs.mkdirSync(path.dirname(target), {
+                    recursive: true,
+                    mode: 0o700,
+                });
+                fs.writeFileSync(target, bytes, {
+                    flag: "wx",
+                    mode: 0o600,
+                });
+            };
+            writeBytes(
+                IMPOSSIBILITY_REQUEST_FILENAME,
+                Buffer.from(canonicalJson(command.request), "utf8"),
             );
+            writeBytes(
+                IMPOSSIBILITY_PROPOSAL_FILENAME,
+                Buffer.from(
+                    canonicalJson(command.proposedCertificate),
+                    "utf8",
+                ),
+            );
+            const generated = generatedImpossibilityDocuments(command);
+            const seenPaths = new Set();
+            const packedObjects = [];
+            for (const entry of manifest.entries) {
+                if (entry === null
+                    || typeof entry !== "object"
+                    || !canonicalEqual(
+                        Object.keys(entry).sort(),
+                        [
+                            "artifactIds",
+                            "byteHash",
+                            "kind",
+                            "objectId",
+                            "path",
+                            "semanticHashes",
+                        ],
+                    )
+                    || typeof entry.path !== "string"
+                    || typeof entry.objectId !== "string"
+                    || typeof entry.byteHash !== "string"
+                    || (entry.kind !== "generated"
+                        && entry.kind !== "cas_object")
+                    || !Array.isArray(entry.artifactIds)
+                    || (entry.kind === "generated"
+                        && entry.artifactIds.length !== 0)
+                    || (entry.kind === "cas_object"
+                        && entry.artifactIds.length === 0)
+                    || [
+                        IMPOSSIBILITY_REQUEST_FILENAME,
+                        IMPOSSIBILITY_PROPOSAL_FILENAME,
+                        manifest.pack.path,
+                    ].includes(entry.path)
+                    || seenPaths.has(entry.path)) {
+                    throw new RuntimeIntegrityError(
+                        "Impossibility verifier object manifest is malformed",
+                        { entry },
+                    );
+                }
+                seenPaths.add(entry.path);
+                const document = generated.get(entry.path);
+                if ((entry.kind === "generated") !== (document !== undefined)) {
+                    throw new RuntimeIntegrityError(
+                        "Impossibility verifier object source kind is inconsistent",
+                        { path: entry.path, kind: entry.kind },
+                    );
+                }
+                const bytes = document === undefined
+                    ? this.#artifactStore.readObject(
+                        entry.objectId,
+                        { verify: true },
+                    )
+                    : Buffer.from(canonicalJson(document), "utf8");
+                if (objectIdForBytes(bytes) !== entry.objectId
+                    || !taggedHashMatchesObjectId(
+                        entry.byteHash,
+                        entry.objectId,
+                    )
+                    || !Array.isArray(entry.semanticHashes)
+                    || entry.semanticHashes.some((hash) =>
+                        !taggedHashMatchesObjectId(
+                            hash,
+                            entry.objectId,
+                        ))) {
+                    throw new RuntimeIntegrityError(
+                        "Impossibility verifier object bytes disagree with the request manifest",
+                        { path: entry.path, objectId: entry.objectId },
+                    );
+                }
+                if (document === undefined) {
+                    packedObjects.push({
+                        path: entry.path,
+                        objectId: entry.objectId,
+                        byteHash: entry.byteHash,
+                        artifactIds: entry.artifactIds,
+                        semanticHashes: entry.semanticHashes,
+                        contentBase64: bytes.toString("base64"),
+                    });
+                } else {
+                    writeBytes(entry.path, bytes);
+                }
+            }
+            if ([...generated.keys()].some((path) => !seenPaths.has(path))) {
+                throw new RuntimeIntegrityError(
+                    "Impossibility verifier object manifest omitted a generated proof input",
+                    {
+                        missing: [...generated.keys()]
+                            .filter((path) => !seenPaths.has(path)),
+                    },
+                );
+            }
+            const objectPack = {
+                version: manifest.pack.format,
+                entries: packedObjects.sort((left, right) =>
+                    left.path.localeCompare(right.path)),
+            };
+            const objectPackBytes = Buffer.from(
+                canonicalJson(objectPack),
+                "utf8",
+            );
+            writeBytes(manifest.pack.path, objectPackBytes);
             this.#reserveDirectoryCas(
                 attemptId,
                 sourceDir,
                 `impossibility-request-${command.attemptOrdinal}`,
             );
             const snapshot = this.#artifactStore.ingestDirectory({ sourceDir });
+            const expectedEntries = new Map([
+                [
+                    IMPOSSIBILITY_REQUEST_FILENAME,
+                    objectIdForBytes(
+                        Buffer.from(canonicalJson(command.request), "utf8"),
+                    ),
+                ],
+                [
+                    IMPOSSIBILITY_PROPOSAL_FILENAME,
+                    objectIdForBytes(
+                        Buffer.from(
+                            canonicalJson(command.proposedCertificate),
+                            "utf8",
+                        ),
+                    ),
+                ],
+                ...manifest.entries
+                    .filter((entry) => entry.kind === "generated")
+                    .map((entry) => [
+                        entry.path,
+                        entry.objectId,
+                    ]),
+                [
+                    manifest.pack.path,
+                    objectIdForBytes(objectPackBytes),
+                ],
+            ]);
+            if (snapshot.manifest.entries.length !== expectedEntries.size
+                || snapshot.manifest.entries.some((entry) =>
+                    expectedEntries.get(entry.path) !== entry.object)) {
+                throw new RuntimeIntegrityError(
+                    "Persisted impossibility verifier snapshot does not match the request object manifest",
+                );
+            }
             this.#assertDeadlineOpen("impossibility request artifact persistence");
             return snapshot;
         } finally {
@@ -3196,6 +3538,11 @@ export class AutonomousRunner {
                 commandId,
                 attemptOrdinal: command.attemptOrdinal,
                 requestHash: command.requestHash,
+                proposedCertificateArtifactHash:
+                    command.proposedCertificateArtifactHash,
+                proofArtifactHash: command.proofArtifactHash,
+                objectManifestRoot:
+                    command.request.objectManifest.root,
                 snapshotId,
                 verificationSnapshotHash: measurementSnapshotHash(snapshotId),
                 artifactId: snapshotProvenance.manifestArtifact.artifactId,
@@ -3212,48 +3559,69 @@ export class AutonomousRunner {
         rawOutput,
     }) {
         const verificationSnapshotHash = measurementSnapshotHash(snapshotId);
-        if (!receiptHasVerifiedSnapshotBytes(
-            measurement.receipt,
-            verificationSnapshotHash,
-        )
-            || measurement.receipt?.parserVersion !== command.parserVersion
-            || measurement.receipt?.parsed === undefined
-            || !canonicalEqual(measurement.receipt.parsed, measurement.parsed)
-            || sha256Bytes(rawOutput.stdout, STREAM_HASH_ALGORITHM)
-                !== measurement.stdoutHash
-            || sha256Bytes(rawOutput.stderr, STREAM_HASH_ALGORITHM)
-                !== measurement.stderrHash) {
+        let checkerResult;
+        try {
+            checkerResult = normalizeImpossibilityCheckerResult(
+                measurement.parsed,
+                {
+                    request: command.request,
+                    requestHash: command.requestHash,
+                    binding: command.measurementBinding,
+                },
+            );
+        } catch (error) {
+            throw new RuntimeIntegrityError(
+                `Impossibility checker output is invalid: ${
+                    error?.message ?? String(error)
+                }`,
+                { cause: error?.code ?? null },
+            );
+        }
+        const verifierRole = aggregate.contract.harnessSuite.roles
+            .impossibility_verifier;
+        const frozenExecution =
+            inspectFrozenImpossibilityVerifierExecution({
+                receipt: measurement.receipt,
+                verifierRole,
+                parserVersion: command.parserVersion,
+            });
+        const bindingChecks = {
+            snapshotBytes: receiptHasVerifiedSnapshotBytes(
+                measurement.receipt,
+                verificationSnapshotHash,
+            ),
+            parsed: measurement.receipt?.parsed !== undefined
+                && canonicalEqual(
+                    measurement.receipt.parsed,
+                    measurement.parsed,
+                ),
+            stdout: sha256Bytes(rawOutput.stdout, STREAM_HASH_ALGORITHM)
+                === measurement.stdoutHash,
+            stderr: sha256Bytes(rawOutput.stderr, STREAM_HASH_ALGORITHM)
+                === measurement.stderrHash,
+        };
+        const failedBindings = Object.entries(bindingChecks)
+            .filter(([, valid]) => !valid)
+            .map(([name]) => name)
+            .concat(frozenExecution.failedBindings);
+        if (failedBindings.length > 0) {
             throw new RuntimeIntegrityError(
                 "Impossibility measurement receipt is not bound to the reserved verifier request",
                 {
                     requestHash: command.requestHash,
                     verificationSnapshotHash,
+                    failedBindings,
                 },
             );
         }
-        const verifiedFacts = {
-            pass: measurement.parsed.pass,
-            searchSpaceExhausted: measurement.parsed.searchSpaceExhausted,
-            parserVersion: measurement.receipt.parserVersion,
-        };
-        const certificateVerdict = deriveImpossibilityVerdict(verifiedFacts);
+        const certificate = checkerResult.certificate;
+        const certificateVerdict = certificate.verdict;
+        const checkerStatus = checkerResult.status;
         const measurementReceiptHash = hashReceipt(measurement.receipt);
         const measurementReceiptBytes = Buffer.from(
             canonicalJson(measurement.receipt),
             "utf8",
         );
-        const certificate = {
-            version: command.certificateVersion,
-            verdict: certificateVerdict,
-            contractHash: aggregate.contractHash,
-            harnessId: command.harnessId,
-            parserVersion: command.parserVersion,
-            verificationRequestHash: command.requestHash,
-            verificationSnapshotHash,
-            measurementReceiptHash,
-            verifiedFacts,
-            parsedResult: measurement.parsed,
-        };
         const certificateBytes = Buffer.from(canonicalJson(certificate), "utf8");
         return {
             measurement,
@@ -3261,8 +3629,9 @@ export class AutonomousRunner {
             rawStderrBytes: rawOutput.stderr,
             certificate,
             certificateBytes,
+            checkerResult,
+            checkerStatus,
             certificateVerdict,
-            verifiedFacts,
             verificationSnapshotHash,
             measurementReceiptHash,
             measurementReceiptArtifactHash: taggedHash(
@@ -3290,11 +3659,39 @@ export class AutonomousRunner {
         mainAttemptId,
         command,
     ) {
-        if (command.request.contractHash !== aggregate.contractHash
+        if (command.request.signedExperiment.contractHash
+                !== aggregate.contractHash
             || !canonicalEqual(command.request.contract, aggregate.contract)) {
             throw new RuntimeIntegrityError(
                 "Reserved impossibility request does not match the replayed contract",
                 { commandId, requestHash: command.requestHash },
+            );
+        }
+        const verification = createImpossibilityVerificationPackage(
+            aggregate,
+            {
+                attemptOrdinal: command.attemptOrdinal,
+                progress: searchProgress(aggregate),
+                validation: currentValidationEvidence(aggregate),
+            },
+        );
+        if (!verification.eligible
+            || verification.requestHash !== command.requestHash
+            || verification.proposalArtifactHash
+                !== command.proposedCertificateArtifactHash
+            || verification.proofArtifactHash
+                !== command.proofArtifactHash
+            || !canonicalEqual(
+                verification.proofArtifact,
+                command.proofArtifact,
+            )) {
+            throw new RuntimeIntegrityError(
+                "Reserved impossibility request no longer matches complete current coverage",
+                {
+                    commandId,
+                    requestHash: command.requestHash,
+                    missing: verification.missing,
+                },
             );
         }
         const requestSnapshot = this.#ingestImpossibilityRequest(
@@ -3311,23 +3708,7 @@ export class AutonomousRunner {
             requestSnapshot.snapshot,
             `impossibility-${command.attemptOrdinal}`,
         );
-        const measurementBinding = {
-            role: "impossibility_verifier",
-            phase: "impossibility_verification",
-            replicateIndex: null,
-            blockIndex: null,
-            armIndex: null,
-            armId: null,
-            deterministicSeed: hashCanonical({
-                contractHash: aggregate.contractHash,
-                requestHash: command.requestHash,
-                attemptOrdinal: command.attemptOrdinal,
-            }, "sha256:crucible-impossibility-measurement-seed-v1"),
-            subjectId: `impossibility-${command.attemptOrdinal}`,
-            environmentIdentity:
-                aggregate.contract.harnessSuite.environmentIdentity,
-            suiteIdentity: aggregate.contract.harnessSuiteIdentity,
-        };
+        const measurementBinding = command.measurementBinding;
         try {
             const effect = await this.#executeEffect(
                 {
@@ -3344,6 +3725,10 @@ export class AutonomousRunner {
                         attemptId,
                         runnerEpochId: this.#config.runnerEpochId,
                         measurementBinding,
+                        resultParserContext: {
+                            request: command.request,
+                            requestHash: command.requestHash,
+                        },
                     });
                     return this.#buildImpossibilityVerificationResult({
                         aggregate,
@@ -3409,12 +3794,16 @@ export class AutonomousRunner {
                 },
                 data: {
                     certificateVersion: command.certificateVersion,
+                    checkerStatus: result.checkerStatus,
                     certificateVerdict: result.certificateVerdict,
                     certificateArtifactHash: result.certificateArtifactHash,
                     measurementReceiptHash: result.measurementReceiptHash,
                     verificationRequestHash: command.requestHash,
+                    proposedCertificateArtifactHash:
+                        command.proposedCertificateArtifactHash,
+                    proofArtifactHash: command.proofArtifactHash,
                     verificationSnapshotHash: result.verificationSnapshotHash,
-                    verifiedFacts: result.verifiedFacts,
+                    checkerResult: result.checkerResult,
                 },
             };
         } finally {
@@ -3543,7 +3932,8 @@ export class AutonomousRunner {
             );
         }
         const manifestOptions = {
-            topology: aggregate.contract.hypothesisTopology,
+            topology: aggregate.contract.enumerandManifest?.topology
+                ?? aggregate.contract.hypothesisTopology,
             observableRegistry: aggregate.contract.observableRegistry,
             hypothesisPolicy: aggregate.contract.hypothesisPolicy,
         };
@@ -4079,7 +4469,8 @@ export class AutonomousRunner {
                 const binding = resolveControlEnumerand(
                     aggregate.contract.enumerandManifest,
                     {
-                        topology: aggregate.contract.hypothesisTopology,
+                        topology: aggregate.contract.enumerandManifest?.topology
+                            ?? aggregate.contract.hypothesisTopology,
                         observableRegistry:
                             aggregate.contract.observableRegistry,
                         hypothesisPolicy:
@@ -4110,7 +4501,8 @@ export class AutonomousRunner {
             schedule: sourceSchedule,
             enumerandManifest: aggregate.contract.enumerandManifest ?? null,
             manifestOptions: {
-                topology: aggregate.contract.hypothesisTopology,
+                topology: aggregate.contract.enumerandManifest?.topology
+                    ?? aggregate.contract.hypothesisTopology,
                 observableRegistry: aggregate.contract.observableRegistry,
                 hypothesisPolicy: aggregate.contract.hypothesisPolicy,
             },
@@ -5768,8 +6160,14 @@ export class AutonomousRunner {
                 commandId,
                 attemptOrdinal: command.attemptOrdinal,
                 requestHash: command.requestHash,
+                proposedCertificateArtifactHash:
+                    command.proposedCertificateArtifactHash,
+                proofArtifactHash: command.proofArtifactHash,
+                objectManifestRoot:
+                    command.request.objectManifest.root,
                 snapshotId,
                 verificationSnapshotHash: result.verificationSnapshotHash,
+                checkerStatus: result.checkerStatus,
                 certificateVerdict: result.certificateVerdict,
                 certificateArtifactHash: result.certificateArtifactHash,
                 certificateArtifactId: certificateArtifact.artifactId,
