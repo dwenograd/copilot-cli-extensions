@@ -391,6 +391,8 @@ describe("HarnessSuiteV4 parser/receipt binding", () => {
             phase: "confirmation",
             replicateIndex: 1,
             blockIndex: 3,
+            armIndex: 0,
+            armId: "candidate",
             deterministicSeed: "confirmation-seed",
             subjectId: "candidate-42",
             environmentIdentity:

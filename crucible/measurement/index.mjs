@@ -51,6 +51,20 @@ export {
 } from "./parser.mjs";
 
 export {
+    NOVELTY_BINDING_SEED_ALGORITHM,
+    NOVELTY_MAX_STRUCTURAL_FEATURES,
+    NOVELTY_ROLE_ADAPTER_VERSION,
+    NOVELTY_ROLE_FINGERPRINT_ALGORITHM,
+    NOVELTY_STRUCTURAL_FINGERPRINT_ALGORITHM,
+    NoveltyRoleError,
+    adaptNoveltyRoleAttempt,
+    createNoveltyMeasurementBinding,
+    normalizeNoveltyRoleAttempt,
+    noveltyRoleFingerprint,
+    tryAdaptNoveltyRoleAttempt,
+} from "./novelty-role.mjs";
+
+export {
     HARNESS_SUITE_V4_CASE_MANIFEST_ALGORITHM,
     HARNESS_SUITE_V4_CONFIG_ALGORITHM,
     HARNESS_SUITE_V4_CORPUS_ALGORITHM,

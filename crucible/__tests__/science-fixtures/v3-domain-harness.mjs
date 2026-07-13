@@ -102,6 +102,12 @@ function fakeMeasurement({
     snapshotId,
     observationId,
     parserVersion,
+    role = "search",
+    phase = role === "impossibility_verifier"
+        ? "impossibility_verification"
+        : role === "search"
+            ? "search"
+            : "calibration",
 }) {
     const stdoutHash = hashCanonical(
         { observationId, subjectId, stream: "stdout" },
@@ -132,6 +138,8 @@ function fakeMeasurement({
     });
     const measurement = createMeasurementProvenance({
         subjectId,
+        role,
+        phase,
         receiptArtifact: fakeArtifact(`${subjectId}-receipt`, receiptHash),
         receiptHash,
         rawStdoutArtifact: fakeArtifact(`${subjectId}-stdout`, stdoutHash),
@@ -195,6 +203,8 @@ function fullHarnessReceipt(context, command, {
                 snapshotId: validationCase.artifactHash,
                 observationId,
                 parserVersion,
+                role: "calibration",
+                phase: "calibration",
             }))
         : [fakeMeasurement({
             subjectId: purpose === "candidate"
@@ -205,6 +215,12 @@ function fullHarnessReceipt(context, command, {
                 : `sha256:${digestOf(command.requestHash)}`,
             observationId,
             parserVersion,
+            role: purpose === "candidate"
+                ? "search"
+                : "impossibility_verifier",
+            phase: purpose === "candidate"
+                ? "search"
+                : "impossibility_verification",
         })];
     const normalizedCandidateHash = purpose === "candidate"
         ? measurements[0].measurement.snapshot.snapshotHash

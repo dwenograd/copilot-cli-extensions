@@ -2,6 +2,28 @@ import { RuntimeConfigError } from "./errors.mjs";
 
 const SUPERVISOR_HEARTBEAT_OPERATION_MARGIN_MS = 1_000;
 const RUNNER_BUDGET_MINIMUM_SAFETY_MARGIN = 64;
+const REPLICATION_ARMS_PER_BLOCK = 2;
+const CONFIRMATION_ROLE_COUNT = 3;
+
+function checkedProduct(values, field) {
+    let result = 1;
+    for (const value of values) {
+        if (!Number.isSafeInteger(value) || value < 0) {
+            throw new RuntimeConfigError(`${field} contains an invalid integer`, {
+                field,
+                value,
+            });
+        }
+        result *= value;
+        if (!Number.isSafeInteger(result)) {
+            throw new RuntimeConfigError(`${field} exceeds safe integer capacity`, {
+                field,
+                values,
+            });
+        }
+    }
+    return result;
+}
 
 export const STRICT_ISO_TIMESTAMP_PATTERN_SOURCE =
     String.raw`^\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])T(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d{1,3})?(?:Z|[+-](?:[01]\d|2[0-3]):[0-5]\d)$`;
@@ -164,25 +186,74 @@ export function deriveRunnerExecutionLimits(contract) {
             { candidateEvaluations, searchCapacity },
         );
     }
-    const validationEffects = Array.isArray(contract.validationCases)
-        ? contract.validationCases.length
+    const validationSeries = Array.isArray(contract.validationCases)
+        && Array.isArray(contract.validationRoles)
+        ? checkedProduct(
+            [contract.validationCases.length, contract.validationRoles.length],
+            "validation role/case series",
+        )
         : 0;
     const impossibilityEffects =
         contract.hypothesisTopology === "certified_impossibility" ? 1 : 0;
     const statisticalPolicy = contract.statisticalPolicy;
     const evaluationBudget = statisticalPolicy?.evaluationBudget;
     const byteBudgets = statisticalPolicy?.resourceBudget;
+    const maxBlocks = statisticalPolicy?.maxBlocks;
+    const maxConfirmations = statisticalPolicy?.maxConfirmations;
+    if (!Number.isSafeInteger(maxBlocks)
+        || maxBlocks < 1
+        || !Number.isSafeInteger(maxConfirmations)
+        || maxConfirmations < 1) {
+        throw new RuntimeConfigError(
+            "frozen statistical block/confirmation limits are required",
+            { maxBlocks, maxConfirmations },
+        );
+    }
+    const confirmationRoleUnits = checkedProduct(
+        [maxConfirmations, CONFIRMATION_ROLE_COUNT],
+        "confirmation role units",
+    );
+    const replicatedRoleUnits = candidateEvaluations + confirmationRoleUnits;
+    const scheduledBlocks = checkedProduct(
+        [replicatedRoleUnits, maxBlocks],
+        "replication block capacity",
+    );
+    const requiredCandidateEvaluations = scheduledBlocks;
+    const requiredControlEvaluations = scheduledBlocks;
+    const requiredReplicationEvaluations = checkedProduct(
+        [scheduledBlocks, REPLICATION_ARMS_PER_BLOCK],
+        "replication arm capacity",
+    );
+    const validationEffects = checkedProduct(
+        [validationSeries, maxBlocks],
+        "validation replicated attempts",
+    );
+    const requiredMeasurementEvaluations = validationEffects
+        + impossibilityEffects
+        + requiredReplicationEvaluations;
     if (evaluationBudget === null
         || typeof evaluationBudget !== "object"
+        || !Number.isSafeInteger(evaluationBudget.maxCandidateEvaluations)
+        || evaluationBudget.maxCandidateEvaluations
+            < requiredCandidateEvaluations
+        || !Number.isSafeInteger(evaluationBudget.maxControlEvaluations)
+        || evaluationBudget.maxControlEvaluations
+            < requiredControlEvaluations
         || !Number.isSafeInteger(evaluationBudget.maxTotalEvaluations)
         || evaluationBudget.maxTotalEvaluations
-            < validationEffects + candidateEvaluations + impossibilityEffects) {
+            < requiredMeasurementEvaluations) {
         throw new RuntimeConfigError(
-            "frozen statistical evaluation budget cannot cover runtime execution",
+            "frozen statistical evaluation budget cannot cover role × block × arm execution",
             {
                 evaluationBudget: evaluationBudget ?? null,
                 validationEffects,
                 candidateEvaluations,
+                confirmationRoleUnits,
+                scheduledBlocks,
+                requiredCandidateEvaluations,
+                requiredControlEvaluations,
+                requiredReplicationEvaluations,
+                requiredMeasurementEvaluations,
                 impossibilityEffects,
             },
         );
@@ -192,8 +263,30 @@ export function deriveRunnerExecutionLimits(contract) {
             "frozen statistical resource budget is required",
         );
     }
+    const minimumByteBudgets = {};
+    for (const kind of ["Output", "Receipt", "Cas"]) {
+        const perAttempt = byteBudgets[`perAttempt${kind}Bytes`];
+        const perInvestigation = byteBudgets[`perInvestigation${kind}Bytes`];
+        const required = checkedProduct(
+            [perAttempt, requiredMeasurementEvaluations],
+            `required investigation ${kind.toLowerCase()} bytes`,
+        );
+        if (perInvestigation < required) {
+            throw new RuntimeConfigError(
+                `frozen per-investigation ${kind.toLowerCase()} budget cannot cover worst-case role × block × arm attempts`,
+                {
+                    kind,
+                    perAttempt,
+                    perInvestigation,
+                    required,
+                    requiredMeasurementEvaluations,
+                },
+            );
+        }
+        minimumByteBudgets[`perInvestigation${kind}Bytes`] = required;
+    }
     const proposalEffects = candidateEvaluations;
-    const expectedExternalEffects = evaluationBudget.maxTotalEvaluations
+    const expectedExternalEffects = requiredMeasurementEvaluations
         + proposalEffects;
     const effectSafetyMargin = Math.max(
         RUNNER_BUDGET_MINIMUM_SAFETY_MARGIN,
@@ -201,9 +294,13 @@ export function deriveRunnerExecutionLimits(contract) {
     );
     const maxExternalEffects = expectedExternalEffects + effectSafetyMargin;
 
-    const domainCommands = 1 + candidateEvaluations + impossibilityEffects;
+    const domainCommands = maxBlocks
+        + candidateEvaluations
+        + confirmationRoleUnits
+        + impossibilityEffects;
     const expectedKernelIterations = (domainCommands * 2)
         + maxRounds
+        + scheduledBlocks
         + 4;
     const maxLoopIterations = expectedKernelIterations
         + maxExternalEffects
@@ -221,11 +318,20 @@ export function deriveRunnerExecutionLimits(contract) {
     );
     return Object.freeze({
         candidateEvaluations,
+        confirmationRoleUnits,
+        replicatedRoleUnits,
+        scheduledBlocks,
+        replicationArmsPerBlock: REPLICATION_ARMS_PER_BLOCK,
+        requiredCandidateEvaluations,
+        requiredControlEvaluations,
+        requiredReplicationEvaluations,
+        requiredMeasurementEvaluations,
         expectedExternalEffects,
         maxExternalEffects,
         maxLoopIterations,
         maxRestarts,
         safetyMargin: effectSafetyMargin,
+        minimumByteBudgets: Object.freeze(minimumByteBudgets),
         byteBudgets: Object.freeze({ ...byteBudgets }),
     });
 }

@@ -41,6 +41,18 @@ import {
 } from "./evidence.mjs";
 import { deriveImpossibilityVerdict } from "./impossibility.mjs";
 import { normalizeSealedHypotheses } from "./hypotheses.mjs";
+import {
+    ReplicationScheduleError,
+    assertReplicationSchedulePolicyBinding,
+    deriveReplicationControlBinding,
+    normalizeRawMeasurementSeries,
+    normalizeReplicationSchedule,
+    replicationBlockPlan,
+} from "./replication.mjs";
+import {
+    createNoveltyMeasurementBinding,
+    normalizeNoveltyRoleAttempt,
+} from "../measurement/novelty-role.mjs";
 import { createInitialAggregate } from "./state.mjs";
 
 const RECEIPT_FIELDS = Object.freeze([
@@ -61,7 +73,6 @@ const IMPOSSIBILITY_RECEIPT_FIELDS = Object.freeze([
     "verificationRequestHash",
     "verificationSnapshotHash",
 ]);
-
 function requireString(value, field, maximum = 4096) {
     if (typeof value !== "string" || value.length === 0 || value.length > maximum) {
         throw new TransitionError(
@@ -204,10 +215,11 @@ function normalizeAnnotations(
     value,
     maximumCitations = ANNOTATION_LIMITS.citedEvidenceCount,
     hypothesisOptions = {},
+    expectedHypotheses = undefined,
 ) {
     if (value === undefined || value === null) {
         const hypotheses = normalizeAnnotationHypotheses(undefined, hypothesisOptions);
-        return {
+        const normalized = {
             mechanism: null,
             hypothesis: null,
             expectedEffects: [],
@@ -215,6 +227,14 @@ function normalizeAnnotations(
             finding: null,
             ...(hypotheses === null ? {} : { hypotheses }),
         };
+        if (expectedHypotheses !== undefined
+            && !canonicalEqual(hypotheses, expectedHypotheses)) {
+            throw new TransitionError(
+                ERROR_CODES.INVALID_EVENT,
+                "annotations.hypotheses must match the kernel-frozen command hypotheses",
+            );
+        }
+        return normalized;
     }
     if (typeof value !== "object" || Array.isArray(value)) {
         throw new TransitionError(
@@ -318,6 +338,13 @@ function normalizeAnnotations(
         ),
     };
     const hypotheses = normalizeAnnotationHypotheses(value.hypotheses, hypothesisOptions);
+    if (expectedHypotheses !== undefined
+        && !canonicalEqual(hypotheses, expectedHypotheses)) {
+        throw new TransitionError(
+            ERROR_CODES.INVALID_EVENT,
+            "annotations.hypotheses must match the kernel-frozen command hypotheses",
+        );
+    }
     if (hypotheses !== null) {
         normalized.hypotheses = hypotheses;
     }
@@ -343,6 +370,24 @@ function normalizeAnnotations(
     return normalized;
 }
 
+function replicatedCandidatePurpose(purpose) {
+    return purpose === "candidate"
+        || purpose === "confirmation"
+        || purpose === "challenge";
+}
+
+function replicatedRole(purpose, command) {
+    return purpose === "candidate"
+        ? "search"
+        : command?.harnessRole ?? purpose;
+}
+
+function replicatedPhase(purpose, command) {
+    return purpose === "candidate"
+        ? "search"
+        : command?.harnessRole ?? purpose;
+}
+
 function normalizeHarnessReceipt(value, purpose, { command = null, contract = null } = {}) {
     const receipt = requirePlainObject(value, "receipt");
     const expectedFields = purpose === "impossibility"
@@ -363,7 +408,7 @@ function normalizeHarnessReceipt(value, purpose, { command = null, contract = nu
         );
     }
     const candidateArtifactHash = receipt.candidateArtifactHash;
-    if (purpose === "candidate") {
+    if (replicatedCandidatePurpose(purpose)) {
         requireAlgorithmHash(candidateArtifactHash, "receipt.candidateArtifactHash");
     } else if (candidateArtifactHash !== null) {
         throw new TransitionError(
@@ -407,6 +452,28 @@ function normalizeHarnessReceipt(value, purpose, { command = null, contract = nu
                 "Validation receipt stream roots are not derived from all case outputs",
             );
         }
+    } else if (replicatedCandidatePurpose(purpose)) {
+        const expectedStdoutHash = hashCanonical(
+            provenance.measurements.map((item) => ({
+                id: item.subjectId,
+                hash: item.rawStdoutHash,
+            })),
+            OBSERVATION_STREAM_HASH_ALGORITHM,
+        );
+        const expectedStderrHash = hashCanonical(
+            provenance.measurements.map((item) => ({
+                id: item.subjectId,
+                hash: item.rawStderrHash,
+            })),
+            OBSERVATION_STREAM_HASH_ALGORITHM,
+        );
+        if (normalized.rawStdoutHash !== expectedStdoutHash
+            || normalized.rawStderrHash !== expectedStderrHash) {
+            throw new TransitionError(
+                ERROR_CODES.INVALID_EVENT,
+                `${purpose} receipt stream roots are not derived from every raw replicate attempt`,
+            );
+        }
     } else {
         const measurement = provenance.measurements[0];
         if (normalized.rawStdoutHash !== measurement.rawStdoutHash
@@ -417,12 +484,95 @@ function normalizeHarnessReceipt(value, purpose, { command = null, contract = nu
             );
         }
     }
-    if (purpose === "candidate"
-        && candidateArtifactHash !== provenance.measurements[0].snapshot.snapshotHash) {
-        throw new TransitionError(
-            ERROR_CODES.INVALID_EVENT,
-            "Candidate receipt artifact hash does not match the persisted snapshot closure",
+    if (replicatedCandidatePurpose(purpose)) {
+        const schedule = normalizeReplicationSchedule(command?.replicationSchedule);
+        assertReplicationSchedulePolicyBinding({
+            schedule,
+            contractHash: contractHash(contract),
+            statisticalPolicy: contract?.statisticalPolicy,
+        });
+        const role = replicatedRole(purpose, command);
+        const phase = replicatedPhase(purpose, command);
+        const roleMeasurements = provenance.measurements.filter(
+            (measurement) =>
+                measurement.role === role && measurement.phase === phase,
         );
+        const noveltyMeasurements = purpose === "candidate"
+            ? provenance.measurements.filter(
+            (measurement) => measurement.role === "novelty",
+        )
+            : [];
+        if (roleMeasurements.length + noveltyMeasurements.length
+            !== provenance.measurements.length) {
+            throw new TransitionError(
+                ERROR_CODES.INVALID_EVENT,
+                `${purpose} receipt contains an unsupported measurement role`,
+            );
+        }
+        if (roleMeasurements.length % schedule.arms.length !== 0) {
+            throw new TransitionError(
+                ERROR_CODES.INVALID_EVENT,
+                `${purpose} receipt must contain complete replicate blocks`,
+            );
+        }
+        const blockCount = roleMeasurements.length / schedule.arms.length;
+        const bySubject = new Map(
+            roleMeasurements.map((measurement) => [
+                measurement.subjectId,
+                measurement,
+            ]),
+        );
+        const candidateSnapshots = [];
+        const controlSnapshots = [];
+        for (let blockIndex = 0; blockIndex < blockCount; blockIndex += 1) {
+            const plan = replicationBlockPlan(schedule, blockIndex);
+            for (const arm of plan.arms) {
+                const measurement = bySubject.get(arm.subjectId);
+                if (measurement === undefined) {
+                    throw new TransitionError(
+                        ERROR_CODES.INVALID_EVENT,
+                        "Candidate receipt is missing a scheduled replicate measurement",
+                    );
+                }
+                if (arm.armId === "candidate") {
+                    candidateSnapshots.push(measurement.snapshot.snapshotHash);
+                } else if (arm.armId === "control") {
+                    controlSnapshots.push(measurement.snapshot.snapshotHash);
+                }
+            }
+        }
+        if (candidateSnapshots.length !== blockCount
+            || candidateSnapshots.some((hash) => hash !== candidateArtifactHash)
+            || new Set(controlSnapshots).size > 1
+            || noveltyMeasurements.some((measurement) =>
+                measurement.snapshot.snapshotHash !== candidateArtifactHash)) {
+            throw new TransitionError(
+                ERROR_CODES.INVALID_EVENT,
+                `${purpose} candidate/control snapshot closures are not stable across measurements`,
+            );
+        }
+        try {
+            deriveReplicationControlBinding({
+                contractHash: contractHash(contract),
+                statisticalPolicy: contract.statisticalPolicy,
+                schedule,
+                enumerandManifest: contract.enumerandManifest ?? null,
+                manifestOptions: {
+                    topology: contract.hypothesisTopology,
+                    observableRegistry: contract.observableRegistry,
+                    hypothesisPolicy: contract.hypothesisPolicy,
+                },
+                controlSnapshotHashes: controlSnapshots,
+                requireObservedControl: true,
+            });
+        } catch (error) {
+            if (!(error instanceof ReplicationScheduleError)) throw error;
+            throw new TransitionError(
+                ERROR_CODES.INVALID_EVENT,
+                `${purpose} control binding is invalid: ${error.message}`,
+                error.details ?? null,
+            );
+        }
     }
     if (purpose === "impossibility") {
         for (const field of IMPOSSIBILITY_RECEIPT_FIELDS) {
@@ -458,6 +608,7 @@ function normalizeImpossibilityData(value, command) {
                     "data.verifiedFacts.pass must be boolean",
                 );
             }
+
             return pass;
         })(),
         searchSpaceExhausted: requireBooleanOrNull(
@@ -537,6 +688,198 @@ function normalizeImpossibilityData(value, command) {
     });
 }
 
+function normalizeCandidateRawData(
+    value,
+    command,
+    {
+        contract = null,
+        candidateArtifactHash = null,
+        purpose = "candidate",
+    } = {},
+) {
+    const input = requirePlainObject(value, "data");
+    const allowNovelty = purpose === "candidate";
+    const expectedKeys = allowNovelty && input.version === 2
+        ? ["novelty", "series", "version"]
+        : ["series", "version"];
+    if (!canonicalEqual(Object.keys(input).sort(), expectedKeys)) {
+        throw new TransitionError(
+            ERROR_CODES.INVALID_EVENT,
+            `${purpose} data must contain only raw complete measurement series`,
+        );
+    }
+    if ((input.version !== 1 && (!allowNovelty || input.version !== 2))
+        || !Array.isArray(input.series)
+        || input.series.length !== 1) {
+        throw new TransitionError(
+            ERROR_CODES.INVALID_EVENT,
+            `${purpose} data must contain exactly one versioned raw measurement series`,
+        );
+    }
+    const role = replicatedRole(purpose, command);
+    const phase = replicatedPhase(purpose, command);
+    let normalized;
+    try {
+        normalized = normalizeRawMeasurementSeries(input.series[0], {
+            schedule: command?.replicationSchedule,
+            role,
+            phase,
+            caseId: null,
+        }).series;
+    } catch (error) {
+        if (!(error instanceof ReplicationScheduleError)) throw error;
+        throw new TransitionError(
+            ERROR_CODES.INVALID_EVENT,
+            `${purpose} raw measurement series is invalid: ${error.message}`,
+            error.details ?? null,
+        );
+    }
+    const schedule = normalizeReplicationSchedule(command?.replicationSchedule);
+    if (normalized.completeBlocks.length < schedule.minBlocks
+        || normalized.completeBlocks.length > schedule.maxBlocks
+        || normalized.completeBlocks.some(
+            (block, index) => block.blockIndex !== index,
+        )) {
+        throw new TransitionError(
+            ERROR_CODES.INVALID_EVENT,
+            `${purpose} raw complete blocks do not satisfy the frozen schedule`,
+        );
+    }
+    if (input.version === 1) {
+        return immutableCanonical({ version: 1, series: [normalized] });
+    }
+    let novelty = null;
+    if (input.novelty !== null) {
+        try {
+            novelty = normalizeNoveltyRoleAttempt(input.novelty, {
+                expectedBinding: createNoveltyMeasurementBinding({
+                    contract,
+                    candidateArtifactHash,
+                }),
+                environmentIdentity:
+                    contract?.harnessSuite?.environmentIdentity,
+                suiteIdentity: contract?.harnessSuiteIdentity,
+            });
+        } catch (error) {
+            throw new TransitionError(
+                ERROR_CODES.INVALID_EVENT,
+                `candidate novelty attempt is invalid: ${error.message}`,
+                error.details ?? null,
+            );
+        }
+    }
+    return immutableCanonical({
+        version: 2,
+        series: [normalized],
+        novelty,
+    });
+}
+
+function normalizeValidationRawData(value, command, contract) {
+    const input = requirePlainObject(value, "data");
+    if (!canonicalEqual(
+        Object.keys(input).sort(),
+        ["attemptIndex", "series", "version"],
+    )) {
+        throw new TransitionError(
+            ERROR_CODES.INVALID_EVENT,
+            "validation data must contain only raw role-tagged measurement series",
+        );
+    }
+    if (input.version !== 1
+        || input.attemptIndex !== command?.attemptIndex
+        || !Array.isArray(input.series)
+        || !Array.isArray(command?.validationSeries)
+        || input.series.length !== command.validationSeries.length) {
+        throw new TransitionError(
+            ERROR_CODES.INVALID_EVENT,
+            "validation raw series do not match the reserved attempt",
+        );
+    }
+    const supplied = new Map(input.series.map((series) => [
+        `${series?.role ?? ""}\0${series?.caseId ?? ""}`,
+        series,
+    ]));
+    if (supplied.size !== input.series.length) {
+        throw new TransitionError(
+            ERROR_CODES.INVALID_EVENT,
+            "validation raw series contain a duplicate role/case",
+        );
+    }
+    const normalized = command.validationSeries.map((series) => {
+        let item;
+        try {
+            assertReplicationSchedulePolicyBinding({
+                schedule: series.replicationSchedule,
+                contractHash: contractHash(contract),
+                statisticalPolicy: contract.statisticalPolicy,
+            });
+            item = normalizeRawMeasurementSeries(
+                supplied.get(`${series.role}\0${series.caseId}`),
+                {
+                    schedule: series.replicationSchedule,
+                    role: series.role,
+                    phase: "calibration",
+                    caseId: series.caseId,
+                },
+            ).series;
+        } catch (error) {
+            if (!(error instanceof ReplicationScheduleError)) throw error;
+            throw new TransitionError(
+                ERROR_CODES.INVALID_EVENT,
+                `validation raw measurement series is invalid: ${error.message}`,
+                error.details ?? null,
+            );
+        }
+        if (item.completeBlocks.length !== 1
+            || item.completeBlocks[0].blockIndex !== command.attemptIndex) {
+            throw new TransitionError(
+                ERROR_CODES.INVALID_EVENT,
+                "validation observation must contain exactly its reserved complete block",
+            );
+        }
+        return item;
+    }).sort((left, right) =>
+        `${left.role}\0${left.caseId}`.localeCompare(
+            `${right.role}\0${right.caseId}`,
+        ));
+    return immutableCanonical({
+        version: 1,
+        attemptIndex: command.attemptIndex,
+        series: normalized,
+    });
+}
+
+function assertRawObservationReceiptBindings(receipt, data, purpose) {
+    if (!replicatedCandidatePurpose(purpose) && purpose !== "validation") return;
+    const measurements = receipt.provenance.measurements;
+    const bySubject = new Map(
+        measurements.map((measurement) => [
+            measurement.subjectId,
+            measurement,
+        ]),
+    );
+    const observations = data.series.flatMap((series) =>
+        series.completeBlocks.flatMap((block) => block.observations));
+    if (purpose === "candidate" && data.novelty !== null
+        && data.novelty !== undefined) {
+        observations.push(data.novelty);
+    }
+    if (bySubject.size !== measurements.length
+        || observations.length !== measurements.length
+        || observations.some((observation) => {
+            const measurement = bySubject.get(observation.subjectId);
+            return measurement === undefined
+                || observation.receiptHash !== measurement.receiptHash
+                || observation.measurementRoot !== measurement.measurementRoot;
+        })) {
+        throw new TransitionError(
+            ERROR_CODES.INVALID_EVENT,
+            `${purpose} raw observations are not bound one-to-one to their persisted measurement receipts`,
+        );
+    }
+}
+
 export function normalizeCommandObservedPayload(payload, aggregate = null, options = {}) {
     const input = requirePlainObject(payload, "payload");
     const sourceKind = requireOwnField(input, "sourceKind", "sourceKind");
@@ -548,11 +891,37 @@ export function normalizeCommandObservedPayload(payload, aggregate = null, optio
         throw new TransitionError(ERROR_CODES.INVALID_EVENT, "purpose is not supported");
     }
     const harnessCandidate = sourceKind === "harness" && purpose === "candidate";
+    const harnessReplicated = sourceKind === "harness"
+        && replicatedCandidatePurpose(purpose);
     const commandId = normalizeEventIdentifier(
         requireOwnField(input, "commandId", "commandId"),
         "commandId",
     );
     const command = ownEntry(aggregate?.commands, commandId)?.command ?? null;
+    const commandHypotheses = harnessReplicated
+        ? (() => {
+            if (command === null || !Object.hasOwn(command, "hypotheses")) {
+                throw new TransitionError(
+                    ERROR_CODES.INVALID_EVENT,
+                    "Replicated commands must carry kernel-frozen hypotheses",
+                );
+            }
+            return normalizeAnnotationHypotheses(command.hypotheses, {
+                observableRegistry:
+                    options.observableRegistry
+                    ?? aggregate?.contract?.observableRegistry
+                    ?? [],
+                hypothesisPolicy:
+                    options.hypothesisPolicy
+                    ?? aggregate?.contract?.hypothesisPolicy
+                    ?? {},
+                assignedParentEvidenceIds:
+                    options.assignedParentEvidenceIds
+                    ?? command.parentEvidenceIds
+                    ?? [],
+            });
+        })()
+        : null;
     const receipt = sourceKind === "harness"
         ? normalizeHarnessReceipt(requireOwnField(input, "receipt", "receipt"), purpose, {
             command,
@@ -567,6 +936,32 @@ export function normalizeCommandObservedPayload(payload, aggregate = null, optio
     const annotations = Object.hasOwn(input, "annotations")
         ? input.annotations
         : undefined;
+    const data = purpose === "impossibility"
+        ? normalizeImpossibilityData(
+            requireOwnField(input, "data", "data"),
+            command,
+        )
+        : harnessReplicated
+            ? normalizeCandidateRawData(
+                requireOwnField(input, "data", "data"),
+                command,
+                {
+                    contract: aggregate?.contract ?? null,
+                    candidateArtifactHash:
+                        receipt?.candidateArtifactHash ?? null,
+                    purpose,
+                },
+            )
+            : purpose === "validation"
+                ? normalizeValidationRawData(
+                    requireOwnField(input, "data", "data"),
+                    command,
+                    aggregate?.contract ?? null,
+                )
+                : immutableCanonical(requireOwnField(input, "data", "data"));
+    if (receipt !== null) {
+        assertRawObservationReceiptBindings(receipt, data, purpose);
+    }
     return immutableCanonical({
         commandId,
         observationId: normalizeEventIdentifier(
@@ -594,10 +989,10 @@ export function normalizeCommandObservedPayload(payload, aggregate = null, optio
         slotIndex: harnessCandidate
             ? requireNonNegativeInteger(slotIndex ?? command?.slotIndex, "slotIndex")
             : null,
-        candidateId: harnessCandidate
+        candidateId: harnessReplicated
             ? normalizeEventIdentifier(candidateId ?? command?.candidateId, "candidateId")
             : null,
-        annotations: purpose === "candidate"
+        annotations: purpose === "candidate" || harnessReplicated
             ? normalizeAnnotations(
                 annotations,
                 aggregate?.contract?.searchPolicy?.promptCaps?.promptContextRefs
@@ -616,14 +1011,10 @@ export function normalizeCommandObservedPayload(payload, aggregate = null, optio
                         ?? command?.parentEvidenceIds
                         ?? [],
                 },
+                harnessReplicated ? commandHypotheses : undefined,
             )
             : null,
-        data: purpose === "impossibility"
-            ? normalizeImpossibilityData(
-                requireOwnField(input, "data", "data"),
-                command,
-            )
-            : immutableCanonical(requireOwnField(input, "data", "data")),
+        data,
     });
 }
 

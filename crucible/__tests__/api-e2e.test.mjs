@@ -70,7 +70,7 @@ function makeWorkspace() {
     for (const [id, score] of [
         ["search", "100\n"],
         ["confirmation", "100\n"],
-        ["challenge", "10\n"],
+        ["challenge", "-1\n"],
         ["novelty", "100\n"],
         ["candidate-a", "10\n"],
         ["candidate-b", "20\n"],
@@ -203,7 +203,12 @@ function startArgs(workspace, overrides = {}) {
         objective: "e2e",
         project_dir: projectDir,
         harness_suite_id: "score-suite",
-        acceptance_predicate: { kind: "harness_pass" },
+        acceptance_predicate: {
+            kind: "metric_compare",
+            metric: "score",
+            operator: ">=",
+            value: 0,
+        },
         hypothesis_topology: "open_generative",
         observable_registry: fakeObservableRegistry().map((observable) => ({
             ...observable,
@@ -215,7 +220,7 @@ function startArgs(workspace, overrides = {}) {
             metrics: statisticalPolicy.metrics.map((metric) => ({
                 ...metric,
                 maximum: 100,
-                acceptanceThreshold: 90,
+                acceptanceThreshold: 0,
                 practicalEquivalenceDelta: 1,
             })),
         },
@@ -345,43 +350,49 @@ function makeDeps(workspace, candidateContent) {
 }
 
 describe("joined Crucible API execution", () => {
-    it("keeps a search-only accepted candidate behind the scientific closure gate", async () => {
+    it("runs held-out roles before exposing a verified result", async () => {
         const workspace = makeWorkspace();
-        const joined = makeDeps(workspace, () => "accept-without-metric\n");
+        const joined = makeDeps(workspace, () => "95\n");
         const started = await startInvestigation(
             startArgs(workspace),
             joined.deps,
         );
 
         expect(await joined.waitForRunner()).toMatchObject({
-            kind: "NON_RESULT",
-            code: "SCIENTIFIC_CONFIRMATION_REQUIRED",
+            kind: "TERMINAL",
+            decision: "VERIFIED_RESULT",
         });
         expect(statusInvestigation({
             investigation_id: started.investigation_id,
         }, joined.deps)).toMatchObject({
             is_result: false,
             investigation_id: started.investigation_id,
-            terminal_available: false,
-            non_result: true,
-            non_result_code: "SCIENTIFIC_CONFIRMATION_REQUIRED",
+            terminal_available: true,
         });
 
         const repository = openRepositoryReadOnly({ file: started.events_db_path });
+        let candidate;
         try {
             const aggregate = createDomainRepositoryAdapter({
                 repository,
                 investigationId: started.investigation_id,
                 ensure: false,
             }).replay().aggregate;
-            const candidate = aggregate.evidenceOrder
+            candidate = aggregate.evidenceOrder
                 .map((evidenceId) => aggregate.evidence[evidenceId])
                 .find((evidence) => evidence.purpose === "candidate");
             expect(candidate).toMatchObject({
                 acceptanceSatisfied: true,
                 outcomeClass: "accepted",
-                rankable: false,
+                rankable: true,
             });
+            expect(aggregate.evidenceOrder
+                .map((evidenceId) => aggregate.evidence[evidenceId].purpose))
+                .toEqual(expect.arrayContaining([
+                    "candidate",
+                    "confirmation",
+                    "challenge",
+                ]));
         } finally {
             repository.close();
         }
@@ -390,13 +401,11 @@ describe("joined Crucible API execution", () => {
             investigation_id: started.investigation_id,
         }, joined.deps);
         expect(result).toMatchObject({
-            is_result: false,
-            non_result: true,
-            non_result_code: "SCIENTIFIC_CONFIRMATION_REQUIRED",
+            is_result: true,
+            decision: "VERIFIED_RESULT",
+            candidate_id: candidate.candidateId,
+            evidence_id: candidate.evidenceId,
         });
-        expect(result).not.toHaveProperty("decision");
-        expect(result).not.toHaveProperty("candidate_id");
-        expect(result).not.toHaveProperty("evidence_id");
     }, 60_000);
 
     it("requires independent verification after the real runner exhausts bounded ids", async () => {
@@ -422,6 +431,12 @@ describe("joined Crucible API execution", () => {
         });
         const started = await startInvestigation(startArgs(workspace, {
             hypothesis_topology: "finite_enumerable",
+            acceptance_predicate: {
+                kind: "metric_compare",
+                metric: "score",
+                operator: ">=",
+                value: 90,
+            },
             candidates_per_round: 1,
             max_rounds: 2,
             enumerand_manifest: {

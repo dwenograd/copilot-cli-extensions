@@ -75,7 +75,20 @@ const MAX_ALLOWLIST_BYTES = 1 * 1024 * 1024;
 // Known argv template placeholders. Only these are substituted; any other
 // `{{...}}` pattern in a template argv is rejected at load time so that a
 // new placeholder cannot be silently misused as opaque data.
-export const ARGV_PLACEHOLDERS = Object.freeze(["candidatePath", "attemptId"]);
+export const ARGV_PLACEHOLDERS = Object.freeze([
+    "candidatePath",
+    "attemptId",
+    "role",
+    "phase",
+    "replicateIndex",
+    "blockIndex",
+    "armIndex",
+    "armId",
+    "deterministicSeed",
+    "subjectId",
+    "environmentIdentity",
+    "suiteIdentity",
+]);
 
 const SAFE_ID = /^(?!.*\.\.)[a-z0-9][a-z0-9._-]{0,127}$/u;
 const ENV_KEY = /^[A-Z_][A-Z0-9_]{0,127}$/u;

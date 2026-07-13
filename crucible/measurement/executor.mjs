@@ -61,6 +61,7 @@ import {
 import {
     PARSER_MAX_INPUT_BYTES,
     PARSER_VERSION,
+    normalizeHarnessResultBinding,
     parseHarnessResult,
 } from "./parser.mjs";
 import { MEASUREMENT_LIFECYCLE_ADAPTER } from "./private-adapters.mjs";
@@ -143,6 +144,7 @@ function substituteArgv(template, substitutions) {
                 `unknown argv placeholder {{${name}}}`,
             );
         }
+
         const value = substitutions[name];
         if (typeof value !== "string" || value.length === 0) {
             throw new MeasurementError(
@@ -152,6 +154,22 @@ function substituteArgv(template, substitutions) {
         }
         return value;
     }));
+}
+
+function bindingArgv(binding) {
+    if (binding === null) return [];
+    return [
+        `--crucible-role=${binding.role}`,
+        `--crucible-phase=${binding.phase}`,
+        `--crucible-replicate-index=${binding.replicateIndex}`,
+        `--crucible-block-index=${binding.blockIndex}`,
+        `--crucible-arm-index=${binding.armIndex}`,
+        `--crucible-arm-id=${binding.armId}`,
+        `--crucible-deterministic-seed=${binding.deterministicSeed}`,
+        `--crucible-subject-id=${binding.subjectId}`,
+        `--crucible-environment-identity=${binding.environmentIdentity}`,
+        `--crucible-suite-identity=${binding.suiteIdentity}`,
+    ];
 }
 
 function validateCandidateSnapshot(snapshot) {
@@ -801,6 +819,13 @@ async function runOnce({
     const snapshot = validateCandidateSnapshot(runInput.candidateSnapshot);
     const attemptId = validateIdentifier(runInput.attemptId, "attemptId");
     const runnerEpochId = validateIdentifier(runInput.runnerEpochId, "runnerEpochId");
+    const measurementBinding = runInput.measurementBinding === undefined
+        || runInput.measurementBinding === null
+        ? null
+        : normalizeHarnessResultBinding(runInput.measurementBinding, {
+            field: "run().measurementBinding",
+            required: true,
+        });
     const deadlineMs = normalizeDeadline(runInput.deadlineMs);
     const budgetLimits = byteLedger.snapshot(attemptId).limits;
     const casBudget = byteLedger.consumeCas(
@@ -847,13 +872,26 @@ async function runOnce({
         const concreteArgv = substituteArgv(entry.argvTemplate, {
             candidatePath: stagedSnapshot.path,
             attemptId,
+            role: measurementBinding?.role ?? "none",
+            phase: measurementBinding?.phase ?? "none",
+            replicateIndex: String(measurementBinding?.replicateIndex ?? 0),
+            blockIndex: String(measurementBinding?.blockIndex ?? 0),
+            armIndex: String(measurementBinding?.armIndex ?? 0),
+            armId: measurementBinding?.armId ?? "none",
+            deterministicSeed: measurementBinding?.deterministicSeed ?? "none",
+            subjectId: measurementBinding?.subjectId ?? "none",
+            environmentIdentity: measurementBinding?.environmentIdentity ?? "none",
+            suiteIdentity: measurementBinding?.suiteIdentity ?? "none",
         });
         const spawnExecutable = stagedRun.executable.path;
-        const spawnArgv = rewriteDependencyArgv(
+        const spawnArgv = [
+            ...rewriteDependencyArgv(
             entry,
             concreteArgv,
             stagedRun.dependencies,
-        );
+            ),
+            ...bindingArgv(measurementBinding),
+        ];
 
         // The child never receives a source cwd. Any required relative layout
         // was preserved under stagedRun.cwd or the configuration was refused.
@@ -869,6 +907,21 @@ async function runOnce({
         env.CANDIDATE_SNAPSHOT_PATH = stagedSnapshot.path;
         env.CRUCIBLE_ATTEMPT_ID = attemptId;
         env.CRUCIBLE_RUNNER_EPOCH_ID = runnerEpochId;
+        if (measurementBinding !== null) {
+            env.CRUCIBLE_ROLE = measurementBinding.role;
+            env.CRUCIBLE_PHASE = measurementBinding.phase;
+            env.CRUCIBLE_REPLICATE_INDEX =
+                String(measurementBinding.replicateIndex);
+            env.CRUCIBLE_BLOCK_INDEX = String(measurementBinding.blockIndex);
+            env.CRUCIBLE_ARM_INDEX = String(measurementBinding.armIndex);
+            env.CRUCIBLE_ARM_ID = measurementBinding.armId;
+            env.CRUCIBLE_DETERMINISTIC_SEED =
+                measurementBinding.deterministicSeed;
+            env.CRUCIBLE_SUBJECT_ID = measurementBinding.subjectId;
+            env.CRUCIBLE_ENVIRONMENT_IDENTITY =
+                measurementBinding.environmentIdentity;
+            env.CRUCIBLE_SUITE_IDENTITY = measurementBinding.suiteIdentity;
+        }
 
         const argvHash = hashArgv(spawnArgv);
         const envHash = hashEnv(env);
@@ -1194,6 +1247,7 @@ async function runOnce({
                 outputCapture,
                 parserVersion: PARSER_VERSION,
                 sandbox,
+                measurementBinding,
                 attemptId,
                 runnerEpochId,
                 startedAt,
@@ -1218,6 +1272,23 @@ async function runOnce({
             }
             return receipt;
         };
+        let capturedOutputPublished = false;
+        const publishCapturedOutput = async () => {
+            if (capturedOutputPublished || onCapturedOutput === null) return;
+            await onCapturedOutput(Object.freeze({
+                attemptId,
+                runnerEpochId,
+                stdout: Buffer.from(stdoutBytes),
+                stderr: Buffer.from(stderrBytes),
+                stdoutHash,
+                stderrHash,
+                outputCapture,
+                launchPath: capability === null
+                    ? "host-process-adapter"
+                    : "sandbox-capability",
+            }));
+            capturedOutputPublished = true;
+        };
 
         // Timeout / overflow: reject BEFORE attempting to parse. Even if the
         // partial output happens to contain valid JSON, the run itself was not
@@ -1231,6 +1302,7 @@ async function runOnce({
         }
         if (outcome.timedOut) {
             const receipt = buildReceiptFor(null, true);
+            await publishCapturedOutput();
             throw new MeasurementError(
                 MEASUREMENT_ERROR_CODES.TIMEOUT,
                 `harness ${entry.id} exceeded timeout of ${effectiveTimeoutMs}ms`,
@@ -1250,6 +1322,7 @@ async function runOnce({
         }
         if (outcome.overflowStream !== null) {
             const receipt = buildReceiptFor(null, false);
+            await publishCapturedOutput();
             throw new MeasurementError(
                 MEASUREMENT_ERROR_CODES.OUTPUT_OVERFLOW,
                 `harness ${entry.id} exceeded ${outcome.overflowStream} cap`,
@@ -1274,6 +1347,7 @@ async function runOnce({
         }
         if (outcome.exit.code !== 0 || outcome.exit.signal !== null) {
             const receipt = buildReceiptFor(null, false);
+            await publishCapturedOutput();
             throw new MeasurementError(
                 MEASUREMENT_ERROR_CODES.NONZERO_EXIT,
                 `harness ${entry.id} exited non-zero`,
@@ -1290,29 +1364,42 @@ async function runOnce({
         // Parse result. The parser is strict — anything wrong throws
         // ResultParseError which the caller sees directly.
         if (stdoutBytes.length > PARSER_MAX_INPUT_BYTES) {
+            const receipt = buildReceiptFor(null, false);
+            await publishCapturedOutput();
             throw new MeasurementError(
                 MEASUREMENT_ERROR_CODES.PARSE_OVERSIZED,
                 `harness result exceeds parser maximum of ${PARSER_MAX_INPUT_BYTES} bytes`,
-                { bytes: stdoutBytes.length },
+                { bytes: stdoutBytes.length, receipt, outputCapture },
             );
         }
         const rawStdoutText = stdoutBytes.toString("utf8");
-        const parsed = parseHarnessResult(rawStdoutText);
-        const receipt = buildReceiptFor(parsed, false);
-        if (onCapturedOutput !== null) {
-            await onCapturedOutput(Object.freeze({
-                attemptId,
-                runnerEpochId,
-                stdout: Buffer.from(stdoutBytes),
-                stderr: Buffer.from(stderrBytes),
-                stdoutHash,
-                stderrHash,
+        let parsed;
+        try {
+            parsed = parseHarnessResult(rawStdoutText);
+            if (measurementBinding !== null) {
+                if (parsed.role !== null) {
+                    parsed = parseHarnessResult(rawStdoutText, {
+                        expectedBinding: measurementBinding,
+                    });
+                } else {
+                    parsed = immutableCanonical({
+                        ...parsed,
+                        ...measurementBinding,
+                    });
+                }
+            }
+        } catch (error) {
+            const receipt = buildReceiptFor(null, false);
+            await publishCapturedOutput();
+            error.details = {
+                ...(error?.details ?? {}),
+                receipt,
                 outputCapture,
-                launchPath: capability === null
-                    ? "host-process-adapter"
-                    : "sandbox-capability",
-            }));
+            };
+            throw error;
         }
+        const receipt = buildReceiptFor(parsed, false);
+        await publishCapturedOutput();
 
         return immutableCanonical({
             receipt,

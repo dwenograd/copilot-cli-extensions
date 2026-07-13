@@ -218,6 +218,51 @@ describe("Crucible prompt context", () => {
         expect(context.plateau.notice).toMatch(/mandatory escape phase/);
     });
 
+    it("never exposes confirmation/challenge manifests, ids, bytes, or raw results", () => {
+        const archive = baseArchive();
+        archive.confirmation = {
+            evidenceId: "confirmation-evidence-secret",
+            protocolManifest: "confirmation-manifest-secret",
+            rawBytes: "confirmation-bytes-secret",
+            rawResult: "confirmation-result-secret",
+        };
+        archive.challenge = {
+            evidenceId: "challenge-evidence-secret",
+            protocolManifest: "challenge-manifest-secret",
+            rawBytes: "challenge-bytes-secret",
+            rawResult: "challenge-result-secret",
+        };
+        archive.accepted[0] = {
+            ...archive.accepted[0],
+            confirmationFreezeHash: "freeze-hash-secret",
+            protocolManifestHash: "protocol-hash-secret",
+            rawAuthorityDigest: "raw-authority-secret",
+        };
+
+        const { context } = buildPromptContext({
+            slot: baseSlot(),
+            contract: CONTRACT,
+            archive,
+            plateau: MANDATORY_ESCAPE_PLATEAU,
+        });
+        const serialized = canonicalJson(context);
+        for (const secret of [
+            "confirmation-evidence-secret",
+            "confirmation-manifest-secret",
+            "confirmation-bytes-secret",
+            "confirmation-result-secret",
+            "challenge-evidence-secret",
+            "challenge-manifest-secret",
+            "challenge-bytes-secret",
+            "challenge-result-secret",
+            "freeze-hash-secret",
+            "protocol-hash-secret",
+            "raw-authority-secret",
+        ]) {
+            expect(serialized).not.toContain(secret);
+        }
+    });
+
     it("byte-caps deterministically by dropping whole low-priority entries first", () => {
         const longMechanism = "M".repeat(160);
         const longFinding = "F".repeat(160);
@@ -265,7 +310,7 @@ describe("Crucible prompt context", () => {
                 Array.from({ length: 10 }, (_unused, index) => [artifactHash(`d${index}`), `ev-nm-${String(index).padStart(2, "0")}`]),
             ),
         };
-        const byteCap = 2048;
+        const byteCap = 3072;
         const promptContextRefs = [
             "ev-inc",
             "ev-elite",

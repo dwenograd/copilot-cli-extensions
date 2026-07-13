@@ -5,28 +5,44 @@ import {
     isAlgorithmTaggedSha256,
 } from "./canonical.mjs";
 import {
-    acceptanceSatisfied,
-    candidateMetricValues,
-    candidateMetricsRankable,
-    validationSatisfied,
-} from "./contract.mjs";
-import {
-    classifyCandidateOutcome,
     duplicateEvidenceId,
 } from "./archive.mjs";
 import { ERROR_CODES, TransitionError } from "./errors.mjs";
+import {
+    ReplicationScheduleError,
+    analyzeReplicationAttempts,
+    deriveReplicationControlBinding,
+    expectedReplicationSubjects,
+    normalizeRawMeasurementSeries,
+    normalizeReplicationSchedule,
+    replicationBlockPlan,
+} from "./replication.mjs";
+import {
+    createCandidateStatisticalClaimPlan,
+    evaluateReplicationProgress,
+    evaluateReplicatedStatisticalClaims,
+    evaluateSealedPredictions,
+    prepareReplicatedStatisticalEvaluation,
+} from "./statistical-evaluation.mjs";
+import {
+    deriveCandidateNovelty,
+} from "./novelty.mjs";
 
-export const EVIDENCE_PROVENANCE_VERSION = 1;
+export const EVIDENCE_PROVENANCE_VERSION = 2;
 export const SNAPSHOT_PROVENANCE_HASH_ALGORITHM =
     "sha256:crucible-evidence-snapshot-provenance-v1";
 export const MEASUREMENT_PROVENANCE_HASH_ALGORITHM =
     "sha256:crucible-evidence-measurement-provenance-v1";
 export const EVIDENCE_PROVENANCE_HASH_ALGORITHM =
-    "sha256:crucible-evidence-provenance-v1";
+    "sha256:crucible-evidence-provenance-v2";
 export const SNAPSHOT_EXECUTION_HASH_ALGORITHM =
     "sha256:crucible-evidence-snapshot-execution-v1";
 export const OBSERVATION_STREAM_HASH_ALGORITHM =
     "sha256:crucible-runtime-observation-streams-v1";
+export const RAW_OBSERVATION_AUTHORITY_HASH_ALGORITHM =
+    "sha256:crucible-raw-observation-authority-v1";
+export const STATISTICAL_CACHE_HASH_ALGORITHM =
+    "sha256:crucible-statistical-cache-v1";
 
 const OBJECT_ID_RE = /^sha256:([a-f0-9]{64})$/u;
 const SNAPSHOT_HASH_RE =
@@ -51,12 +67,14 @@ const MEASUREMENT_KEYS = Object.freeze([
     "harnessEntryHash",
     "measurementRoot",
     "parserVersion",
+    "phase",
     "rawStderrArtifact",
     "rawStderrHash",
     "rawStdoutArtifact",
     "rawStdoutHash",
     "receiptArtifact",
     "receiptHash",
+    "role",
     "sandboxPolicy",
     "snapshot",
     "snapshotExecutionHash",
@@ -71,6 +89,8 @@ const PROVENANCE_KEYS = Object.freeze([
     "measurements",
     "promptContextHash",
     "proposalArtifact",
+    "replicationCompositeArtifact",
+    "replicationScheduleArtifact",
     "validationCompositeArtifact",
     "version",
 ]);
@@ -340,6 +360,8 @@ function normalizeMeasurementCore(value, field) {
     }
     return {
         subjectId: requireIdentifier(input.subjectId, `${field}.subjectId`),
+        role: requireIdentifier(input.role, `${field}.role`),
+        phase: requireIdentifier(input.phase, `${field}.phase`),
         receiptArtifact,
         receiptHash,
         rawStdoutArtifact,
@@ -418,12 +440,13 @@ export function deriveEvidenceProvenanceRoot(provenance) {
 
 function expectedMeasurementSubjects(purpose, command, contract) {
     if (purpose === "validation") {
-        return (command?.validationCases ?? contract?.validationCases ?? [])
-            .map((item) => item.id)
+        return (command?.validationSeries ?? [])
+            .flatMap((series) =>
+                replicationBlockPlan(
+                    series.replicationSchedule,
+                    command.attemptIndex,
+                ).arms.map((arm) => arm.subjectId))
             .sort();
-    }
-    if (purpose === "candidate") {
-        return [command?.candidateId ?? null];
     }
     if (purpose === "impossibility") {
         return [`impossibility-${command?.attemptOrdinal ?? ""}`];
@@ -431,46 +454,202 @@ function expectedMeasurementSubjects(purpose, command, contract) {
     return [];
 }
 
+function replicatedCandidatePurpose(purpose) {
+    return purpose === "candidate"
+        || purpose === "confirmation"
+        || purpose === "challenge";
+}
+
+function replicatedRole(purpose, command) {
+    return purpose === "candidate"
+        ? "search"
+        : command?.harnessRole ?? purpose;
+}
+
+function replicatedPhase(purpose, command) {
+    return purpose === "candidate"
+        ? "search"
+        : command?.harnessRole ?? purpose;
+}
+
 function assertPurposeShape(provenance, { purpose, command, contract }) {
     const subjects = provenance.measurements.map((item) => item.subjectId);
     const expectedSubjects = expectedMeasurementSubjects(purpose, command, contract);
-    if (!canonicalEqual(subjects, expectedSubjects)) {
+    if (!replicatedCandidatePurpose(purpose)
+        && !canonicalEqual(subjects, expectedSubjects)) {
         fail("receipt.provenance measurements do not match the reserved command subjects", {
             purpose,
             subjects,
             expectedSubjects,
         });
     }
-    if (provenance.measurements.some((item) =>
-        item.parserVersion !== contract?.parserVersion)) {
-        fail("receipt.provenance parser identity does not match the frozen contract");
+    for (const measurement of provenance.measurements) {
+        const role = contract?.harnessSuite?.roles?.[measurement.role];
+        const parserVersion = role?.parser?.version
+            ?? contract?.parserVersion;
+        if (parserVersion === undefined
+            || measurement.parserVersion !== parserVersion
+            || (contract?.harnessSuite !== undefined && role === undefined)) {
+            fail("receipt.provenance role identity does not match the frozen contract", {
+                role: measurement.role,
+                subjectId: measurement.subjectId,
+            });
+        }
     }
     if (purpose === "validation") {
         if (provenance.proposalArtifact !== null
             || provenance.promptContextHash !== null
             || provenance.impossibilityCertificateArtifact !== null
             || provenance.measurementReuseArtifact !== null
+            || provenance.replicationScheduleArtifact !== null
+            || provenance.replicationCompositeArtifact !== null
             || provenance.validationCompositeArtifact === null) {
             fail("Validation provenance has an invalid purpose-specific artifact shape");
         }
-        const byId = new Map(
-            (command?.validationCases ?? contract?.validationCases ?? [])
-                .map((item) => [item.id, item]),
+        const bySubject = new Map(
+            (command?.validationSeries ?? []).flatMap((series) =>
+                replicationBlockPlan(
+                    series.replicationSchedule,
+                    command.attemptIndex,
+                ).arms.map((arm) => [
+                    arm.subjectId,
+                    {
+                        artifactHash: series.artifactHash,
+                        role: series.role,
+                    },
+                ])),
         );
         for (const measurement of provenance.measurements) {
-            if (measurement.snapshot.manifestArtifact.objectId
-                !== byId.get(measurement.subjectId)?.artifactHash) {
+            const expected = bySubject.get(measurement.subjectId);
+            if (measurement.role !== expected?.role
+                || measurement.phase !== "calibration"
+                || measurement.snapshot.manifestArtifact.objectId
+                    !== expected?.artifactHash) {
                 fail("Validation provenance snapshot does not match the frozen case artifact");
             }
         }
         return;
     }
     if (purpose === "candidate") {
+        const schedule = normalizeReplicationSchedule(
+            command?.replicationSchedule,
+        );
+        const searchMeasurements = provenance.measurements.filter(
+            (measurement) => measurement.role === "search",
+        );
+        const noveltyMeasurements = provenance.measurements.filter(
+            (measurement) => measurement.role === "novelty",
+        );
+        if (searchMeasurements.length + noveltyMeasurements.length
+            !== provenance.measurements.length
+            || noveltyMeasurements.length > 1) {
+            fail("Candidate provenance contains an unsupported measurement role");
+        }
+        if (searchMeasurements.some((measurement) =>
+            measurement.phase !== "search")
+            || noveltyMeasurements.some((measurement) =>
+                measurement.phase !== "novelty")) {
+            fail("Candidate provenance measurement phases do not match their roles");
+        }
+        if (searchMeasurements.length % schedule.arms.length !== 0) {
+            fail("Candidate provenance must contain complete replicate blocks");
+        }
+        const blockCount = searchMeasurements.length / schedule.arms.length;
+        if (blockCount < schedule.minBlocks || blockCount > schedule.maxBlocks) {
+            fail("Candidate provenance block count is outside the frozen schedule", {
+                blockCount,
+                minBlocks: schedule.minBlocks,
+                maxBlocks: schedule.maxBlocks,
+            });
+        }
+        const scheduledSubjects = [...expectedReplicationSubjects(
+            schedule,
+            blockCount,
+        )].sort();
+        const searchSubjects = searchMeasurements
+            .map((measurement) => measurement.subjectId)
+            .sort();
+        if (!canonicalEqual(searchSubjects, scheduledSubjects)) {
+            fail("Candidate provenance measurements do not match the frozen replicate schedule", {
+                subjects: searchSubjects,
+                expectedSubjects: scheduledSubjects,
+            });
+        }
+        if (noveltyMeasurements.length === 1) {
+            const bySubject = new Map(
+                searchMeasurements.map((measurement) => [
+                    measurement.subjectId,
+                    measurement,
+                ]),
+            );
+            const candidateSnapshots = [];
+            for (let blockIndex = 0; blockIndex < blockCount; blockIndex += 1) {
+                for (const arm of replicationBlockPlan(schedule, blockIndex).arms) {
+                    if (arm.armId === "candidate") {
+                        candidateSnapshots.push(
+                            bySubject.get(arm.subjectId)?.snapshot?.snapshotHash
+                                ?? null,
+                        );
+                    }
+                }
+            }
+            if (candidateSnapshots.length !== blockCount
+                || new Set(candidateSnapshots).size !== 1
+                || noveltyMeasurements[0].snapshot.snapshotHash
+                    !== candidateSnapshots[0]) {
+                fail("Novelty measurement is not bound to the immutable candidate snapshot");
+            }
+        }
         if (provenance.proposalArtifact === null
             || provenance.promptContextHash === null
+            || provenance.replicationScheduleArtifact === null
+            || provenance.replicationCompositeArtifact === null
             || provenance.validationCompositeArtifact !== null
             || provenance.impossibilityCertificateArtifact !== null) {
             fail("Candidate provenance has an invalid purpose-specific artifact shape");
+        }
+        return;
+    }
+    if (purpose === "confirmation" || purpose === "challenge") {
+        const schedule = normalizeReplicationSchedule(
+            command?.replicationSchedule,
+        );
+        const role = replicatedRole(purpose, command);
+        const phase = replicatedPhase(purpose, command);
+        if (provenance.measurements.some((measurement) =>
+            measurement.role !== role || measurement.phase !== phase)) {
+            fail(
+                `${purpose} provenance measurement phases do not match the frozen role`,
+            );
+        }
+        if (provenance.measurements.length % schedule.arms.length !== 0) {
+            fail(`${purpose} provenance must contain complete replicate blocks`);
+        }
+        const blockCount = provenance.measurements.length / schedule.arms.length;
+        if (blockCount < schedule.minBlocks || blockCount > schedule.maxBlocks) {
+            fail(`${purpose} provenance block count is outside the frozen schedule`, {
+                blockCount,
+                minBlocks: schedule.minBlocks,
+                maxBlocks: schedule.maxBlocks,
+            });
+        }
+        const scheduledSubjects = [...expectedReplicationSubjects(
+            schedule,
+            blockCount,
+        )].sort();
+        if (!canonicalEqual([...subjects].sort(), scheduledSubjects)) {
+            fail(
+                `${purpose} provenance measurements do not match the frozen replicate schedule`,
+            );
+        }
+        if (provenance.proposalArtifact !== null
+            || provenance.promptContextHash !== null
+            || provenance.validationCompositeArtifact !== null
+            || provenance.impossibilityCertificateArtifact !== null
+            || provenance.measurementReuseArtifact !== null
+            || provenance.replicationScheduleArtifact === null
+            || provenance.replicationCompositeArtifact === null) {
+            fail(`${purpose} provenance has an invalid purpose-specific artifact shape`);
         }
         return;
     }
@@ -479,6 +658,8 @@ function assertPurposeShape(provenance, { purpose, command, contract }) {
             || provenance.promptContextHash !== null
             || provenance.validationCompositeArtifact !== null
             || provenance.measurementReuseArtifact !== null
+            || provenance.replicationScheduleArtifact !== null
+            || provenance.replicationCompositeArtifact !== null
             || provenance.impossibilityCertificateArtifact === null) {
             fail("Impossibility provenance has an invalid purpose-specific artifact shape");
         }
@@ -531,6 +712,14 @@ export function normalizeEvidenceProvenance(
             input.measurementReuseArtifact,
             "receipt.provenance.measurementReuseArtifact",
         ),
+        replicationScheduleArtifact: optionalArtifactRef(
+            input.replicationScheduleArtifact,
+            "receipt.provenance.replicationScheduleArtifact",
+        ),
+        replicationCompositeArtifact: optionalArtifactRef(
+            input.replicationCompositeArtifact,
+            "receipt.provenance.replicationCompositeArtifact",
+        ),
         measurements,
     };
     assertPurposeShape(normalized, { purpose, command, contract });
@@ -567,6 +756,14 @@ export function createEvidenceProvenance(input, context = {}) {
             input.measurementReuseArtifact ?? null,
             "receipt.provenance.measurementReuseArtifact",
         ),
+        replicationScheduleArtifact: optionalArtifactRef(
+            input.replicationScheduleArtifact ?? null,
+            "receipt.provenance.replicationScheduleArtifact",
+        ),
+        replicationCompositeArtifact: optionalArtifactRef(
+            input.replicationCompositeArtifact ?? null,
+            "receipt.provenance.replicationCompositeArtifact",
+        ),
         measurements: input.measurements
             .map((item, index) =>
                 normalizeMeasurementProvenance(
@@ -598,6 +795,8 @@ export function artifactRefsFromProvenance(provenance) {
     add(provenance.validationCompositeArtifact);
     add(provenance.impossibilityCertificateArtifact);
     add(provenance.measurementReuseArtifact);
+    add(provenance.replicationScheduleArtifact);
+    add(provenance.replicationCompositeArtifact);
     for (const measurement of provenance.measurements) {
         add(measurement.receiptArtifact);
         add(measurement.rawStdoutArtifact);
@@ -628,35 +827,513 @@ function ownEntry(record, key) {
     return Object.hasOwn(record, key) ? record[key] : null;
 }
 
+export function deriveRawObservationAuthorityDigest(
+    aggregate,
+    observation,
+    command = ownEntry(
+        aggregate.commands,
+        observation.commandId,
+    )?.command ?? null,
+) {
+    const {
+        observedSeq: _observedSeq,
+        evidenceId: _evidenceId,
+        rawAuthorityDigest: _rawAuthorityDigest,
+        ...rawObservation
+    } = observation;
+    return hashCanonical({
+        contractHash: aggregate.contractHash,
+        statisticalPolicyIdentity:
+            aggregate.contract?.statisticalPolicyIdentity ?? null,
+        command,
+        observation: rawObservation,
+    }, RAW_OBSERVATION_AUTHORITY_HASH_ALGORITHM);
+}
+
+function normalizedReplicatedCandidateAttempts(observation, command) {
+    const role = replicatedRole(observation.purpose, command);
+    const phase = replicatedPhase(observation.purpose, command);
+    return normalizeRawMeasurementSeries(
+        observation.data.series[0],
+        {
+            schedule: command.replicationSchedule,
+            role,
+            phase,
+            caseId: null,
+        },
+    ).attempts;
+}
+
+function normalizedCandidateEvaluation(
+    aggregate,
+    command,
+    attempts,
+    claimPlan,
+    parentEvidence,
+    prepared,
+) {
+    return evaluateReplicatedStatisticalClaims({
+        contract: aggregate.contract,
+        schedule: command.replicationSchedule,
+        attempts,
+        claims: claimPlan.acceptanceClaims,
+        requiredClaimIds: claimPlan.acceptanceClaimIds,
+        allocationClaims: claimPlan.allocationClaims,
+        parentEvidence,
+        prepared,
+    });
+}
+
+function replicationControlBinding(
+    aggregate,
+    command,
+    attempts,
+    provenance,
+) {
+    const schedule = normalizeReplicationSchedule(command.replicationSchedule);
+    const analysis = analyzeReplicationAttempts({ schedule, attempts });
+    const measurementBySubject = new Map(
+        provenance.measurements.map((measurement) => [
+            measurement.subjectId,
+            measurement,
+        ]),
+    );
+    const controlSnapshotHashes = analysis.completeBlocks.flatMap(
+        (block) => replicationBlockPlan(
+            schedule,
+            block.blockIndex,
+        ).arms.filter((arm) => arm.armId === "control")
+            .map((arm) =>
+                measurementBySubject.get(arm.subjectId)
+                    ?.snapshot?.snapshotHash ?? null),
+    );
+    if (controlSnapshotHashes.some((hash) => hash === null)) {
+        throw new ReplicationScheduleError(
+            "replicated evidence is missing a scheduled control artifact",
+        );
+    }
+    return deriveReplicationControlBinding({
+        contractHash: aggregate.contractHash,
+        statisticalPolicy: aggregate.contract.statisticalPolicy,
+        schedule,
+        enumerandManifest:
+            aggregate.contract.enumerandManifest ?? null,
+        manifestOptions: {
+            topology: aggregate.contract.hypothesisTopology,
+            observableRegistry:
+                aggregate.contract.observableRegistry,
+            hypothesisPolicy:
+                aggregate.contract.hypothesisPolicy,
+        },
+        controlSnapshotHashes,
+        requireObservedControl: true,
+    });
+}
+
+function validationControlBindings(aggregate, command) {
+    try {
+        return command.validationSeries.map((series) =>
+            deriveReplicationControlBinding({
+                contractHash: aggregate.contractHash,
+                statisticalPolicy: aggregate.contract.statisticalPolicy,
+                schedule: series.replicationSchedule,
+                enumerandManifest:
+                    aggregate.contract.enumerandManifest ?? null,
+                manifestOptions: {
+                    topology: aggregate.contract.hypothesisTopology,
+                    observableRegistry:
+                        aggregate.contract.observableRegistry,
+                    hypothesisPolicy:
+                        aggregate.contract.hypothesisPolicy,
+                },
+            }));
+    } catch (error) {
+        if (!(error instanceof ReplicationScheduleError)) throw error;
+        throw new TransitionError(
+            ERROR_CODES.INVALID_EVIDENCE,
+            `Validation control binding is invalid: ${error.message}`,
+            error.details ?? null,
+        );
+    }
+}
+
+function parentPredictionEvidence(aggregate, claimPlan) {
+    const parentIds = [...new Set(
+        claimPlan.predictionBindings
+            .map((binding) =>
+                binding.reference?.kind === "assigned_parent"
+                    ? binding.reference.evidenceId
+                    : null)
+            .filter((evidenceId) => evidenceId !== null),
+    )].sort();
+    const result = {};
+    for (const evidenceId of parentIds) {
+        const evidence = ownEntry(aggregate.evidence, evidenceId);
+        const observation = evidence === null
+            ? null
+            : ownEntry(aggregate.observations, evidence.observationId);
+        const command = observation === null
+            ? null
+            : ownEntry(aggregate.commands, observation.commandId)?.command ?? null;
+        if (evidence === null
+            || observation === null
+            || command?.kind !== "search_candidate"
+            || observation.data?.series?.[0] === undefined) {
+            result[evidenceId] = {
+                evidenceId,
+                evidenceHash: evidence?.commitEventHash ?? null,
+                rawAuthorityDigest: evidence?.rawAuthorityDigest ?? null,
+                scheduleHash: command?.replicationSchedule?.scheduleHash ?? null,
+                invalidated: true,
+                blocks: [],
+            };
+            continue;
+        }
+        const attempts = normalizedReplicatedCandidateAttempts(
+            observation,
+            command,
+        );
+        const analysis = analyzeReplicationAttempts({
+            schedule: command.replicationSchedule,
+            attempts,
+        });
+        const excluded = new Set(
+            (evidence.statisticalEvaluation?.exclusions ?? [])
+                .map((item) => item.blockIndex),
+        );
+        result[evidenceId] = {
+            evidenceId,
+            evidenceHash: evidence.commitEventHash,
+            rawAuthorityDigest: evidence.rawAuthorityDigest,
+            scheduleHash: command.replicationSchedule.scheduleHash,
+            invalidated: evidence.invalidated === true,
+            blocks: analysis.completeBlocks.map((block) => ({
+                ...block.statisticalBlock,
+                candidate: excluded.has(block.blockIndex)
+                    ? null
+                    : block.statisticalBlock.candidate,
+            })),
+        };
+    }
+    return result;
+}
+
+function validationAttemptInputs(aggregate, observation, evidenceId) {
+    const prior = aggregate.validation.attemptEvidenceIds
+        .map((priorEvidenceId) => ownEntry(aggregate.evidence, priorEvidenceId))
+        .filter((evidence) =>
+            evidence !== null
+            && !evidence.invalidated
+            && evidence.sourceKind === "harness"
+            && evidence.purpose === "validation")
+        .map((evidence) => ({
+            evidenceId: evidence.evidenceId,
+            observation: ownEntry(aggregate.observations, evidence.observationId),
+        }));
+    return [...prior, { evidenceId, observation }]
+        .sort((left, right) =>
+            left.observation.data.attemptIndex
+            - right.observation.data.attemptIndex);
+}
+
+function validationEvaluation(aggregate, observation, evidenceId, command) {
+    const attempts = validationAttemptInputs(
+        aggregate,
+        observation,
+        evidenceId,
+    );
+    const caseById = new Map(
+        aggregate.contract.validationCases.map((item) => [item.id, item]),
+    );
+    const evaluations = command.validationSeries.flatMap((series) => {
+        const seriesAttempts = attempts.flatMap((item) => {
+            const commandRecord = ownEntry(
+                aggregate.commands,
+                item.observation.commandId,
+            )?.command ?? command;
+            const commandSeries = commandRecord.validationSeries.find(
+                (candidate) =>
+                    candidate.role === series.role
+                    && candidate.caseId === series.caseId,
+            );
+            const raw = item.observation.data.series.find(
+                (candidate) =>
+                    candidate.role === series.role
+                    && candidate.caseId === series.caseId,
+            );
+            return normalizeRawMeasurementSeries(raw, {
+                schedule: commandSeries.replicationSchedule,
+                role: series.role,
+                phase: "calibration",
+                caseId: series.caseId,
+            }).attempts;
+        });
+        const evaluation = evaluateReplicatedStatisticalClaims({
+            contract: aggregate.contract,
+            schedule: series.replicationSchedule,
+            attempts: seriesAttempts,
+            claims: aggregate.contract.validationClaimSet.claims,
+            requiredClaimIds:
+                aggregate.contract.validationClaimSet.requiredClaimIds,
+        });
+        const validationCase = caseById.get(series.caseId);
+        const expectedState = validationCase.expectedClaimState;
+        return series.coveredRoles.map((role) => ({
+            role,
+            executionRole: series.role,
+            caseId: series.caseId,
+            expectedState,
+            actualState: evaluation.requiredState,
+            satisfied: evaluation.completeValidBlocks
+                && evaluation.requiredState === expectedState,
+            evaluation,
+        }));
+    }).sort((left, right) =>
+        `${left.role}\0${left.caseId}`.localeCompare(
+            `${right.role}\0${right.caseId}`,
+        ));
+    const basisEvidenceIds = attempts.map((item) => item.evidenceId);
+    return immutableCanonical({
+        attemptIndex: observation.data.attemptIndex,
+        attemptCount: attempts.length,
+        basisEvidenceIds,
+        satisfied: evaluations.length > 0
+            && evaluations.every((item) => item.satisfied),
+        evaluations,
+    });
+}
+
+function candidateOutcome(evaluation) {
+    if (evaluation.requiredState === "SUPPORTED") return "accepted";
+    if (evaluation.requiredState === "REFUTED") return "rejected";
+    if (evaluation.requiredState === "INVALID") return "invalid_metrics";
+    return "inconclusive";
+}
+
+function candidateObservationContent(data) {
+    return data.series[0].completeBlocks.map((block) => {
+        const candidate = block.observations.find(
+            (observation) => observation.armId === "candidate",
+        );
+        if (candidate?.parsed === null || candidate?.parsed === undefined) {
+            return null;
+        }
+        const {
+            role: _role,
+            phase: _phase,
+            replicateIndex: _replicateIndex,
+            blockIndex: _blockIndex,
+            armIndex: _armIndex,
+            armId: _armId,
+            deterministicSeed: _deterministicSeed,
+            subjectId: _subjectId,
+            environmentIdentity: _environmentIdentity,
+            suiteIdentity: _suiteIdentity,
+            parserVersion: _parserVersion,
+            ...raw
+        } = candidate.parsed;
+        return raw;
+    });
+}
+
 export function deriveEvidencePayload(aggregate, observation, evidenceId) {
     const harnessEvidence = observation.sourceKind === "harness";
     const candidateEvidence = harnessEvidence && observation.purpose === "candidate";
+    const scientificRoleEvidence = harnessEvidence
+        && (observation.purpose === "confirmation"
+            || observation.purpose === "challenge");
+    const replicatedEvidence = candidateEvidence || scientificRoleEvidence;
     const validationEvidence = harnessEvidence && observation.purpose === "validation";
-    const accepted = candidateEvidence
-        && acceptanceSatisfied(aggregate.contract.acceptancePredicate, observation.data);
-    const metrics = candidateEvidence
-        ? candidateMetricValues(aggregate.contract.metrics, observation.data)
+    const command = ownEntry(aggregate.commands, observation.commandId)?.command ?? null;
+    const rawAuthorityDigest = harnessEvidence
+        ? deriveRawObservationAuthorityDigest(
+            aggregate,
+            observation,
+            command,
+        )
         : null;
-    const rankable = candidateEvidence
-        && candidateMetricsRankable(aggregate.contract.metrics, metrics);
+    const candidateAttempts = replicatedEvidence
+        ? normalizedReplicatedCandidateAttempts(observation, command)
+        : null;
+    if (replicatedEvidence
+        && (!Object.hasOwn(command, "hypotheses")
+            || !canonicalEqual(
+                observation.annotations?.hypotheses ?? null,
+                command.hypotheses,
+            ))) {
+        throw new TransitionError(
+            ERROR_CODES.INVALID_EVIDENCE,
+            "Replicated evidence hypotheses do not match the kernel-frozen command",
+        );
+    }
+    const claimPlan = replicatedEvidence
+        ? createCandidateStatisticalClaimPlan({
+            contract: aggregate.contract,
+            hypotheses: command.hypotheses,
+            assignedParentEvidenceIds:
+                candidateEvidence ? command.parentEvidenceIds : [],
+        })
+        : null;
+    const parentEvidence = candidateEvidence
+        ? parentPredictionEvidence(aggregate, claimPlan)
+        : {};
+    const preparedCandidateEvaluation = replicatedEvidence
+        ? prepareReplicatedStatisticalEvaluation({
+            contract: aggregate.contract,
+            schedule: command.replicationSchedule,
+            attempts: candidateAttempts,
+            parentEvidence,
+        })
+        : null;
+    const candidateEvaluation = replicatedEvidence
+        ? normalizedCandidateEvaluation(
+            aggregate,
+            command,
+            candidateAttempts,
+            claimPlan,
+            parentEvidence,
+            preparedCandidateEvaluation,
+        )
+        : null;
+    const replicationProgress = replicatedEvidence
+        ? evaluateReplicationProgress({
+            contract: aggregate.contract,
+            schedule: command.replicationSchedule,
+            attempts: candidateAttempts,
+            claims: claimPlan.acceptanceClaims,
+            requiredClaimIds: claimPlan.acceptanceClaimIds,
+        })
+        : null;
+    if (replicatedEvidence && replicationProgress.shouldContinue) {
+        throw new TransitionError(
+            ERROR_CODES.INVALID_EVIDENCE,
+            "Replicated evidence stopped before its preregistered statistical stopping rule",
+            {
+                purpose: observation.purpose,
+                blockCount: replicationProgress.blockCount,
+                minBlocks: replicationProgress.minBlocks,
+                maxBlocks: replicationProgress.maxBlocks,
+                statisticalState: replicationProgress.statisticalState,
+                goalMode:
+                    aggregate.contract.statisticalPolicy.goalMode,
+                stoppingDigest: replicationProgress.stoppingDigest,
+            },
+        );
+    }
+    let controlBinding = null;
+    if (replicatedEvidence) {
+        try {
+            controlBinding = replicationControlBinding(
+                aggregate,
+                command,
+                candidateAttempts,
+                observation.receipt.provenance,
+            );
+        } catch (error) {
+            if (!(error instanceof ReplicationScheduleError)) throw error;
+            throw new TransitionError(
+                ERROR_CODES.INVALID_EVIDENCE,
+                `Replicated control binding is invalid: ${error.message}`,
+                error.details ?? null,
+            );
+        }
+    }
+    const predictionEvaluation = candidateEvidence
+        ? evaluateSealedPredictions({
+            contract: aggregate.contract,
+            schedule: command.replicationSchedule,
+            attempts: candidateAttempts,
+            claimPlan,
+            parentEvidence,
+            prepared: preparedCandidateEvaluation,
+            evidenceId,
+            rawAuthorityDigest,
+        })
+        : null;
+    const accepted = candidateEvaluation?.requiredState === "SUPPORTED";
+    const metrics = replicatedEvidence ? candidateEvaluation.metrics : null;
+    const rankable = replicatedEvidence
+        && aggregate.contract.metrics.every((metric) =>
+            typeof metrics?.[metric.key] === "number"
+            && Number.isFinite(metrics[metric.key]));
     const allPriorCandidates = aggregate.evidenceOrder
         .map((existingId) => ownEntry(aggregate.evidence, existingId))
         .filter((evidence) =>
             evidence !== null
             && evidence.sourceKind === "harness"
             && evidence.purpose === "candidate");
-    const priorCandidates = allPriorCandidates.filter((evidence) => !evidence.invalidated);
-    const outcomeClass = candidateEvidence
-        ? classifyCandidateOutcome(aggregate.contract, observation.data, {
+    const outcomeClass = replicatedEvidence
+        ? candidateOutcome(candidateEvaluation)
+        : null;
+    const validation = validationEvidence
+        ? validationEvaluation(
+            aggregate,
+            observation,
+            evidenceId,
+            command,
+        )
+        : null;
+    const validationControls = validationEvidence
+        ? validationControlBindings(aggregate, command)
+        : [];
+    const candidateArtifactHash = replicatedEvidence
+        ? observation.receipt.candidateArtifactHash
+        : null;
+    const replication = replicatedEvidence
+        ? {
+            version: 3,
+            scheduleHash: candidateEvaluation.scheduleHash,
+            minBlocks: replicationProgress.minBlocks,
+            maxBlocks: replicationProgress.maxBlocks,
+            blockCount: candidateEvaluation.blockCount,
+            attemptCount: candidateEvaluation.attemptCount,
+            blockLedgerHash:
+                candidateEvaluation.blockLedger.hash,
+            statisticalState: candidateEvaluation.requiredState,
+            evaluationHash: candidateEvaluation.evaluationHash,
+            stopping: replicationProgress.stopping,
+            stoppingDigest: replicationProgress.stoppingDigest,
+            control: controlBinding,
+            controlTolerance: candidateEvaluation.controlTolerance,
+        }
+        : null;
+    const statisticalCacheCore = replicatedEvidence
+        ? {
+            version: 2,
+            purpose: observation.purpose,
+            replication,
             metrics,
             rankable,
-            accepted,
-            priorCandidates,
+            outcomeClass,
+            acceptanceSatisfied: accepted,
+            statisticalEvaluation: candidateEvaluation,
+            predictionEvaluation,
+        }
+        : validationEvidence
+            ? {
+                version: 1,
+                purpose: "validation",
+                validationAttemptIndex: validation.attemptIndex,
+                validationBasisEvidenceIds: validation.basisEvidenceIds,
+                validationEvaluation: validation,
+                validationSatisfied: validation.satisfied,
+                validationControlBindings: validationControls,
+            }
+            : null;
+    const novelty = candidateEvidence
+        ? deriveCandidateNovelty({
+            aggregate,
+            evidence: {
+                evidenceId,
+                observationId: observation.observationId,
+                sourceKind: observation.sourceKind,
+                purpose: observation.purpose,
+                receipt: observation.receipt,
+            },
+            observation,
+            command,
+            candidateEvaluation,
         })
-        : null;
-    const command = ownEntry(aggregate.commands, observation.commandId)?.command ?? null;
-    const candidateArtifactHash = candidateEvidence
-        ? observation.receipt.candidateArtifactHash
         : null;
 
     return {
@@ -670,15 +1347,27 @@ export function deriveEvidencePayload(aggregate, observation, evidenceId) {
         provenanceRoot: harnessEvidence
             ? observation.receipt.provenance.closureRoot
             : null,
-        contentHash: hashCanonical(observation.data),
+        contentHash: hashCanonical(
+            replicatedEvidence
+                ? candidateObservationContent(observation.data)
+                : observation.data,
+        ),
         round: candidateEvidence ? observation.round : null,
         slotIndex: candidateEvidence ? observation.slotIndex : null,
-        candidateId: candidateEvidence ? observation.candidateId : null,
+        candidateId: replicatedEvidence ? observation.candidateId : null,
         model: candidateEvidence ? command.model : null,
         operator: candidateEvidence ? command.operator : null,
         parentEvidenceIds: candidateEvidence ? command.parentEvidenceIds : [],
         promptContextRefs: candidateEvidence ? command.promptContextRefs : [],
         seed: candidateEvidence ? command.seed : null,
+        rawAuthorityDigest,
+        statisticalCacheDigest: statisticalCacheCore === null
+            ? null
+            : hashCanonical(
+                statisticalCacheCore,
+                STATISTICAL_CACHE_HASH_ALGORITHM,
+            ),
+        replication,
         boundedCandidateId: candidateEvidence ? (command.boundedCandidateId ?? null) : null,
         ...(candidateEvidence && command?.enumerand !== undefined
             ? {
@@ -691,12 +1380,30 @@ export function deriveEvidencePayload(aggregate, observation, evidenceId) {
         rankable,
         outcomeClass,
         acceptanceSatisfied: accepted,
-        annotations: candidateEvidence ? observation.annotations : null,
+        statisticalEvaluation: candidateEvaluation,
+        hypothesesIdentity:
+            claimPlan?.hypothesesIdentity ?? null,
+        predictionEvaluation,
+        novelty,
+        annotations: replicatedEvidence ? observation.annotations : null,
         duplicateOf: candidateEvidence
             ? duplicateEvidenceId(allPriorCandidates, candidateArtifactHash)
             : null,
-        validationSatisfied: validationEvidence
-            && validationSatisfied(aggregate.contract.validationCases, observation.data),
+        ...(scientificRoleEvidence
+            ? {
+                confirmationFreezeHash:
+                    command.confirmationFreezeHash,
+                candidateEvidenceId: command.candidateEvidenceId,
+                candidateEvidenceHash: command.candidateEvidenceHash,
+                roleManifestHash: command.roleManifestHash,
+                protocolManifestHash: command.protocolManifestHash,
+            }
+            : {}),
+        validationAttemptIndex: validation?.attemptIndex ?? null,
+        validationBasisEvidenceIds: validation?.basisEvidenceIds ?? [],
+        validationEvaluation: validation,
+        validationSatisfied: validation?.satisfied ?? false,
+        validationControlBindings: validationControls,
         unreachableBasis: deriveCertificateBasis(aggregate, observation),
     };
 }

@@ -55,7 +55,6 @@ export {
     requiredHarnessRoles,
     statisticalEvaluationRequirements,
     statisticalPolicyHash,
-    validationSatisfied,
 } from "./contract.mjs";
 
 export {
@@ -65,6 +64,7 @@ export {
     HYPOTHESIS_LIMITS,
     HYPOTHESIS_POLICY_IDENTITY_HASH_ALGORITHM,
     OBSERVABLE_REGISTRY_IDENTITY_HASH_ALGORITHM,
+    PREDICTION_CLAIM_ID_HASH_ALGORITHM,
     PREDICTION_IDENTITY_HASH_ALGORITHM,
     PREDICTION_KINDS,
     hypothesesIdentity,
@@ -76,6 +76,7 @@ export {
     normalizeSealedHypotheses,
     observableRegistryIdentity,
     predictionIdentity,
+    statisticalClaimsForHypotheses,
 } from "./hypotheses.mjs";
 
 export {
@@ -135,11 +136,143 @@ export {
     SEARCH_OPERATORS,
     SCIENTIFIC_TERMINAL_POLICY_VERSION,
     SOURCE_KINDS,
+    STATISTICAL_ALLOCATION_SCHEDULE,
+    STATISTICAL_CLAIM_STATES,
+    STATISTICAL_DEFAULT_SUCCESS_PROBABILITY_THRESHOLD,
+    STATISTICAL_ERROR_CODES,
+    STATISTICAL_KERNEL_VERSION,
     STATISTICAL_METRIC_DIRECTIONS,
     STATISTICAL_POLICY_HASH_ALGORITHM,
     STATISTICAL_POLICY_VERSION,
     TERMINAL_EVENT_TYPES,
+    VALIDATION_HARNESS_ROLES,
 } from "./constants.mjs";
+
+export {
+    StatisticsError,
+    aggregateRequiredClaimState,
+    claimAlphaAllocation,
+    claimSetAlphaAllocation,
+    evaluateDirectionClaim,
+    evaluateIntervalClaim,
+    evaluatePracticalEquivalence,
+    evaluateStatisticalClaims,
+    evaluateThresholdClaim,
+    hoeffdingMeanConfidenceSequence,
+    hoeffdingIndependentDifferenceConfidenceSequence,
+    hoeffdingPairedDifferenceConfidenceSequence,
+    normalizeBinaryObservation,
+    normalizeBoundedObservation,
+    statisticalAcceptanceClaimSet,
+    statisticalMetricClaims,
+    statisticalScheduleWeight,
+    supportsPracticalEquivalence,
+    supportsPracticalMargin,
+} from "./statistics.mjs";
+
+export {
+    CANDIDATE_CLAIM_PLAN_HASH_ALGORITHM,
+    CANDIDATE_CLAIM_PLAN_VERSION,
+    CONTROL_TOLERANCE_HASH_ALGORITHM,
+    PREDICTION_BLOCK_LEDGER_HASH_ALGORITHM,
+    PREDICTION_EVALUATION_HASH_ALGORITHM,
+    PREDICTION_EVALUATION_VERSION,
+    REPLICATION_STATISTICAL_SUMMARY_HASH_ALGORITHM,
+    REPLICATION_STOPPING_DIGEST_HASH_ALGORITHM,
+    STATISTICAL_EVALUATION_HASH_ALGORITHM,
+    STATISTICAL_EVALUATION_VERSION,
+    createCandidateStatisticalClaimPlan,
+    deriveControlToleranceMetadata,
+    evaluateReplicationProgress,
+    evaluateReplicatedStatisticalClaims,
+    evaluateSealedPredictions,
+    prepareReplicatedStatisticalEvaluation,
+} from "./statistical-evaluation.mjs";
+
+export {
+    BEHAVIORAL_NOVELTY_BASIS_ALGORITHM,
+    BEHAVIORAL_NOVELTY_SIGNATURE_ALGORITHM,
+    BEHAVIORAL_ROLE_FINGERPRINT_ALGORITHM,
+    CANDIDATE_NOVELTY_VERSION,
+    CONTENT_NOVELTY_SIGNATURE_ALGORITHM,
+    behavioralRoleIdentity,
+    candidateNoveltySignatures,
+    contentNoveltySignature,
+    deriveBehavioralNovelty,
+    deriveCandidateNovelty,
+    replayDerivedCandidateNovelty,
+    structuralRoleIdentity,
+    supportedBehavioralDifference,
+} from "./novelty.mjs";
+
+export {
+    CANDIDATE_COHORT_HASH_ALGORITHM,
+    CANDIDATE_COHORT_VERSION,
+    CANDIDATE_RELATION_EVIDENCE_HASH_ALGORITHM,
+    CANDIDATE_RELATIONS,
+    TIE_RESOLUTION_PLAN_HASH_ALGORITHM,
+    compareCandidatePair,
+    deriveCandidateCohortComparison,
+    summarizeCandidateCohortComparison,
+} from "./cohort.mjs";
+
+export {
+    SCIENTIFIC_CONFIRMATION_ALPHA_USE_HASH_ALGORITHM,
+    SCIENTIFIC_CONFIRMATION_CLOSURE_HASH_ALGORITHM,
+    SCIENTIFIC_CONFIRMATION_FREEZE_HASH_ALGORITHM,
+    SCIENTIFIC_CONFIRMATION_PROTOCOL_MANIFEST_HASH_ALGORITHM,
+    SCIENTIFIC_CONFIRMATION_PROTOCOL_SEED_HASH_ALGORITHM,
+    SCIENTIFIC_CONFIRMATION_ROLE_MANIFEST_HASH_ALGORITHM,
+    SCIENTIFIC_CONFIRMATION_ROLES,
+    SCIENTIFIC_CONFIRMATION_VERSION,
+    deriveScientificConfirmationFreeze,
+    deriveScientificConfirmationState,
+    nextScientificConfirmationCommand,
+    scientificConfirmationEvidenceItems,
+} from "./confirmation.mjs";
+
+export {
+    SCIENTIFIC_AGGREGATE_HASH_ALGORITHM,
+    SCIENTIFIC_ALPHA_LEDGER_HASH_ALGORITHM,
+    SCIENTIFIC_CLAIM_STATES_HASH_ALGORITHM,
+    SCIENTIFIC_CONCLUSION_HASH_ALGORITHM,
+    SCIENTIFIC_CONCLUSION_VERSION,
+    SCIENTIFIC_RAW_AUTHORITY_HASH_ALGORITHM,
+    SCIENTIFIC_REPLAY_CLOSURE_HASH_ALGORITHM,
+    SCIENTIFIC_REPLAY_VERSION,
+    deriveScientificConclusion,
+    deriveScientificReplayState,
+    materializeScientificReplayState,
+    replayDerivedCandidateEvidence,
+    scientificReplaySummary,
+} from "./scientific-replay.mjs";
+
+export {
+    REPLICATION_ARM_SEED_HASH_ALGORITHM,
+    REPLICATION_BLOCK_SEED_HASH_ALGORITHM,
+    REPLICATION_CONTROL_BINDING_HASH_ALGORITHM,
+    REPLICATION_MEASUREMENT_SUBJECT_HASH_ALGORITHM,
+    RAW_MEASUREMENT_SERIES_VERSION,
+    REPLICATION_SCHEDULE_ALGORITHM,
+    REPLICATION_SCHEDULE_HASH_ALGORITHM,
+    REPLICATION_SCHEDULE_SEED_HASH_ALGORITHM,
+    REPLICATION_SCHEDULE_VERSION,
+    REPLICATION_SUBJECT_HASH_ALGORITHM,
+    ReplicationScheduleError,
+    analyzeReplicationAttempts,
+    assertReplicationScheduleMatches,
+    assertReplicationSchedulePolicyBinding,
+    deriveReplicationControlBinding,
+    deriveReplicationSchedule,
+    deriveReplicationSubjectIdentity,
+    createRawMeasurementSeries,
+    expectedReplicationSubjects,
+    normalizeReplicationSchedule,
+    normalizeRawMeasurementSeries,
+    replicationAttemptKey,
+    replicationBlockPlan,
+    statisticalSubjectIndex,
+} from "./replication.mjs";
 
 export {
     deriveImpossibilityVerdict,
@@ -158,8 +291,10 @@ export {
     EVIDENCE_PROVENANCE_VERSION,
     MEASUREMENT_PROVENANCE_HASH_ALGORITHM,
     OBSERVATION_STREAM_HASH_ALGORITHM,
+    RAW_OBSERVATION_AUTHORITY_HASH_ALGORITHM,
     SNAPSHOT_EXECUTION_HASH_ALGORITHM,
     SNAPSHOT_PROVENANCE_HASH_ALGORITHM,
+    STATISTICAL_CACHE_HASH_ALGORITHM,
     artifactIdsFromProvenance,
     artifactRefsFromProvenance,
     createEvidenceProvenance,
@@ -167,11 +302,15 @@ export {
     createSnapshotProvenance,
     deriveEvidenceProvenanceRoot,
     deriveMeasurementProvenanceRoot,
+    deriveRawObservationAuthorityDigest,
     deriveSnapshotProvenanceRoot,
     normalizeEvidenceProvenance,
 } from "./evidence.mjs";
 
-export { decideNext } from "./decision.mjs";
+export {
+    decideNext,
+    deriveTerminalEvidenceClosure,
+} from "./decision.mjs";
 
 export {
     computeEventHash,
@@ -220,6 +359,8 @@ export {
 } from "./archive.mjs";
 
 export {
+    SEARCH_OPERATOR_ARCHIVE_FINGERPRINT_ALGORITHM,
+    SEARCH_OPERATOR_POLICY_IDENTITY_ALGORITHM,
     adaptiveOperatorWeights,
     analyzePlateau,
     assignSearchOperator,
@@ -230,6 +371,7 @@ export {
     detectSearchPlateau,
     deterministicHashInteger,
     deterministicSeed,
+    searchOperatorPolicyIdentity,
     selectAdaptiveOperator,
     selectOperator,
 } from "./strategy.mjs";
@@ -243,6 +385,9 @@ export {
 export {
     activeCommand,
     boundedSearchExhaustion,
+    candidateCohortState,
+    candidatePredictionEvaluation,
+    candidateReplicationStatus,
     candidateSelectionReady,
     createInitialAggregate,
     currentValidationEvidence,
@@ -252,9 +397,14 @@ export {
     latestUnhandledStopRequest,
     latestImpossibilityEvidence,
     qualifyingCandidateEvidence,
+    qualifyingCandidateCohort,
     qualifyingCandidateEvidenceItems,
     qualifyingUnreachableEvidence,
     qualifyingValidationEvidence,
+    replicatedCandidateEvidenceItems,
+    resolvedPredictionFindings,
     searchProgress,
     uncommittedObservation,
+    validationAttemptIndexes,
+    validationEvidenceItems,
 } from "./state.mjs";

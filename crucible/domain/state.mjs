@@ -6,7 +6,6 @@ import {
 } from "./canonical.mjs";
 import {
     compareCandidateEvidence,
-    selectIncumbent,
 } from "./archive.mjs";
 import { DOMAIN_VERSION } from "./constants.mjs";
 import { impossibilitySearchEvidenceHash } from "./impossibility.mjs";
@@ -15,6 +14,7 @@ import {
     enumerandExhaustion,
     normalizeEnumerandManifest,
 } from "./enumerands.mjs";
+import { replayDerivedCandidateEvidence } from "./scientific-replay.mjs";
 
 const BOUNDED_CANDIDATE_SET_HASH_ALGORITHM =
     "sha256:crucible-bounded-candidate-set-v1";
@@ -68,8 +68,12 @@ export function createInitialAggregate() {
         evidence: {},
         evidenceOrder: [],
         validation: {
+            attemptEvidenceIds: [],
             completions: [],
             currentEvidenceId: null,
+        },
+        confirmation: {
+            freeze: null,
         },
         searchStrategy: {
             revision: 0,
@@ -80,7 +84,20 @@ export function createInitialAggregate() {
         pauseHistory: [],
         nonResults: [],
         terminal: null,
+        scientificReplay: null,
     });
+}
+
+function replayCalibrationState(aggregate, evidenceId) {
+    return aggregate.scientificReplay?.calibrationState?.find(
+        (item) => item.evidenceId === evidenceId,
+    ) ?? null;
+}
+
+function replayCandidateSupport(aggregate, evidenceId) {
+    return aggregate.scientificReplay?.candidateSupport?.find(
+        (item) => item.evidenceId === evidenceId,
+    ) ?? null;
 }
 
 export function currentValidationEvidence(aggregate) {
@@ -89,7 +106,14 @@ export function currentValidationEvidence(aggregate) {
         return null;
     }
     const evidence = ownEntry(aggregate.evidence, evidenceId);
-    if (evidence === null || evidence.invalidated || evidence.validationSatisfied !== true) {
+    const replayState = replayCalibrationState(aggregate, evidenceId);
+    const basisEvidenceIds = replayState?.basisEvidenceIds ?? null;
+    if (evidence === null
+        || evidence.invalidated
+        || replayState?.validationSatisfied !== true
+        || !Array.isArray(basisEvidenceIds)
+        || basisEvidenceIds.some((basisId) =>
+            ownEntry(aggregate.evidence, basisId)?.invalidated !== false)) {
         return null;
     }
     return evidence;
@@ -101,14 +125,42 @@ export function qualifyingValidationEvidence(aggregate) {
         if (evidence === null) {
             continue;
         }
+        const replayState = replayCalibrationState(
+            aggregate,
+            evidence.evidenceId,
+        );
         if (!evidence.invalidated
             && evidence.sourceKind === "harness"
             && evidence.purpose === "validation"
-            && evidence.validationSatisfied === true) {
+            && replayState?.validationSatisfied === true
+            && Array.isArray(replayState.basisEvidenceIds)
+            && replayState.basisEvidenceIds.every((basisId) =>
+                ownEntry(aggregate.evidence, basisId)?.invalidated === false)) {
             return evidence;
         }
+
     }
     return null;
+}
+
+export function validationEvidenceItems(
+    aggregate,
+    { includeInvalidated = false } = {},
+) {
+    return aggregate.validation.attemptEvidenceIds
+        .map((evidenceId) => ownEntry(aggregate.evidence, evidenceId))
+        .filter((evidence) =>
+            evidence !== null
+            && evidence.sourceKind === "harness"
+            && evidence.purpose === "validation"
+            && (includeInvalidated || !evidence.invalidated));
+}
+
+export function validationAttemptIndexes(aggregate) {
+    return validationEvidenceItems(aggregate)
+        .map((evidence) => evidence.validationAttemptIndex)
+        .filter((index) => Number.isSafeInteger(index) && index >= 0)
+        .sort((left, right) => left - right);
 }
 
 export function activeCommand(aggregate) {
@@ -138,12 +190,48 @@ export function uncommittedObservation(aggregate) {
 }
 
 export function qualifyingCandidateEvidence(aggregate) {
-    return selectIncumbent(aggregate.contract, harnessCandidateEvidenceItems(aggregate));
+    const cohort = candidateCohortState(aggregate);
+    if (cohort?.status !== "UNIQUE_BEST"
+        || cohort.provisionalWinner === null) {
+        return null;
+    }
+    return ownEntry(
+        aggregate.evidence,
+        cohort.provisionalWinner.evidenceId,
+    );
+}
+
+export function candidateCohortState(aggregate) {
+    return aggregate?.scientificReplay?.candidateCohort ?? null;
+}
+
+export function qualifyingCandidateCohort(aggregate) {
+    const cohort = candidateCohortState(aggregate);
+    if (cohort?.resolved !== true
+        || (cohort.status !== "UNIQUE_BEST"
+            && cohort.status !== "TIE_COHORT")) {
+        return immutableCanonical([]);
+    }
+    return immutableCanonical(
+        cohort.cohort
+            .map((candidate) =>
+                ownEntry(aggregate.evidence, candidate.evidenceId))
+            .filter((evidence) =>
+                evidence !== null && evidence.invalidated !== true),
+    );
 }
 
 export function qualifyingCandidateEvidenceItems(aggregate) {
     return harnessCandidateEvidenceItems(aggregate)
-        .filter((evidence) => evidence.outcomeClass === "accepted")
+        .filter((evidence) => {
+            const support = replayCandidateSupport(
+                aggregate,
+                evidence.evidenceId,
+            );
+            return support?.outcomeClass === "accepted"
+                && support.requiredState === "SUPPORTED"
+                && support.acceptanceSatisfied === true;
+        })
         .sort((left, right) => compareCandidateEvidence(aggregate.contract.metrics, left, right));
 }
 
@@ -154,7 +242,79 @@ export function harnessCandidateEvidenceItems(aggregate, { includeInvalidated = 
             evidence !== null
             && evidence.sourceKind === "harness"
             && evidence.purpose === "candidate"
-            && (includeInvalidated || !evidence.invalidated));
+            && (includeInvalidated || !evidence.invalidated))
+        .map((evidence) =>
+            replayDerivedCandidateEvidence(aggregate, evidence));
+}
+
+export function replicatedCandidateEvidenceItems(
+    aggregate,
+    { includeInvalidated = false } = {},
+) {
+    return harnessCandidateEvidenceItems(aggregate, { includeInvalidated })
+        .filter((evidence) =>
+            evidence.replication !== null
+            && typeof evidence.replication === "object");
+}
+
+export function candidateReplicationStatus(aggregate, candidateId) {
+    const evidence = replicatedCandidateEvidenceItems(
+        aggregate,
+        { includeInvalidated: true },
+    ).find((item) => item.candidateId === candidateId) ?? null;
+    if (evidence === null) return null;
+    return immutableCanonical({
+        evidenceId: evidence.evidenceId,
+        invalidated: evidence.invalidated,
+        ...evidence.replication,
+    });
+}
+
+export function candidatePredictionEvaluation(aggregate, candidateId) {
+    const evidence = harnessCandidateEvidenceItems(
+        aggregate,
+        { includeInvalidated: true },
+    ).find((item) => item.candidateId === candidateId) ?? null;
+    if (evidence === null) return null;
+    return replayCandidateSupport(
+        aggregate,
+        evidence.evidenceId,
+    )?.predictionEvaluation ?? null;
+}
+
+export function resolvedPredictionFindings(
+    aggregate,
+    { statuses = ["SUPPORTED", "REFUTED"] } = {},
+) {
+    const allowed = new Set(statuses);
+    return immutableCanonical(
+        harnessCandidateEvidenceItems(aggregate)
+            .flatMap((evidence) =>
+                (candidatePredictionEvaluation(
+                    aggregate,
+                    evidence.candidateId,
+                )?.predictions ?? [])
+                    .filter((prediction) =>
+                        allowed.has(prediction.status))
+                    .map((prediction) => ({
+                        candidateId: evidence.candidateId,
+                        evidenceId: evidence.evidenceId,
+                        predictionId: prediction.predictionId,
+                        predictionIdentity:
+                            prediction.predictionIdentity,
+                        requiredForResult:
+                            prediction.requiredForResult,
+                        status: prediction.status,
+                        estimate: prediction.estimate,
+                        confidenceBounds:
+                            prediction.confidenceBounds,
+                        evidenceReference:
+                            prediction.evidenceReference,
+                        blockReference: prediction.blockReference,
+                        alphaReference: prediction.alphaReference,
+                        limitations: prediction.limitations,
+                    }))),
+    );
 }
 
 export function impossibilityEvidenceItems(aggregate, { includeInvalidated = false } = {}) {
@@ -338,8 +498,10 @@ export function searchProgress(aggregate) {
 }
 
 export function candidateSelectionReady(aggregate) {
-    const incumbent = qualifyingCandidateEvidence(aggregate);
-    return incumbent !== null && searchProgress(aggregate).roundsExhausted;
+    const cohort = candidateCohortState(aggregate);
+    return cohort?.resolved === true
+        && cohort.cohort.length > 0
+        && searchProgress(aggregate).roundsExhausted;
 }
 
 export function boundedSearchExhaustion(aggregate) {

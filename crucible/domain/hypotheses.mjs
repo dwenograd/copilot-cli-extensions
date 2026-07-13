@@ -11,6 +11,8 @@ export const HYPOTHESES_IDENTITY_HASH_ALGORITHM =
     "sha256:crucible-preregistered-hypotheses-v4";
 export const PREDICTION_IDENTITY_HASH_ALGORITHM =
     "sha256:crucible-preregistered-prediction-v4";
+export const PREDICTION_CLAIM_ID_HASH_ALGORITHM =
+    "sha256:crucible-preregistered-prediction-claim-v1";
 export const OBSERVABLE_REGISTRY_IDENTITY_HASH_ALGORITHM =
     "sha256:crucible-observable-registry-v4";
 export const HYPOTHESIS_POLICY_IDENTITY_HASH_ALGORITHM =
@@ -718,4 +720,132 @@ export function hypothesesIdentity(value, options = {}) {
 
 export function normalizeSealedHypotheses(value, options = {}) {
     return normalizeHypotheses(value, { ...options, requireSealed: true });
+}
+
+function statisticalPolicyContext(statisticalPolicy) {
+    requirePlainObject(statisticalPolicy, "statisticalPolicy");
+    if (!Array.isArray(statisticalPolicy.metrics)
+        || !Array.isArray(statisticalPolicy.familyAllocations)
+        || statisticalPolicy.familyAllocations.length === 0) {
+        fail("statisticalPolicy must define metrics and at least one alpha family");
+    }
+    const metrics = new Map();
+    for (const metric of statisticalPolicy.metrics) {
+        requirePlainObject(metric, "statisticalPolicy.metrics item");
+        metrics.set(identifier(metric.key, "statisticalPolicy metric key"), metric);
+    }
+    const defaultFamily = identifier(
+        statisticalPolicy.familyAllocations[0].family,
+        "statisticalPolicy.familyAllocations[0].family",
+    );
+    return { metrics, defaultFamily };
+}
+
+function statisticalClaimId(hypothesesIdentityValue, prediction) {
+    const digest = hashCanonical({
+        hypothesesIdentity: hypothesesIdentityValue,
+        predictionId: prediction.id,
+    }, PREDICTION_CLAIM_ID_HASH_ALGORITHM).split(":").at(-1);
+    return `prediction.${digest}`;
+}
+
+function predictionStatisticalClaim(
+    prediction,
+    hypothesesIdentityValue,
+    context,
+    statistical,
+) {
+    const registration = context.observableByKey.get(prediction.observable);
+    const metric = statistical.metrics.get(prediction.observable) ?? null;
+    const family = metric?.family ?? statistical.defaultFamily;
+    const claimId = statisticalClaimId(hypothesesIdentityValue, prediction);
+    const common = {
+        id: claimId,
+        observable: prediction.observable,
+        family,
+        source: "sealed_preregistered_prediction",
+    };
+    let claim;
+    if (prediction.kind === "threshold") {
+        claim = {
+            ...common,
+            kind: "threshold",
+            operator: prediction.operator,
+            value: prediction.value,
+        };
+    } else if (prediction.kind === "bounded_interval") {
+        claim = {
+            ...common,
+            kind: "bounded_interval",
+            lower: prediction.lower,
+            upper: prediction.upper,
+        };
+    } else if (prediction.kind === "direction") {
+        claim = {
+            ...common,
+            kind: "direction",
+            direction: prediction.direction,
+            reference: prediction.reference,
+            referenceSampling: prediction.reference.kind === "control"
+                ? "paired_within_block"
+                : "independent_replay_blocks",
+            practicalEquivalenceDelta:
+                metric?.practicalEquivalenceDelta ?? 0,
+        };
+    } else {
+        claim = {
+            ...common,
+            kind: "categorical_outcome",
+            outcome: prediction.outcome,
+        };
+    }
+    return {
+        claim: immutableCanonical(claim),
+        binding: immutableCanonical({
+            claimId,
+            predictionId: prediction.id,
+            predictionIdentity: normalizedPredictionIdentity(
+                prediction,
+                context.registryIdentity,
+                context.policyIdentity,
+            ),
+            hypothesesIdentity: hypothesesIdentityValue,
+            requiredForResult: prediction.requiredForResult,
+            kind: prediction.kind,
+            observable: prediction.observable,
+            reference: prediction.kind === "direction"
+                ? prediction.reference
+                : null,
+            registeredObservable: registration,
+            prediction,
+        }),
+    };
+}
+
+export function statisticalClaimsForHypotheses(value, options = {}) {
+    const context = predictionContext(options);
+    const hypotheses = normalizeHypotheses(value, {
+        ...options,
+        requireSealed: options.requireSealed !== false,
+    });
+    if (hypotheses === null) {
+        return immutableCanonical({
+            hypothesesIdentity: null,
+            claims: [],
+            bindings: [],
+        });
+    }
+    const statistical = statisticalPolicyContext(options.statisticalPolicy);
+    const projected = hypotheses.predictions.map((prediction) =>
+        predictionStatisticalClaim(
+            prediction,
+            hypotheses.identity,
+            context,
+            statistical,
+        ));
+    return immutableCanonical({
+        hypothesesIdentity: hypotheses.identity,
+        claims: projected.map((item) => item.claim),
+        bindings: projected.map((item) => item.binding),
+    });
 }

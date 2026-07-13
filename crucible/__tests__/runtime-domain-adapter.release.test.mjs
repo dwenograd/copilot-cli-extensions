@@ -9,15 +9,18 @@ import {
     DEFAULT_SEARCH_POLICY,
     EVENT_TYPES,
     artifactRefsFromProvenance,
+    computeEventHash as computeDomainEventHash,
     constructEvidenceCommittedEvent,
     constructHarnessObservedEvent,
     constructKernelDecisionEvent,
     createExternalEvent,
     createEvidenceProvenance,
+    createRawMeasurementSeries,
     createInvestigationContract,
     createMeasurementProvenance,
     createSnapshotProvenance,
     hashCanonical,
+    replicationBlockPlan,
 } from "../domain/index.mjs";
 import {
     ERROR_CODES as PERSISTENCE_ERROR_CODES,
@@ -291,13 +294,12 @@ function searchPolicy(overrides = {}) {
 
 function contractInput(overrides = {}) {
     return upgradeLegacyContractInput({
-        objective: "Find a score of at least 90",
+        objective: "Find a non-negative trusted score",
         acceptancePredicate: {
-            kind: "all",
-            predicates: [
-                { kind: "harness_pass" },
-                { kind: "metric_compare", metric: "score", operator: ">=", value: 90 },
-            ],
+            kind: "metric_compare",
+            metric: "score",
+            operator: ">=",
+            value: 0,
         },
         validationCases: [
             { id: "good", expectation: "accept", artifactHash: artifactHash("a") },
@@ -451,12 +453,31 @@ function harnessReceipt(
     attemptId,
     purpose,
 ) {
-    const subjectIds = purpose === "validation"
-        ? contract.validationCases.map((item) => item.id)
-        : [command.candidateId];
-    const measurements = subjectIds.map((subjectId) => {
+    const descriptors = purpose === "validation"
+        ? command.validationSeries.flatMap((series) =>
+            replicationBlockPlan(
+                series.replicationSchedule,
+                command.attemptIndex,
+            ).arms.map((arm) => ({
+                subjectId: arm.subjectId,
+                arm,
+                series,
+            })))
+        : Array.from(
+            { length: command.replicationSchedule.minBlocks },
+            (_unused, blockIndex) =>
+                replicationBlockPlan(
+                    command.replicationSchedule,
+                    blockIndex,
+                ).arms,
+        ).flat()
+            .sort((left, right) =>
+                left.blockIndex - right.blockIndex
+                || left.armIndex - right.armIndex)
+            .map((arm) => ({ subjectId: arm.subjectId, arm, series: null }));
+    const measurements = descriptors.map(({ subjectId, series }) => {
         const snapshotId = purpose === "validation"
-            ? contract.validationCases.find((item) => item.id === subjectId).artifactHash
+            ? series.artifactHash
             : `sha256:${digestOf(hashCanonical({ attemptId, artifact: true }))}`;
         const stdoutHash = hashCanonical(
             { attemptId, subjectId, stream: "stdout" },
@@ -476,6 +497,8 @@ function harnessReceipt(
         );
         return createMeasurementProvenance({
             subjectId,
+            role: purpose === "validation" ? series.role : "search",
+            phase: purpose === "validation" ? "calibration" : "search",
             receiptArtifact: fakeArtifact(`${subjectId}-receipt`, receiptHash),
             receiptHash,
             rawStdoutArtifact: fakeArtifact(`${subjectId}-stdout`, stdoutHash),
@@ -532,14 +555,26 @@ function harnessReceipt(
                 hashCanonical({ attemptId, validation: true }),
             )
             : null,
+        replicationScheduleArtifact: purpose === "candidate"
+            ? fakeArtifact(
+                `${command.candidateId}-schedule`,
+                hashCanonical(command.replicationSchedule),
+            )
+            : null,
+        replicationCompositeArtifact: purpose === "candidate"
+            ? fakeArtifact(
+                `${command.candidateId}-replication`,
+                hashCanonical({ attemptId, replication: true }),
+            )
+            : null,
         measurements,
     }, { purpose, command, contract });
     registerProvenanceArtifacts(repository, investigationId, provenance);
-    return {
+    const receipt = {
         version: 1,
         attemptId,
         runnerEpochId: "runner-epoch",
-        rawStdoutHash: purpose === "validation"
+        rawStdoutHash: purpose === "validation" || purpose === "candidate"
             ? hashCanonical(
                 provenance.measurements.map((item) => ({
                     id: item.subjectId,
@@ -548,7 +583,7 @@ function harnessReceipt(
                 "sha256:crucible-runtime-observation-streams-v1",
             )
             : provenance.measurements[0].rawStdoutHash,
-        rawStderrHash: purpose === "validation"
+        rawStderrHash: purpose === "validation" || purpose === "candidate"
             ? hashCanonical(
                 provenance.measurements.map((item) => ({
                     id: item.subjectId,
@@ -562,6 +597,86 @@ function harnessReceipt(
             : null,
         provenance,
     };
+    const parsedFor = ({ arm, series }) => {
+        const binding = {
+            role: purpose === "validation" ? series.role : "search",
+            phase: purpose === "validation" ? "calibration" : "search",
+            replicateIndex: arm.replicateIndex,
+            blockIndex: arm.blockIndex,
+            armIndex: arm.armIndex,
+            armId: arm.armId,
+            deterministicSeed: arm.deterministicSeed,
+            subjectId: arm.subjectId,
+        };
+        const validationCase = purpose === "validation"
+            ? contract.validationCases.find((item) => item.id === series.caseId)
+            : null;
+        const pass = purpose === "validation"
+            ? validationCase.expectation === "accept"
+            : true;
+        return {
+            pass,
+            metrics: {
+                score: purpose === "validation" && !pass ? 0 : 95,
+            },
+            ...binding,
+        };
+    };
+    const data = purpose === "validation"
+        ? {
+            version: 1,
+            attemptIndex: command.attemptIndex,
+            series: command.validationSeries.map((series) =>
+                createRawMeasurementSeries({
+                    schedule: series.replicationSchedule,
+                    attempts: descriptors
+                        .filter((item) => item.series === series)
+                        .map((item) => {
+                            const measurement = measurements.find(
+                                (candidate) =>
+                                    candidate.subjectId === item.subjectId,
+                            );
+                            return {
+                                ...item.arm,
+                                attemptId: `${attemptId}-${item.subjectId}`,
+                                parsed: parsedFor(item),
+                                invalid: null,
+                                receiptHash: measurement.receiptHash,
+                                measurementRoot: measurement.measurementRoot,
+                            };
+                        }),
+                    role: series.role,
+                    phase: "calibration",
+                    caseId: series.caseId,
+                })),
+        }
+        : {
+            version: 1,
+            series: [createRawMeasurementSeries({
+                schedule: command.replicationSchedule,
+                attempts: descriptors.map((item) => {
+                    const measurement = measurements.find(
+                        (candidate) => candidate.subjectId === item.subjectId,
+                    );
+                    return {
+                        ...item.arm,
+                        attemptId: `${attemptId}-${item.subjectId}`,
+                        parsed: parsedFor(item),
+                        invalid: null,
+                        receiptHash: measurement.receiptHash,
+                        measurementRoot: measurement.measurementRoot,
+                    };
+                }),
+                role: "search",
+                phase: "search",
+                caseId: null,
+            })],
+        };
+    Object.defineProperty(receipt, "seedData", {
+        value: data,
+        enumerable: false,
+    });
+    return receipt;
 }
 
 function prepareValidationCommand(adapter, repository, {
@@ -596,20 +711,17 @@ function prepareValidationCommand(adapter, repository, {
             commandId: reserved.commandId,
             observationId: `${attemptId}-validation-observation`,
             purpose: "validation",
-            receipt: harnessReceipt(
-                repository,
-                adapter.investigationId,
-                aggregate.contract,
-                reserved.command,
-                attemptId,
-                "validation",
-            ),
-            data: {
-                caseResults: [
-                    { id: "good", artifactHash: artifactHash("a"), outcome: "accept" },
-                    { id: "bad", artifactHash: artifactHash("b"), outcome: "reject" },
-                ],
-            },
+            ...(() => {
+                const receipt = harnessReceipt(
+                    repository,
+                    adapter.investigationId,
+                    aggregate.contract,
+                    reserved.command,
+                    attemptId,
+                    "validation",
+                );
+                return { receipt, data: receipt.seedData };
+            })(),
         },
     };
 }
@@ -640,20 +752,17 @@ function appendFullVerifiedHistory(adapter, { includeTerminal = true } = {}) {
             commandId: "cmd-000001",
             observationId: "validation-observation",
             purpose: "validation",
-            receipt: harnessReceipt(
-                adapter.repository,
-                adapter.investigationId,
-                aggregate.contract,
-                aggregate.commands["cmd-000001"].command,
-                "validation-attempt",
-                "validation",
-            ),
-            data: {
-                caseResults: [
-                    { id: "good", artifactHash: artifactHash("a"), outcome: "accept" },
-                    { id: "bad", artifactHash: artifactHash("b"), outcome: "reject" },
-                ],
-            },
+            ...(() => {
+                const receipt = harnessReceipt(
+                    adapter.repository,
+                    adapter.investigationId,
+                    aggregate.contract,
+                    aggregate.commands["cmd-000001"].command,
+                    "validation-attempt",
+                    "validation",
+                );
+                return { receipt, data: receipt.seedData };
+            })(),
         }),
         { aggregate },
     ).aggregate;
@@ -686,15 +795,17 @@ function appendFullVerifiedHistory(adapter, { includeTerminal = true } = {}) {
             purpose: "candidate",
             // round/slotIndex/candidateId default to the kernel-reserved
             // search-candidate assignment; supplying our own would be rejected.
-            receipt: harnessReceipt(
-                adapter.repository,
-                adapter.investigationId,
-                aggregate.contract,
-                aggregate.commands["cmd-000002"].command,
-                "candidate-attempt",
-                "candidate",
-            ),
-            data: { pass: true, metrics: { score: 95 } },
+            ...(() => {
+                const receipt = harnessReceipt(
+                    adapter.repository,
+                    adapter.investigationId,
+                    aggregate.contract,
+                    aggregate.commands["cmd-000002"].command,
+                    "candidate-attempt",
+                    "candidate",
+                );
+                return { receipt, data: receipt.seedData };
+            })(),
         }),
         { aggregate },
     ).aggregate;
@@ -822,6 +933,71 @@ describe("Crucible domain/persistence adapter", () => {
         releaseRepository(reopened);
     });
 
+    it("rejects a recomputed repository row whose statistical cache was tampered", () => {
+        const {
+            root,
+            repository,
+            adapter,
+            investigationId,
+        } = openAdapter("statistical-cache-tamper", fullVerifiedHistoryContract());
+        appendFullVerifiedHistory(adapter, { includeTerminal: false });
+        const row = repository.listEvents(investigationId).at(-1);
+        expect(row.payload.domainEvent.type).toBe(
+            EVENT_TYPES.EVIDENCE_COMMITTED,
+        );
+        releaseRepository(repository);
+
+        const forgedPayload = structuredClone(row.payload);
+        forgedPayload.domainEvent.payload.statisticalEvaluation
+            .statistics.overallState = "REFUTED";
+        forgedPayload.domainEvent.eventHash = computeDomainEventHash(
+            forgedPayload.domainEvent,
+        );
+        const payloadCanonical = canonicalize(forgedPayload);
+        const repositoryHash = computeRepositoryEventHash({
+            investigationId: row.investigationId,
+            seq: row.seq,
+            prevHash: row.prevHash,
+            kind: row.kind,
+            payloadCanonical,
+            isTerminal: row.isTerminal,
+            terminalKind: row.terminalKind,
+            attemptId: row.attemptId,
+            evidenceKind: row.evidenceKind,
+            createdAt: row.createdAt,
+        });
+        const raw = new DatabaseSync(path.join(root, "events.sqlite"));
+        try {
+            raw.prepare(`
+                UPDATE events
+                SET payload = ?, event_hash = ?
+                WHERE investigation_id = ? AND seq = ?
+            `).run(
+                payloadCanonical,
+                repositoryHash,
+                investigationId,
+                row.seq,
+            );
+        } finally {
+            raw.close();
+        }
+
+        const reopened = trackRepository(openRepository({
+            file: path.join(root, "events.sqlite"),
+        }));
+        const replayAdapter = createDomainRepositoryAdapter({
+            repository: reopened,
+            investigationId,
+        });
+        expect(reopened.verifyInvestigation(investigationId).ok).toBe(true);
+        expect(() => replayAdapter.replay()).toThrow(
+            expect.objectContaining({
+                code: RUNTIME_ERROR_CODES.INTEGRITY_FAILURE,
+            }),
+        );
+        releaseRepository(reopened);
+    });
+
     it("prevents evidence commitment when an observation artifact ref is missing", () => {
         const {
             root,
@@ -848,12 +1024,7 @@ describe("Crucible domain/persistence adapter", () => {
             observationId: "missing-ref-observation",
             purpose: "validation",
             receipt,
-            data: {
-                caseResults: [
-                    { id: "good", artifactHash: artifactHash("a"), outcome: "accept" },
-                    { id: "bad", artifactHash: artifactHash("b"), outcome: "reject" },
-                ],
-            },
+            data: receipt.seedData,
         });
         const observationSeq = observed.domainEvent.seq;
         expect(repository.listArtifactRefsForEvent(investigationId, observationSeq).length)
@@ -1032,17 +1203,19 @@ describe("Crucible domain/persistence adapter", () => {
         });
         adapterB.dispatchAttempt(currentAttemptId, leaseB);
         const currentAggregate = adapterB.replay().aggregate;
+        const currentReceipt = harnessReceipt(
+            repositoryB,
+            adapterB.investigationId,
+            currentAggregate.contract,
+            prepared.reserved.command,
+            currentAttemptId,
+            "validation",
+        );
         const currentObservation = {
             ...prepared.observation,
             observationId: "current-validation-observation",
-            receipt: harnessReceipt(
-                repositoryB,
-                adapterB.investigationId,
-                currentAggregate.contract,
-                prepared.reserved.command,
-                currentAttemptId,
-                "validation",
-            ),
+            receipt: currentReceipt,
+            data: currentReceipt.seedData,
         };
         adapterB.appendHarnessObservationFenced(currentObservation, {
             attemptId: currentAttemptId,
@@ -1142,17 +1315,19 @@ describe("Crucible domain/persistence adapter", () => {
         });
         adapterB.dispatchAttempt("attempt-four-two", currentLease);
         const aggregate = adapterB.replay().aggregate;
+        const currentReceipt = harnessReceipt(
+            repositoryB,
+            adapterB.investigationId,
+            aggregate.contract,
+            prepared.reserved.command,
+            "attempt-four-two",
+            "validation",
+        );
         const currentObservation = {
             ...prepared.observation,
             observationId: "runner-four-two-observation",
-            receipt: harnessReceipt(
-                repositoryB,
-                adapterB.investigationId,
-                aggregate.contract,
-                prepared.reserved.command,
-                "attempt-four-two",
-                "validation",
-            ),
+            receipt: currentReceipt,
+            data: currentReceipt.seedData,
         };
         adapterB.appendHarnessObservationFenced(currentObservation, {
             attemptId: "attempt-four-two",
@@ -1245,17 +1420,19 @@ describe("Crucible domain/persistence adapter", () => {
         });
         adapterB.dispatchAttempt("attempt-b", leaseB);
         const aggregate = adapterB.replay().aggregate;
+        const currentReceipt = harnessReceipt(
+            repositoryB,
+            adapterB.investigationId,
+            aggregate.contract,
+            prepared.reserved.command,
+            "attempt-b",
+            "validation",
+        );
         const currentObservation = {
             ...prepared.observation,
             observationId: "cas-current-observation",
-            receipt: harnessReceipt(
-                repositoryB,
-                adapterB.investigationId,
-                aggregate.contract,
-                prepared.reserved.command,
-                "attempt-b",
-                "validation",
-            ),
+            receipt: currentReceipt,
+            data: currentReceipt.seedData,
         };
         adapterB.appendHarnessObservationFenced(currentObservation, {
             attemptId: "attempt-b",

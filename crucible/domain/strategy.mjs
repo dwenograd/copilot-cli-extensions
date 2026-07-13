@@ -13,6 +13,23 @@ import {
     enumerandBinding,
     normalizeEnumerandManifest,
 } from "./enumerands.mjs";
+import {
+    deriveReplicationSchedule,
+    deriveReplicationSubjectIdentity,
+    statisticalSubjectIndex,
+} from "./replication.mjs";
+import { replayDerivedCandidateEvidence } from "./scientific-replay.mjs";
+import {
+    behavioralRoleIdentity,
+    replayDerivedCandidateNovelty,
+    structuralRoleIdentity,
+    supportedBehavioralDifference,
+} from "./novelty.mjs";
+
+export const SEARCH_OPERATOR_POLICY_IDENTITY_ALGORITHM =
+    "sha256:crucible-search-operator-policy-v1";
+export const SEARCH_OPERATOR_ARCHIVE_FINGERPRINT_ALGORITHM =
+    "sha256:crucible-search-operator-archive-v1";
 
 function candidateEvidence(aggregate, { includeInvalidated = false } = {}) {
     return aggregate.evidenceOrder
@@ -20,7 +37,12 @@ function candidateEvidence(aggregate, { includeInvalidated = false } = {}) {
         .filter((evidence) =>
             evidence.sourceKind === "harness"
             && evidence.purpose === "candidate"
-            && (includeInvalidated || !evidence.invalidated));
+            && (includeInvalidated || !evidence.invalidated))
+        .map((evidence) =>
+            replayDerivedCandidateNovelty(
+                aggregate,
+                replayDerivedCandidateEvidence(aggregate, evidence),
+            ));
 }
 
 function expectedSlotsForRound(contract, round) {
@@ -87,7 +109,8 @@ function roundSignalSummaries(aggregate) {
     const completed = completedRoundNumbers(aggregate);
     const current = candidateEvidence(aggregate);
     const seenContent = new Set();
-    const seenMechanisms = new Set();
+    const seenStructural = new Set();
+    const priorBehavioral = [];
     let acceptedSeen = false;
     let best = null;
     const summaries = [];
@@ -98,7 +121,8 @@ function roundSignalSummaries(aggregate) {
             .sort((left, right) => left.slotIndex - right.slotIndex);
         let metricImproved = false;
         let acceptanceNovelty = false;
-        let mechanismNovelty = false;
+        let structuralNovelty = false;
+        let behavioralNovelty = false;
         let contentNovelty = false;
 
         for (const evidence of items) {
@@ -121,19 +145,25 @@ function roundSignalSummaries(aggregate) {
                 acceptanceNovelty = true;
                 acceptedSeen = true;
             }
-            const mechanism = evidence.annotations?.mechanism;
-            if (typeof mechanism === "string"
-                && mechanism.length > 0
-                && evidence.duplicateOf === null
-                && !seenMechanisms.has(mechanism)) {
-                seenMechanisms.add(mechanism);
-                mechanismNovelty = true;
+            const content = evidence.novelty?.content?.signature;
+            if (typeof content !== "string" || seenContent.has(content)) continue;
+            seenContent.add(content);
+            contentNovelty = true;
+
+            const structural =
+                evidence.novelty?.structural?.structuralFingerprint;
+            if (typeof structural === "string"
+                && !seenStructural.has(structural)) {
+                seenStructural.add(structural);
+                structuralNovelty = true;
             }
-            if (typeof evidence.contentHash === "string"
-                && evidence.duplicateOf === null
-                && !seenContent.has(evidence.contentHash)) {
-                seenContent.add(evidence.contentHash);
-                contentNovelty = true;
+            const behavioral = evidence.novelty?.behavioral;
+            if (behavioral !== null && behavioral !== undefined) {
+                if (priorBehavioral.some((prior) =>
+                    supportedBehavioralDifference(behavioral, prior))) {
+                    behavioralNovelty = true;
+                }
+                priorBehavioral.push(behavioral);
             }
         }
 
@@ -141,11 +171,13 @@ function roundSignalSummaries(aggregate) {
             round,
             metricImproved,
             acceptanceNovelty,
-            mechanismNovelty,
+            structuralNovelty,
+            behavioralNovelty,
             contentNovelty,
             improvementOrNovelty: metricImproved
                 || acceptanceNovelty
-                || mechanismNovelty
+                || structuralNovelty
+                || behavioralNovelty
                 || contentNovelty,
         });
     }
@@ -213,6 +245,84 @@ export function deterministicHashInteger(value, modulus = 0x7fffffff) {
 
 export function deterministicSeed(value) {
     return deterministicHashInteger(value, 0x7ffffffe) + 1;
+}
+
+export function searchOperatorPolicyIdentity(contract) {
+    return hashCanonical({
+        version: "crucible-search-operator-policy-v1",
+        searchPolicy: contract.searchPolicy,
+        statisticalPolicyIdentity:
+            contract.statisticalPolicyIdentity ?? null,
+        structuralRoleIdentity: structuralRoleIdentity(contract),
+        behavioralRoleIdentity: behavioralRoleIdentity(contract),
+    }, SEARCH_OPERATOR_POLICY_IDENTITY_ALGORITHM);
+}
+
+function exactNoveltySignature(value, domain) {
+    return typeof value === "string"
+        && value.startsWith(`${domain}:`)
+        && value.length === domain.length + 65
+        && /^[a-f0-9]{64}$/u.test(value.slice(-64));
+}
+
+function archivePolicyFingerprint(archive) {
+    const candidates = [
+        archive.incumbent,
+        ...(archive.accepted ?? []),
+        ...(archive.nearMisses ?? []),
+        ...(archive.rejected ?? []),
+        ...(archive.inconclusive ?? []),
+        ...(archive.invalidMetrics ?? []),
+    ].filter((candidate) =>
+        candidate !== null
+        && candidate !== undefined
+        && candidate.invalidated !== true);
+    const byId = new Map(
+        candidates
+            .filter((candidate) => typeof candidate.evidenceId === "string")
+            .map((candidate) => [candidate.evidenceId, candidate]),
+    );
+    const artifactHashes = [...new Set(candidates
+        .map((candidate) => candidate.receipt?.candidateArtifactHash)
+        .filter((value) => typeof value === "string"))]
+        .sort();
+    const structuralSignatures = [...new Set(
+        (archive.noveltyNiches?.structural ?? [])
+            .map((niche) => niche.signature)
+            .filter((value) => exactNoveltySignature(
+                value,
+                "sha256:crucible-novelty-structural-v1",
+            )),
+    )].sort();
+    const behavioralGroups = archive.noveltyNiches?.behavioral ?? [];
+    const behavioralNiches = (behavioralGroups.length > 1
+        ? behavioralGroups
+        : [])
+        .filter((niche) => exactNoveltySignature(
+            niche.signature,
+            "sha256:crucible-behavioral-novelty-v1",
+        ))
+        .map((niche) => ({
+            artifactHashes: [...new Set(
+                (niche.evidenceIds ?? [])
+                    .map((evidenceId) =>
+                        byId.get(evidenceId)
+                            ?.receipt?.candidateArtifactHash ?? null)
+                    .filter((value) => typeof value === "string"),
+            )].sort(),
+        }))
+        .filter((niche) => niche.artifactHashes.length > 0)
+        .sort((left, right) => {
+            const leftKey = left.artifactHashes.join("\0");
+            const rightKey = right.artifactHashes.join("\0");
+            return leftKey < rightKey ? -1 : leftKey > rightKey ? 1 : 0;
+        });
+    return hashCanonical({
+        version: "crucible-search-operator-archive-v1",
+        artifactHashes,
+        structuralSignatures,
+        behavioralNiches,
+    }, SEARCH_OPERATOR_ARCHIVE_FINGERPRINT_ALGORITHM);
 }
 
 function deterministicStrategyError(message) {
@@ -284,12 +394,20 @@ export function adaptiveOperatorWeights(searchPolicy, archive, phase = "normal")
     } else if (weights.refinement > 0) {
         weights.refinement += refinementPool.length;
     }
+    const structuralNicheCount =
+        archive.noveltyNiches?.structural?.length ?? 0;
+    const behavioralDifferenceCount = Math.max(
+        0,
+        (archive.noveltyNiches?.behavioral?.length ?? 0) - 1,
+    );
+    const trustedNicheCount =
+        structuralNicheCount + behavioralDifferenceCount;
     if (crossoverParents.length !== 2) {
         weights.crossover = 0;
     } else if (weights.crossover > 0) {
-        weights.crossover += Math.min(archive.mechanismGroups.length, 8);
+        weights.crossover += Math.min(trustedNicheCount, 8);
     }
-    if (weights.diversification > 0 && archive.mechanismGroups.length < 2) {
+    if (weights.diversification > 0 && trustedNicheCount < 2) {
         weights.diversification += 1;
     }
     if (adversarialParents.length !== 1) {
@@ -307,7 +425,7 @@ export function adaptiveOperatorWeights(searchPolicy, archive, phase = "normal")
         if (weights.adversarial > 0) {
             weights.adversarial += 1;
         }
-        if (weights.diversification > 0 && archive.mechanismGroups.length === 0) {
+        if (weights.diversification > 0 && trustedNicheCount === 0) {
             weights.diversification += 1;
         }
     }
@@ -318,6 +436,7 @@ export function selectAdaptiveOperator({
     searchPolicy,
     archive,
     contractHash,
+    policyIdentity = contractHash,
     round,
     slotIndex,
     phase = "normal",
@@ -333,7 +452,8 @@ export function selectAdaptiveOperator({
     }
     const weights = adaptiveOperatorWeights(searchPolicy, archive, phase);
     return selectWeightedOperator(weights, {
-        contractHash,
+        policyIdentity,
+        archiveFingerprint: archivePolicyFingerprint(archive),
         round,
         slotIndex,
         phase,
@@ -393,6 +513,15 @@ function distinctParentCandidates(archive) {
         }
         seenGroups.add(groupKey);
         return true;
+    }).sort((left, right) => {
+        const leftHash = left.receipt?.candidateArtifactHash ?? "";
+        const rightHash = right.receipt?.candidateArtifactHash ?? "";
+        if (leftHash !== rightHash) return leftHash < rightHash ? -1 : 1;
+        return left.evidenceId < right.evidenceId
+            ? -1
+            : left.evidenceId > right.evidenceId
+                ? 1
+                : 0;
     });
 }
 
@@ -402,31 +531,28 @@ function eligibleIncumbent(archive) {
         : null;
 }
 
-function mechanismGroupOf(archive, candidate) {
-    const annotation = candidate.annotations?.mechanism;
-    if (typeof annotation === "string" && annotation.length > 0) {
-        return annotation;
-    }
-    for (const group of archive.mechanismGroups ?? []) {
-        if (group.representativeEvidenceId === candidate.evidenceId
-            || group.evidenceIds?.includes(candidate.evidenceId)) {
-            return typeof group.mechanism === "string" && group.mechanism.length > 0
-                ? group.mechanism
-                : null;
-        }
-    }
-    return null;
-}
-
-function preferredCrossoverParents(archive, visible) {
+function preferredCrossoverParents(_archive, visible) {
     for (let firstIndex = 0; firstIndex < visible.length - 1; firstIndex += 1) {
-        const firstMechanism = mechanismGroupOf(archive, visible[firstIndex]);
-        if (firstMechanism === null) {
-            continue;
-        }
+        const first = visible[firstIndex];
+        const firstStructural =
+            first.novelty?.structural?.structuralFingerprint ?? null;
+        if (firstStructural === null) continue;
         for (let secondIndex = firstIndex + 1; secondIndex < visible.length; secondIndex += 1) {
-            const secondMechanism = mechanismGroupOf(archive, visible[secondIndex]);
-            if (secondMechanism !== null && secondMechanism !== firstMechanism) {
+            const secondStructural =
+                visible[secondIndex].novelty?.structural?.structuralFingerprint
+                ?? null;
+            if (secondStructural !== null
+                && secondStructural !== firstStructural) {
+                return [first, visible[secondIndex]];
+            }
+        }
+    }
+    for (let firstIndex = 0; firstIndex < visible.length - 1; firstIndex += 1) {
+        for (let secondIndex = firstIndex + 1; secondIndex < visible.length; secondIndex += 1) {
+            if (supportedBehavioralDifference(
+                visible[firstIndex].novelty?.behavioral,
+                visible[secondIndex].novelty?.behavioral,
+            )) {
                 return [visible[firstIndex], visible[secondIndex]];
             }
         }
@@ -474,7 +600,7 @@ function fallbackOperator({
     searchPolicy,
     archive,
     promptContextRefs,
-    contractHash,
+    policyIdentity,
     round,
     slotIndex,
     phase,
@@ -503,12 +629,12 @@ function fallbackOperator({
         }
     }
     return selectWeightedOperator(weights, {
-        contractHash,
+        policyIdentity,
+        archiveFingerprint: archivePolicyFingerprint(archive),
         round,
         slotIndex,
         phase,
         failedOperator,
-        promptContextRefs,
         weights,
     }, `no positive-weight eligible fallback after "${failedOperator}" for phase "${phase}"`);
 }
@@ -535,6 +661,7 @@ export function buildSearchCandidateCommand(aggregate, progress) {
     }
     const contract = aggregate.contract;
     const policy = contract.searchPolicy;
+    const policyIdentity = searchOperatorPolicyIdentity(contract);
     const archive = buildCandidateArchive(aggregate);
     const plateau = detectPlateau(aggregate);
     const round = progress.nextRound;
@@ -566,7 +693,7 @@ export function buildSearchCandidateCommand(aggregate, progress) {
     let operator = selectAdaptiveOperator({
         searchPolicy: policy,
         archive,
-        contractHash: aggregate.contractHash,
+        policyIdentity,
         round,
         slotIndex,
         phase: plateau.phase,
@@ -583,7 +710,7 @@ export function buildSearchCandidateCommand(aggregate, progress) {
             searchPolicy: policy,
             archive,
             promptContextRefs,
-            contractHash: aggregate.contractHash,
+            policyIdentity,
             round,
             slotIndex,
             phase: plateau.phase,
@@ -618,6 +745,24 @@ export function buildSearchCandidateCommand(aggregate, progress) {
         replacementOrdinal: replacement,
         enumerandHash: assignedEnumerand?.enumerandHash ?? null,
     });
+    const replicationSchedule = deriveReplicationSchedule({
+        contractHash: aggregate.contractHash,
+        statisticalPolicy: contract.statisticalPolicy,
+        subject: {
+            kind: assignedEnumerand === null ? "candidate" : "enumerand",
+            index: statisticalSubjectIndex(
+                assignedEnumerand === null ? "candidate" : "enumerand",
+                globalSlot,
+            ),
+            id: candidateId,
+            identity: deriveReplicationSubjectIdentity({
+                contractHash: aggregate.contractHash,
+                candidateId,
+                candidateSeed: seed,
+                enumerandHash: assignedEnumerand?.enumerandHash ?? null,
+            }),
+        },
+    });
 
     const harnessId =
         contract.harnessSuite?.roles?.search?.harnessId
@@ -642,6 +787,8 @@ export function buildSearchCandidateCommand(aggregate, progress) {
         parentEvidenceIds: parents,
         promptContextRefs,
         seed,
+        hypotheses: assignedEnumerand?.hypotheses ?? null,
+        replicationSchedule,
         replacementOrdinal: replacement,
         ...(boundedCandidateId === null ? {} : { boundedCandidateId }),
         ...(assignedEnumerand === null
@@ -652,9 +799,6 @@ export function buildSearchCandidateCommand(aggregate, progress) {
                     observableRegistry: contract.observableRegistry,
                     hypothesisPolicy: contract.hypothesisPolicy,
                 }),
-                ...(assignedEnumerand.hypotheses === undefined
-                    ? {}
-                    : { hypotheses: assignedEnumerand.hypotheses }),
             }),
     });
 }

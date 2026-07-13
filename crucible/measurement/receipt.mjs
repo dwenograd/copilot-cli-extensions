@@ -48,13 +48,15 @@ export const RECEIPT_HASH_ALGORITHM = "sha256:crucible-measurement-receipt-v1";
 export const ARGV_HASH_ALGORITHM = "sha256:crucible-measurement-argv-v1";
 export const ENV_HASH_ALGORITHM = "sha256:crucible-measurement-env-v1";
 export const RECEIPT_VERSION = 5;
-export const HARNESS_SUITE_RECEIPT_VERSION = 6;
+export const HARNESS_SUITE_RECEIPT_VERSION = 7;
 
 const MEASUREMENT_BINDING_KEYS = Object.freeze([
     "role",
     "phase",
     "replicateIndex",
     "blockIndex",
+    "armIndex",
+    "armId",
     "deterministicSeed",
     "subjectId",
     "environmentIdentity",
@@ -291,6 +293,8 @@ export function buildMeasurementReceipt(input) {
                 phase: measurementBinding.phase,
                 replicateIndex: measurementBinding.replicateIndex,
                 blockIndex: measurementBinding.blockIndex,
+                armIndex: measurementBinding.armIndex,
+                armId: measurementBinding.armId,
                 deterministicSeed: measurementBinding.deterministicSeed,
                 subjectId: measurementBinding.subjectId,
                 environmentIdentity: measurementBinding.environmentIdentity,

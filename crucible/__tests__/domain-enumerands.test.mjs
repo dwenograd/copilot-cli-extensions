@@ -34,6 +34,7 @@ import {
     validateCandidateSubmission,
     validateWorkerProposal,
 } from "../runtime/worker-pool.mjs";
+import { fakeStatisticalPolicy } from "./v4-contract-fixture.mjs";
 
 function snapshot(character) {
     return `sha256:${character.repeat(64)}`;
@@ -397,6 +398,11 @@ describe("enumerand strategy and runner plans", () => {
                 workerModels: ["worker-a"],
                 metrics: [],
                 searchPolicy: DEFAULT_SEARCH_POLICY,
+                statisticalPolicy: fakeStatisticalPolicy({
+                    topology: manifest.topology,
+                    searchSlots: manifest.entries.length,
+                    manifest,
+                }),
             },
             evidenceOrder: [],
             evidence: {},

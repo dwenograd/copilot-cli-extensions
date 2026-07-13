@@ -18,12 +18,18 @@ import {
     createInvestigationOpenedEvent,
     createMeasurementProvenance,
     createSnapshotProvenance,
+    deriveReplicationControlBinding,
     enumerandArtifactMeasurementHash,
     enumerandBindingHash,
     hashCanonical,
+    normalizeRawMeasurementSeries,
+    normalizeReplicationSchedule,
+    replicationBlockPlan,
     normalizeRuntimeConfigAuthority,
     reduceEvent,
     replayEvents,
+    materializeScientificReplayState,
+    scientificReplaySummary,
     verifyEventChain,
 } from "../domain/index.mjs";
 import {
@@ -35,6 +41,7 @@ import {
     sha256Hex,
 } from "../persistence/index.mjs";
 import {
+    HARNESS_SUITE_RECEIPT_VERSION,
     RECEIPT_VERSION,
     STREAM_HASH_ALGORITHM,
     hashReceipt,
@@ -66,8 +73,6 @@ const SNAPSHOT_CLOSURE_HASH_RE =
     /^sha256:crucible-measurement-snapshot-closure-v1:[a-f0-9]{64}$/u;
 const SNAPSHOT_CLOSURE_HASH_ALGORITHM =
     "sha256:crucible-measurement-snapshot-closure-v1";
-const VALIDATION_RECEIPT_HASH_ALGORITHM =
-    "sha256:crucible-runtime-validation-receipts-v1";
 const DOMAIN_FACT_IDENTITY_HASH_ALGORITHM =
     "sha256:crucible-runtime-domain-fact-v1";
 const IMPOSSIBILITY_CERTIFICATE_ARTIFACT_HASH_ALGORITHM =
@@ -109,6 +114,19 @@ const MEASUREMENT_RECEIPT_KEYS = Object.freeze([
     "stderrHash",
     "stdoutHash",
     "version",
+]);
+const HARNESS_SUITE_MEASUREMENT_RECEIPT_KEYS = Object.freeze([
+    ...MEASUREMENT_RECEIPT_KEYS,
+    "armId",
+    "armIndex",
+    "blockIndex",
+    "deterministicSeed",
+    "environmentIdentity",
+    "phase",
+    "replicateIndex",
+    "role",
+    "subjectId",
+    "suiteIdentity",
 ]);
 
 function isCasConflict(error) {
@@ -310,7 +328,8 @@ function receiptBindsExecutedBytes(receipt, snapshotHash) {
     const identity = receipt?.candidateSnapshotIdentitySummary;
     const stagedIdentity = receipt?.stagedCandidateSnapshotIdentitySummary;
     const mutation = receipt?.candidateSnapshotMutationCheck;
-    return receipt?.version === RECEIPT_VERSION
+    return (receipt?.version === RECEIPT_VERSION
+            || receipt?.version === HARNESS_SUITE_RECEIPT_VERSION)
         && receipt.candidateSnapshotHash === snapshotHash
         && receipt.stagedCandidateSnapshotHash === snapshotHash
         && SNAPSHOT_CLOSURE_HASH_RE.test(
@@ -334,7 +353,7 @@ function receiptBindsExecutedBytes(receipt, snapshotHash) {
         && mutation.identityStable === true
         && mutation.openHandleRehashStable === true
         && mutation.reparseStable === true
-        && receiptHasCompleteOutput(receipt)
+        && (receiptHasCompleteOutput(receipt) || receipt.parsed === null)
         && receipt.executableHash === receipt.stagedExecutableHash
         && canonicalEqual(
             dependencyIdentity(receipt.dependencyHashes),
@@ -750,13 +769,19 @@ function verifyMeasurementArtifactClosure(
 ) {
     const receiptRead = reader.readJson(measurement.receiptArtifact, `${label} receipt`);
     const receipt = receiptRead.value;
-    if (!exactKeys(receipt, MEASUREMENT_RECEIPT_KEYS)) {
+    const expectedReceiptKeys =
+        receipt?.version === HARNESS_SUITE_RECEIPT_VERSION
+            ? HARNESS_SUITE_MEASUREMENT_RECEIPT_KEYS
+            : MEASUREMENT_RECEIPT_KEYS;
+    if (!exactKeys(receipt, expectedReceiptKeys)) {
         integrityFailure("Measurement receipt artifact does not contain the complete receipt schema", {
             artifactId: measurement.receiptArtifact.artifactId,
             label,
         });
     }
     if (hashReceipt(receipt) !== measurement.receiptHash
+        || receipt.role !== measurement.role
+        || receipt.phase !== measurement.phase
         || receipt.parserVersion !== measurement.parserVersion
         || receipt.allowlistFileHash !== measurement.allowlistFileHash
         || receipt.harnessEntryHash !== measurement.harnessEntryHash
@@ -813,6 +838,8 @@ function verifyMeasurementArtifactClosure(
 
     const rebuilt = createMeasurementProvenance({
         subjectId: measurement.subjectId,
+        role: receipt.role,
+        phase: receipt.phase,
         receiptArtifact: measurement.receiptArtifact,
         receiptHash: hashReceipt(receipt),
         rawStdoutArtifact: measurement.rawStdoutArtifact,
@@ -845,6 +872,16 @@ function verifyMeasurementArtifactClosure(
     };
 }
 
+export function candidateProposalAnnotationsMatch(
+    proposal,
+    observation,
+) {
+    return canonicalEqual(
+        proposal?.annotations ?? null,
+        observation?.annotations ?? null,
+    );
+}
+
 function verifyProposalSnapshot(proposal, measurementResult, reader, label) {
     if (proposal === null
         || typeof proposal !== "object"
@@ -855,6 +892,7 @@ function verifyProposalSnapshot(proposal, measurementResult, reader, label) {
             label,
         });
     }
+
     const proposed = proposal.files.map((file) => {
         if (file === null
             || typeof file !== "object"
@@ -905,7 +943,9 @@ function verifyCandidateArtifacts(
     measurements,
     reader,
 ) {
-    if (measurements.length !== 1 || provenance.proposalArtifact === null) {
+    if (provenance.proposalArtifact === null
+        || provenance.replicationScheduleArtifact === null
+        || provenance.replicationCompositeArtifact === null) {
         integrityFailure("Candidate evidence has an incomplete proposal/measurement closure", {
             evidenceId: evidence.evidenceId,
         });
@@ -915,6 +955,219 @@ function verifyCandidateArtifacts(
         integrityFailure("Candidate evidence does not reference its reserved search command", {
             evidenceId: evidence.evidenceId,
         });
+    }
+    const schedule = normalizeReplicationSchedule(command.replicationSchedule);
+    if (!Object.hasOwn(command, "hypotheses")
+        || !canonicalEqual(
+            command.hypotheses,
+            observation.annotations?.hypotheses ?? null,
+        )
+        || evidence.hypothesesIdentity
+            !== (command.hypotheses?.identity ?? null)) {
+        integrityFailure("Candidate hypotheses are not bound to the frozen command", {
+            evidenceId: evidence.evidenceId,
+        });
+    }
+    const rawSeries = normalizeRawMeasurementSeries(
+        observation.data?.series?.[0],
+        {
+            schedule,
+            role: "search",
+            phase: "search",
+            caseId: null,
+        },
+    ).series;
+    const searchMeasurements = measurements.filter(
+        (item) => item.measurement.role === "search",
+    );
+    const noveltyMeasurements = measurements.filter(
+        (item) => item.measurement.role === "novelty",
+    );
+    if (searchMeasurements.length + noveltyMeasurements.length
+        !== measurements.length
+        || noveltyMeasurements.length > 1
+        || searchMeasurements.length % schedule.arms.length !== 0) {
+        integrityFailure("Candidate evidence does not contain complete replicate blocks", {
+            evidenceId: evidence.evidenceId,
+        });
+    }
+    const blockCount = searchMeasurements.length / schedule.arms.length;
+    if (blockCount !== rawSeries.completeBlocks.length
+        || blockCount !== evidence.replication?.blockCount
+        || searchMeasurements.length !== evidence.replication?.attemptCount) {
+        integrityFailure("Candidate replication counts disagree with its provenance", {
+            evidenceId: evidence.evidenceId,
+        });
+    }
+    const persistedSchedule = reader.readJson(
+        provenance.replicationScheduleArtifact,
+        `candidate ${evidence.evidenceId} measurement schedule`,
+    ).value;
+    if (!canonicalEqual(persistedSchedule, schedule)) {
+        integrityFailure("Candidate measurement schedule artifact changed", {
+            evidenceId: evidence.evidenceId,
+        });
+    }
+    const bySubject = new Map(
+        searchMeasurements.map((measurement) => [
+            measurement.measurement.subjectId,
+            measurement,
+        ]),
+    );
+    const candidateMeasurements = [];
+    const controlMeasurements = [];
+    const expectedAttempts = [];
+    for (let blockIndex = 0; blockIndex < blockCount; blockIndex += 1) {
+        const blockPlan = replicationBlockPlan(schedule, blockIndex);
+        for (const arm of [...blockPlan.arms].sort((left, right) =>
+            left.armIndex - right.armIndex)) {
+            const measured = bySubject.get(arm.subjectId);
+            if (measured === undefined
+                || measured.receipt.role !== "search"
+                || measured.receipt.phase !== "search"
+                || measured.receipt.replicateIndex !== arm.replicateIndex
+                || measured.receipt.blockIndex !== arm.blockIndex
+                || measured.receipt.armIndex !== arm.armIndex
+                || measured.receipt.armId !== arm.armId
+                || measured.receipt.deterministicSeed !== arm.deterministicSeed
+                || measured.receipt.subjectId !== arm.subjectId
+                || measured.receipt.environmentIdentity
+                    !== aggregate.contract.harnessSuite.environmentIdentity
+                || measured.receipt.suiteIdentity
+                    !== aggregate.contract.harnessSuiteIdentity) {
+                integrityFailure(
+                    "Candidate measurement receipt does not match its scheduled block arm",
+                    {
+                        evidenceId: evidence.evidenceId,
+                        blockIndex,
+                        armIndex: arm.armIndex,
+                    },
+                );
+            }
+            expectedAttempts.push({ arm, measured });
+            if (arm.armId === "candidate") candidateMeasurements.push(measured);
+            if (arm.armId === "control") controlMeasurements.push(measured);
+        }
+    }
+    if (candidateMeasurements.length !== blockCount
+        || controlMeasurements.length !== blockCount
+        || candidateMeasurements.some((measured) =>
+            measured.measurement.snapshot.snapshotHash
+                !== observation.receipt.candidateArtifactHash)
+        || new Set(controlMeasurements.map((measured) =>
+            measured.measurement.snapshot.snapshotHash)).size !== 1) {
+        integrityFailure("Candidate/control snapshot identity drifted across replicate blocks", {
+            evidenceId: evidence.evidenceId,
+        });
+    }
+    const controlBinding = deriveReplicationControlBinding({
+        contractHash: aggregate.contractHash,
+        statisticalPolicy: aggregate.contract.statisticalPolicy,
+        schedule,
+        enumerandManifest: aggregate.contract.enumerandManifest ?? null,
+        manifestOptions: {
+            topology: aggregate.contract.hypothesisTopology,
+            observableRegistry: aggregate.contract.observableRegistry,
+            hypothesisPolicy: aggregate.contract.hypothesisPolicy,
+        },
+        controlSnapshotHashes: controlMeasurements.map((measured) =>
+            measured.measurement.snapshot.snapshotHash),
+        requireObservedControl: true,
+    });
+    if (!canonicalEqual(controlBinding, evidence.replication?.control ?? null)) {
+        integrityFailure("Candidate control binding disagrees with the signed contract", {
+            evidenceId: evidence.evidenceId,
+        });
+    }
+
+    const composite = reader.readJson(
+        provenance.replicationCompositeArtifact,
+        `candidate ${evidence.evidenceId} replication composite`,
+    ).value;
+    if (!exactKeys(composite, [
+        "authority",
+        "candidateId",
+        "commandId",
+        "schedule",
+        "scheduleArtifact",
+        "series",
+        "stopping",
+        "version",
+    ])
+        || composite.version !== 2
+        || composite.authority !== "raw_complete_blocks"
+        || composite.commandId !== observation.commandId
+        || composite.candidateId !== command.candidateId
+        || !canonicalEqual(composite.schedule, schedule)
+        || !canonicalEqual(
+            composite.scheduleArtifact,
+            provenance.replicationScheduleArtifact,
+        )
+        || !canonicalEqual(composite.series, rawSeries)
+        || !canonicalEqual(
+            composite.stopping,
+            evidence.replication?.stopping ?? null,
+        )) {
+        integrityFailure("Candidate replication composite is inconsistent", {
+            evidenceId: evidence.evidenceId,
+        });
+    }
+    const rawAttempts = rawSeries.completeBlocks.flatMap(
+        (block) => block.observations,
+    );
+    for (const [index, expected] of expectedAttempts.entries()) {
+        const raw = rawAttempts[index];
+        const { arm, measured } = expected;
+        if (raw?.attemptId !== measured.receipt.attemptId
+            || raw.blockIndex !== arm.blockIndex
+            || raw.replicateIndex !== arm.replicateIndex
+            || raw.armIndex !== arm.armIndex
+            || raw.armId !== arm.armId
+            || raw.logicalSubjectId !== arm.logicalSubjectId
+            || raw.subjectId !== arm.subjectId
+            || raw.deterministicSeed !== arm.deterministicSeed
+            || raw.receiptHash !== measured.measurement.receiptHash
+            || raw.measurementRoot !== measured.measurement.measurementRoot
+            || !canonicalEqual(raw.parsed, measured.receipt.parsed)
+            || (raw.invalid === null) !== (measured.receipt.parsed !== null)) {
+            integrityFailure("Replication composite does not reference every raw receipt", {
+                evidenceId: evidence.evidenceId,
+                index,
+            });
+        }
+    }
+    const rawNovelty = observation.data?.novelty ?? null;
+    if ((rawNovelty === null) !== (noveltyMeasurements.length === 0)) {
+        integrityFailure("Candidate novelty authority is not one-to-one with its receipt", {
+            evidenceId: evidence.evidenceId,
+        });
+    }
+    if (rawNovelty !== null) {
+        const measured = noveltyMeasurements[0];
+        if (measured.receipt.role !== "novelty"
+            || measured.receipt.phase !== "novelty"
+            || measured.receipt.replicateIndex !== rawNovelty.replicateIndex
+            || measured.receipt.blockIndex !== rawNovelty.blockIndex
+            || measured.receipt.armIndex !== rawNovelty.armIndex
+            || measured.receipt.armId !== rawNovelty.armId
+            || measured.receipt.deterministicSeed
+                !== rawNovelty.deterministicSeed
+            || measured.receipt.subjectId !== rawNovelty.subjectId
+            || measured.measurement.subjectId !== rawNovelty.subjectId
+            || measured.measurement.snapshot.snapshotHash
+                !== observation.receipt.candidateArtifactHash
+            || rawNovelty.attemptId !== measured.receipt.attemptId
+            || rawNovelty.receiptHash !== measured.measurement.receiptHash
+            || rawNovelty.measurementRoot
+                !== measured.measurement.measurementRoot
+            || !canonicalEqual(rawNovelty.parsed, measured.receipt.parsed)
+            || (rawNovelty.invalid === null)
+                !== (measured.receipt.parsed !== null)) {
+            integrityFailure(
+                "Candidate novelty observation disagrees with its role-tagged receipt",
+                { evidenceId: evidence.evidenceId },
+            );
+        }
     }
     const proposalArtifact = reader.readJson(
         provenance.proposalArtifact,
@@ -952,14 +1205,17 @@ function verifyCandidateArtifacts(
         || !canonicalEqual(value.assignment, value.promptContext?.assignment)
         || !canonicalEqual(value.assignment, expectedAssignment(command))
         || value.proposal?.candidateId !== command.candidateId
-        || !canonicalEqual(measurements[0].receipt.parsed, observation.data)) {
+        || !candidateProposalAnnotationsMatch(
+            value.proposal,
+            observation,
+        )) {
         integrityFailure("Candidate proposal/context artifact is inconsistent with persisted evidence", {
             evidenceId: evidence.evidenceId,
         });
     }
     if (finiteEnumerand) {
         const measuredSnapshot =
-            measurements[0].measurement.snapshot.manifestArtifact.objectId;
+            candidateMeasurements[0].measurement.snapshot.manifestArtifact.objectId;
         if (!canonicalEqual(value.enumerand, command.enumerand)
             || !Array.isArray(value.proposal.files)
             || value.proposal.files.length !== 0
@@ -998,52 +1254,249 @@ function verifyCandidateArtifacts(
         }
         verifyProposalSnapshot(
             value.proposal,
-            measurements[0],
+            candidateMeasurements[0],
             reader,
             `candidate ${evidence.evidenceId}`,
         );
     }
 
     if (provenance.measurementReuseArtifact !== null) {
-        const reused = reader.readJson(
-            provenance.measurementReuseArtifact,
-            `candidate ${evidence.evidenceId} measurement reuse`,
-        ).value;
-        const sourceEvidence = aggregate.evidence[reused?.sourceEvidenceId] ?? null;
-        const sourceObservation = sourceEvidence === null
-            ? null
-            : aggregate.observations[sourceEvidence.observationId] ?? null;
-        const sourceMeasurement = sourceEvidence?.receipt?.provenance?.measurements?.find(
-            (item) => item.snapshot.snapshotHash === measurements[0].measurement.snapshot.snapshotHash,
-        ) ?? null;
-        if (!exactKeys(reused, [
-            "candidateArtifactHash",
-            "candidateId",
-            "commandId",
-            "duplicateOf",
-            "policy",
-            "snapshotId",
-            "sourceEvidenceId",
-            "sourceMeasurementAttemptId",
-            "sourceObservationId",
-            "sourceReceiptHash",
-            "version",
-        ])
-            || reused.version !== 1
-            || reused.policy !== "mark"
-            || reused.commandId !== observation.commandId
-            || reused.candidateId !== command.candidateId
-            || reused.candidateArtifactHash !== measurements[0].measurement.snapshot.snapshotHash
-            || reused.snapshotId !== measurements[0].measurement.snapshot.manifestArtifact.objectId
-            || reused.duplicateOf !== evidence.duplicateOf
-            || sourceEvidence === null
-            || sourceObservation === null
-            || reused.sourceObservationId !== sourceObservation.observationId
-            || reused.sourceMeasurementAttemptId !== sourceObservation.receipt?.attemptId
-            || reused.sourceReceiptHash !== sourceMeasurement?.receiptHash) {
-            integrityFailure("Measurement-reuse artifact is inconsistent with its source evidence", {
-                evidenceId: evidence.evidenceId,
-            });
+        integrityFailure(
+            "Replicated candidate evidence cannot reuse another candidate's measurement",
+            { evidenceId: evidence.evidenceId },
+        );
+    }
+}
+
+function verifyScientificRoleArtifacts(
+    aggregate,
+    evidence,
+    observation,
+    provenance,
+    measurements,
+    reader,
+) {
+    const role = evidence.purpose;
+    const command = aggregate.commands[observation.commandId]?.command ?? null;
+    const expectedKind = role === "confirmation"
+        ? "run_confirmation"
+        : "run_challenge";
+    const freeze = aggregate.confirmation?.freeze?.payload ?? null;
+    const member = freeze?.members?.find((item) =>
+        item.evidenceId === command?.candidateEvidenceId) ?? null;
+    const protocol = member?.roles?.[role] ?? null;
+    if (command?.kind !== expectedKind
+        || command.harnessRole !== role
+        || protocol === null
+        || !canonicalEqual(command.protocolManifest, protocol)
+        || command.protocolManifestHash !== protocol.protocolManifestHash
+        || provenance.proposalArtifact !== null
+        || provenance.replicationScheduleArtifact === null
+        || provenance.replicationCompositeArtifact === null) {
+        integrityFailure(
+            "Scientific role evidence has an incomplete or mismatched frozen protocol closure",
+            { evidenceId: evidence.evidenceId, role },
+        );
+    }
+    const schedule = normalizeReplicationSchedule(command.replicationSchedule);
+    if (!Object.hasOwn(command, "hypotheses")
+        || !canonicalEqual(
+            command.hypotheses,
+            observation.annotations?.hypotheses ?? null,
+        )
+        || evidence.hypothesesIdentity
+            !== (command.hypotheses?.identity ?? null)
+        || !canonicalEqual(command.hypotheses, protocol.hypotheses)) {
+        integrityFailure(
+            "Scientific role hypotheses are not bound to the frozen protocol",
+            { evidenceId: evidence.evidenceId, role },
+        );
+    }
+    const rawSeries = normalizeRawMeasurementSeries(
+        observation.data?.series?.[0],
+        {
+            schedule,
+            role,
+            phase: role,
+            caseId: null,
+        },
+    ).series;
+    if (measurements.length % schedule.arms.length !== 0
+        || measurements.some((item) =>
+            item.measurement.role !== role
+            || item.measurement.phase !== role)) {
+        integrityFailure(
+            "Scientific role evidence does not contain complete role-tagged replicate blocks",
+            { evidenceId: evidence.evidenceId, role },
+        );
+    }
+    const blockCount = measurements.length / schedule.arms.length;
+    if (blockCount !== rawSeries.completeBlocks.length
+        || blockCount !== evidence.replication?.blockCount
+        || measurements.length !== evidence.replication?.attemptCount) {
+        integrityFailure(
+            "Scientific role replication counts disagree with its provenance",
+            { evidenceId: evidence.evidenceId, role },
+        );
+    }
+    const persistedSchedule = reader.readJson(
+        provenance.replicationScheduleArtifact,
+        `${role} ${evidence.evidenceId} measurement schedule`,
+    ).value;
+    if (!canonicalEqual(persistedSchedule, schedule)) {
+        integrityFailure("Scientific role measurement schedule artifact changed", {
+            evidenceId: evidence.evidenceId,
+            role,
+        });
+    }
+    const bySubject = new Map(
+        measurements.map((item) => [item.measurement.subjectId, item]),
+    );
+    const expectedAttempts = [];
+    const candidateMeasurements = [];
+    const controlMeasurements = [];
+    for (let blockIndex = 0; blockIndex < blockCount; blockIndex += 1) {
+        for (const arm of [...replicationBlockPlan(
+            schedule,
+            blockIndex,
+        ).arms].sort((left, right) => left.armIndex - right.armIndex)) {
+            const measured = bySubject.get(arm.subjectId);
+            if (measured === undefined
+                || measured.receipt.role !== role
+                || measured.receipt.phase !== role
+                || measured.receipt.replicateIndex !== arm.replicateIndex
+                || measured.receipt.blockIndex !== arm.blockIndex
+                || measured.receipt.armIndex !== arm.armIndex
+                || measured.receipt.armId !== arm.armId
+                || measured.receipt.deterministicSeed
+                    !== arm.deterministicSeed
+                || measured.receipt.subjectId !== arm.subjectId
+                || measured.receipt.environmentIdentity
+                    !== aggregate.contract.harnessSuite.environmentIdentity
+                || measured.receipt.suiteIdentity
+                    !== aggregate.contract.harnessSuiteIdentity) {
+                integrityFailure(
+                    "Scientific role receipt does not match its scheduled block arm",
+                    {
+                        evidenceId: evidence.evidenceId,
+                        role,
+                        blockIndex,
+                        armIndex: arm.armIndex,
+                    },
+                );
+            }
+            expectedAttempts.push({ arm, measured });
+            if (arm.armId === "candidate") {
+                candidateMeasurements.push(measured);
+            } else if (arm.armId === "control") {
+                controlMeasurements.push(measured);
+            }
+        }
+    }
+    if (candidateMeasurements.length !== blockCount
+        || controlMeasurements.length !== blockCount
+        || candidateMeasurements.some((measured) =>
+            measured.measurement.snapshot.snapshotHash
+                !== member.candidateArtifactHash)
+        || new Set(controlMeasurements.map((measured) =>
+            measured.measurement.snapshot.snapshotHash)).size !== 1) {
+        integrityFailure(
+            "Scientific role candidate/control snapshot identity drifted",
+            { evidenceId: evidence.evidenceId, role },
+        );
+    }
+    const controlBinding = deriveReplicationControlBinding({
+        contractHash: aggregate.contractHash,
+        statisticalPolicy: aggregate.contract.statisticalPolicy,
+        schedule,
+        enumerandManifest: aggregate.contract.enumerandManifest ?? null,
+        manifestOptions: {
+            topology: aggregate.contract.hypothesisTopology,
+            observableRegistry: aggregate.contract.observableRegistry,
+            hypothesisPolicy: aggregate.contract.hypothesisPolicy,
+        },
+        controlSnapshotHashes: controlMeasurements.map((measured) =>
+            measured.measurement.snapshot.snapshotHash),
+        requireObservedControl: true,
+    });
+    if (!canonicalEqual(controlBinding, evidence.replication?.control ?? null)
+        || !canonicalEqual(controlBinding, protocol.control ?? null)) {
+        integrityFailure(
+            "Scientific role control binding disagrees with the frozen protocol",
+            { evidenceId: evidence.evidenceId, role },
+        );
+    }
+    const composite = reader.readJson(
+        provenance.replicationCompositeArtifact,
+        `${role} ${evidence.evidenceId} replication composite`,
+    ).value;
+    if (!exactKeys(composite, [
+        "authority",
+        "candidateEvidenceId",
+        "candidateId",
+        "commandId",
+        "confirmationFreezeHash",
+        "protocolManifest",
+        "protocolManifestHash",
+        "role",
+        "schedule",
+        "scheduleArtifact",
+        "series",
+        "stopping",
+        "version",
+    ])
+        || composite.version !== 2
+        || composite.authority !== "raw_complete_blocks"
+        || composite.commandId !== observation.commandId
+        || composite.candidateId !== command.candidateId
+        || composite.candidateEvidenceId !== command.candidateEvidenceId
+        || composite.confirmationFreezeHash
+            !== command.confirmationFreezeHash
+        || composite.role !== role
+        || composite.protocolManifestHash
+            !== command.protocolManifestHash
+        || !canonicalEqual(
+            composite.protocolManifest,
+            command.protocolManifest,
+        )
+        || !canonicalEqual(composite.schedule, schedule)
+        || !canonicalEqual(
+            composite.scheduleArtifact,
+            provenance.replicationScheduleArtifact,
+        )
+        || !canonicalEqual(composite.series, rawSeries)
+        || !canonicalEqual(
+            composite.stopping,
+            evidence.replication?.stopping ?? null,
+        )) {
+        integrityFailure(
+            "Scientific role replication/protocol composite is inconsistent",
+            { evidenceId: evidence.evidenceId, role },
+        );
+    }
+    const rawAttempts = rawSeries.completeBlocks.flatMap(
+        (block) => block.observations,
+    );
+    for (const [index, expected] of expectedAttempts.entries()) {
+        const raw = rawAttempts[index];
+        const { arm, measured } = expected;
+        if (raw?.attemptId !== measured.receipt.attemptId
+            || raw.blockIndex !== arm.blockIndex
+            || raw.replicateIndex !== arm.replicateIndex
+            || raw.armIndex !== arm.armIndex
+            || raw.armId !== arm.armId
+            || raw.logicalSubjectId !== arm.logicalSubjectId
+            || raw.subjectId !== arm.subjectId
+            || raw.deterministicSeed !== arm.deterministicSeed
+            || raw.receiptHash !== measured.measurement.receiptHash
+            || raw.measurementRoot !== measured.measurement.measurementRoot
+            || !canonicalEqual(raw.parsed, measured.receipt.parsed)
+            || (raw.invalid === null)
+                !== (measured.receipt.parsed !== null)) {
+            integrityFailure(
+                "Scientific role composite does not reference every raw receipt",
+                { evidenceId: evidence.evidenceId, role, index },
+            );
         }
     }
 }
@@ -1056,60 +1509,107 @@ function verifyValidationArtifacts(
     measurements,
     reader,
 ) {
-    if (provenance.validationCompositeArtifact === null
-        || measurements.length !== aggregate.contract.validationCases.length) {
+    const command = aggregate.commands[observation.commandId]?.command ?? null;
+    if (command?.kind !== "run_validation"
+        || provenance.validationCompositeArtifact === null
+        || measurements.length !== command.validationSeries.length) {
         integrityFailure("Validation evidence has an incomplete composite closure", {
             evidenceId: evidence.evidenceId,
         });
     }
-    const bySubject = new Map(measurements.map((item) => [item.measurement.subjectId, item]));
-    const caseMap = {};
-    const receiptRoots = [];
-    const validationCases = [...aggregate.contract.validationCases]
-        .sort((left, right) => left.id.localeCompare(right.id));
-    for (const validationCase of validationCases) {
-        const measured = bySubject.get(validationCase.id);
-        if (measured === undefined) {
-            integrityFailure("Validation composite omits a frozen validation case", {
+    const validationControlBindings = command.validationSeries.map((series) =>
+        deriveReplicationControlBinding({
+            contractHash: aggregate.contractHash,
+            statisticalPolicy: aggregate.contract.statisticalPolicy,
+            schedule: series.replicationSchedule,
+            enumerandManifest: aggregate.contract.enumerandManifest ?? null,
+            manifestOptions: {
+                topology: aggregate.contract.hypothesisTopology,
+                observableRegistry: aggregate.contract.observableRegistry,
+                hypothesisPolicy: aggregate.contract.hypothesisPolicy,
+            },
+        }));
+    if (!canonicalEqual(
+        validationControlBindings,
+        evidence.validationControlBindings ?? [],
+    )) {
+        integrityFailure(
+            "Validation schedules do not bind the signed statistical control",
+            { evidenceId: evidence.evidenceId },
+        );
+    }
+    const bySubject = new Map(
+        measurements.map((item) => [item.measurement.subjectId, item]),
+    );
+    const normalizedSeries = [];
+    for (const reservedSeries of command.validationSeries) {
+        const raw = observation.data?.series?.find((series) =>
+            series.role === reservedSeries.role
+            && series.caseId === reservedSeries.caseId);
+        const normalized = normalizeRawMeasurementSeries(raw, {
+            schedule: reservedSeries.replicationSchedule,
+            role: reservedSeries.role,
+            phase: "calibration",
+            caseId: reservedSeries.caseId,
+        }).series;
+        if (normalized.completeBlocks.length !== 1
+            || normalized.completeBlocks[0].blockIndex !== command.attemptIndex
+            || normalized.completeBlocks[0].observations.length !== 1) {
+            integrityFailure("Validation composite has an invalid complete block", {
                 evidenceId: evidence.evidenceId,
-                caseId: validationCase.id,
+                role: reservedSeries.role,
+                caseId: reservedSeries.caseId,
             });
         }
-        const outcome = measured.receipt.parsed?.pass === true ? "accept" : "reject";
-        caseMap[validationCase.id] = {
-            artifactHash: validationCase.artifactHash,
-            expectation: validationCase.expectation,
-            outcome,
-            matched: outcome === validationCase.expectation,
-            attemptId: measured.receipt.attemptId,
-            parsed: measured.receipt.parsed,
-            receiptHash: measured.measurement.receiptHash,
-        };
-        receiptRoots.push({
-            id: validationCase.id,
-            receiptHash: measured.measurement.receiptHash,
-            attemptId: measured.receipt.attemptId,
-        });
+        const rawObservation = normalized.completeBlocks[0].observations[0];
+        const measured = bySubject.get(rawObservation.subjectId);
+        if (measured === undefined
+            || measured.receipt.role !== reservedSeries.role
+            || measured.receipt.phase !== "calibration"
+            || measured.receipt.blockIndex !== command.attemptIndex
+            || measured.receipt.subjectId !== rawObservation.subjectId
+            || measured.measurement.snapshot.manifestArtifact.objectId
+                !== reservedSeries.artifactHash
+            || rawObservation.attemptId !== measured.receipt.attemptId
+            || rawObservation.receiptHash !== measured.measurement.receiptHash
+            || rawObservation.measurementRoot
+                !== measured.measurement.measurementRoot
+            || !canonicalEqual(rawObservation.parsed, measured.receipt.parsed)
+            || (rawObservation.invalid === null)
+                !== (measured.receipt.parsed !== null)) {
+            integrityFailure(
+                "Validation raw observation disagrees with its role-tagged receipt",
+                {
+                    evidenceId: evidence.evidenceId,
+                    role: reservedSeries.role,
+                    caseId: reservedSeries.caseId,
+                },
+            );
+        }
+        normalizedSeries.push(normalized);
     }
-    const compositeReceiptHash = hashCanonical(
-        { cases: receiptRoots },
-        VALIDATION_RECEIPT_HASH_ALGORITHM,
-    );
+    normalizedSeries.sort((left, right) =>
+        `${left.role}\0${left.caseId}`.localeCompare(
+            `${right.role}\0${right.caseId}`,
+        ));
     const composite = reader.readJson(
         provenance.validationCompositeArtifact,
         `validation ${evidence.evidenceId} composite`,
     ).value;
-    const caseResults = validationCases.map((validationCase) => ({
-        id: validationCase.id,
-        artifactHash: validationCase.artifactHash,
-        outcome: caseMap[validationCase.id].outcome,
-    }));
-    if (!exactKeys(composite, ["caseMap", "compositeReceiptHash"])
-        || !canonicalEqual(composite.caseMap, caseMap)
-        || composite.compositeReceiptHash !== compositeReceiptHash
-        || !canonicalEqual(observation.data?.caseResults, caseResults)
-        || !canonicalEqual(observation.data?.caseMap, caseMap)
-        || observation.data?.compositeReceiptHash !== compositeReceiptHash) {
+    if (!exactKeys(composite, [
+        "attemptIndex",
+        "authority",
+        "commandId",
+        "series",
+        "version",
+    ])
+        || composite.version !== 2
+        || composite.authority !== "raw_complete_blocks"
+        || composite.commandId !== observation.commandId
+        || composite.attemptIndex !== command.attemptIndex
+        || observation.data?.attemptIndex !== command.attemptIndex
+        || !canonicalEqual(composite.series, normalizedSeries)
+        || !canonicalEqual(observation.data?.series, normalizedSeries)) {
         integrityFailure("Validation composite artifact disagrees with its full receipts", {
             evidenceId: evidence.evidenceId,
         });
@@ -1214,7 +1714,7 @@ function verifyEvidenceArtifactClosure(
         ));
     if (measurements.some((item) =>
         item.receipt.runnerEpochId !== observation.receipt?.runnerEpochId)
-        || (evidence.purpose !== "validation"
+        || (evidence.purpose === "impossibility"
             && measurements[0]?.receipt.attemptId !== observation.receipt?.attemptId)) {
         integrityFailure("Full measurement receipts are not bound to the observation attempt", {
             evidenceId: evidence.evidenceId,
@@ -1229,10 +1729,14 @@ function verifyEvidenceArtifactClosure(
         id: item.measurement.subjectId,
         hash: item.measurement.rawStderrHash,
     }));
-    const expectedStdout = evidence.purpose === "validation"
+    const compositeStreams = evidence.purpose === "validation"
+        || evidence.purpose === "candidate"
+        || evidence.purpose === "confirmation"
+        || evidence.purpose === "challenge";
+    const expectedStdout = compositeStreams
         ? hashCanonical(stdoutHashes, OBSERVATION_STREAM_HASH_ALGORITHM)
         : measurements[0]?.measurement.rawStdoutHash ?? null;
-    const expectedStderr = evidence.purpose === "validation"
+    const expectedStderr = compositeStreams
         ? hashCanonical(stderrHashes, OBSERVATION_STREAM_HASH_ALGORITHM)
         : measurements[0]?.measurement.rawStderrHash ?? null;
     if (observation.receipt?.rawStdoutHash !== expectedStdout
@@ -1244,6 +1748,16 @@ function verifyEvidenceArtifactClosure(
 
     if (evidence.purpose === "candidate") {
         verifyCandidateArtifacts(
+            aggregate,
+            evidence,
+            observation,
+            provenance,
+            measurements,
+            reader,
+        );
+    } else if (evidence.purpose === "confirmation"
+        || evidence.purpose === "challenge") {
+        verifyScientificRoleArtifacts(
             aggregate,
             evidence,
             observation,
@@ -1276,6 +1790,47 @@ function verifyEvidenceArtifactClosure(
         });
     }
     return measurements.length;
+}
+
+function verifyOperationalMeasurementClosure(
+    observation,
+    provenance,
+    operationalEvidence,
+    { requirePresence = true } = {},
+) {
+    const committed = operationalEvidence.filter((event) =>
+        event.kind === "runtime:measurement"
+        && event.payload?.commandId === observation.commandId
+        && event.payload?.purpose === observation.purpose);
+    if (!requirePresence && committed.length === 0) return;
+    const bySubject = new Map();
+    for (const event of committed) {
+        const subjectId = event.payload?.measurementSubjectId;
+        if (typeof subjectId !== "string" || bySubject.has(subjectId)) {
+            integrityFailure(
+                "Operational measurement history has a duplicate or invalid subject",
+                { commandId: observation.commandId, subjectId: subjectId ?? null },
+            );
+        }
+        bySubject.set(subjectId, event.payload);
+    }
+    if (bySubject.size !== provenance.measurements.length
+        || provenance.measurements.some((measurement) =>
+            !canonicalEqual(
+                bySubject.get(measurement.subjectId)?.measurementProvenance
+                    ?? null,
+                measurement,
+            ))) {
+        integrityFailure(
+            "Evidence omitted or changed committed operational measurement blocks",
+            {
+                commandId: observation.commandId,
+                purpose: observation.purpose,
+                committedCount: bySubject.size,
+                evidenceCount: provenance.measurements.length,
+            },
+        );
+    }
 }
 
 export class DomainRepositoryAdapter {
@@ -1411,7 +1966,13 @@ export class DomainRepositoryAdapter {
         try {
             verifyEventChain(domainEvents);
             const aggregate = replayEvents(domainEvents);
-            return { aggregate, domainEvents, repositoryEvents: rows, repositoryReport };
+            return {
+                aggregate,
+                scientificReplay: aggregate.scientificReplay,
+                domainEvents,
+                repositoryEvents: rows,
+                repositoryReport,
+            };
         } catch (error) {
             throw new RuntimeIntegrityError(
                 "Domain hash-chain or reducer replay failed",
@@ -1422,6 +1983,16 @@ export class DomainRepositoryAdapter {
                 { cause: error },
             );
         }
+    }
+
+    replayScientific() {
+        const replay = this.replay();
+        return {
+            ...replay,
+            scientificReplay: materializeScientificReplayState(
+                replay.aggregate,
+            ),
+        };
     }
 
     verifyTerminalArtifactClosure({ artifactStore } = {}) {
@@ -1454,6 +2025,7 @@ export class DomainRepositoryAdapter {
         );
         let checkedEvidence = 0;
         let checkedMeasurements = 0;
+        const operationalEvidence = this.listOperationalEvidence();
         for (const evidenceId of aggregate.evidenceOrder) {
             const evidence = aggregate.evidence[evidenceId] ?? null;
             if (evidence === null) {
@@ -1463,6 +2035,19 @@ export class DomainRepositoryAdapter {
                 );
             }
             if (evidence.sourceKind === "harness") {
+                const observation =
+                    aggregate.observations[evidence.observationId] ?? null;
+                if (observation === null) {
+                    throw new RuntimeIntegrityError(
+                        "Terminal harness evidence is missing its observation",
+                        { investigationId: this.#investigationId, evidenceId },
+                    );
+                }
+                verifyOperationalMeasurementClosure(
+                    observation,
+                    evidence.receipt.provenance,
+                    operationalEvidence,
+                );
                 checkedEvidence += 1;
                 checkedMeasurements += verifyEvidenceArtifactClosure(
                     aggregate,
@@ -1486,6 +2071,18 @@ export class DomainRepositoryAdapter {
                 { investigationId: this.#investigationId },
             );
         }
+        const expectedScientificReplay = scientificReplaySummary(
+            aggregate.scientificReplay,
+        );
+        if (!canonicalEqual(
+            aggregate.terminal.evidenceClosure.scientificReplay,
+            expectedScientificReplay,
+        )) {
+            throw new RuntimeIntegrityError(
+                "Persisted terminal scientific replay closure is inconsistent",
+                { investigationId: this.#investigationId },
+            );
+        }
 
         return {
             ...replay,
@@ -1495,6 +2092,8 @@ export class DomainRepositoryAdapter {
                 checkedArtifacts: reader.count(),
                 checkedEvidence,
                 checkedMeasurements,
+                scientificReplayClosureRoot:
+                    expectedScientificReplay.closureRoot,
             },
         };
     }
@@ -1634,6 +2233,12 @@ export class DomainRepositoryAdapter {
                     { observationId: domainEvent.payload.observationId },
                 );
             }
+            verifyOperationalMeasurementClosure(
+                observation,
+                observation.receipt.provenance,
+                this.listOperationalEvidence(),
+                { requirePresence: false },
+            );
             assertArtifactBindings(
                 this.#repository,
                 this.#investigationId,

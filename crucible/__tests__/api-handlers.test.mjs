@@ -20,6 +20,7 @@ import {
     DOMAIN_VERSION,
     EVENT_TYPES,
     createEvidenceProvenance,
+    createRawMeasurementSeries,
     createInvestigationContract,
     createMeasurementProvenance,
     createSnapshotProvenance,
@@ -28,8 +29,10 @@ import {
     computeEventHash as computeDomainEventHash,
     decideNext,
     deriveImpossibilityVerdict,
+    deriveTerminalEvidenceClosure,
     enumerandBindingHash,
     hashCanonical,
+    replicationBlockPlan,
 } from "../domain/index.mjs";
 import {
     canonicalize,
@@ -73,6 +76,7 @@ import {
 } from "../api/handlers.mjs";
 import {
     NON_RESULT_BANNER,
+    assertPublicToolPayload,
 } from "../api/result.mjs";
 import {
     ContractConflictError,
@@ -571,6 +575,7 @@ function seedMeasurementReceipt({
     stderrHash,
     stdoutBytes,
     stderrBytes,
+    measurementBinding = null,
 }) {
     const executableHash = hashCanonical(
         { harness: "executable" },
@@ -663,6 +668,7 @@ function seedMeasurementReceipt({
         },
         parserVersion: aggregate.contract.parserVersion,
         sandbox: null,
+        ...(measurementBinding === null ? {} : { measurementBinding }),
         attemptId: `attempt-${observationId}-${subjectId}`,
         runnerEpochId: "runner-epoch-seed",
         startedAt: "2026-01-01T00:00:00.000Z",
@@ -674,14 +680,41 @@ function seedMeasurementReceipt({
 }
 
 function seedReceipt(adapter, store, aggregate, reserved, observationId, purpose, options = {}) {
-    const subjectIds = purpose === "validation"
-        ? aggregate.contract.validationCases.map((item) => item.id)
-        : [purpose === "candidate"
-            ? reserved.candidateId
-            : `impossibility-${reserved.attemptOrdinal}`];
+    const replicatedPurpose = purpose === "candidate"
+        || purpose === "confirmation"
+        || purpose === "challenge";
+    const subjectDescriptors = purpose === "validation"
+        ? reserved.validationSeries.flatMap((series) =>
+            replicationBlockPlan(
+                series.replicationSchedule,
+                reserved.attemptIndex,
+            ).arms.map((arm) => ({
+                subjectId: arm.subjectId,
+                arm,
+                series,
+            })))
+        : replicatedPurpose
+            ? Array.from(
+                { length: reserved.replicationSchedule.minBlocks },
+                (_unused, blockIndex) =>
+                    replicationBlockPlan(
+                        reserved.replicationSchedule,
+                        blockIndex,
+                    ).arms,
+            ).flat()
+                .sort((left, right) =>
+                    left.blockIndex - right.blockIndex
+                    || left.armIndex - right.armIndex)
+                .map((arm) => ({ subjectId: arm.subjectId, arm, series: null }))
+            : [{
+                subjectId: `impossibility-${reserved.attemptOrdinal}`,
+                arm: null,
+                series: null,
+            }];
     let candidateProposalArtifact = null;
     let promptContextHash = null;
     let candidateSnapshot = null;
+    let replicationScheduleArtifact = null;
     if (purpose === "candidate") {
         const assignment = {
             operator: reserved.operator,
@@ -711,6 +744,13 @@ function seedReceipt(adapter, store, aggregate, reserved, observationId, purpose
             reserved.enumerand?.topology === "finite_enumerable";
         const proposal = {
             candidateId: reserved.candidateId,
+            annotations: {
+                mechanism: null,
+                hypothesis: null,
+                expectedEffects: [],
+                citedEvidenceIds: [],
+                finding: null,
+            },
             files: finiteEnumerand
                 ? []
                 : [{
@@ -748,32 +788,99 @@ function seedReceipt(adapter, store, aggregate, reserved, observationId, purpose
             }), "utf8"),
             "application/vnd.crucible.candidate-proposal+json",
         );
+    } else if (replicatedPurpose) {
+        const snapshotId =
+            `sha256:${reserved.candidateArtifactHash.split(":").at(-1)}`;
+        candidateSnapshot = {
+            snapshotId,
+            manifest: store.loadManifest(snapshotId),
+        };
     }
-    const measurementDetails = subjectIds.map((subjectId) => {
+    if (replicatedPurpose) {
+        replicationScheduleArtifact = persistSeedBytes(
+            adapter,
+            store,
+            `${observationId}-replication-schedule`,
+            Buffer.from(canonicalJson(reserved.replicationSchedule), "utf8"),
+            "application/vnd.crucible.measurement-schedule+json",
+        );
+    }
+    const measurementDetails = subjectDescriptors.map(({
+        subjectId,
+        arm,
+        series,
+    }) => {
         const snapshotId = purpose === "validation"
-            ? aggregate.contract.validationCases.find((item) => item.id === subjectId)
-                .artifactHash
-            : purpose === "candidate"
+            ? series.artifactHash
+            : replicatedPurpose
                 ? candidateSnapshot.snapshotId
                 : createSeedSnapshot(store, [{
                     path: "request.json",
                     content: canonicalJson(reserved.request),
                 }]).snapshotId;
-        const parsed = purpose === "validation"
+        const rawParsed = purpose === "validation"
             ? {
                 pass: aggregate.contract.validationCases.find(
-                    (item) => item.id === subjectId,
+                    (item) => item.id === series.caseId,
                 ).expectation === "accept",
-                metrics: {},
+                metrics: {
+                    score: aggregate.contract.validationCases.find(
+                        (item) => item.id === series.caseId,
+                    ).expectation === "accept"
+                        ? aggregate.contract.statisticalPolicy.metrics[0].maximum
+                        : aggregate.contract.statisticalPolicy.metrics[0].minimum,
+                },
             }
-            : purpose === "candidate"
+            : replicatedPurpose
                 ? options.candidateData
                 : {
                     pass: options.impossibilityFacts.pass,
                     searchSpaceExhausted: options.impossibilityFacts.searchSpaceExhausted,
                     metrics: {},
                 };
-        const stdoutBytes = Buffer.from(canonicalJson(parsed), "utf8");
+        const measurementBinding = arm === null
+            ? {
+                role: "impossibility_verifier",
+                phase: "impossibility_verification",
+                replicateIndex: null,
+                blockIndex: null,
+                armIndex: null,
+                armId: null,
+                deterministicSeed: hashCanonical({
+                    contractHash: aggregate.contractHash,
+                    requestHash: reserved.requestHash,
+                    attemptOrdinal: reserved.attemptOrdinal,
+                }, "sha256:crucible-impossibility-measurement-seed-v1"),
+                subjectId,
+                environmentIdentity:
+                    aggregate.contract.harnessSuite.environmentIdentity,
+                suiteIdentity: aggregate.contract.harnessSuiteIdentity,
+            }
+            : {
+                role: purpose === "validation"
+                    ? series.role
+                    : purpose === "candidate"
+                        ? "search"
+                        : purpose,
+                phase: purpose === "validation"
+                    ? "calibration"
+                    : purpose === "candidate"
+                        ? "search"
+                        : purpose,
+                replicateIndex: arm.replicateIndex,
+                blockIndex: arm.blockIndex,
+                armIndex: arm.armIndex,
+                armId: arm.armId,
+                deterministicSeed: arm.deterministicSeed,
+                subjectId: arm.subjectId,
+                environmentIdentity:
+                    aggregate.contract.harnessSuite.environmentIdentity,
+                suiteIdentity: aggregate.contract.harnessSuiteIdentity,
+            };
+        const parsed = measurementBinding === null
+            ? rawParsed
+            : { ...rawParsed, ...measurementBinding };
+        const stdoutBytes = Buffer.from(canonicalJson(rawParsed), "utf8");
         const stderrBytes = Buffer.from(`stderr-${observationId}-${subjectId}`, "utf8");
         const stdoutHash = sha256Bytes(stdoutBytes, STREAM_HASH_ALGORITHM);
         const stderrHash = sha256Bytes(stderrBytes, STREAM_HASH_ALGORITHM);
@@ -795,6 +902,7 @@ function seedReceipt(adapter, store, aggregate, reserved, observationId, purpose
             stderrHash,
             stdoutBytes: stdoutBytes.length,
             stderrBytes: stderrBytes.length,
+            measurementBinding,
         });
         const receiptArtifact = persistSeedBytes(
             adapter,
@@ -819,6 +927,22 @@ function seedReceipt(adapter, store, aggregate, reserved, observationId, purpose
         );
         const measurement = createMeasurementProvenance({
             subjectId,
+            role: fullReceipt.role
+                ?? (purpose === "impossibility"
+                    ? "impossibility_verifier"
+                    : purpose === "validation"
+                        ? series.role
+                        : purpose === "candidate"
+                            ? "search"
+                            : purpose),
+            phase: fullReceipt.phase
+                ?? (purpose === "impossibility"
+                    ? "impossibility_verification"
+                    : purpose === "validation"
+                        ? "calibration"
+                        : purpose === "candidate"
+                            ? "search"
+                            : purpose),
             receiptArtifact,
             receiptHash: hashReceipt(fullReceipt),
             rawStdoutArtifact,
@@ -861,62 +985,107 @@ function seedReceipt(adapter, store, aggregate, reserved, observationId, purpose
             fullReceipt,
             stdoutBytes,
             stderrBytes,
+            arm,
+            series,
         };
     });
     const measurements = measurementDetails.map((item) => item.measurement);
     let validationCompositeArtifact = null;
     let impossibilityCertificateArtifact = null;
+    let replicationCompositeArtifact = null;
     let data;
     let impossibilityReceiptFields = {};
     if (purpose === "validation") {
-        const caseMap = {};
-        const cases = [];
-        const sortedDetails = [...measurementDetails].sort((left, right) =>
-            left.measurement.subjectId.localeCompare(right.measurement.subjectId));
-        for (const detail of sortedDetails) {
-            const validationCase = aggregate.contract.validationCases.find(
-                (item) => item.id === detail.measurement.subjectId,
-            );
-            const outcome = detail.fullReceipt.parsed.pass ? "accept" : "reject";
-            caseMap[validationCase.id] = {
-                artifactHash: validationCase.artifactHash,
-                expectation: validationCase.expectation,
-                outcome,
-                matched: outcome === validationCase.expectation,
-                attemptId: detail.fullReceipt.attemptId,
-                parsed: detail.fullReceipt.parsed,
-                receiptHash: detail.measurement.receiptHash,
-            };
-            cases.push({
-                id: validationCase.id,
-                receiptHash: detail.measurement.receiptHash,
-                attemptId: detail.fullReceipt.attemptId,
+        const series = reserved.validationSeries.map((reservedSeries) => {
+            const details = measurementDetails.filter((detail) =>
+                detail.series.role === reservedSeries.role
+                && detail.series.caseId === reservedSeries.caseId);
+            return createRawMeasurementSeries({
+                schedule: reservedSeries.replicationSchedule,
+                attempts: details.map((detail) => ({
+                    ...detail.arm,
+                    attemptId: detail.fullReceipt.attemptId,
+                    parsed: detail.fullReceipt.parsed,
+                    invalid: null,
+                    receiptHash: detail.measurement.receiptHash,
+                    measurementRoot: detail.measurement.measurementRoot,
+                })),
+                role: reservedSeries.role,
+                phase: "calibration",
+                caseId: reservedSeries.caseId,
             });
-        }
-        const compositeReceiptHash = hashCanonical(
-            { cases },
-            "sha256:crucible-runtime-validation-receipts-v1",
-        );
+        }).sort((left, right) =>
+            `${left.role}\0${left.caseId}`.localeCompare(
+                `${right.role}\0${right.caseId}`,
+            ));
+        data = {
+            version: 1,
+            attemptIndex: reserved.attemptIndex,
+            series,
+        };
         validationCompositeArtifact = persistSeedBytes(
             adapter,
             store,
             `${observationId}-validation`,
-            Buffer.from(canonicalJson({ caseMap, compositeReceiptHash }), "utf8"),
+            Buffer.from(canonicalJson({
+                version: 2,
+                authority: "raw_complete_blocks",
+                commandId: aggregate.commandOrder.at(-1),
+                attemptIndex: reserved.attemptIndex,
+                series,
+            }), "utf8"),
             "application/vnd.crucible.validation-receipt+json",
         );
-        data = {
-            caseResults: [...aggregate.contract.validationCases]
-                .sort((left, right) => left.id.localeCompare(right.id))
-                .map((validationCase) => ({
-                id: validationCase.id,
-                artifactHash: validationCase.artifactHash,
-                outcome: caseMap[validationCase.id].outcome,
-                })),
-            caseMap,
-            compositeReceiptHash,
-        };
-    } else if (purpose === "candidate") {
-        data = options.candidateData;
+    } else if (replicatedPurpose) {
+        const role = purpose === "candidate" ? "search" : purpose;
+        const series = createRawMeasurementSeries({
+            schedule: reserved.replicationSchedule,
+            attempts: measurementDetails.map((detail) => ({
+                ...detail.arm,
+                attemptId: detail.fullReceipt.attemptId,
+                parsed: detail.fullReceipt.parsed,
+                invalid: null,
+                receiptHash: detail.measurement.receiptHash,
+                measurementRoot: detail.measurement.measurementRoot,
+            })),
+            role,
+            phase: role,
+            caseId: null,
+        });
+        data = { version: 1, series: [series] };
+        const composite = purpose === "candidate"
+            ? {
+                version: 2,
+                authority: "raw_complete_blocks",
+                commandId: aggregate.commandOrder.at(-1),
+                candidateId: reserved.candidateId,
+                schedule: reserved.replicationSchedule,
+                scheduleArtifact: replicationScheduleArtifact,
+                series,
+            }
+            : {
+                version: 2,
+                authority: "raw_complete_blocks",
+                commandId: aggregate.commandOrder.at(-1),
+                candidateId: reserved.candidateId,
+                candidateEvidenceId: reserved.candidateEvidenceId,
+                confirmationFreezeHash:
+                    reserved.confirmationFreezeHash,
+                role,
+                protocolManifest: reserved.protocolManifest,
+                protocolManifestHash:
+                    reserved.protocolManifestHash,
+                schedule: reserved.replicationSchedule,
+                scheduleArtifact: replicationScheduleArtifact,
+                series,
+            };
+        replicationCompositeArtifact = persistSeedBytes(
+            adapter,
+            store,
+            `${observationId}-replication-composite`,
+            Buffer.from(canonicalJson(composite), "utf8"),
+            "application/vnd.crucible.replication-composite+json",
+        );
     } else {
         const detail = measurementDetails[0];
         const verifiedFacts = {
@@ -972,6 +1141,8 @@ function seedReceipt(adapter, store, aggregate, reserved, observationId, purpose
         promptContextHash,
         validationCompositeArtifact,
         impossibilityCertificateArtifact,
+        replicationScheduleArtifact,
+        replicationCompositeArtifact,
         measurements,
     }, {
         purpose,
@@ -981,11 +1152,11 @@ function seedReceipt(adapter, store, aggregate, reserved, observationId, purpose
     return {
         receipt: {
         version: 1,
-        attemptId: purpose === "validation"
+        attemptId: purpose === "validation" || replicatedPurpose
             ? `attempt-${observationId}`
             : measurementDetails[0].fullReceipt.attemptId,
         runnerEpochId: "runner-epoch-seed",
-        rawStdoutHash: purpose === "validation"
+        rawStdoutHash: purpose === "validation" || replicatedPurpose
             ? hashCanonical(
                 provenance.measurements.map((item) => ({
                     id: item.subjectId,
@@ -994,7 +1165,7 @@ function seedReceipt(adapter, store, aggregate, reserved, observationId, purpose
                 "sha256:crucible-runtime-observation-streams-v1",
             )
             : provenance.measurements[0].rawStdoutHash,
-        rawStderrHash: purpose === "validation"
+        rawStderrHash: purpose === "validation" || replicatedPurpose
             ? hashCanonical(
                 provenance.measurements.map((item) => ({
                     id: item.subjectId,
@@ -1003,8 +1174,10 @@ function seedReceipt(adapter, store, aggregate, reserved, observationId, purpose
                 "sha256:crucible-runtime-observation-streams-v1",
             )
             : provenance.measurements[0].rawStderrHash,
-        candidateArtifactHash: purpose === "candidate"
-            ? provenance.measurements[0].snapshot.snapshotHash
+        candidateArtifactHash: replicatedPurpose
+            ? measurementDetails.find((detail) =>
+                detail.arm.armId === "candidate")
+                .measurement.snapshot.snapshotHash
             : null,
         provenance,
         ...impossibilityReceiptFields,
@@ -1034,11 +1207,10 @@ function baseSeedContract(overrides = {}) {
     return upgradeLegacyContractInput({
         objective: "seed objective",
         acceptancePredicate: {
-            kind: "all",
-            predicates: [
-                { kind: "harness_pass" },
-                { kind: "metric_compare", metric: "score", operator: ">=", value: 90 },
-            ],
+            kind: "metric_compare",
+            metric: "score",
+            operator: ">=",
+            value: 0,
         },
         validationCases: [
             { id: "good", expectation: "accept", artifactHash: seedArtifactHash("a") },
@@ -1144,6 +1316,35 @@ function driveToTerminal(adapter, store, candidateQueue) {
                         receipt: seeded.receipt,
                         data: seeded.data,
                         ...(spec.annotations === undefined ? {} : { annotations: spec.annotations }),
+                    });
+                } else if (reserved.kind === "run_confirmation"
+                    || reserved.kind === "run_challenge") {
+                    const purpose = reserved.harnessRole;
+                    const seeded = seedReceipt(
+                        adapter,
+                        store,
+                        aggregate,
+                        reserved,
+                        observationId,
+                        purpose,
+                        {
+                            candidateData: {
+                                pass: true,
+                                metrics: {
+                                    score: aggregate.contract
+                                        .statisticalPolicy.metrics[0]
+                                        .maximum,
+                                },
+                            },
+                        },
+                    );
+                    adapter.appendHarnessObservation({
+                        commandId: recommendation.commandId,
+                        observationId,
+                        purpose,
+                        candidateId: reserved.candidateId,
+                        receipt: seeded.receipt,
+                        data: seeded.data,
                     });
                 } else if (reserved.kind === "verify_impossibility") {
                     const spec = candidateQueue.shift();
@@ -1373,6 +1574,7 @@ function seedTargetUnreachable(stateRoot, investigationId) {
                 candidatesPerRound: 2,
                 maxRounds: 1,
                 boundedCandidateIds: ["cand-a", "cand-b"],
+                acceptancePredicate: { kind: "harness_pass" },
                 enumerandManifest: {
                     topology: "finite_enumerable",
                     entries: enumerands,
@@ -1397,6 +1599,7 @@ function seedCertifiedTargetUnreachable(stateRoot, investigationId) {
             workerModels: ["model-a"],
             candidatesPerRound: 1,
             maxRounds: 1,
+            acceptancePredicate: { kind: "harness_pass" },
             validationCases: seedValidationCases(store),
         }),
         (adapter, store) => driveToTerminal(adapter, store, [
@@ -1420,6 +1623,7 @@ function seedCertifiedNonResult(stateRoot, investigationId) {
             workerModels: ["model-a"],
             candidatesPerRound: 1,
             maxRounds: 1,
+            acceptancePredicate: { kind: "harness_pass" },
             validationCases: seedValidationCases(store),
         }),
         (adapter, store) => driveToTerminal(adapter, store, [
@@ -2793,6 +2997,74 @@ describe("crucible_stop", () => {
 // --- crucible_result ---------------------------------------------------------
 
 describe("crucible_result", () => {
+    it("keeps cohort and relation evidence result-only", () => {
+        expect(() => assertPublicToolPayload("crucible_status", {
+            is_result: false,
+            investigation_id: "redacted-cohort",
+            cohort_status: "TIE_COHORT",
+        })).toThrow(expect.objectContaining({
+            code: "CRUCIBLE_API_PUBLIC_PAYLOAD_INVARIANT",
+        }));
+        expect(() => assertPublicToolPayload("crucible_result", {
+            is_result: false,
+            investigation_id: "redacted-relations",
+            relation_evidence_hash: hashCanonical({ relations: true }),
+        })).toThrow(expect.objectContaining({
+            code: "CRUCIBLE_API_PUBLIC_PAYLOAD_INVARIANT",
+        }));
+    });
+
+    it("returns a confirmation-closed unique cohort with relation structure only at result", () => {
+        const workspace = makeWorkspace("result-confirmed-cohort");
+        const seeded = seedVerifiedResult(
+            workspace.stateRoot,
+            "confirmed-cohort-source",
+        );
+        const aggregate = seeded.aggregate;
+        const evidence = aggregate.evidenceOrder
+            .map((id) => aggregate.evidence[id])
+            .find((item) => item.purpose === "candidate");
+        const cohort = aggregate.scientificReplay.candidateCohort;
+        expect(aggregate.terminal).toMatchObject({
+            decision: "VERIFIED_RESULT",
+            candidateId: evidence.candidateId,
+        });
+        const deps = depsForSyntheticTerminal(workspace, aggregate);
+
+        expect(statusInvestigation({
+            investigation_id: seeded.investigationId,
+        }, deps)).toEqual({
+            is_result: false,
+            investigation_id: seeded.investigationId,
+            terminal_available: true,
+        });
+        const result = resultInvestigation({
+            investigation_id: seeded.investigationId,
+        }, deps);
+        expect(result).toMatchObject({
+            is_result: true,
+            decision: "VERIFIED_RESULT",
+            candidate_id: evidence.candidateId,
+            candidate_ids: [evidence.candidateId],
+            cohort_status: "UNIQUE_BEST",
+            evidence_ids: [evidence.evidenceId],
+            evidence_hashes: [evidence.commitEventHash],
+            relation_evidence_hash: cohort.relationEvidenceHash,
+            relation_evidence: {
+                comparisonHash: cohort.comparisonHash,
+                relationEvidenceHash: cohort.relationEvidenceHash,
+                status: "UNIQUE_BEST",
+            },
+            scientific_conclusions: [
+                expect.objectContaining({
+                    candidate: expect.objectContaining({
+                        candidateId: evidence.candidateId,
+                    }),
+                }),
+            ],
+        });
+    });
+
     it("blocks a directly forged unsigned v4 terminal without disclosing hashes", () => {
         const workspace = makeWorkspace("result-unsigned-forged");
         const investigationId = "unsigned-forged-terminal";
@@ -2888,7 +3160,7 @@ describe("crucible_result", () => {
             scientific_blocked: true,
             terminal_available: false,
             non_result: true,
-            non_result_code: "SCIENTIFIC_CONFIRMATION_REQUIRED",
+            non_result_code: "INTEGRITY_BLOCKED",
         });
         expect(result).not.toHaveProperty("decision");
         expect(result).not.toHaveProperty("candidate_id");
@@ -2903,7 +3175,7 @@ describe("crucible_result", () => {
             is_result: false,
             scientific_blocked: true,
             terminal_available: false,
-            non_result_code: "SCIENTIFIC_CONFIRMATION_REQUIRED",
+            non_result_code: "INTEGRITY_BLOCKED",
         });
         expect(status).not.toHaveProperty("decision");
         expect(status).not.toHaveProperty("candidate_id");
@@ -2951,7 +3223,6 @@ describe("crucible_result", () => {
             "unreach-inv",
         );
         const { deps } = makeDeps(workspace.env);
-
         const result = resultInvestigation({
             investigation_id: seeded.investigationId,
         }, deps);
@@ -3017,7 +3288,6 @@ describe("crucible_result", () => {
             "certified-unreach-inv",
         );
         const { deps } = makeDeps(workspace.env);
-
         const result = resultInvestigation({
             investigation_id: seeded.investigationId,
         }, deps);

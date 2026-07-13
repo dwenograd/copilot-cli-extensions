@@ -2,19 +2,29 @@ import { describe, expect, it } from "vitest";
 import {
     DEFAULT_SEARCH_POLICY,
     ESCAPE_SEARCH_OPERATORS,
+    CANDIDATE_NOVELTY_VERSION,
     adaptiveOperatorWeights,
     buildCandidateArchive,
     buildSearchCandidateCommand,
     compareCandidateEvidence,
     contractHash,
     createInvestigationContract,
+    contentNoveltySignature,
     hashCanonical,
     selectAdaptiveOperator,
+    structuralRoleIdentity,
 } from "../domain/index.mjs";
 import { makeV4ContractInput } from "./v4-contract-fixture.mjs";
 
 function artifactHash(character) {
     return `sha256:${character.repeat(64)}`;
+}
+
+function structuralHash(label) {
+    return hashCanonical(
+        { structure: label },
+        "sha256:crucible-novelty-structural-v1",
+    );
 }
 
 function policy(overrides = {}) {
@@ -36,14 +46,17 @@ function policy(overrides = {}) {
     };
 }
 
-function contract(searchPolicy = policy()) {
+function contract(
+    searchPolicy = policy(),
+    { workerModels = ["model-a"] } = {},
+) {
     const input = makeV4ContractInput({
         objective: "exercise deterministic archive selection",
         acceptancePredicate: { kind: "harness_pass" },
         hypothesisTopology: "open_generative",
         criticality: "high",
         policyVersion: "policy-v2",
-        workerModels: ["model-a"],
+        workerModels,
         candidatesPerRound: 1,
         maxRounds: 10,
         searchPolicy,
@@ -62,10 +75,28 @@ function evidence({
     duplicateOf = null,
     mechanism = null,
     finding = null,
+    structuralSignature = null,
+    behavioralSignature = null,
     round = 1,
     slotIndex = 0,
     invalidated = false,
 }) {
+    const novelty = {
+        version: CANDIDATE_NOVELTY_VERSION,
+        content: {
+            snapshotHash: artifact,
+            signature: contentNoveltySignature(artifact),
+        },
+        structural: structuralSignature === null
+            ? null
+            : { structuralFingerprint: structuralSignature },
+        behavioral: behavioralSignature === null
+            ? null
+            : {
+                signature: behavioralSignature,
+                claims: [],
+            },
+    };
     return {
         evidenceId,
         committedSeq,
@@ -79,6 +110,7 @@ function evidence({
         metrics: outcomeClass === "invalid_metrics" ? {} : { score },
         receipt: { candidateArtifactHash: artifact },
         duplicateOf,
+        novelty,
         annotations: {
             mechanism,
             hypothesis: null,
@@ -89,13 +121,65 @@ function evidence({
     };
 }
 
-function aggregateFor(items, searchPolicy) {
-    const frozenContract = contract(searchPolicy);
+function aggregateFor(items, searchPolicy, contractOptions = {}) {
+    const frozenContract = contract(searchPolicy, contractOptions);
+    const roleFingerprint = structuralRoleIdentity(frozenContract);
+    const normalizedItems = items.map((item) => {
+        const structuralToken =
+            item.novelty.structural?.structuralFingerprint ?? null;
+        const structuralFeatures = structuralToken === null
+            ? null
+            : {
+                structureCode: Number(BigInt(
+                    `0x${structuralToken.slice(-12)}`,
+                )),
+            };
+        return {
+            ...item,
+            novelty: {
+                ...item.novelty,
+                structural: structuralFeatures === null
+                    ? null
+                    : {
+                        version: "crucible-novelty-role-adapter-v1",
+                        roleFingerprint,
+                        structuralFingerprint: hashCanonical({
+                            version: "crucible-novelty-role-adapter-v1",
+                            roleFingerprint,
+                            observableSchemaHash:
+                                frozenContract.harnessSuite.roles.novelty
+                                    .observableSchemaHash,
+                            features: structuralFeatures,
+                        }, "sha256:crucible-novelty-structural-v1"),
+                        features: structuralFeatures,
+                        receiptHash: hashCanonical(
+                            { evidenceId: item.evidenceId, receipt: "novelty" },
+                            "sha256:crucible-measurement-receipt-v1",
+                        ),
+                        measurementRoot: hashCanonical(
+                            {
+                                evidenceId: item.evidenceId,
+                                measurement: "novelty",
+                            },
+                            "sha256:crucible-evidence-measurement-provenance-v1",
+                        ),
+                        subjectId: `novelty-${
+                            item.receipt.candidateArtifactHash
+                                .split(":")
+                                .at(-1)
+                                .slice(0, 48)
+                        }`,
+                    },
+            },
+        };
+    });
     return {
         contract: frozenContract,
         contractHash: contractHash(frozenContract),
-        evidenceOrder: items.map((item) => item.evidenceId),
-        evidence: Object.fromEntries(items.map((item) => [item.evidenceId, item])),
+        evidenceOrder: normalizedItems.map((item) => item.evidenceId),
+        evidence: Object.fromEntries(
+            normalizedItems.map((item) => [item.evidenceId, item]),
+        ),
     };
 }
 
@@ -328,6 +412,64 @@ describe("Crucible deterministic archive and strategy", () => {
         expect(ESCAPE_SEARCH_OPERATORS).toContain(escape);
     });
 
+    it("does not treat a lone behavioral profile as a supported difference", () => {
+        const searchPolicy = policy();
+        const incumbent = evidence({
+            evidenceId: "behavior-incumbent",
+            committedSeq: 1,
+            score: 100,
+            outcomeClass: "accepted",
+            artifact: hashCanonical({ artifact: "behavior-incumbent" }),
+        });
+        const near = evidence({
+            evidenceId: "behavior-near",
+            committedSeq: 2,
+            score: 99,
+            outcomeClass: "near_miss",
+            artifact: hashCanonical({ artifact: "behavior-near" }),
+        });
+        const archive = {
+            accepted: [incumbent],
+            nearMisses: [near],
+            rejected: [],
+            inconclusive: [],
+            invalidMetrics: [],
+            noveltyNiches: {
+                content: [],
+                structural: [],
+                behavioral: [],
+            },
+            mechanismGroups: [],
+            lessonGroups: [],
+            duplicateIndex: {},
+            incumbent,
+        };
+        const oneProfile = {
+            ...archive,
+            noveltyNiches: {
+                ...archive.noveltyNiches,
+                behavioral: [{
+                    signature: hashCanonical(
+                        { behavior: "profile" },
+                        "sha256:crucible-behavioral-novelty-v1",
+                    ),
+                    representativeEvidenceId: incumbent.evidenceId,
+                    evidenceIds: [incumbent.evidenceId, near.evidenceId],
+                }],
+            },
+        };
+        const selection = {
+            searchPolicy,
+            contractHash: hashCanonical({ contract: "behavior-profile" }),
+            round: 2,
+            slotIndex: 0,
+        };
+        expect(adaptiveOperatorWeights(searchPolicy, oneProfile))
+            .toEqual(adaptiveOperatorWeights(searchPolicy, archive));
+        expect(selectAdaptiveOperator({ ...selection, archive: oneProfile }))
+            .toBe(selectAdaptiveOperator({ ...selection, archive }));
+    });
+
     it("uses an enabled parent-free escape operator when no incumbent exists", () => {
         const searchPolicy = contract(policy({
             operatorWeights: {
@@ -450,7 +592,7 @@ describe("Crucible deterministic archive and strategy", () => {
         expect(invalidOnlyWeights.adversarial).toBe(0);
     });
 
-    it("assigns crossover two distinct parents and prefers different mechanisms", () => {
+    it("assigns crossover two distinct parents and prefers different structural signatures", () => {
         const crossoverPolicy = policy({
             operatorWeights: {
                 fresh: 1,
@@ -468,6 +610,7 @@ describe("Crucible deterministic archive and strategy", () => {
             outcomeClass: "accepted",
             artifact: hashCanonical({ artifact: "incumbent" }),
             mechanism: "mechanism-a",
+            structuralSignature: structuralHash("a"),
         });
         const near = evidence({
             evidenceId: "near",
@@ -476,6 +619,7 @@ describe("Crucible deterministic archive and strategy", () => {
             outcomeClass: "near_miss",
             artifact: hashCanonical({ artifact: "near" }),
             mechanism: "mechanism-b",
+            structuralSignature: structuralHash("b"),
         });
         const aggregate = aggregateFor([incumbent, near], crossoverPolicy);
         let command = null;
@@ -491,7 +635,7 @@ describe("Crucible deterministic archive and strategy", () => {
         expect(new Set(command.parentEvidenceIds).size).toBe(2);
     });
 
-    it("prefers two represented mechanism groups even when the incumbent has none", () => {
+    it("prefers two represented structural niches even when the incumbent has none", () => {
         const crossoverPolicy = policy({
             operatorWeights: {
                 fresh: 1,
@@ -516,6 +660,7 @@ describe("Crucible deterministic archive and strategy", () => {
             outcomeClass: "near_miss",
             artifact: hashCanonical({ artifact: "near-a" }),
             mechanism: "mechanism-a",
+            structuralSignature: structuralHash("a"),
         });
         const nearB = evidence({
             evidenceId: "near-b",
@@ -524,6 +669,7 @@ describe("Crucible deterministic archive and strategy", () => {
             outcomeClass: "near_miss",
             artifact: hashCanonical({ artifact: "near-b" }),
             mechanism: "mechanism-b",
+            structuralSignature: structuralHash("b"),
         });
         const aggregate = aggregateFor([incumbent, nearA, nearB], crossoverPolicy);
         let command = null;
@@ -573,6 +719,143 @@ describe("Crucible deterministic archive and strategy", () => {
         expect(["fresh", "diversification", "restart"]).toContain(command.operator);
         expect(command.operator).not.toBe("crossover");
         expect(command.parentEvidenceIds.length).toBeLessThanOrEqual(1);
+    });
+
+    it("keeps parent and operator policy neutral to labels, prose, output hashes, and arrival", () => {
+        const searchPolicy = policy({
+            operatorWeights: {
+                fresh: 1,
+                refinement: 1,
+                crossover: 1_000,
+                diversification: 1,
+                adversarial: 1,
+                restart: 1,
+            },
+        });
+        const firstParent = evidence({
+            evidenceId: "parent-a",
+            committedSeq: 1,
+            score: 100,
+            outcomeClass: "accepted",
+            artifact: hashCanonical({ artifact: "parent-a" }),
+            mechanism: "first model label",
+            finding: "first explanation",
+            structuralSignature: structuralHash("a"),
+        });
+        const secondParent = evidence({
+            evidenceId: "parent-b",
+            committedSeq: 2,
+            score: 99,
+            outcomeClass: "near_miss",
+            artifact: hashCanonical({ artifact: "parent-b" }),
+            mechanism: "second model label",
+            finding: "second explanation",
+            structuralSignature: structuralHash("b"),
+        });
+        const baseline = aggregateFor(
+            [firstParent, secondParent],
+            searchPolicy,
+        );
+        const relabeledItems = [
+            {
+                ...secondParent,
+                committedSeq: 20,
+                model: "model-z",
+                contentHash: hashCanonical({ outputText: "rewritten-b" }),
+                annotations: {
+                    ...secondParent.annotations,
+                    mechanism: "paraphrased second label",
+                    finding: "paraphrased second explanation",
+                },
+            },
+            {
+                ...firstParent,
+                committedSeq: 10,
+                model: "model-y",
+                contentHash: hashCanonical({ outputText: "rewritten-a" }),
+                annotations: {
+                    ...firstParent.annotations,
+                    mechanism: "paraphrased first label",
+                    finding: "paraphrased first explanation",
+                },
+            },
+        ];
+        const relabeled = aggregateFor(relabeledItems, searchPolicy);
+        const progress = { nextRound: 2, nextSlot: 0 };
+        const first = buildSearchCandidateCommand(baseline, progress);
+        const second = buildSearchCandidateCommand(relabeled, progress);
+
+        expect({
+            operator: second.operator,
+            parentEvidenceIds: second.parentEvidenceIds,
+            promptContextRefs: second.promptContextRefs,
+            seed: second.seed,
+        }).toEqual({
+            operator: first.operator,
+            parentEvidenceIds: first.parentEvidenceIds,
+            promptContextRefs: first.promptContextRefs,
+            seed: first.seed,
+        });
+    });
+
+    it("keeps operator policy neutral to worker-model ordering", () => {
+        const searchPolicy = policy({
+            operatorWeights: {
+                fresh: 1,
+                refinement: 1,
+                crossover: 10,
+                diversification: 1,
+                adversarial: 1,
+                restart: 1,
+            },
+        });
+        const items = [
+            evidence({
+                evidenceId: "parent-a",
+                committedSeq: 1,
+                score: 100,
+                outcomeClass: "accepted",
+                artifact: hashCanonical({ artifact: "model-order-a" }),
+                structuralSignature: structuralHash("model-order-a"),
+            }),
+            evidence({
+                evidenceId: "parent-b",
+                committedSeq: 2,
+                score: 99,
+                outcomeClass: "near_miss",
+                artifact: hashCanonical({ artifact: "model-order-b" }),
+                structuralSignature: structuralHash("model-order-b"),
+            }),
+        ];
+        const firstAggregate = aggregateFor(
+            items,
+            searchPolicy,
+            { workerModels: ["model-a", "model-b"] },
+        );
+        const reorderedAggregate = aggregateFor(
+            items,
+            searchPolicy,
+            { workerModels: ["model-b", "model-a"] },
+        );
+        expect(reorderedAggregate.contractHash)
+            .not.toBe(firstAggregate.contractHash);
+
+        const progress = { nextRound: 2, nextSlot: 0 };
+        const first = buildSearchCandidateCommand(firstAggregate, progress);
+        const reordered = buildSearchCandidateCommand(
+            reorderedAggregate,
+            progress,
+        );
+        expect({
+            operator: reordered.operator,
+            parentEvidenceIds: reordered.parentEvidenceIds,
+            promptContextRefs: reordered.promptContextRefs,
+        }).toEqual({
+            operator: first.operator,
+            parentEvidenceIds: first.parentEvidenceIds,
+            promptContextRefs: first.promptContextRefs,
+        });
+        expect(reordered.model).not.toBe(first.model);
     });
 
     it("replays the zero-weight fallback audit case without selecting disabled diversification", () => {
@@ -625,10 +908,11 @@ describe("Crucible deterministic archive and strategy", () => {
             nextSlot: 0,
         });
         expect(first).toEqual(replay);
-        expect(first.promptContextRefs).toEqual(["incumbent", "rejected-context"]);
-        expect(["fresh", "restart"]).toContain(first.operator);
+        expect(first.promptContextRefs).toEqual(["incumbent", "accepted-second"]);
+        expect(first.operator).toBe("crossover");
         expect(fallbackPolicy.operatorWeights[first.operator]).toBeGreaterThan(0);
-        expect(first.parentEvidenceIds).toEqual([]);
+        expect(new Set(first.parentEvidenceIds))
+            .toEqual(new Set(["incumbent", "accepted-second"]));
     });
 
     it.each([

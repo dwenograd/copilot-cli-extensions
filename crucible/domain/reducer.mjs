@@ -37,7 +37,11 @@ import {
     enumerandArtifactMeasurementHash,
     normalizeEnumerandManifest,
 } from "./enumerands.mjs";
-import { deriveEvidencePayload } from "./evidence.mjs";
+import {
+    deriveEvidencePayload,
+    deriveRawObservationAuthorityDigest,
+} from "./evidence.mjs";
+import { deriveScientificReplayState } from "./scientific-replay.mjs";
 import {
     cloneAggregateForMutation,
     createInitialAggregate,
@@ -45,6 +49,13 @@ import {
 } from "./state.mjs";
 
 const EVENT_KEYS = Object.freeze(["eventHash", "payload", "prevHash", "seq", "type"]);
+const SCIENTIFIC_REPLAY_EVENT_TYPES = new Set([
+    EVENT_TYPES.INVESTIGATION_OPENED,
+    EVENT_TYPES.EVIDENCE_COMMITTED,
+    EVENT_TYPES.EVIDENCE_INVALIDATED,
+    EVENT_TYPES.VALIDATION_COMPLETED,
+    EVENT_TYPES.SCIENTIFIC_CONFIRMATION_FROZEN,
+]);
 
 function hasOwnEntry(record, key) {
     return Object.hasOwn(record, key);
@@ -356,6 +367,22 @@ function applyCommandObserved(next, event) {
             "Search-candidate commands require authoritative harness candidate observations",
         );
     }
+    if (command.command.kind === "run_confirmation"
+        && (payload.sourceKind !== "harness"
+            || payload.purpose !== "confirmation")) {
+        throw new TransitionError(
+            ERROR_CODES.INVALID_EVIDENCE,
+            "Confirmation commands require authoritative held-out confirmation observations",
+        );
+    }
+    if (command.command.kind === "run_challenge"
+        && (payload.sourceKind !== "harness"
+            || payload.purpose !== "challenge")) {
+        throw new TransitionError(
+            ERROR_CODES.INVALID_EVIDENCE,
+            "Challenge commands require authoritative adversarial challenge observations",
+        );
+    }
     if (command.command.kind === "verify_impossibility"
         && (payload.sourceKind !== "harness" || payload.purpose !== "impossibility")) {
         throw new TransitionError(
@@ -411,6 +438,20 @@ function applyCommandObserved(next, event) {
             );
         }
     }
+    if (payload.sourceKind === "harness"
+        && (payload.purpose === "candidate"
+            || payload.purpose === "confirmation"
+            || payload.purpose === "challenge")
+        && (!Object.hasOwn(command.command, "hypotheses")
+            || !canonicalEqual(
+                payload.annotations?.hypotheses ?? null,
+                command.command.hypotheses,
+            ))) {
+        throw new TransitionError(
+            ERROR_CODES.INVALID_EVIDENCE,
+            "Replicated observation hypotheses do not match the kernel-frozen command",
+        );
+    }
     if (payload.purpose === "candidate") {
         const promptRefs = new Set(command.command.promptContextRefs ?? []);
         if (payload.annotations.citedEvidenceIds.some((evidenceId) => !promptRefs.has(evidenceId))) {
@@ -421,6 +462,47 @@ function applyCommandObserved(next, event) {
                     citedEvidenceIds: payload.annotations.citedEvidenceIds,
                     promptContextRefs: command.command.promptContextRefs ?? [],
                 },
+            );
+        }
+    }
+    if (payload.purpose === "confirmation"
+        || payload.purpose === "challenge") {
+        const freeze = next.confirmation.freeze?.payload ?? null;
+        const member = freeze?.members?.find((item) =>
+            item.evidenceId === command.command.candidateEvidenceId) ?? null;
+        const protocol = member?.roles?.[payload.purpose] ?? null;
+        const candidateEvidence = member === null
+            ? null
+            : ownEntry(next.evidence, member.evidenceId);
+        if (freeze === null
+            || member === null
+            || protocol === null
+            || candidateEvidence === null
+            || candidateEvidence.invalidated
+            || command.command.confirmationFreezeHash !== freeze.freezeHash
+            || command.command.candidateId !== member.candidateId
+            || command.command.candidateEvidenceHash !== member.evidenceHash
+            || command.command.candidateArtifactHash
+                !== member.candidateArtifactHash
+            || command.command.roleManifestHash
+                !== protocol.roleManifest.roleManifestHash
+            || command.command.protocolManifestHash
+                !== protocol.protocolManifestHash
+            || !canonicalEqual(command.command.protocolManifest, protocol)
+            || !canonicalEqual(
+                command.command.replicationSchedule,
+                protocol.replicationSchedule,
+            )
+            || !canonicalEqual(
+                command.command.hypotheses,
+                protocol.hypotheses,
+            )
+            || payload.candidateId !== member.candidateId
+            || payload.receipt?.candidateArtifactHash
+                !== member.candidateArtifactHash) {
+            throw new TransitionError(
+                ERROR_CODES.INVALID_EVIDENCE,
+                "Scientific confirmation observation does not match the frozen cohort and role protocol",
             );
         }
     }
@@ -494,6 +576,15 @@ function applyCommandObserved(next, event) {
                     },
                 );
             }
+            if (!canonicalEqual(
+                command.command.hypotheses,
+                binding.hypotheses ?? null,
+            )) {
+                throw new TransitionError(
+                    ERROR_CODES.INVALID_EVIDENCE,
+                    "Harness candidate command hypotheses do not match the frozen enumerand",
+                );
+            }
             if (binding.topology === "finite_enumerable"
                 && payload.receipt.candidateArtifactHash
                     !== enumerandArtifactMeasurementHash(
@@ -509,6 +600,12 @@ function applyCommandObserved(next, event) {
                 );
             }
         } else {
+            if (command.command.hypotheses !== null) {
+                throw new TransitionError(
+                    ERROR_CODES.INVALID_EVIDENCE,
+                    "Open-generative candidate commands cannot introduce model-authored hypotheses",
+                );
+            }
             const boundedIds = next.contract.boundedCandidateIds;
             if (boundedIds !== undefined && !boundedIds.includes(payload.candidateId)) {
                 throw new TransitionError(
@@ -526,11 +623,19 @@ function applyCommandObserved(next, event) {
             }
         }
     }
-    next.observations[payload.observationId] = {
+    const observation = {
         ...payload,
         observedSeq: event.seq,
         evidenceId: null,
     };
+    observation.rawAuthorityDigest = payload.sourceKind === "harness"
+        ? deriveRawObservationAuthorityDigest(
+            next,
+            observation,
+            command.command,
+        )
+        : null;
+    next.observations[payload.observationId] = observation;
     next.observationOrder.push(payload.observationId);
     command.status = "observed";
     command.observationId = payload.observationId;
@@ -565,6 +670,29 @@ function applyEvidenceCommitted(next, event) {
         if (duplicateCandidate) {
             duplicate("candidate", observation.candidateId);
         }
+        if (observation.sourceKind === "harness"
+            && (observation.purpose === "confirmation"
+                || observation.purpose === "challenge")) {
+            const duplicateRoleEvidence = next.evidenceOrder.some((existingId) => {
+                const existing = ownEntry(next.evidence, existingId);
+                return existing !== null
+                    && existing.sourceKind === "harness"
+                    && existing.purpose === observation.purpose
+                    && existing.confirmationFreezeHash
+                        === next.commands[observation.commandId]
+                            ?.command?.confirmationFreezeHash
+                    && existing.candidateEvidenceId
+                        === next.commands[observation.commandId]
+                            ?.command?.candidateEvidenceId;
+            });
+            if (duplicateRoleEvidence) {
+                duplicate(
+                    `${observation.purpose} cohort member`,
+                    next.commands[observation.commandId]
+                        ?.command?.candidateEvidenceId,
+                );
+            }
+        }
         const duplicateSlot = next.evidenceOrder.some((existingId) => {
             const existing = ownEntry(next.evidence, existingId);
             return existing !== null
@@ -587,7 +715,7 @@ function applyEvidenceCommitted(next, event) {
     }
 
     next.evidence[evidenceId] = {
-        ...payload,
+        ...expected,
         committedSeq: event.seq,
         commitEventHash: event.eventHash,
         invalidated: false,
@@ -596,6 +724,9 @@ function applyEvidenceCommitted(next, event) {
     };
     next.evidenceOrder.push(evidenceId);
     observation.evidenceId = evidenceId;
+    if (payload.sourceKind === "harness" && payload.purpose === "validation") {
+        next.validation.attemptEvidenceIds.push(evidenceId);
+    }
 }
 
 function applyEvidenceInvalidated(next, event) {
@@ -617,7 +748,14 @@ function applyEvidenceInvalidated(next, event) {
     evidence.invalidated = true;
     evidence.invalidatedSeq = event.seq;
     evidence.invalidationReason = event.payload.reason;
-    if (next.validation.currentEvidenceId === evidence.evidenceId) {
+    const currentValidation = ownEntry(
+        next.evidence,
+        next.validation.currentEvidenceId,
+    );
+    if (next.validation.currentEvidenceId === evidence.evidenceId
+        || currentValidation?.validationBasisEvidenceIds?.includes(
+            evidence.evidenceId,
+        )) {
         next.validation.currentEvidenceId = null;
     }
 }
@@ -625,9 +763,12 @@ function applyEvidenceInvalidated(next, event) {
 function applyValidationCompleted(next, event) {
     const evidenceId = normalizeEventIdentifier(event.payload?.evidenceId, "evidenceId");
     const evidence = ownEntry(next.evidence, evidenceId);
+    const replayState = next.scientificReplay?.calibrationState?.find(
+        (item) => item.evidenceId === evidenceId,
+    ) ?? null;
     if (evidence === null
         || evidence.invalidated
-        || evidence.validationSatisfied !== true
+        || replayState?.validationSatisfied !== true
         || event.payload.evidenceHash !== evidence.commitEventHash) {
         throw new TransitionError(
             ERROR_CODES.INVALID_EVIDENCE,
@@ -642,6 +783,20 @@ function applyValidationCompleted(next, event) {
         ...event.payload,
         seq: event.seq,
     });
+}
+
+function applyScientificConfirmationFrozen(next, event) {
+    if (next.confirmation.freeze !== null) {
+        throw new TransitionError(
+            ERROR_CODES.ILLEGAL_TRANSITION,
+            "Scientific confirmation may be frozen only once",
+        );
+    }
+    next.confirmation.freeze = {
+        payload: event.payload,
+        seq: event.seq,
+        eventHash: event.eventHash,
+    };
 }
 
 function applySearchStrategyRevised(next, event) {
@@ -751,6 +906,9 @@ function applyTransition(next, event) {
         case EVENT_TYPES.VALIDATION_COMPLETED:
             applyValidationCompleted(next, event);
             break;
+        case EVENT_TYPES.SCIENTIFIC_CONFIRMATION_FROZEN:
+            applyScientificConfirmationFrozen(next, event);
+            break;
         case EVENT_TYPES.SEARCH_STRATEGY_REVISED:
             applySearchStrategyRevised(next, event);
             break;
@@ -824,6 +982,9 @@ export function reduceEvent(aggregate, event) {
     applyTransition(next, event);
     next.lastSeq = event.seq;
     next.lastEventHash = event.eventHash;
+    if (SCIENTIFIC_REPLAY_EVENT_TYPES.has(event.type)) {
+        next.scientificReplay = deriveScientificReplayState(next);
+    }
     return immutableAggregate(next);
 }
 

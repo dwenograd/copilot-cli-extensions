@@ -23,6 +23,7 @@ describe("parseHarnessResult", () => {
         const result = parseHarnessResult(JSON.stringify({
             pass: false,
             metrics: { latencyMs: 42.5, throughput: 1000, exact: 0 },
+            observables: { category: "good", converged: true, ratio: 0.5 },
             validationCases: { "case-a": true, "case-b": false },
             searchSpaceExhausted: true,
             impossibilityCertificateHash: certificate,
@@ -31,6 +32,7 @@ describe("parseHarnessResult", () => {
         expect(result).toEqual({
             pass: false,
             metrics: { exact: 0, latencyMs: 42.5, throughput: 1000 },
+            observables: { category: "good", converged: true, ratio: 0.5 },
             validationCases: { "case-a": true, "case-b": false },
             searchSpaceExhausted: true,
             impossibilityCertificateHash: certificate,
@@ -38,6 +40,8 @@ describe("parseHarnessResult", () => {
             phase: null,
             replicateIndex: null,
             blockIndex: null,
+            armIndex: null,
+            armId: null,
             deterministicSeed: null,
             subjectId: null,
             environmentIdentity: null,
@@ -46,12 +50,16 @@ describe("parseHarnessResult", () => {
         });
         expect(Object.isFrozen(result)).toBe(true);
         expect(Object.isFrozen(result.metrics)).toBe(true);
+        expect(Object.isFrozen(result.observables)).toBe(true);
         expect(Object.isFrozen(result.validationCases)).toBe(true);
         expect(() => {
             result.metrics.exact = 1;
         }).toThrow(TypeError);
         expect(() => {
             result.validationCases["case-a"] = false;
+        }).toThrow(TypeError);
+        expect(() => {
+            result.observables.category = "bad";
         }).toThrow(TypeError);
     });
 
@@ -60,6 +68,7 @@ describe("parseHarnessResult", () => {
         expect(result).toEqual({
             pass: true,
             metrics: null,
+            observables: null,
             validationCases: null,
             searchSpaceExhausted: null,
             impossibilityCertificateHash: null,
@@ -67,6 +76,8 @@ describe("parseHarnessResult", () => {
             phase: null,
             replicateIndex: null,
             blockIndex: null,
+            armIndex: null,
+            armId: null,
             deterministicSeed: null,
             subjectId: null,
             environmentIdentity: null,
@@ -106,6 +117,7 @@ describe("parseHarnessResult", () => {
             '{"pass":true,"pass":false}',
             '{"pass":true,"\\u0070ass":false}',
             '{"pass":true,"metrics":{"count":1,"count":2}}',
+            '{"pass":true,"observables":{"outcome":"a","outcome":"b"}}',
             '{"pass":true,"validationCases":{"case-a":true,"case-a":false}}',
         ]) {
             const error = parseError(raw);
@@ -118,6 +130,7 @@ describe("parseHarnessResult", () => {
         for (const raw of [
             '{"pass":true,"metrics":{"__proto__":1}}',
             '{"pass":true,"metrics":{"constructor":1}}',
+            '{"pass":true,"observables":{"__proto__":"bad"}}',
             '{"pass":true,"validationCases":{"prototype":true}}',
         ]) {
             expect(parseError(raw).code)
@@ -138,6 +151,9 @@ describe("parseHarnessResult", () => {
             '{"pass":true,"metrics":{"x":"1.0"}}',
             '{"pass":true,"metrics":{"":0}}',
             '{"pass":true,"metrics":{"a":true}}',
+            '{"pass":true,"observables":{"outcome":null}}',
+            '{"pass":true,"observables":{"outcome":""}}',
+            '{"pass":true,"metrics":{"score":1},"observables":{"score":1}}',
             '{"pass":true,"validationCases":{"good":1}}',
             '{"pass":true,"searchSpaceExhausted":"yes"}',
             '{"pass":true,"impossibilityCertificateHash":"abcd"}',
@@ -174,6 +190,8 @@ describe("parseHarnessResult", () => {
             phase: "confirmation",
             replicateIndex: 2,
             blockIndex: 5,
+            armIndex: 0,
+            armId: "candidate",
             deterministicSeed: "seed-confirm-2",
             subjectId: "candidate-7",
             environmentIdentity:
@@ -202,6 +220,7 @@ describe("parseHarnessResult", () => {
             phase: "search",
             replicateIndex: 0,
             blockIndex: 1,
+            armIndex: 0,
             deterministicSeed: "seed",
             subjectId: "candidate-1",
             environmentIdentity: binding.environmentIdentity,

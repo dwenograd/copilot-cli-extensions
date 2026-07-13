@@ -175,7 +175,7 @@ describe("canonical export", () => {
 
         const manifest = readBundleManifest(first.destDir);
         expect(manifest.type).toBe("crucible-audit-bundle");
-        expect(BUNDLE_VERSION).toBe(3);
+        expect(BUNDLE_VERSION).toBe(4);
         expect(manifest.version).toBe(BUNDLE_VERSION);
         expect(manifest.database.path).toBe("db/database.sqlite");
         expect(manifest.database.schemaFingerprint).toMatch(/^[0-9a-f]{64}$/);

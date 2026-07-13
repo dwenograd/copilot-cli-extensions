@@ -7,8 +7,8 @@
 //     the SDK edge, converting to a structured `{ textResultForLlm, resultType }`.
 //   * All environment/state resolution goes through api/environment.mjs; no tool
 //     argument ever selects a filesystem path, harness allowlist, or CLI.
-//   * Domain scoring/policy is never recomputed for results: crucible_result reads
-//     the persisted terminal decision and reports it (or redacts a non-result).
+//   * crucible_result accepts a persisted terminal only after reducer replay has
+//     re-derived and closure-bound statistics from raw blocks and receipts.
 //   * Diagnostics go only through the injected `log` (session.log), never stdout.
 //
 // Every runtime collaborator is injectable via `deps` so handler tests can run
@@ -25,7 +25,6 @@ import {
     decideNext,
     detectPlateau,
     harnessCandidateEvidenceItems,
-    qualifyingCandidateEvidence,
     qualifyingCandidateEvidenceItems,
     searchProgress,
 } from "../domain/index.mjs";
@@ -334,7 +333,7 @@ function buildProgress(aggregate) {
         evaluations: progress.attemptedCandidates.length,
         candidates_observed: progress.candidates.length,
         accepted_candidates: accepted.length,
-        passing_incumbent_available: qualifyingCandidateEvidence(aggregate) !== null,
+        passing_incumbent_available: accepted.length > 0,
         next_round: progress.nextRound,
         next_slot: progress.nextSlot,
         partial_round: progress.partialRound,
@@ -353,6 +352,7 @@ function buildProgress(aggregate) {
             accepted: archive.accepted.length,
             near_misses: archive.nearMisses.length,
             rejected: archive.rejected.length,
+            inconclusive: archive.inconclusive.length,
             invalid_metrics: archive.invalidMetrics.length,
             mechanism_groups: archive.mechanismGroups.length,
             lesson_groups: archive.lessonGroups.length,
@@ -836,11 +836,50 @@ export function resultInvestigation(args, deps) {
             contract_hash: aggregate.contractHash,
             event_head_hash: aggregate.lastEventHash,
             ...(terminal.decision === "VERIFIED_RESULT"
-                ? { candidate_id: terminal.candidateId }
+                ? {
+                    ...(terminal.candidateId === null
+                        || terminal.candidateId === undefined
+                        ? {}
+                        : { candidate_id: terminal.candidateId }),
+                    candidate_ids:
+                        terminal.candidateIds
+                        ?? (terminal.candidateId === null
+                            || terminal.candidateId === undefined
+                            ? []
+                            : [terminal.candidateId]),
+                    cohort_status:
+                        terminal.cohortStatus ?? "UNIQUE_BEST",
+                    relation_evidence_hash:
+                        terminal.relationEvidenceHash ?? null,
+                }
                 : {}),
             evidence_id: terminal.evidenceId ?? null,
             evidence_hash: terminal.evidenceHash ?? null,
+            ...(terminal.decision === "VERIFIED_RESULT"
+                ? {
+                    evidence_ids:
+                        terminal.evidenceIds
+                        ?? (terminal.evidenceId === null
+                            || terminal.evidenceId === undefined
+                            ? []
+                            : [terminal.evidenceId]),
+                    evidence_hashes:
+                        terminal.evidenceHashes
+                        ?? (terminal.evidenceHash === null
+                            || terminal.evidenceHash === undefined
+                            ? []
+                            : [terminal.evidenceHash]),
+                }
+                : {}),
             evidence_closure: terminal.evidenceClosure ?? terminal.basis?.evidenceClosure ?? null,
+            scientific_replay:
+                terminal.evidenceClosure?.scientificReplay ?? null,
+            scientific_conclusion:
+                terminal.evidenceClosure?.scientificConclusion ?? null,
+            scientific_conclusions:
+                terminal.evidenceClosure?.scientificConclusions ?? [],
+            relation_evidence:
+                terminal.evidenceClosure?.relationEvidence ?? null,
             basis: terminal.basis ?? null,
             message: `${TERMINAL_BANNER} decision=${terminal.decision}`,
         };

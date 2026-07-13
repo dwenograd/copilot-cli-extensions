@@ -37,6 +37,7 @@ export const SEARCH_POLICY_LIMITS = Object.freeze({
         accepted: 32,
         nearMisses: 32,
         rejected: 32,
+        inconclusive: 32,
         invalidMetrics: 32,
         mechanismGroups: 32,
         lessonGroups: 32,
@@ -58,6 +59,25 @@ export const HYPOTHESIS_TOPOLOGIES = Object.freeze([
 export const STATISTICAL_POLICY_VERSION = "crucible-statistical-policy-v4";
 export const STATISTICAL_POLICY_HASH_ALGORITHM =
     "sha256:crucible-statistical-policy-v4";
+export const STATISTICAL_KERNEL_VERSION = "crucible-bounded-statistics-v4";
+export const STATISTICAL_ALLOCATION_SCHEDULE =
+    "telescoping-1-over-n-n-plus-1";
+export const STATISTICAL_CLAIM_STATES = Object.freeze([
+    "SUPPORTED",
+    "REFUTED",
+    "UNRESOLVED",
+    "INVALID",
+]);
+export const STATISTICAL_DEFAULT_SUCCESS_PROBABILITY_THRESHOLD = 0.5;
+export const STATISTICAL_ERROR_CODES = Object.freeze({
+    INVALID_ARGUMENT: "CRUCIBLE_STATISTICS_INVALID_ARGUMENT",
+    INVALID_POLICY: "CRUCIBLE_STATISTICS_INVALID_POLICY",
+    INVALID_CLAIM: "CRUCIBLE_STATISTICS_INVALID_CLAIM",
+    INVALID_BLOCK: "CRUCIBLE_STATISTICS_INVALID_BLOCK",
+    INVALID_OBSERVATION: "CRUCIBLE_STATISTICS_INVALID_OBSERVATION",
+    MISSINGNESS_POLICY_VIOLATION:
+        "CRUCIBLE_STATISTICS_MISSINGNESS_POLICY_VIOLATION",
+});
 export const GOAL_MODES = Object.freeze(["satisfice", "optimize"]);
 export const STATISTICAL_METRIC_DIRECTIONS = Object.freeze(["min", "max"]);
 export const MISSINGNESS_MODES = Object.freeze(["fail_closed", "bounded"]);
@@ -98,7 +118,15 @@ export const CANDIDATE_OUTCOME_CLASSES = Object.freeze([
     "accepted",
     "near_miss",
     "rejected",
+    "inconclusive",
     "invalid_metrics",
+]);
+
+export const VALIDATION_HARNESS_ROLES = Object.freeze([
+    "calibration",
+    "search",
+    "confirmation",
+    "challenge",
 ]);
 
 export const SEARCH_OPERATORS = Object.freeze([
@@ -133,6 +161,7 @@ export const DEFAULT_SEARCH_POLICY = Object.freeze({
         accepted: 8,
         nearMisses: 16,
         rejected: 8,
+        inconclusive: 16,
         invalidMetrics: 8,
         mechanismGroups: 12,
         lessonGroups: 12,
@@ -168,6 +197,7 @@ export const EVENT_TYPES = Object.freeze({
     EVIDENCE_COMMITTED: "evidence_committed",
     EVIDENCE_INVALIDATED: "evidence_invalidated",
     VALIDATION_COMPLETED: "validation_completed",
+    SCIENTIFIC_CONFIRMATION_FROZEN: "scientific_confirmation_frozen",
     SEARCH_STRATEGY_REVISED: "search_strategy_revised",
     STOP_REQUESTED: "stop_requested",
     INVESTIGATION_PAUSED: "investigation_paused",
@@ -189,6 +219,7 @@ export const EXTERNAL_EVENT_TYPES = Object.freeze([
 export const KERNEL_DECISION_EVENT_TYPES = Object.freeze([
     EVENT_TYPES.COMMAND_RESERVED,
     EVENT_TYPES.VALIDATION_COMPLETED,
+    EVENT_TYPES.SCIENTIFIC_CONFIRMATION_FROZEN,
     EVENT_TYPES.SEARCH_STRATEGY_REVISED,
     EVENT_TYPES.INVESTIGATION_PAUSED,
     EVENT_TYPES.NON_RESULT_RECORDED,
@@ -236,6 +267,8 @@ export const SOURCE_KINDS = Object.freeze([
 export const EVIDENCE_PURPOSES = Object.freeze([
     "validation",
     "candidate",
+    "confirmation",
+    "challenge",
     "impossibility",
 ]);
 
@@ -244,6 +277,7 @@ export const NON_RESULT_CODES = Object.freeze({
     IMPOSSIBILITY_CERTIFICATE_INCONCLUSIVE: "IMPOSSIBILITY_CERTIFICATE_INCONCLUSIVE",
     INDEPENDENT_VERIFICATION_REQUIRED: "INDEPENDENT_VERIFICATION_REQUIRED",
     SCIENTIFIC_CONFIRMATION_REQUIRED: "SCIENTIFIC_CONFIRMATION_REQUIRED",
+    SCIENTIFIC_CONFIRMATION_FAILED: "SCIENTIFIC_CONFIRMATION_FAILED",
     VALIDATION_INCONCLUSIVE: "VALIDATION_INCONCLUSIVE",
     INVESTIGATION_PAUSED: "INVESTIGATION_PAUSED",
 });

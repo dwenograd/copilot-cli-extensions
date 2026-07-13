@@ -497,6 +497,7 @@ const searchPolicyShape = object({
         accepted: integer({ minimum: 1, maximum: SEARCH_POLICY_LIMITS.archiveCaps.accepted, default: DEFAULT_SEARCH_POLICY.archiveCaps.accepted }),
         nearMisses: integer({ minimum: 1, maximum: SEARCH_POLICY_LIMITS.archiveCaps.nearMisses, default: DEFAULT_SEARCH_POLICY.archiveCaps.nearMisses }),
         rejected: integer({ minimum: 1, maximum: SEARCH_POLICY_LIMITS.archiveCaps.rejected, default: DEFAULT_SEARCH_POLICY.archiveCaps.rejected }),
+        inconclusive: integer({ minimum: 1, maximum: SEARCH_POLICY_LIMITS.archiveCaps.inconclusive, default: DEFAULT_SEARCH_POLICY.archiveCaps.inconclusive }),
         invalidMetrics: integer({ minimum: 1, maximum: SEARCH_POLICY_LIMITS.archiveCaps.invalidMetrics, default: DEFAULT_SEARCH_POLICY.archiveCaps.invalidMetrics }),
         mechanismGroups: integer({ minimum: 1, maximum: SEARCH_POLICY_LIMITS.archiveCaps.mechanismGroups, default: DEFAULT_SEARCH_POLICY.archiveCaps.mechanismGroups }),
         lessonGroups: integer({ minimum: 1, maximum: SEARCH_POLICY_LIMITS.archiveCaps.lessonGroups, default: DEFAULT_SEARCH_POLICY.archiveCaps.lessonGroups }),
@@ -772,6 +773,13 @@ const optionalEnumerandManifestField = makeField({
 
 const statisticalMetricShape = object({
     key: identifier(),
+    priority: makeField({
+        ...integer({
+            minimum: 0,
+            maximum: CONTRACT_LIMITS.metrics - 1,
+        }),
+        optional: true,
+    }),
     minimum: number(),
     maximum: number(),
     estimand: string({ maxLength: 256, maxBytes: 512 }),
@@ -917,7 +925,7 @@ const operatorExperimentConfigShape = object({
             optional: true,
         }),
         acceptance_predicate: rawObject({
-            description: "Acceptance-predicate grammar object (harness_pass / metric_compare / field_equals / all / any / not ...). Validated by the domain contract.",
+            description: "Statistical acceptance claim object: metric_compare, harness_pass, or an all conjunction of those. Validated against the frozen statistical policy.",
             maxBytes: MAX_ACCEPTANCE_PREDICATE_BYTES,
         }),
         hypothesis_topology: enumField(HYPOTHESIS_TOPOLOGIES, {

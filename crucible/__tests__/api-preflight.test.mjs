@@ -566,9 +566,10 @@ describe("crucible_start lifecycle preflight", () => {
         const plan = preflightStartInvestigation(startArgs(workspace, {
             objective: "o".repeat(CONTRACT_LIMITS.objectiveBytes),
             acceptance_predicate: {
-                kind: "field_equals",
-                path: "payload",
-                value: Array.from({ length: 4 }, () => "p".repeat(900)),
+                kind: "metric_compare",
+                metric: "score",
+                operator: ">=",
+                value: 90,
             },
             candidates_per_round: CONTRACT_LIMITS.candidatesPerRound,
             max_rounds: CONTRACT_LIMITS.maxRounds,

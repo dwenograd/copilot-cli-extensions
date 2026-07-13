@@ -30,7 +30,7 @@ crucible/
   domain/                   v4 contract, reducer, strategy, archive, decisions
   persistence/              SQLite event repository, CAS, audit bundles
   measurement/              allowlist, parser, executor, Windows containment
-  runtime/                  worker pool, runner, supervisor, config
+  runtime/                  worker pool, measurement scheduler, runner, supervisor
   tools/configure-harness.mjs
   __tests__/
 
@@ -151,14 +151,14 @@ The strict operator config (not a `crucible_start` argument) contains:
     version: "crucible-statistical-policy-v4",
     goalMode: "satisfice" | "optimize",
     metrics: [{
-      key, minimum, maximum, estimand, unit, direction,
+      key, priority?, minimum, maximum, estimand, unit, direction,
       acceptanceThreshold, practicalEquivalenceDelta, family
     }, ...],
     investigationAlpha,
     familyAllocations: [{ family, alpha }, ...],
     minBlocks, maxBlocks,
     control:
-      { kind: "enumerand", tolerances } |
+      { kind: "enumerand", identity, tolerances } |
       { kind: "snapshot", identity, tolerances },
     missingness: { mode, maxMissingPerBlock, maxMissingFraction },
     deterministicBlockSeed,
@@ -186,6 +186,7 @@ The strict operator config (not a `crucible_start` argument) contains:
     },
     archiveCaps?: {
       accepted?: integer, nearMisses?: integer, rejected?: integer,
+      inconclusive?: integer,
       invalidMetrics?: integer, mechanismGroups?: integer,
       lessonGroups?: integer, duplicateIndex?: integer
     },
@@ -210,9 +211,11 @@ challenge, and novelty roles. `certified_impossibility` additionally requires
 the independent verifier role. Calibration expectations and every role case
 snapshot come from the configured operator corpus; callers cannot supply or
 relabel them.
-The acceptance grammar supports exactly `harness_pass`, `constant`,
-`field_equals`, `number_compare`, `metric_compare`, `all`, `any`, and `not`
-nodes. A supplied deadline must be a future timestamp with an explicit zone.
+Statistical acceptance supports `metric_compare`, `harness_pass`, or an `all`
+conjunction of those claims. Metric comparisons must exactly match the frozen
+metric direction and acceptance threshold. `harness_pass` is the only contract
+form that gives the raw `pass` field acceptance meaning. A supplied deadline
+must be a future timestamp with an explicit zone.
 
 ### Operator-signature boundary
 
@@ -277,7 +280,7 @@ For a normal nonterminal read, the payload contains:
 
 - `terminal_available`, `non_result`, `non_result_code`, `paused`, and domain
   `status`;
-- `progress`: event sequence, attempted/observed/accepted counts, incumbent
+- `progress`: event sequence, attempted/observed/accepted counts, passing-candidate
   availability, next round/slot, partial/completed-round state, bounded/round
   completion, plateau/escape state, operator mix, archive counts, duplicates,
   stop requests, pauses, and domain non-result count;
@@ -318,7 +321,8 @@ for a terminal event, verifies the persisted artifact closure for all harness
 evidence before returning:
 
 - `is_result:true`, `decision`, terminal/event/contract hashes;
-- winner/evidence identifiers when applicable;
+- unique-candidate or supported tie-cohort identifiers when applicable;
+- the frozen-priority pairwise relation and cohort closure;
 - the kernel-sealed `basis` and `evidence_closure`.
 
 Every nonterminal, paused, non-result, or integrity-blocked state returns
@@ -395,7 +399,7 @@ are intentionally opaque lifecycle channels.
 | Acceptance predicate | 4,096 bytes; depth 16; 128 nodes; 32 children per boolean node |
 | Predicate paths | 16 segments; 128 characters per segment |
 | Predicate literal values | depth 8; 128 nodes; arrays 32; objects 32 properties; strings 1,024 characters / 2,048 bytes |
-| Statistical metrics | 12, each with finite bounds, estimand/unit, direction, threshold, and equivalence delta |
+| Statistical metrics | 12, each with frozen priority, finite bounds, estimand/unit, direction, threshold, and equivalence delta |
 | Calibration cases | 64, operator-owned, including at least one accept and one reject |
 | Worker models | 8 distinct ids |
 | Candidates per round | 8 |
@@ -414,6 +418,57 @@ tolerances cover every metric exactly once. Finite/bounded control identity must
 match the manifest; other topologies require a durable snapshot control.
 Evaluation capacity must cover the frozen search, block, confirmation, control,
 calibration, and optional verifier workload.
+Runtime admission independently derives the worst-case role × block × arm count.
+The frozen per-investigation output, receipt, and CAS budgets must cover that
+count at their corresponding per-attempt caps; underprovisioned configurations
+are rejected before effects.
+
+### Deterministic blocked replication
+
+Every search subject receives a canonical schedule derived from the contract
+hash, subject/enumerand identity, frozen control, `minBlocks`, `maxBlocks`, and
+`deterministicBlockSeed`. The schedule and seed are persisted before proposal or
+measurement effects. Candidate and control use the exact frozen `search` role.
+Within each block, a seeded base permutation is cyclically rotated, balancing
+arm position while leaving each arm's seed independent of execution order.
+
+Each raw arm attempt has stable block, replicate, arm, subject, and seed
+bindings and its own receipt/stdout/stderr/snapshot artifact closure. A candidate
+evidence item references the schedule artifact, a raw-complete-block composite,
+and every raw measurement. Runner observations and composites contain no claim
+state, pass/fail verdict, matched label, acceptance decision, or outcome class.
+The kernel recomputes those from the raw blocks. Persisted means, confidence
+sequences, claim states, alpha ledgers, control-tolerance metadata, calibration
+states, and candidate support are cache only: each cache has a deterministic
+digest and reducer replay canonical-compares it with a fresh raw-block
+derivation before the value can enter domain state.
+
+Only contiguous complete blocks from zero enter the statistical kernel. Partial
+blocks resume at the exact missing arm after restart. Invalid or missing
+candidate/control observations remain in their block and are handled by the
+frozen missingness policy rather than selectively dropped. Out-of-bounds values,
+invalid attempts, and control-drifted blocks become missing blocks and cannot
+support acceptance. Replication continues through the minimum while required claims are unresolved.
+Satisfice mode may stop when they resolve. Optimize mode keeps consuming the
+candidate's preregistered blocks through `maxBlocks` so later pairwise
+superiority/equivalence decisions do not inherit an early-stop ordering bias.
+Either mode stops when `maxBlocks` is reached or the evaluation budget cannot
+admit another complete block.
+
+Calibration uses the same `evaluateStatisticalClaims` path. The signed
+known-positive corpus must produce `SUPPORTED`; known-negative cases must
+produce `REFUTED`. Calibration covers the frozen calibration, search,
+confirmation, and challenge execution roles (identity-equivalent roles may
+share one raw execution) before search starts. Each unsuccessful calibration
+block is durable and retried only through the frozen `maxBlocks` bound. Exhaustion
+records `VALIDATION_INCONCLUSIVE`; it never loops indefinitely or becomes a
+result.
+
+Candidate `outcomeClass` is kernel-derived from every required acceptance claim:
+all `SUPPORTED` is `accepted`, any `REFUTED` is `rejected`, `INVALID` is
+`invalid_metrics`, and unresolved evidence is `inconclusive`. A max-block
+unresolved candidate remains inconclusive rather than becoming a rejection or
+acceptance.
 
 Search-policy maxima are 64 for plateau window/minimum/escape rounds; archive
 cohorts and mechanism/lesson groups are each capped at 32; duplicate index at
@@ -608,10 +663,13 @@ The harness must emit exactly one JSON object followed only by whitespace.
 {
   "pass": true,
   "metrics": { "score": 1.0 },
+  "observables": { "outcome": "accepted" },
   "role": "confirmation",
   "phase": "confirmation",
   "replicateIndex": 0,
   "blockIndex": 2,
+  "armIndex": 0,
+  "armId": "candidate",
   "deterministicSeed": "confirmation-seed-v1",
   "subjectId": "candidate-17",
   "environmentIdentity": "sha256:crucible-harness-environment-v4:<64hex>",
@@ -619,21 +677,31 @@ The harness must emit exactly one JSON object followed only by whitespace.
 }
 ```
 
-The legacy five result fields remain supported. Suite-bound runs additionally
-carry the eight execution-binding fields shown above, which the parser compares
-to a trusted expected binding and the receipt repeats verbatim. Search requires
-`blockIndex` and forbids `replicateIndex`; confirmation/challenge/novelty
-require both; calibration and impossibility verification forbid both.
-`validationCases` is calibration-only once a role binding is present, while
+The legacy five result fields remain supported. For suite-bound runs, Crucible
+passes the ten execution-binding fields shown above in concrete argv and env and
+repeats them verbatim in the receipt. If a harness echoes binding fields in its
+JSON, the parser requires an exact match to the trusted binding; otherwise the
+executor injects the trusted binding into the canonical parsed observation.
+Search, confirmation, challenge, novelty, and replicated calibration require
+replicate, block, and arm ordinals. Validation may execute calibration, search,
+confirmation, or challenge roles with `phase:"calibration"`. Impossibility
+verification forbids replication ordinals. `validationCases` is
+calibration-phase-only once a role binding is present, while
 `searchSpaceExhausted` and `impossibilityCertificateHash` are verifier-only.
 Unknown top-level fields, duplicate JSON keys, non-finite metrics, trailing
-content, and output overflow are rejected. Declared metrics rank candidates;
-missing metrics do not overturn an accepted candidate. Accepted-but-unrankable
-candidates sort behind rankable accepted candidates; non-accepted candidates
-with incomplete metrics become `invalid_metrics`. The optional
+content, and output overflow are rejected. Metrics named by acceptance claims
+are required evidence; other declared metrics are ranking-only. An explicit
+`harness_pass` claim can therefore accept a statistically supported candidate
+without optional ranking metrics. Accepted-but-unrankable candidates sort
+behind rankable accepted candidates. The optional
 `impossibilityCertificateHash` is not authority for unreachability; only the
 kernel-bound verifier observation and persisted artifact/receipt closure can
 qualify.
+
+`observables` is an optional bounded record for registered numeric or
+categorical prediction values that are not ranking metrics. Values may be
+finite numbers, booleans, or bounded strings. A key cannot appear in both
+`metrics` and `observables`; ambiguous duplicate observations fail closed.
 
 Every executable/dependency is reverified, privately staged, and rehashed for
 each attempt. Receipts bind the allowlist/harness identity, concrete argv/env,
@@ -677,12 +745,49 @@ Operators are `fresh`, `refinement`, `crossover`, `diversification`,
 It **prefers** parents from different mechanism groups when available, then
 falls back to the first two distinct eligible candidates.
 
-The default does not stop on first accept. Search-only acceptance never
-terminalizes. Until trusted confirmation, challenge, and every
-`requiredForResult` prediction evaluation are closed, an incumbent ends as
-`SCIENTIFIC_CONFIRMATION_REQUIRED`. Finite/bounded exhaustion alone ends as
+The default does not stop on first accept. Accepted candidates are compared
+pairwise in frozen metric-priority order from replay-derived confidence
+sequences. A relation is `BETTER`/`WORSE` only when the supported margin exceeds
+the practical delta; supported bounds wholly inside ±delta are
+`PRACTICALLY_EQUIVALENT`; overlap alone is `UNRESOLVED`; missing metric authority
+is `INCOMPARABLE`. The non-dominated frontier becomes either one provisional
+best candidate or a supported tie cohort. Candidate ids and event order only
+stabilize display order and never break scientific ties.
+
+Statistical search support is only a provisional readiness gate and never
+terminalizes by itself. When discovery stops, the kernel first persists
+`scientific_confirmation_frozen`, binding the provisional unique candidate or
+tie cohort, discovery head, relation closure, held-out role manifests,
+candidate-dependent challenge seed policy, replication schedules, and distinct
+alpha subject lanes. It then runs fresh `confirmation` blocks for every cohort
+member followed by fresh `challenge` blocks. No confirmation/challenge
+manifest, id, bytes, receipt, or raw result is exposed to workers or fed back
+into search, and no research round follows the freeze.
+
+Every cohort member must independently resolve both held-out roles to
+`SUPPORTED`. Refutation, invalid evidence, unresolved claims at the frozen
+block limit, invalidation, budget exhaustion, or attempted cohort/alpha reuse
+ends as `SCIENTIFIC_CONFIRMATION_FAILED`; it never resumes search. A fully
+supported closure makes the aggregate scientifically ready, but
+`VERIFIED_RESULT` is still emitted only by the subsequent kernel decision
+gate. Unresolved/incomparable discovery relations retain an explicit
+preregistered-block plan and become a scientific non-result when those blocks
+are exhausted. Finite/bounded exhaustion alone ends as
 `INDEPENDENT_VERIFICATION_REQUIRED`; only qualifying evidence from the pinned
 independent impossibility-verifier role may support `TARGET_UNREACHABLE`.
+
+Every sealed typed prediction is translated into a frozen statistical claim
+and evaluated independently from candidate acceptance over replay-derived
+replicated blocks. Outcomes are exactly `SUPPORTED`, `REFUTED`, `UNRESOLVED`,
+or `INVALID`, with evidence, block-ledger, estimate/bounds, and alpha-ledger
+references. Optional refutations do not erase a successful candidate;
+`requiredForResult` predictions must all be `SUPPORTED` before scientific
+readiness. Later worker prompts receive supported/refuted outcomes in a
+separate kernel-derived findings section, never mixed with prior model prose.
+Control directions use paired within-block differences. Assigned-parent
+directions use separately replayed parent blocks and an independent two-sample
+Hoeffding sequence with a Bonferroni-split claim alpha; that limitation is
+carried into the conclusion.
 
 The domain also supports a declared-command-budget termination basis, but the
 public start schema does not expose that budget. Derived runner/effect/restart
@@ -701,15 +806,33 @@ ignored and deterministically retried with the next attempt ordinal.
 Domain replay verifies the repository structure, event/artifact-reference
 bindings, domain hash chain, and reducer transitions. It deterministically
 reconstructs domain state and recommendations; it does not re-run model or
-harness side effects. Operational evidence has its own verified event stream.
+harness side effects. The replay result exposes a raw-authority root plus a
+byte-canonical scientific aggregate, claim-state ledger, alpha ledger, and
+closure hashes. Domain decisions read the compact replay-derived
+support/calibration state,
+never an unchecked persisted summary. Operational evidence has its own verified
+event stream.
+The terminal evidence closure carries the supported cohort, pairwise relation
+hash/evidence, and one code-authored scientific conclusion per cohort member.
+Candidate-performance status remains separate from sealed hypothesis-set
+status, and every prediction includes its estimate, confidence bounds,
+evidence/block/alpha references, and explicit limitations. Explanatory model
+prose is excluded from conclusion authority.
 `crucible_result` adds full terminal artifact-closure verification across
 harness evidence, measurements, snapshots, raw output, receipts, and decisive
-basis, then rechecks the frozen scientific readiness policy. Persisted
+basis, requires the terminal closure to bind the replay-science root, then
+rechecks the frozen scientific readiness policy. Persisted
 search-only or synthetic terminals remain non-results with all
 candidate/evidence/hash fields redacted.
 
-Persistence bundles are self-contained and internally hash-verifiable, but
-authenticity is out of band:
+Persistence bundle version 4 is self-contained and internally hash-verifiable.
+It includes the event database, every referenced raw receipt/output/snapshot/
+schedule/composite object, and a cache-only scientific replay digest. Export and
+import both replay the bundled v4 database and reject any mismatch between that
+digest and the raw schedule/policy/block history. They also canonical-compare
+schedule/composite objects and each raw parsed observation against its
+content-addressed receipt before publication or import. Authenticity is out of
+band:
 
 - export reports `trustLevel:"self-consistent"`;
 - import requires an expected digest/signature by default;
@@ -717,6 +840,25 @@ authenticity is out of band:
   `authenticated:false` and `verified:false`.
 
 Do not treat an unauthenticated bundle as proof of who produced it.
+
+## Development test loop
+
+Use the smallest applicable tier while implementing:
+
+```text
+npm exec vitest run -- crucible/__tests__/<affected-file>.test.mjs
+npm run test:crucible:unit
+npm run test:crucible:changed
+```
+
+`test:crucible:unit` covers pure domain/schema/parser behavior and is intended
+for the inner edit loop. `test:crucible:changed` asks Vitest for tests related
+to changed Crucible files and aborts after 120 seconds; reaching that limit
+means the next run should target explicit test files.
+
+The complete safe suite runs once at a phase gate. Hard-kill, multiprocess,
+credentialed SDK, and native AppContainer tests remain release-gate work and
+must not run after every implementation edit.
 
 ## Release validation
 

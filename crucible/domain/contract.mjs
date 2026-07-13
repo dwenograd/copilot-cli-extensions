@@ -20,6 +20,7 @@ import {
     STATISTICAL_POLICY_HASH_ALGORITHM,
     STATISTICAL_METRIC_DIRECTIONS,
     STATISTICAL_POLICY_VERSION,
+    VALIDATION_HARNESS_ROLES,
 } from "./constants.mjs";
 import {
     normalizeEnumerandManifest,
@@ -39,6 +40,10 @@ import {
     computeHarnessSuiteV4Identity,
     normalizeHarnessSuiteV4,
 } from "../measurement/harness-suite.mjs";
+import {
+    StatisticsError,
+    statisticalAcceptanceClaimSet,
+} from "./statistics.mjs";
 
 const COMPARISON_OPERATORS = Object.freeze(["<", "<=", "==", ">=", ">"]);
 const VALIDATION_EXPECTATIONS = Object.freeze(["accept", "reject"]);
@@ -132,6 +137,7 @@ const SEARCH_POLICY_KEYS = Object.freeze([
 const ARCHIVE_CAP_KEYS = Object.freeze([
     "accepted",
     "duplicateIndex",
+    "inconclusive",
     "invalidMetrics",
     "lessonGroups",
     "mechanismGroups",
@@ -164,6 +170,7 @@ const CONTRACT_INPUT_OPTIONAL_KEYS = Object.freeze([
     "impossibilityPolicy",
 ]);
 const CONTRACT_OUTPUT_REQUIRED_KEYS = Object.freeze([
+    "acceptanceClaimSet",
     "acceptancePredicate",
     "candidatesPerRound",
     "criticality",
@@ -187,6 +194,8 @@ const CONTRACT_OUTPUT_REQUIRED_KEYS = Object.freeze([
     "statisticalPolicy",
     "statisticalPolicyIdentity",
     "validationCases",
+    "validationClaimSet",
+    "validationRoles",
     "workerModels",
 ]);
 const CONTRACT_OUTPUT_OPTIONAL_KEYS = Object.freeze([
@@ -219,6 +228,7 @@ const STATISTICAL_METRIC_KEYS = Object.freeze([
     "practicalEquivalenceDelta",
     "unit",
 ]);
+const STATISTICAL_METRIC_OPTIONAL_KEYS = Object.freeze(["priority"]);
 const FAMILY_ALLOCATION_KEYS = Object.freeze(["alpha", "family"]);
 const CONTROL_KEYS = Object.freeze(["identity", "kind", "tolerances"]);
 const CONTROL_TOLERANCE_KEYS = Object.freeze([
@@ -838,8 +848,33 @@ function normalizePredicateNode(predicate, state, depth = 0) {
 
     switch (predicate.kind) {
         case "harness_pass":
-            requireExactObjectKeys(predicate, "acceptancePredicate", ["kind"]);
-            return { kind: "harness_pass" };
+            requireObjectKeys(
+                predicate,
+                "acceptancePredicate",
+                ["kind"],
+                ["family", "probabilityThreshold"],
+            );
+            return {
+                kind: "harness_pass",
+                ...(predicate.family === undefined
+                    ? {}
+                    : {
+                        family: requireIdentifier(
+                            predicate.family,
+                            "acceptancePredicate.family",
+                        ),
+                    }),
+                ...(predicate.probabilityThreshold === undefined
+                    ? {}
+                    : {
+                        probabilityThreshold: requireFiniteNumberInRange(
+                            predicate.probabilityThreshold,
+                            "acceptancePredicate.probabilityThreshold",
+                            Number.MIN_VALUE,
+                            1 - Number.EPSILON,
+                        ),
+                    }),
+            };
         case "constant":
             requireExactObjectKeys(predicate, "acceptancePredicate", ["kind", "value"]);
             if (typeof predicate.value !== "boolean") {
@@ -1191,6 +1226,9 @@ function normalizeValidationCases(cases) {
         return {
             id,
             expectation: item.expectation,
+            expectedClaimState: item.expectation === "accept"
+                ? "SUPPORTED"
+                : "REFUTED",
             artifactHash: requireArtifactHash(
                 item.artifactHash,
                 `validationCases[${index}].artifactHash`,
@@ -1436,6 +1474,20 @@ function checkedSum(values, field) {
     return result;
 }
 
+function compensatedFiniteSum(values) {
+    let sum = 0;
+    let correction = 0;
+    for (const value of values) {
+        const next = sum + value;
+        correction += Math.abs(sum) >= Math.abs(value)
+            ? (sum - next) + value
+            : (value - next) + sum;
+        sum = next;
+    }
+    const result = sum + correction;
+    return Object.is(result, -0) ? 0 : result;
+}
+
 export function harnessSuiteRoleCases(value, role) {
     const suite = normalizeHarnessSuiteV4(value?.harnessSuite ?? value);
     const roleId = requireIdentifier(role, "role");
@@ -1532,9 +1584,27 @@ function normalizeStatisticalMetrics(value, observableRegistry) {
         observableRegistry.map((observable) => [observable.key, observable]),
     );
     const keys = new Set();
+    const hasExplicitPriority = value.some((metric) =>
+        metric !== null
+        && typeof metric === "object"
+        && Object.hasOwn(metric, "priority"));
+    if (hasExplicitPriority
+        && value.some((metric) =>
+            metric === null
+            || typeof metric !== "object"
+            || !Object.hasOwn(metric, "priority"))) {
+        throw new ContractError(
+            "statisticalPolicy.metrics must either all declare priority or all omit it",
+        );
+    }
     const metrics = value.map((metric, index) => {
         const field = `statisticalPolicy.metrics[${index}]`;
-        requireExactObjectKeys(metric, field, STATISTICAL_METRIC_KEYS);
+        requireObjectKeys(
+            metric,
+            field,
+            STATISTICAL_METRIC_KEYS,
+            STATISTICAL_METRIC_OPTIONAL_KEYS,
+        );
         const key = requireIdentifier(metric.key, `${field}.key`);
         if (keys.has(key)) {
             throw new ContractError("statisticalPolicy.metrics keys must be unique", {
@@ -1586,6 +1656,13 @@ function normalizeStatisticalMetrics(value, observableRegistry) {
         );
         return {
             key,
+            priority: hasExplicitPriority
+                ? requireNonNegativeSafeInteger(
+                    metric.priority,
+                    `${field}.priority`,
+                    value.length - 1,
+                )
+                : null,
             minimum,
             maximum,
             estimand: requireBoundedText(
@@ -1601,7 +1678,25 @@ function normalizeStatisticalMetrics(value, observableRegistry) {
             family: requireIdentifier(metric.family, `${field}.family`),
         };
     });
-    metrics.sort((left, right) => left.key.localeCompare(right.key));
+    if (hasExplicitPriority) {
+        const priorities = metrics.map((metric) => metric.priority);
+        if (new Set(priorities).size !== metrics.length
+            || priorities.some((priority) =>
+                priority < 0 || priority >= metrics.length)) {
+            throw new ContractError(
+                "statisticalPolicy.metrics priorities must be unique and contiguous from zero",
+                { priorities },
+            );
+        }
+        metrics.sort((left, right) =>
+            left.priority - right.priority
+            || left.key.localeCompare(right.key));
+    } else {
+        metrics.sort((left, right) => left.key.localeCompare(right.key));
+        metrics.forEach((metric, priority) => {
+            metric.priority = priority;
+        });
+    }
     return immutableCanonical(metrics);
 }
 
@@ -1635,7 +1730,10 @@ function normalizeFamilyAllocations(value, investigationAlpha, metrics) {
             ),
         };
     });
-    const sum = allocations.reduce((total, allocation) => total + allocation.alpha, 0);
+    allocations.sort((left, right) => left.family.localeCompare(right.family));
+    const sum = compensatedFiniteSum(
+        allocations.map((allocation) => allocation.alpha),
+    );
     const tolerance = Math.max(1e-12, investigationAlpha * 1e-12);
     if (!Number.isFinite(sum) || Math.abs(sum - investigationAlpha) > tolerance) {
         throw new ContractError(
@@ -1653,7 +1751,6 @@ function normalizeFamilyAllocations(value, investigationAlpha, metrics) {
             { missing: missing.sort(), unused: unused.sort() },
         );
     }
-    allocations.sort((left, right) => left.family.localeCompare(right.family));
     return immutableCanonical(allocations);
 }
 
@@ -1773,8 +1870,17 @@ export function statisticalEvaluationRequirements({
     maxBlocks,
     maxConfirmations,
     validationCaseCount,
+    validationRoleCount = VALIDATION_HARNESS_ROLES.length,
     hypothesisTopology,
 }) {
+    const validationSeriesCount = checkedProduct(
+        [validationCaseCount, validationRoleCount],
+        "statistical validation series",
+    );
+    const requiredValidationEvaluations = checkedProduct(
+        [validationSeriesCount, maxBlocks],
+        "required validation evaluations",
+    );
     const confirmationRoleSlots = checkedProduct(
         [maxConfirmations, 3],
         "statistical confirmation role slots",
@@ -1794,7 +1900,7 @@ export function statisticalEvaluationRequirements({
     const verifierEvaluations = hypothesisTopology === "certified_impossibility" ? 1 : 0;
     const requiredTotalEvaluations = checkedSum(
         [
-            validationCaseCount,
+            requiredValidationEvaluations,
             requiredCandidateEvaluations,
             requiredControlEvaluations,
             verifierEvaluations,
@@ -1807,6 +1913,9 @@ export function statisticalEvaluationRequirements({
         requiredCandidateEvaluations,
         requiredControlEvaluations,
         validationCaseCount,
+        validationRoleCount,
+        validationSeriesCount,
+        requiredValidationEvaluations,
         verifierEvaluations,
         requiredTotalEvaluations,
     });
@@ -1846,7 +1955,7 @@ function normalizeEvaluationBudget(value, requirements) {
         [
             budget.maxCandidateEvaluations,
             budget.maxControlEvaluations,
-            requirements.validationCaseCount,
+            requirements.requiredValidationEvaluations,
             requirements.verifierEvaluations,
         ],
         "allocated total evaluations",
@@ -1951,6 +2060,7 @@ export function createStatisticalPolicy(input, context = {}) {
         maxBlocks,
         maxConfirmations,
         validationCaseCount: context.validationCaseCount,
+        validationRoleCount: context.validationRoleCount,
         hypothesisTopology: context.hypothesisTopology,
     });
     const evaluationBudget = normalizeEvaluationBudget(
@@ -2120,6 +2230,11 @@ export function createInvestigationContract(input) {
         observableRegistry,
         hypothesisPolicy,
     );
+    if (hypothesisPolicy.required && enumerandManifest === null) {
+        throw new ContractError(
+            "A required hypothesisPolicy needs operator-frozen enumerand hypotheses",
+        );
+    }
     const harness = normalizeHarnessSuiteContract(
         input.harnessSuite,
         input.harnessSuiteIdentity,
@@ -2129,11 +2244,13 @@ export function createInvestigationContract(input) {
     const validationCases = normalizeValidationCases(
         harnessSuiteRoleCases(harness.suite, "calibration"),
     );
+    const validationRoles = immutableCanonical([...VALIDATION_HARNESS_ROLES]);
     const statisticalPolicy = createStatisticalPolicy(input.statisticalPolicy, {
         observableRegistry,
         enumerandManifest,
         searchSlots: enumerandManifest?.entries.length ?? searchCapacity,
         validationCaseCount: validationCases.length,
+        validationRoleCount: validationRoles.length,
         hypothesisTopology: input.hypothesisTopology,
     });
     const searchPolicy = createSearchPolicy(input.searchPolicy);
@@ -2150,14 +2267,43 @@ export function createInvestigationContract(input) {
     );
     const rankingMetrics = statisticalPolicy.metrics.map((metric) => ({
         key: metric.key,
+        priority: metric.priority,
         direction: metric.direction,
         epsilon: metric.practicalEquivalenceDelta,
     }));
+    const acceptancePredicate = normalizePredicate(input.acceptancePredicate);
+    let acceptanceClaimSet;
+    try {
+        acceptanceClaimSet = statisticalAcceptanceClaimSet({
+            acceptancePredicate,
+            statisticalPolicy,
+        });
+    } catch (error) {
+        if (!(error instanceof StatisticsError)) throw error;
+        throw new ContractError(
+            `acceptancePredicate is not a valid frozen statistical claim set: ${error.message}`,
+            { cause: error.code, details: error.details ?? null },
+        );
+    }
+    const validationFamily = statisticalPolicy.familyAllocations[0].family;
+    const validationClaimSet = immutableCanonical({
+        claims: [{
+            id: "validation.harness_pass",
+            kind: "harness_pass",
+            expected: true,
+            family: validationFamily,
+            source: "operator_signed_validation_corpus",
+        }],
+        requiredClaimIds: ["validation.harness_pass"],
+    });
     const contract = {
         domainVersion: DOMAIN_VERSION,
         objective,
-        acceptancePredicate: normalizePredicate(input.acceptancePredicate),
+        acceptancePredicate,
+        acceptanceClaimSet,
         validationCases,
+        validationClaimSet,
+        validationRoles,
         harnessSuite: harness.suite,
         harnessSuiteIdentity: harness.identity,
         harnessId: harness.suite.roles.search.harnessId,
@@ -2198,30 +2344,6 @@ export function assessAcceptancePredicate(acceptancePredicate, harnessResult) {
         normalizePredicate(acceptancePredicate),
         harnessResult,
     ));
-}
-
-export function validationSatisfied(validationCases, harnessResult) {
-    const results = harnessResult?.caseResults;
-    if (!Array.isArray(results) || results.length !== validationCases.length) {
-        return false;
-    }
-    const byId = new Map();
-    for (const result of results) {
-        if (result === null
-            || typeof result !== "object"
-            || Array.isArray(result)
-            || typeof result.id !== "string"
-            || byId.has(result.id)) {
-            return false;
-        }
-        byId.set(result.id, result);
-    }
-    return validationCases.every((validationCase) => {
-        const result = byId.get(validationCase.id);
-        return result !== undefined
-            && result.artifactHash === validationCase.artifactHash
-            && result.outcome === validationCase.expectation;
-    });
 }
 
 export function candidateMetricValues(metrics, harnessResult) {

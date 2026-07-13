@@ -67,7 +67,6 @@ function roleIdentity(role, cases, executesCandidateCode = false) {
         observableSchemaHash: hashHarnessObservableSchemaV4({
             pass: "boolean",
             metrics: ["score"],
-            role,
         }),
         caseManifest: cases.map(([id, snapshotHash]) => ({
             id,
@@ -177,7 +176,6 @@ export function buildHarnessSuiteForAllowlist(
             observableSchemaHash: hashHarnessObservableSchemaV4({
                 pass: "boolean",
                 metrics: ["score"],
-                role,
             }),
             caseManifest: caseIds.map((id) => ({
                 id,
@@ -262,6 +260,7 @@ export function fakeStatisticalPolicy({
     topology = "open_generative",
     searchSlots = 1,
     validationCaseCount = 2,
+    validationRoleCount = 4,
     manifest = null,
     goalMode = "optimize",
     maxBlocks = 1,
@@ -303,14 +302,12 @@ export function fakeStatisticalPolicy({
         maxBlocks,
         maxConfirmations,
         validationCaseCount,
+        validationRoleCount,
         hypothesisTopology: topology,
     });
     const maxCandidateEvaluations = requirements.requiredCandidateEvaluations;
     const maxControlEvaluations = requirements.requiredControlEvaluations;
-    const maxTotalEvaluations = requirements.validationCaseCount
-        + requirements.verifierEvaluations
-        + maxCandidateEvaluations
-        + maxControlEvaluations;
+    const maxTotalEvaluations = requirements.requiredTotalEvaluations;
     return {
         version: STATISTICAL_POLICY_VERSION,
         goalMode,
@@ -340,11 +337,11 @@ export function fakeStatisticalPolicy({
             maxTotalEvaluations,
         },
         resourceBudget: {
-            perAttemptOutputBytes: 16 * 1024 * 1024,
-            perInvestigationOutputBytes: 256 * 1024 * 1024,
-            perAttemptReceiptBytes: 2 * 1024 * 1024,
-            perInvestigationReceiptBytes: 64 * 1024 * 1024,
-            perAttemptCasBytes: 32 * 1024 * 1024,
+            perAttemptOutputBytes: 1 * 1024 * 1024,
+            perInvestigationOutputBytes: 2 * 1024 * 1024 * 1024,
+            perAttemptReceiptBytes: 256 * 1024,
+            perInvestigationReceiptBytes: 512 * 1024 * 1024,
+            perAttemptCasBytes: 1 * 1024 * 1024,
             perInvestigationCasBytes: 2 * 1024 * 1024 * 1024,
         },
     };
@@ -469,6 +466,15 @@ export function upgradeLegacyContractInput(input) {
             calibration: legacyCalibration,
         },
     });
+    const predicateThresholds = new Map();
+    const visitPredicate = (predicate) => {
+        if (predicate?.kind === "metric_compare") {
+            predicateThresholds.set(predicate.metric, predicate.value);
+        }
+        for (const child of predicate?.predicates ?? []) visitPredicate(child);
+        if (predicate?.predicate !== undefined) visitPredicate(predicate.predicate);
+    };
+    visitPredicate(input.acceptancePredicate);
     const oldMetrics = Array.isArray(input.metrics) && input.metrics.length > 0
         ? input.metrics
         : [{ key: "score", direction: "max", epsilon: 0.01 }];
@@ -476,16 +482,21 @@ export function upgradeLegacyContractInput(input) {
         key: metric.key,
         kind: "numeric",
         minimum: 0,
-        maximum: 1,
+        maximum: Math.max(
+            100,
+            Math.ceil(Math.abs(predicateThresholds.get(metric.key) ?? 0)),
+        ),
     }));
+    const registryByKey = new Map(registry.map((item) => [item.key, item]));
     const statisticalMetrics = oldMetrics.map((metric) => ({
         key: metric.key,
-        minimum: 0,
-        maximum: 1,
+        minimum: registryByKey.get(metric.key)?.minimum ?? 0,
+        maximum: registryByKey.get(metric.key)?.maximum ?? 1,
         estimand: `${metric.key} versus control`,
         unit: metric.key,
         direction: metric.direction,
-        acceptanceThreshold: metric.direction === "min" ? 0.2 : 0.8,
+        acceptanceThreshold: predicateThresholds.get(metric.key)
+            ?? (metric.direction === "min" ? 0.2 : 0.8),
         practicalEquivalenceDelta: Math.max(metric.epsilon ?? 0.01, 0.000001),
         family: "primary",
     }));

@@ -59,6 +59,25 @@ export {
 } from "./enumerand-execution.mjs";
 
 export {
+    REPLICATION_CONTROL_TOLERANCE_HASH_ALGORITHM,
+    REPLICATION_SCHEDULE_ALGORITHM,
+    REPLICATION_SCHEDULE_HASH_ALGORITHM,
+    REPLICATION_SCHEDULE_VERSION,
+    REPLICATION_STATISTICAL_SUMMARY_HASH_ALGORITHM,
+    ReplicationScheduleError,
+    analyzeReplicationAttempts,
+    assertReplicationScheduleMatches,
+    deriveControlToleranceMetadata,
+    deriveReplicationSchedule,
+    deriveReplicationSubjectIdentity,
+    evaluateReplicationProgress,
+    expectedReplicationSubjects,
+    normalizeReplicationSchedule,
+    replicationAttemptKey,
+    replicationBlockPlan,
+} from "./measurement-scheduler.mjs";
+
+export {
     PROMPT_CONTEXT_VERSION,
     PROMPT_CONTEXT_HASH_ALGORITHM,
     DEFAULT_PROMPT_CONTEXT_BYTE_CAP,

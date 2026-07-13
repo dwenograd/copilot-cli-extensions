@@ -19,12 +19,17 @@ import {
     createExternalEvent,
     decideNext,
     deriveImpossibilityVerdict,
+    deriveReplicationControlBinding,
     detectPlateau,
     duplicateEvidenceId,
+    enumerandBindingHash,
     hashCanonical,
     harnessCandidateEvidenceItems,
     immutableCanonical,
     latestUnhandledStopRequest,
+    resolveControlEnumerand,
+    createRawMeasurementSeries,
+    statisticalSubjectIndex,
 } from "../domain/index.mjs";
 import {
     openArtifactStore,
@@ -33,6 +38,7 @@ import {
 import {
     PARSER_VERSION,
     RECEIPT_VERSION,
+    HARNESS_SUITE_RECEIPT_VERSION,
     SANDBOX_POLICY_IDENTITY_HASH_ALGORITHM,
     STREAM_HASH_ALGORITHM,
     DEFAULT_MEASUREMENT_BYTE_BUDGETS,
@@ -69,6 +75,11 @@ import {
     assertFiniteEnumerandSnapshot,
     resolveCommandEnumerand,
 } from "./enumerand-execution.mjs";
+import {
+    evaluateReplicationProgress,
+    normalizeReplicationSchedule,
+    replicationBlockPlan,
+} from "./measurement-scheduler.mjs";
 import { buildPromptContext } from "./prompt-context.mjs";
 import {
     RUNTIME_TEMP_OWNER_MARKER,
@@ -87,7 +98,6 @@ import {
     taggedHash,
 } from "./utils.mjs";
 
-const VALIDATION_RECEIPT_HASH_ALGORITHM = "sha256:crucible-runtime-validation-receipts-v1";
 const LOGICAL_EFFECT_KEY_ALGORITHM = "sha256:crucible-runtime-logical-effect-v1";
 const EFFECT_RECOVERY_CAPSULE_HASH_ALGORITHM =
     "sha256:crucible-runtime-effect-recovery-capsule-v1";
@@ -110,7 +120,10 @@ export const DEFAULT_RUNTIME_BYTE_BUDGETS = Object.freeze({
     perInvestigationCasBytes: 2 * 1024 * 1024 * 1024,
 });
 
-function normalizeRuntimeByteBudgets(value = {}) {
+function normalizeRuntimeByteBudgets(
+    value = {},
+    fallbacks = DEFAULT_RUNTIME_BYTE_BUDGETS,
+) {
     if (value === null || typeof value !== "object" || Array.isArray(value)) {
         throw new RuntimeConfigError("byteBudgets must be an object");
     }
@@ -120,7 +133,7 @@ function normalizeRuntimeByteBudgets(value = {}) {
         throw new RuntimeConfigError("byteBudgets contain unknown keys", { unknown });
     }
     const normalized = {};
-    for (const [key, fallback] of Object.entries(DEFAULT_RUNTIME_BYTE_BUDGETS)) {
+    for (const [key, fallback] of Object.entries(fallbacks)) {
         const actual = value[key] ?? fallback;
         if (!Number.isSafeInteger(actual)
             || actual < 1
@@ -218,11 +231,16 @@ function receiptHasCompleteOutput(receipt) {
     });
 }
 
-function receiptHasVerifiedSnapshotBytes(receipt, candidateSnapshotHash) {
+function receiptHasVerifiedSnapshotBytes(
+    receipt,
+    candidateSnapshotHash,
+    { requireCompleteOutput = true } = {},
+) {
     const identity = receipt?.candidateSnapshotIdentitySummary;
     const stagedIdentity = receipt?.stagedCandidateSnapshotIdentitySummary;
     const mutation = receipt?.candidateSnapshotMutationCheck;
-    return receipt?.version === RECEIPT_VERSION
+    return (receipt?.version === RECEIPT_VERSION
+            || receipt?.version === HARNESS_SUITE_RECEIPT_VERSION)
         && receipt.candidateSnapshotHash === candidateSnapshotHash
         && receipt.stagedCandidateSnapshotHash === candidateSnapshotHash
         && SNAPSHOT_CLOSURE_HASH.test(
@@ -249,7 +267,7 @@ function receiptHasVerifiedSnapshotBytes(receipt, candidateSnapshotHash) {
         && mutation.identityStable === true
         && mutation.openHandleRehashStable === true
         && mutation.reparseStable === true
-        && receiptHasCompleteOutput(receipt)
+        && (!requireCompleteOutput || receiptHasCompleteOutput(receipt))
         && stagedHarnessHashesMatch(receipt);
 }
 
@@ -354,16 +372,16 @@ function truncateUtf8(value, maximumCharacters, maximumBytes) {
     return output;
 }
 
-function trustedHarnessFinding(parsed) {
-    const outcome = parsed?.pass === true ? "pass" : "reject";
-    const metrics = parsed?.metrics !== null && typeof parsed?.metrics === "object"
-        ? parsed.metrics
-        : {};
-    return truncateUtf8(
-        `Trusted harness outcome=${outcome}; metrics=${canonicalJson(metrics)}`,
-        ANNOTATION_LIMITS.findingLength,
-        ANNOTATION_LIMITS.findingBytes,
-    );
+function measurementFailureMetadata(error) {
+    return immutableCanonical({
+        name: error?.name ?? "Error",
+        code: error?.code ?? null,
+        message: truncateUtf8(
+            error?.message ?? String(error),
+            2048,
+            4096,
+        ),
+    });
 }
 
 export class AutonomousRunner {
@@ -581,7 +599,10 @@ export class AutonomousRunner {
         if (this.#byteBudgetOverride === null) {
             this.#byteBudgets = frozenByteBudgets;
         } else {
-            const override = normalizeRuntimeByteBudgets(this.#byteBudgetOverride);
+            const override = normalizeRuntimeByteBudgets(
+                this.#byteBudgetOverride,
+                frozenByteBudgets,
+            );
             for (const [key, value] of Object.entries(override)) {
                 if (value > frozenByteBudgets[key]) {
                     throw new RuntimeConfigError(
@@ -590,6 +611,26 @@ export class AutonomousRunner {
                             key,
                             configured: value,
                             frozen: frozenByteBudgets[key],
+                        },
+                    );
+                }
+            }
+            for (const kind of ["Output", "Receipt", "Cas"]) {
+                const required = override[`perAttempt${kind}Bytes`]
+                    * this.#executionLimits.requiredMeasurementEvaluations;
+                if (!Number.isSafeInteger(required)
+                    || override[`perInvestigation${kind}Bytes`] < required) {
+                    throw new RuntimeConfigError(
+                        `byteBudgets.perInvestigation${kind}Bytes cannot cover worst-case role × block × arm attempts`,
+                        {
+                            kind,
+                            required,
+                            requiredMeasurementEvaluations:
+                                this.#executionLimits.requiredMeasurementEvaluations,
+                            perAttempt:
+                                override[`perAttempt${kind}Bytes`],
+                            perInvestigation:
+                                override[`perInvestigation${kind}Bytes`],
                         },
                     );
                 }
@@ -1182,6 +1223,13 @@ export class AutonomousRunner {
             slotIndex: command.slotIndex ?? null,
             candidateId: command.candidateId ?? command.caseId ?? null,
             snapshotId: command.snapshot ?? null,
+            scheduleHash: command.scheduleHash ?? null,
+            blockIndex: command.blockIndex ?? null,
+            replicateIndex: command.replicateIndex ?? null,
+            armIndex: command.armIndex ?? null,
+            armId: command.armId ?? null,
+            deterministicSeed: command.deterministicSeed ?? null,
+            subjectId: command.subjectId ?? null,
         }, LOGICAL_EFFECT_KEY_ALGORITHM);
     }
 
@@ -1321,9 +1369,12 @@ export class AutonomousRunner {
 
     async #runHarnessMeasurement(input) {
         let measurement;
+        let invalid = null;
+        const captureInvalid = input.captureInvalid === true;
         try {
             const {
                 harnessRole = "search",
+                captureInvalid: _captureInvalid,
                 ...measurementInput
             } = input;
             const verifiedEntry = await this.#verifiedHarnessForMeasurement(
@@ -1335,11 +1386,22 @@ export class AutonomousRunner {
                 deadlineMs: this.#config.deadlineMs,
             });
         } catch (error) {
-            this.#capturedOutputs.delete(input.attemptId);
             if (error?.details?.deadlineExceeded === true || this.#deadlineReached()) {
+                this.#capturedOutputs.delete(input.attemptId);
                 throw this.#deadlineError("trusted harness execution");
             }
-            throw error;
+            const receipt = captureInvalid ? error?.details?.receipt ?? null : null;
+            if (receipt === null) {
+                this.#capturedOutputs.delete(input.attemptId);
+                throw error;
+            }
+            measurement = {
+                receipt,
+                parsed: null,
+                stdoutHash: receipt.stdoutHash,
+                stderrHash: receipt.stderrHash,
+            };
+            invalid = measurementFailureMetadata(error);
         }
         await this.#fault("after_measurement_execution", {
             attemptId: input.attemptId,
@@ -1352,7 +1414,7 @@ export class AutonomousRunner {
                 { attemptId: input.attemptId },
             );
         }
-        return { measurement, rawOutput };
+        return { measurement, rawOutput, invalid };
     }
 
     async #runLoop() {
@@ -1538,6 +1600,14 @@ export class AutonomousRunner {
             );
         } else if (commandRecord.command.kind === "search_candidate") {
             observation = await this.#runSearchCandidateCommand(
+                currentAggregate,
+                commandId,
+                mainAttemptId,
+                commandRecord.command,
+            );
+        } else if (commandRecord.command.kind === "run_confirmation"
+            || commandRecord.command.kind === "run_challenge") {
+            observation = await this.#runScientificRoleCommand(
                 currentAggregate,
                 commandId,
                 mainAttemptId,
@@ -2417,13 +2487,17 @@ export class AutonomousRunner {
         round = null,
         slotIndex = null,
         candidateId,
+        measurementSubjectId = candidateId,
         snapshotId,
+        replication = null,
+        harnessRole: requestedHarnessRole = null,
+        measurementPhase = null,
     }) {
-        const harnessRole = purpose === "validation"
+        const harnessRole = requestedHarnessRole ?? (purpose === "validation"
             ? "calibration"
             : purpose === "impossibility"
                 ? "impossibility_verifier"
-                : "search";
+                : "search");
         const expectedParserVersion =
             aggregate.contract.harnessSuite.roles[harnessRole].parser.version;
         const event = this.#requireRecoveredEffectEvent(
@@ -2438,12 +2512,20 @@ export class AutonomousRunner {
             || payload.round !== round
             || payload.slotIndex !== slotIndex
             || payload.candidateId !== candidateId
+            || payload.measurementSubjectId !== measurementSubjectId
             || payload.snapshotId !== snapshotId
             || payload.candidateArtifactHash !== candidateArtifactHash
+            || (payload.harnessRole ?? harnessRole) !== harnessRole
+            || (payload.measurementPhase ?? (
+                purpose === "validation" ? "calibration" : "search"
+            )) !== (measurementPhase ?? (
+                purpose === "validation" ? "calibration" : "search"
+            ))
             || payload.receipt?.attemptId !== committed.effectAttemptId
             || !receiptHasVerifiedSnapshotBytes(
                 payload.receipt,
                 candidateArtifactHash,
+                { requireCompleteOutput: payload.invalid === null },
             )
             || payload.receipt?.parserVersion !== expectedParserVersion
             || payload.stdoutHash !== payload.receipt?.stdoutHash
@@ -2453,6 +2535,41 @@ export class AutonomousRunner {
                 "Committed measurement evidence does not match its logical effect",
                 { logicalEffectKey, attemptId: committed.attempt.attemptId },
             );
+        }
+        if (!canonicalEqual(payload.replication, replication)) {
+            throw new RuntimeIntegrityError(
+                "Committed measurement replication binding changed",
+                { logicalEffectKey, attemptId: committed.attempt.attemptId },
+            );
+        }
+        if (replication !== null) {
+            const expectedBinding = {
+                role: harnessRole,
+                phase: measurementPhase ?? (purpose === "validation"
+                    ? "calibration"
+                    : "search"),
+                replicateIndex: replication.replicateIndex,
+                blockIndex: replication.blockIndex,
+                armIndex: replication.armIndex,
+                armId: replication.armId,
+                deterministicSeed: replication.deterministicSeed,
+                subjectId: replication.subjectId,
+                environmentIdentity:
+                    aggregate.contract.harnessSuite.environmentIdentity,
+                suiteIdentity: aggregate.contract.harnessSuiteIdentity,
+            };
+            const actualBinding = Object.fromEntries(
+                Object.keys(expectedBinding).map((key) => [
+                    key,
+                    payload.receipt?.[key] ?? null,
+                ]),
+            );
+            if (!canonicalEqual(actualBinding, expectedBinding)) {
+                throw new RuntimeIntegrityError(
+                    "Committed measurement receipt changed its replicate binding",
+                    { logicalEffectKey, attemptId: committed.attempt.attemptId },
+                );
+            }
         }
         const snapshotStatus = this.#artifactStore.verifySnapshot(snapshotId);
         if (!snapshotStatus.ok) {
@@ -2529,7 +2646,9 @@ export class AutonomousRunner {
             "Committed measurement snapshot",
         );
         const measurementProvenance = createMeasurementProvenance({
-            subjectId: candidateId,
+            subjectId: measurementSubjectId,
+            role: payload.receipt.role ?? harnessRole,
+            phase: payload.receipt.phase ?? measurementPhase,
             receiptArtifact,
             receiptHash: payload.receiptHash,
             rawStdoutArtifact,
@@ -2573,6 +2692,7 @@ export class AutonomousRunner {
         };
         return {
             measurement,
+            invalid: payload.invalid,
             rawOutput: {
                 stdout: rawStdoutBytes,
                 stderr: rawStderrBytes,
@@ -2686,6 +2806,8 @@ export class AutonomousRunner {
             commandId,
             candidateId: `impossibility-${command.attemptOrdinal}`,
             snapshotId,
+            harnessRole: "impossibility_verifier",
+            measurementPhase: "impossibility_verification",
         });
         const measurement = recoveredMeasurement.measurement;
         const measurementEvent = this.#requireRecoveredEffectEvent(
@@ -2764,38 +2886,85 @@ export class AutonomousRunner {
 
     async #runValidationCommand(aggregate, commandId, mainAttemptId) {
         const contract = aggregate.contract;
-        const settledCases = await Promise.allSettled(contract.validationCases.map(async (validationCase) => {
-            const command = {
+        const reserved = aggregate.commands[commandId].command;
+        const runSeries = async (series) => {
+            const blockPlan = replicationBlockPlan(
+                series.replicationSchedule,
+                reserved.attemptIndex,
+            );
+            if (blockPlan.arms.length !== 1
+                || blockPlan.arms[0].armId !== "candidate") {
+                throw new RuntimeIntegrityError(
+                    "Validation series must reserve exactly one candidate arm",
+                    { commandId, role: series.role, caseId: series.caseId },
+                );
+            }
+            const arm = blockPlan.arms[0];
+            const replication = immutableCanonical({
+                scheduleHash: series.replicationSchedule.scheduleHash,
+                blockIndex: arm.blockIndex,
+                replicateIndex: arm.replicateIndex,
+                armIndex: arm.armIndex,
+                armId: arm.armId,
+                deterministicSeed: arm.deterministicSeed,
+                subjectId: arm.subjectId,
+            });
+            const effectCommand = {
                 kind: "validation-measurement",
                 commandId,
-                caseId: validationCase.id,
-                snapshot: validationCase.artifactHash,
+                role: series.role,
+                caseId: series.caseId,
+                attemptIndex: reserved.attemptIndex,
+                scheduleHash: series.replicationSchedule.scheduleHash,
+                blockIndex: arm.blockIndex,
+                deterministicSeed: arm.deterministicSeed,
+                subjectId: arm.subjectId,
+                snapshot: series.artifactHash,
             };
             const materialized = this.#materializeSnapshot(
-                validationCase.artifactHash,
-                `validation-${validationCase.id}`,
+                series.artifactHash,
+                `validation-${series.role}-${series.caseId}`,
             );
             try {
                 const effect = await this.#executeEffect(
-                    command,
+                    effectCommand,
                     async (attemptId) => {
                         return this.#runHarnessMeasurement({
-                            harnessRole: "calibration",
+                            harnessRole: series.role,
                             candidateSnapshot: materialized.candidateSnapshot,
                             attemptId,
                             runnerEpochId: this.#config.runnerEpochId,
+                            measurementBinding: {
+                                role: series.role,
+                                phase: "calibration",
+                                replicateIndex: arm.replicateIndex,
+                                blockIndex: arm.blockIndex,
+                                armIndex: arm.armIndex,
+                                armId: arm.armId,
+                                deterministicSeed: arm.deterministicSeed,
+                                subjectId: arm.subjectId,
+                                environmentIdentity:
+                                    contract.harnessSuite.environmentIdentity,
+                                suiteIdentity: contract.harnessSuiteIdentity,
+                            },
+                            captureInvalid: true,
                         });
                     },
                     async (executed, attemptId, logicalEffectKey) =>
                         this.#persistMeasurement({
                             measurement: executed.measurement,
                             rawOutput: executed.rawOutput,
+                            invalid: executed.invalid,
                             attemptId,
                             logicalEffectKey,
                             purpose: "validation",
                             commandId,
-                            candidateId: validationCase.id,
-                            snapshotId: validationCase.artifactHash,
+                            candidateId: `${series.role}.${series.caseId}`,
+                            measurementSubjectId: arm.subjectId,
+                            snapshotId: series.artifactHash,
+                            replication,
+                            harnessRole: series.role,
+                            measurementPhase: "calibration",
                         }),
                     async (committed, logicalEffectKey) => {
                         const recovered = this.#recoverMeasurementEffect({
@@ -2804,44 +2973,69 @@ export class AutonomousRunner {
                             aggregate,
                             purpose: "validation",
                             commandId,
-                            candidateId: validationCase.id,
-                            snapshotId: validationCase.artifactHash,
+                            candidateId: `${series.role}.${series.caseId}`,
+                            measurementSubjectId: arm.subjectId,
+                            snapshotId: series.artifactHash,
+                            replication,
+                            harnessRole: series.role,
+                            measurementPhase: "calibration",
                         });
                         return {
                             result: {
                                 measurement: recovered.measurement,
                                 rawOutput: null,
+                                invalid: recovered.invalid,
                             },
                             persisted: recovered.persisted,
                         };
                     },
                 );
                 const measurement = effect.result.measurement;
-                const outcome = measurement.parsed.pass ? "accept" : "reject";
                 return {
-                    id: validationCase.id,
-                    artifactHash: validationCase.artifactHash,
-                    expectation: validationCase.expectation,
-                    outcome,
-                    matched: outcome === validationCase.expectation,
+                    role: series.role,
+                    caseId: series.caseId,
+                    schedule: series.replicationSchedule,
+                    replication,
                     attemptId: effect.attemptId,
                     parsed: measurement.parsed,
+                    invalid: effect.result.invalid ?? null,
                     receiptHash: ensureReceiptObservationHash(hashReceipt(measurement.receipt)),
-                    stdoutHash: measurement.stdoutHash,
-                    stderrHash: measurement.stderrHash,
+                    measurementRoot:
+                        effect.persisted.measurementProvenance.measurementRoot,
                     measurementProvenance: effect.persisted.measurementProvenance,
                 };
             } finally {
                 removeTreeInside(materialized.dest, this.#runTempRoot);
             }
-        }));
-        const validationFailures = settledCases.filter((item) => item.status === "rejected");
+        };
+        const settledSeries = [];
+        for (const series of reserved.validationSeries) {
+            try {
+                settledSeries.push({
+                    status: "fulfilled",
+                    value: await runSeries(series),
+                });
+            } catch (reason) {
+                settledSeries.push({ status: "rejected", reason });
+            }
+        }
+        const validationFailures = settledSeries.filter(
+            (item) => item.status === "rejected",
+        );
         if (validationFailures.length > 0) {
             const injectedCrash = validationFailures.find(
                 (item) => item.reason?.leaveAttemptActive === true,
             );
             if (injectedCrash !== undefined) {
                 throw injectedCrash.reason;
+            }
+            const configurationFailure = validationFailures.find(
+                (item) =>
+                    item.reason?.code
+                        === RUNTIME_ERROR_CODES.HARNESS_CONFIGURATION_INVALID,
+            );
+            if (configurationFailure !== undefined) {
+                throw configurationFailure.reason;
             }
             const error = new CrucibleRuntimeError(
                 RUNTIME_ERROR_CODES.CHILD_CRASH,
@@ -2857,37 +3051,39 @@ export class AutonomousRunner {
             error.recoverable = true;
             throw error;
         }
-        const caseRuns = settledCases.map((item) => item.value);
-
-        caseRuns.sort((left, right) => left.id.localeCompare(right.id));
-        const caseMap = {};
-        for (const item of caseRuns) {
-            caseMap[item.id] = {
-                artifactHash: item.artifactHash,
-                expectation: item.expectation,
-                outcome: item.outcome,
-                matched: item.matched,
-                attemptId: item.attemptId,
-                parsed: item.parsed,
-                receiptHash: item.receiptHash,
-            };
-        }
-        const compositeReceiptHash = hashCanonical(
-            {
-                cases: caseRuns.map((item) => ({
-                    id: item.id,
-                    receiptHash: item.receiptHash,
-                    attemptId: item.attemptId,
+        const seriesRuns = settledSeries.map((item) => item.value)
+            .sort((left, right) =>
+                `${left.role}\0${left.caseId}`.localeCompare(
+                    `${right.role}\0${right.caseId}`,
+                ));
+        const data = immutableCanonical({
+            version: 1,
+            attemptIndex: reserved.attemptIndex,
+            series: seriesRuns.map((item) =>
+                createRawMeasurementSeries({
+                    schedule: item.schedule,
+                    attempts: [{
+                        ...item.replication,
+                        attemptId: item.attemptId,
+                        parsed: item.parsed,
+                        invalid: item.invalid,
+                        receiptHash: item.receiptHash,
+                        measurementRoot: item.measurementRoot,
+                    }],
+                    role: item.role,
+                    phase: "calibration",
+                    caseId: item.caseId,
                 })),
-            },
-            VALIDATION_RECEIPT_HASH_ALGORITHM,
-        );
+        });
         const compositeArtifact = this.#persistJsonArtifact({
             attemptId: mainAttemptId,
             kind: "validation-composite-receipt",
             value: {
-                caseMap,
-                compositeReceiptHash,
+                version: 2,
+                authority: "raw_complete_blocks",
+                commandId,
+                attemptIndex: reserved.attemptIndex,
+                series: data.series,
             },
             contentType: "application/vnd.crucible.validation-receipt+json",
         });
@@ -2897,14 +3093,13 @@ export class AutonomousRunner {
             kind: "runtime:validation_composite",
             payload: {
                 commandId,
-                caseMap,
-                compositeReceiptHash,
+                attemptIndex: reserved.attemptIndex,
                 artifactId: compositeArtifact.artifactId,
             },
         });
         const provenance = createEvidenceProvenance({
             validationCompositeArtifact: compositeArtifact,
-            measurements: caseRuns.map((item) => item.measurementProvenance),
+            measurements: seriesRuns.map((item) => item.measurementProvenance),
         }, {
             purpose: "validation",
             command: aggregate.commands[commandId].command,
@@ -2922,25 +3117,23 @@ export class AutonomousRunner {
                 attemptId: mainAttemptId,
                 runnerEpochId: this.#config.runnerEpochId,
                 rawStdoutHash: hashCanonical(
-                    caseRuns.map((item) => ({ id: item.id, hash: item.stdoutHash })),
+                    provenance.measurements.map((item) => ({
+                        id: item.subjectId,
+                        hash: item.rawStdoutHash,
+                    })),
                     OBSERVATION_STREAM_HASH_ALGORITHM,
                 ),
                 rawStderrHash: hashCanonical(
-                    caseRuns.map((item) => ({ id: item.id, hash: item.stderrHash })),
+                    provenance.measurements.map((item) => ({
+                        id: item.subjectId,
+                        hash: item.rawStderrHash,
+                    })),
                     OBSERVATION_STREAM_HASH_ALGORITHM,
                 ),
                 candidateArtifactHash: null,
                 provenance,
             },
-            data: {
-                caseResults: caseRuns.map((item) => ({
-                    id: item.id,
-                    artifactHash: item.artifactHash,
-                    outcome: item.outcome,
-                })),
-                caseMap,
-                compositeReceiptHash,
-            },
+            data,
         };
     }
 
@@ -3118,6 +3311,23 @@ export class AutonomousRunner {
             requestSnapshot.snapshot,
             `impossibility-${command.attemptOrdinal}`,
         );
+        const measurementBinding = {
+            role: "impossibility_verifier",
+            phase: "impossibility_verification",
+            replicateIndex: null,
+            blockIndex: null,
+            armIndex: null,
+            armId: null,
+            deterministicSeed: hashCanonical({
+                contractHash: aggregate.contractHash,
+                requestHash: command.requestHash,
+                attemptOrdinal: command.attemptOrdinal,
+            }, "sha256:crucible-impossibility-measurement-seed-v1"),
+            subjectId: `impossibility-${command.attemptOrdinal}`,
+            environmentIdentity:
+                aggregate.contract.harnessSuite.environmentIdentity,
+            suiteIdentity: aggregate.contract.harnessSuiteIdentity,
+        };
         try {
             const effect = await this.#executeEffect(
                 {
@@ -3133,6 +3343,7 @@ export class AutonomousRunner {
                         candidateSnapshot: materialized.candidateSnapshot,
                         attemptId,
                         runnerEpochId: this.#config.runnerEpochId,
+                        measurementBinding,
                     });
                     return this.#buildImpossibilityVerificationResult({
                         aggregate,
@@ -3211,11 +3422,861 @@ export class AutonomousRunner {
         }
     }
 
+    #ensureReplicationScheduleArtifact({
+        aggregate,
+        commandId,
+        mainAttemptId,
+        command,
+    }) {
+        const schedule = normalizeReplicationSchedule(command.replicationSchedule);
+        const searchCommand = command.kind === "search_candidate";
+        const scientificRoleCommand = command.kind === "run_confirmation"
+            || command.kind === "run_challenge";
+        const searchBindingValid = searchCommand
+            && schedule.subject.id === command.candidateId
+            && schedule.subject.index
+                === statisticalSubjectIndex(
+                    schedule.subject.kind,
+                    (command.round - 1)
+                        * aggregate.contract.candidatesPerRound
+                        + command.slotIndex,
+                );
+        const scientificBindingValid = scientificRoleCommand
+            && command.protocolManifest?.replicationSchedule?.scheduleHash
+                === schedule.scheduleHash
+            && command.protocolManifestHash
+                === command.protocolManifest?.protocolManifestHash
+            && command.protocolManifest?.candidateId === command.candidateId
+            && command.protocolManifest?.candidateEvidenceId
+                === command.candidateEvidenceId
+            && command.protocolManifest?.candidateArtifactHash
+                === command.candidateArtifactHash;
+        if (schedule.contractHash !== aggregate.contractHash
+            || (!searchBindingValid && !scientificBindingValid)) {
+            throw new RuntimeIntegrityError(
+                "Reserved replication schedule does not match the candidate assignment",
+                { commandId, scheduleHash: schedule.scheduleHash },
+            );
+        }
+        const existing = this.#adapter.listOperationalEvidence().filter((event) =>
+            event.kind === "runtime:measurement_schedule"
+            && event.payload?.commandId === commandId);
+        if (existing.length > 1) {
+            throw new RuntimeIntegrityError(
+                "More than one measurement schedule exists for one candidate command",
+                { commandId },
+            );
+        }
+        if (existing.length === 1) {
+            const payload = existing[0].payload;
+            if (payload.scheduleHash !== schedule.scheduleHash
+                || payload.candidateId !== command.candidateId
+                || (payload.harnessRole ?? command.harnessRole ?? "search")
+                    !== (command.harnessRole ?? "search")
+                || (payload.protocolManifestHash
+                    ?? command.protocolManifestHash
+                    ?? null)
+                    !== (command.protocolManifestHash ?? null)) {
+                throw new RuntimeIntegrityError(
+                    "Persisted measurement schedule does not match the reserved command",
+                    { commandId, scheduleHash: schedule.scheduleHash },
+                );
+            }
+            const persisted = this.#readRegisteredJsonArtifact(
+                payload.artifactId,
+                "Persisted measurement schedule",
+            );
+            if (!canonicalEqual(persisted, schedule)) {
+                throw new RuntimeIntegrityError(
+                    "Persisted measurement schedule artifact changed",
+                    { commandId, artifactId: payload.artifactId },
+                );
+            }
+            return {
+                schedule,
+                artifact: this.#registeredArtifactRef(
+                    payload.artifactId,
+                    "Persisted measurement schedule",
+                ).artifact,
+            };
+        }
+        const artifact = this.#persistJsonArtifact({
+            attemptId: mainAttemptId,
+            kind: `measurement-schedule-${command.harnessRole ?? "search"}-${command.candidateId}`,
+            value: schedule,
+            contentType: "application/vnd.crucible.measurement-schedule+json",
+        });
+        this.#ingestOperationalEvidence({
+            attemptId: mainAttemptId,
+            evidenceKind: `measurement-schedule:${command.candidateId}`,
+            kind: "runtime:measurement_schedule",
+            payload: {
+                commandId,
+                candidateId: command.candidateId,
+                harnessRole: command.harnessRole ?? "search",
+                protocolManifestHash:
+                    command.protocolManifestHash ?? null,
+                scheduleHash: schedule.scheduleHash,
+                artifactId: artifact.artifactId,
+            },
+        });
+        return { schedule, artifact };
+    }
+
+    async #resolveReplicationControlSnapshot({
+        aggregate,
+        commandId,
+        mainAttemptId,
+        command,
+        schedule,
+        candidateSnapshotId,
+        enumerandPlan,
+    }) {
+        const control = aggregate.contract.statisticalPolicy.control;
+        if (control.kind === "snapshot") {
+            return control.identity;
+        }
+        if (aggregate.contract.enumerandManifest === undefined) {
+            throw new RuntimeIntegrityError(
+                "Enumerand control requires a frozen enumerand manifest",
+                { commandId, control },
+            );
+        }
+        const manifestOptions = {
+            topology: aggregate.contract.hypothesisTopology,
+            observableRegistry: aggregate.contract.observableRegistry,
+            hypothesisPolicy: aggregate.contract.hypothesisPolicy,
+        };
+        const binding = resolveControlEnumerand(
+            aggregate.contract.enumerandManifest,
+            manifestOptions,
+        );
+        if (binding.kind === "reference"
+            || binding.enumerandHash !== control.identity) {
+            throw new RuntimeIntegrityError(
+                "Frozen control enumerand does not match the statistical policy",
+                { commandId, control, binding },
+            );
+        }
+        if (binding.topology === "finite_enumerable") {
+            return binding.artifactSnapshotHash;
+        }
+        if (enumerandPlan?.binding?.enumerandHash === binding.enumerandHash) {
+            return candidateSnapshotId;
+        }
+
+        const existing = this.#adapter.listOperationalEvidence().filter((event) =>
+            event.kind === "runtime:replication_control_snapshot"
+            && event.payload?.commandId === commandId);
+        if (existing.length > 1) {
+            throw new RuntimeIntegrityError(
+                "More than one parameterized control snapshot exists for one command",
+                { commandId },
+            );
+        }
+        if (existing.length === 1) {
+            const payload = existing[0].payload;
+            if (payload.scheduleHash !== schedule.scheduleHash
+                || payload.enumerandHash !== binding.enumerandHash
+                || payload.enumerandBindingHash
+                    !== enumerandBindingHash(binding, manifestOptions)
+                || payload.candidateArtifactHash
+                    !== measurementSnapshotHash(payload.snapshotId)) {
+                throw new RuntimeIntegrityError(
+                    "Persisted parameterized control does not match its frozen binding",
+                    { commandId },
+                );
+            }
+            this.#verifySnapshotProvenance(
+                payload.snapshotProvenance,
+                payload.snapshotId,
+                "Persisted replication control snapshot",
+            );
+            return payload.snapshotId;
+        }
+
+        const generator = this.#dependencies.parameterizedCandidateGenerator;
+        if (typeof generator !== "function") {
+            throw new RuntimeConfigError(
+                "Parameterized control enumerands require a trusted parameterizedCandidateGenerator",
+                {
+                    ordinal: binding.ordinal,
+                    enumerandHash: binding.enumerandHash,
+                },
+            );
+        }
+        const bindingHash = enumerandBindingHash(binding, manifestOptions);
+        const generationRequest = immutableCanonical({
+            kind: "replication_control",
+            commandId,
+            candidateId: binding.id,
+            scheduleHash: schedule.scheduleHash,
+            enumerandBinding: binding,
+            enumerandBindingHash: bindingHash,
+            parameterTuple: binding.parameterTuple,
+            parameterTupleHash: binding.parameterTupleHash,
+        });
+        const generated = await generator(generationRequest);
+        const expectedKeys = [
+            "annotations",
+            "candidateId",
+            "enumerandBindingHash",
+            "files",
+        ];
+        if (generated === null
+            || typeof generated !== "object"
+            || Array.isArray(generated)
+            || !canonicalEqual(Object.keys(generated).sort(), expectedKeys)
+            || generated.enumerandBindingHash !== bindingHash) {
+            throw new RuntimeIntegrityError(
+                "Trusted parameterized control generator returned an invalid binding",
+                { commandId, bindingHash },
+            );
+        }
+        const challengeNonce = stableHex({
+            investigationId: this.#config.investigationId,
+            commandId,
+            scheduleHash: schedule.scheduleHash,
+            enumerandBindingHash: bindingHash,
+        });
+        const candidate = validateCandidateSubmission({
+            challenge: challengeNonce,
+            candidateId: generated.candidateId,
+            annotations: generated.annotations,
+            files: generated.files,
+        }, {
+            challengeNonce,
+            allowedCandidateIds: [binding.id],
+            visibleEvidenceIds: command.promptContextRefs,
+            observableRegistry: aggregate.contract.observableRegistry,
+            hypothesisPolicy: aggregate.contract.hypothesisPolicy,
+            assignedParentEvidenceIds: command.parentEvidenceIds,
+            enumerandBinding: binding,
+            trustedParameterizedGenerator: true,
+            limits: this.#config.options.candidateLimits,
+        });
+        const proposal = immutableCanonical({
+            ...candidate,
+            identity: {
+                source: "trusted_parameterized_control_generator",
+                enumerandBindingHash: bindingHash,
+                generatedPayloadHash: hashCanonical(
+                    candidate,
+                    "sha256:crucible-parameterized-control-v1",
+                ),
+            },
+        });
+        const proposalArtifact = this.#persistJsonArtifact({
+            attemptId: mainAttemptId,
+            kind: `replication-control-${binding.id}`,
+            value: { generationRequest, proposal },
+            contentType:
+                "application/vnd.crucible.replication-control-generation+json",
+        });
+        const snapshot = this.#ingestCandidate(proposal, mainAttemptId);
+        const candidateArtifactHash = measurementSnapshotHash(snapshot.snapshot);
+        const snapshotProvenance = this.#persistSnapshotProvenance({
+            attemptId: mainAttemptId,
+            kind: `replication-control-snapshot-${binding.id}`,
+            snapshotId: snapshot.snapshot,
+        });
+        this.#ingestOperationalEvidence({
+            attemptId: mainAttemptId,
+            evidenceKind: `replication-control-snapshot:${command.candidateId}`,
+            kind: "runtime:replication_control_snapshot",
+            payload: {
+                commandId,
+                scheduleHash: schedule.scheduleHash,
+                enumerandHash: binding.enumerandHash,
+                enumerandBindingHash: bindingHash,
+                snapshotId: snapshot.snapshot,
+                candidateArtifactHash,
+                proposalArtifactId: proposalArtifact.artifactId,
+                snapshotProvenance,
+            },
+        });
+        return snapshot.snapshot;
+    }
+
+    #replicationBudgetAllows(
+        schedule,
+        blockPlan,
+        {
+            purpose = "candidate",
+            harnessRole = "search",
+        } = {},
+    ) {
+        const policy = this.#contract.statisticalPolicy.evaluationBudget;
+        const measurements = this.#adapter.listOperationalEvidence().filter(
+            (event) => event.kind === "runtime:measurement",
+        );
+        const existingKeys = new Set(measurements
+            .filter((event) =>
+                event.payload?.purpose === purpose
+                && (event.payload?.harnessRole ?? "search") === harnessRole
+                &&
+                event.payload?.replication?.scheduleHash === schedule.scheduleHash)
+            .map((event) =>
+                `${event.payload.replication.blockIndex}:${
+                    event.payload.replication.armIndex
+                }`));
+        const pending = blockPlan.arms.filter((arm) =>
+            !existingKeys.has(`${arm.blockIndex}:${arm.armIndex}`));
+        const candidateCount = measurements.filter((event) =>
+            (event.payload?.purpose === "candidate"
+                || event.payload?.purpose === "confirmation"
+                || event.payload?.purpose === "challenge")
+            && event.payload?.replication?.armId === "candidate").length;
+        const controlCount = measurements.filter((event) =>
+            (event.payload?.purpose === "candidate"
+                || event.payload?.purpose === "confirmation"
+                || event.payload?.purpose === "challenge")
+            && event.payload?.replication?.armId === "control").length;
+        return candidateCount + pending.filter((arm) =>
+            arm.armId === "candidate").length
+                <= policy.maxCandidateEvaluations
+            && controlCount + pending.filter((arm) =>
+                arm.armId === "control").length
+                <= policy.maxControlEvaluations
+            && measurements.length + pending.length
+                <= policy.maxTotalEvaluations;
+    }
+
+    async #runReplicationMeasurements({
+        aggregate,
+        commandId,
+        command,
+        schedule,
+        candidateSnapshotId,
+        controlSnapshotId,
+        purpose = "candidate",
+        harnessRole = "search",
+        measurementPhase = "search",
+    }) {
+        const candidateMaterialized = this.#materializeSnapshot(
+            candidateSnapshotId,
+            `candidate-${command.candidateId}`,
+        );
+        const controlMaterialized = this.#materializeSnapshot(
+            controlSnapshotId,
+            `control-${command.candidateId}`,
+        );
+        const attempts = [];
+        let progress = null;
+        try {
+            for (
+                let blockIndex = 0;
+                blockIndex < schedule.maxBlocks;
+                blockIndex += 1
+            ) {
+                const blockPlan = replicationBlockPlan(schedule, blockIndex);
+                if (!this.#replicationBudgetAllows(schedule, blockPlan, {
+                    purpose,
+                    harnessRole,
+                })) {
+                    progress = evaluateReplicationProgress({
+                        contract: aggregate.contract,
+                        schedule,
+                        attempts,
+                        budgetRemaining: false,
+                    });
+                    break;
+                }
+                for (const arm of blockPlan.arms) {
+                    const snapshotId = arm.armId === "control"
+                        ? controlSnapshotId
+                        : candidateSnapshotId;
+                    const materialized = arm.armId === "control"
+                        ? controlMaterialized
+                        : candidateMaterialized;
+                    const replication = immutableCanonical({
+                        scheduleHash: schedule.scheduleHash,
+                        blockIndex: arm.blockIndex,
+                        replicateIndex: arm.replicateIndex,
+                        armIndex: arm.armIndex,
+                        armId: arm.armId,
+                        deterministicSeed: arm.deterministicSeed,
+                        subjectId: arm.subjectId,
+                    });
+                    const measurementBinding = {
+                        role: harnessRole,
+                        phase: measurementPhase,
+                        replicateIndex: arm.replicateIndex,
+                        blockIndex: arm.blockIndex,
+                        armIndex: arm.armIndex,
+                        armId: arm.armId,
+                        deterministicSeed: arm.deterministicSeed,
+                        subjectId: arm.subjectId,
+                        environmentIdentity:
+                            aggregate.contract.harnessSuite.environmentIdentity,
+                        suiteIdentity: aggregate.contract.harnessSuiteIdentity,
+                    };
+                    const effectCommand = {
+                        kind: "replicate-measurement",
+                        purpose,
+                        harnessRole,
+                        measurementPhase,
+                        commandId,
+                        round: command.round ?? null,
+                        slotIndex: command.slotIndex ?? null,
+                        candidateId: command.candidateId,
+                        scheduleHash: schedule.scheduleHash,
+                        blockIndex: arm.blockIndex,
+                        replicateIndex: arm.replicateIndex,
+                        armIndex: arm.armIndex,
+                        armId: arm.armId,
+                        deterministicSeed: arm.deterministicSeed,
+                        subjectId: arm.subjectId,
+                        snapshot: snapshotId,
+                    };
+                    const effect = await this.#executeEffect(
+                        effectCommand,
+                        async (attemptId) => this.#runHarnessMeasurement({
+                            harnessRole,
+                            candidateSnapshot: materialized.candidateSnapshot,
+                            attemptId,
+                            runnerEpochId: this.#config.runnerEpochId,
+                            measurementBinding,
+                            captureInvalid: true,
+                        }),
+                        async (executed, attemptId, logicalEffectKey) =>
+                            this.#persistMeasurement({
+                                measurement: executed.measurement,
+                                rawOutput: executed.rawOutput,
+                                invalid: executed.invalid,
+                                attemptId,
+                                logicalEffectKey,
+                                purpose,
+                                commandId,
+                                round: command.round ?? null,
+                                slotIndex: command.slotIndex ?? null,
+                                candidateId: command.candidateId,
+                                measurementSubjectId: arm.subjectId,
+                                snapshotId,
+                                replication,
+                                harnessRole,
+                                measurementPhase,
+                            }),
+                        async (committed, logicalEffectKey) => {
+                            const recovered = this.#recoverMeasurementEffect({
+                                committed,
+                                logicalEffectKey,
+                                aggregate,
+                                purpose,
+                                commandId,
+                                round: command.round ?? null,
+                                slotIndex: command.slotIndex ?? null,
+                                candidateId: command.candidateId,
+                                measurementSubjectId: arm.subjectId,
+                                snapshotId,
+                                replication,
+                                harnessRole,
+                                measurementPhase,
+                            });
+                            return {
+                                result: {
+                                    measurement: recovered.measurement,
+                                    rawOutput: null,
+                                    invalid: recovered.invalid,
+                                },
+                                persisted: recovered.persisted,
+                            };
+                        },
+                    );
+                    attempts.push({
+                        ...replication,
+                        attemptId: effect.attemptId,
+                        parsed: effect.result.measurement.parsed,
+                        invalid: effect.result.invalid ?? null,
+                        receiptHash: hashReceipt(effect.result.measurement.receipt),
+                        measurementRoot:
+                            effect.persisted.measurementProvenance.measurementRoot,
+                        measurementProvenance:
+                            effect.persisted.measurementProvenance,
+                    });
+                    await this.#fault("after_replication_arm", {
+                        command: effectCommand,
+                        commandId,
+                        attemptId: effect.attemptId,
+                        blockIndex: arm.blockIndex,
+                        armIndex: arm.armIndex,
+                        armId: arm.armId,
+                    });
+                }
+                progress = evaluateReplicationProgress({
+                    contract: aggregate.contract,
+                    schedule,
+                    attempts,
+                });
+                await this.#fault("after_replication_block", {
+                    commandId,
+                    blockIndex,
+                    blockCount: progress.blockCount,
+                });
+                if (!progress.shouldContinue) break;
+            }
+        } finally {
+            removeTreeInside(candidateMaterialized.dest, this.#runTempRoot);
+            removeTreeInside(controlMaterialized.dest, this.#runTempRoot);
+        }
+        progress ??= evaluateReplicationProgress({
+            contract: aggregate.contract,
+            schedule,
+            attempts,
+            budgetRemaining: false,
+        });
+        if (progress.blockCount < schedule.minBlocks
+            || progress.stoppingReason === null) {
+            throw new RuntimeIntegrityError(
+                "Replication stopped without the frozen minimum complete blocks",
+                {
+                    commandId,
+                    blockCount: progress.blockCount,
+                    minBlocks: schedule.minBlocks,
+                    stoppingReason: progress.stoppingReason,
+                },
+            );
+        }
+        return { attempts, progress };
+    }
+
+    #ensureReplicationCompositeArtifact({
+        commandId,
+        mainAttemptId,
+        command,
+        schedule,
+        scheduleArtifact,
+        attempts,
+        progress,
+        rawSeries,
+        purpose = "candidate",
+        harnessRole = "search",
+        protocolManifest = null,
+    }) {
+        const value = immutableCanonical(purpose === "candidate"
+            ? {
+                version: 2,
+                authority: "raw_complete_blocks",
+                commandId,
+                candidateId: command.candidateId,
+                schedule,
+                scheduleArtifact,
+                series: rawSeries,
+                stopping: progress.stopping,
+            }
+            : {
+                version: 2,
+                authority: "raw_complete_blocks",
+                commandId,
+                candidateId: command.candidateId,
+                candidateEvidenceId: command.candidateEvidenceId,
+                confirmationFreezeHash:
+                    command.confirmationFreezeHash,
+                role: harnessRole,
+                protocolManifest,
+                protocolManifestHash:
+                    command.protocolManifestHash,
+                schedule,
+                scheduleArtifact,
+                series: rawSeries,
+                stopping: progress.stopping,
+            });
+        const existing = this.#adapter.listOperationalEvidence().filter((event) =>
+            event.kind === "runtime:replication_composite"
+            && event.payload?.commandId === commandId);
+        if (existing.length > 1) {
+            throw new RuntimeIntegrityError(
+                "More than one replication composite exists for one candidate command",
+                { commandId },
+            );
+        }
+        if (existing.length === 1) {
+            const payload = existing[0].payload;
+            const persisted = this.#readRegisteredJsonArtifact(
+                payload.artifactId,
+                "Persisted replication composite",
+            );
+            if (payload.scheduleHash !== schedule.scheduleHash
+                || (payload.purpose ?? "candidate") !== purpose
+                || (payload.harnessRole ?? "search") !== harnessRole
+                || (payload.protocolManifestHash ?? null)
+                    !== (command.protocolManifestHash ?? null)
+                || payload.stoppingDigest !== progress.stoppingDigest
+                || !canonicalEqual(persisted, value)) {
+                throw new RuntimeIntegrityError(
+                    "Persisted replication composite changed during recovery",
+                    { commandId, artifactId: payload.artifactId },
+                );
+            }
+            return this.#registeredArtifactRef(
+                payload.artifactId,
+                "Persisted replication composite",
+            ).artifact;
+        }
+        const artifact = this.#persistJsonArtifact({
+            attemptId: mainAttemptId,
+            kind: `replication-composite-${harnessRole}-${command.candidateId}`,
+            value,
+            contentType: "application/vnd.crucible.replication-composite+json",
+        });
+        this.#ingestOperationalEvidence({
+            attemptId: mainAttemptId,
+            evidenceKind: `replication-composite:${command.candidateId}`,
+            kind: "runtime:replication_composite",
+            payload: {
+                commandId,
+                candidateId: command.candidateId,
+                purpose,
+                harnessRole,
+                protocolManifestHash:
+                    command.protocolManifestHash ?? null,
+                scheduleHash: schedule.scheduleHash,
+                blockCount: progress.blockCount,
+                attemptCount: attempts.length,
+                stoppingDigest: progress.stoppingDigest,
+                artifactId: artifact.artifactId,
+            },
+        });
+        return artifact;
+    }
+
+    #resolveScientificRoleSnapshots(aggregate, command) {
+        const source = this.#resolveParentSnapshot(
+            aggregate,
+            command.candidateEvidenceId,
+        );
+        if (source.evidence.candidateId !== command.candidateId
+            || source.evidence.commitEventHash
+                !== command.candidateEvidenceHash
+            || source.evidence.receipt?.candidateArtifactHash
+                !== command.candidateArtifactHash
+            || measurementSnapshotHash(source.snapshotId)
+                !== command.candidateArtifactHash) {
+            throw new RuntimeIntegrityError(
+                "Frozen scientific role command no longer matches its candidate snapshot",
+                {
+                    candidateId: command.candidateId,
+                    candidateEvidenceId: command.candidateEvidenceId,
+                },
+            );
+        }
+        const sourceObservation =
+            aggregate.observations[source.evidence.observationId] ?? null;
+        const sourceCommandId = sourceObservation?.commandId ?? null;
+        const controlMeasurements = this.#adapter.listOperationalEvidence()
+            .filter((event) =>
+                event.kind === "runtime:measurement"
+                && event.payload?.purpose === "candidate"
+                && event.payload?.commandId === sourceCommandId
+                && event.payload?.replication?.armId === "control");
+        const controlMeasurement = controlMeasurements.at(-1) ?? null;
+        let controlSnapshotId = controlMeasurement?.payload?.snapshotId ?? null;
+        if (controlSnapshotId === null) {
+            const control = aggregate.contract.statisticalPolicy.control;
+            if (control.kind === "snapshot") {
+                controlSnapshotId = control.identity;
+            } else if (aggregate.contract.enumerandManifest !== undefined) {
+                const binding = resolveControlEnumerand(
+                    aggregate.contract.enumerandManifest,
+                    {
+                        topology: aggregate.contract.hypothesisTopology,
+                        observableRegistry:
+                            aggregate.contract.observableRegistry,
+                        hypothesisPolicy:
+                            aggregate.contract.hypothesisPolicy,
+                    },
+                );
+                if (binding.kind !== "reference"
+                    && binding.topology === "finite_enumerable") {
+                    controlSnapshotId = binding.artifactSnapshotHash;
+                }
+            }
+        }
+        if (typeof controlSnapshotId !== "string"
+            || !this.#artifactStore.verifySnapshot(controlSnapshotId).ok) {
+            throw new RuntimeIntegrityError(
+                "Frozen scientific role control snapshot is missing or invalid",
+                {
+                    candidateId: command.candidateId,
+                    candidateEvidenceId: command.candidateEvidenceId,
+                },
+            );
+        }
+        const sourceSchedule = aggregate.commands[sourceCommandId]
+            ?.command?.replicationSchedule ?? null;
+        const controlBinding = deriveReplicationControlBinding({
+            contractHash: aggregate.contractHash,
+            statisticalPolicy: aggregate.contract.statisticalPolicy,
+            schedule: sourceSchedule,
+            enumerandManifest: aggregate.contract.enumerandManifest ?? null,
+            manifestOptions: {
+                topology: aggregate.contract.hypothesisTopology,
+                observableRegistry: aggregate.contract.observableRegistry,
+                hypothesisPolicy: aggregate.contract.hypothesisPolicy,
+            },
+            controlSnapshotHashes: controlMeasurements.map((measurement) =>
+                measurementSnapshotHash(measurement.payload.snapshotId)),
+            requireObservedControl: true,
+        });
+        if (controlMeasurements.length !== source.evidence.replication?.blockCount
+            || measurementSnapshotHash(controlSnapshotId)
+                !== controlBinding.artifactHash
+            || !canonicalEqual(
+                controlBinding,
+                source.evidence.replication?.control ?? null,
+            )) {
+            throw new RuntimeIntegrityError(
+                "Frozen scientific role control does not match the discovery control authority",
+                {
+                    candidateId: command.candidateId,
+                    candidateEvidenceId: command.candidateEvidenceId,
+                },
+            );
+        }
+        return {
+            candidateSnapshotId: source.snapshotId,
+            controlSnapshotId,
+        };
+    }
+
+    async #runScientificRoleCommand(
+        aggregate,
+        commandId,
+        mainAttemptId,
+        command,
+    ) {
+        const purpose = command.kind === "run_confirmation"
+            ? "confirmation"
+            : "challenge";
+        if (command.harnessRole !== purpose
+            || command.protocolManifest?.role !== purpose
+            || command.protocolManifestHash
+                !== command.protocolManifest?.protocolManifestHash) {
+            throw new RuntimeIntegrityError(
+                "Scientific role command is not bound to its frozen protocol manifest",
+                { commandId, purpose },
+            );
+        }
+        const scheduled = this.#ensureReplicationScheduleArtifact({
+            aggregate,
+            commandId,
+            mainAttemptId,
+            command,
+        });
+        const snapshots = this.#resolveScientificRoleSnapshots(
+            aggregate,
+            command,
+        );
+        const replicated = await this.#runReplicationMeasurements({
+            aggregate,
+            commandId,
+            command,
+            schedule: scheduled.schedule,
+            candidateSnapshotId: snapshots.candidateSnapshotId,
+            controlSnapshotId: snapshots.controlSnapshotId,
+            purpose,
+            harnessRole: purpose,
+            measurementPhase: purpose,
+        });
+        const rawSeries = createRawMeasurementSeries({
+            schedule: scheduled.schedule,
+            attempts: replicated.attempts,
+            role: purpose,
+            phase: purpose,
+            caseId: null,
+        });
+        const replicationCompositeArtifact =
+            this.#ensureReplicationCompositeArtifact({
+                commandId,
+                mainAttemptId,
+                command,
+                schedule: scheduled.schedule,
+                scheduleArtifact: scheduled.artifact,
+                attempts: replicated.attempts,
+                progress: replicated.progress,
+                rawSeries,
+                purpose,
+                harnessRole: purpose,
+                protocolManifest: command.protocolManifest,
+            });
+        const provenance = createEvidenceProvenance({
+            replicationScheduleArtifact: scheduled.artifact,
+            replicationCompositeArtifact,
+            measurements: replicated.attempts.map((attempt) =>
+                attempt.measurementProvenance),
+        }, {
+            purpose,
+            command,
+            contract: aggregate.contract,
+        });
+        return {
+            commandId,
+            observationId: this.#stableObservationId(commandId, {
+                purpose,
+                candidateId: command.candidateId,
+                candidateEvidenceId: command.candidateEvidenceId,
+                confirmationFreezeHash:
+                    command.confirmationFreezeHash,
+            }),
+            purpose,
+            candidateId: command.candidateId,
+            annotations: {
+                mechanism: null,
+                hypothesis: null,
+                expectedEffects: [],
+                citedEvidenceIds: [],
+                finding: null,
+                ...(command.hypotheses === null
+                    ? {}
+                    : { hypotheses: command.hypotheses }),
+            },
+            receipt: {
+                version: 1,
+                attemptId: mainAttemptId,
+                runnerEpochId: this.#config.runnerEpochId,
+                rawStdoutHash: hashCanonical(
+                    provenance.measurements.map((item) => ({
+                        id: item.subjectId,
+                        hash: item.rawStdoutHash,
+                    })),
+                    OBSERVATION_STREAM_HASH_ALGORITHM,
+                ),
+                rawStderrHash: hashCanonical(
+                    provenance.measurements.map((item) => ({
+                        id: item.subjectId,
+                        hash: item.rawStderrHash,
+                    })),
+                    OBSERVATION_STREAM_HASH_ALGORITHM,
+                ),
+                candidateArtifactHash:
+                    command.candidateArtifactHash,
+                provenance,
+            },
+            data: {
+                version: 1,
+                series: [rawSeries],
+            },
+        };
+    }
+
     async #runSearchCandidateCommand(aggregate, commandId, mainAttemptId, command) {
         const enumerandPlan = resolveCommandEnumerand(
             aggregate.contract,
             command,
         );
+        const scheduled = this.#ensureReplicationScheduleArtifact({
+            aggregate,
+            commandId,
+            mainAttemptId,
+            command,
+        });
+        const schedule = scheduled.schedule;
+        await this.#fault("after_replication_schedule", {
+            commandId,
+            candidateId: command.candidateId,
+            scheduleHash: schedule.scheduleHash,
+            artifactId: scheduled.artifact.artifactId,
+        });
         const finiteEnumerand = enumerandPlan?.execution?.kind
             === "staged_snapshot";
         const boundedEnumerand = enumerandPlan?.execution?.kind
@@ -3393,113 +4454,69 @@ export class AutonomousRunner {
             candidateArtifactHash,
         });
 
-        const priorCandidates = harnessCandidateEvidenceItems(aggregate);
-        const duplicateOf = duplicateEvidenceId(priorCandidates, candidateArtifactHash);
-        const reusable = duplicateOf === null
-            || aggregate.contract.searchPolicy.dedupPolicy !== "mark"
-            ? null
-            : this.#findReusableMeasurement(aggregate, duplicateOf, candidateArtifactHash);
-
-        let measurement;
-        let measurementAttemptId;
-        let measurementProvenance;
-        let measurementReuseArtifact = null;
-        if (reusable !== null) {
-            measurement = {
-                parsed: reusable.observation.data,
-                stdoutHash: reusable.observation.receipt.rawStdoutHash,
-                stderrHash: reusable.observation.receipt.rawStderrHash,
-            };
-            measurementAttemptId = reusable.observation.receipt.attemptId;
-            measurementProvenance = createMeasurementProvenance({
-                ...reusable.measurementProvenance,
-                subjectId: command.candidateId,
-            });
-            measurementReuseArtifact = this.#persistDuplicateMeasurementReuse({
-                attemptId: mainAttemptId,
+        const controlSnapshotId = await this.#resolveReplicationControlSnapshot({
+            aggregate,
+            commandId,
+            mainAttemptId,
+            command,
+            schedule,
+            candidateSnapshotId: snapshot.snapshot,
+            enumerandPlan,
+        });
+        const replicated = await this.#runReplicationMeasurements({
+            aggregate,
+            commandId,
+            command,
+            schedule,
+            candidateSnapshotId: snapshot.snapshot,
+            controlSnapshotId,
+        });
+        const rawSeries = createRawMeasurementSeries({
+            schedule,
+            attempts: replicated.attempts,
+            role: "search",
+            phase: "search",
+            caseId: null,
+        });
+        const replicationCompositeArtifact =
+            this.#ensureReplicationCompositeArtifact({
                 commandId,
+                mainAttemptId,
                 command,
-                snapshotId: snapshot.snapshot,
-                candidateArtifactHash,
-                duplicateOf,
-                reusable,
-            }).artifact;
-        } else {
-            const materialized = this.#materializeSnapshot(
-                snapshot.snapshot,
-                `candidate-${command.candidateId}`,
-            );
-            try {
-                const effect = await this.#executeEffect(
-                    {
-                        kind: "candidate-measurement",
-                        commandId,
-                        round: command.round,
-                        slotIndex: command.slotIndex,
-                        candidateId: command.candidateId,
-                        snapshot: snapshot.snapshot,
-                    },
-                    async (attemptId) => {
-                        return this.#runHarnessMeasurement({
-                            harnessRole: "search",
-                            candidateSnapshot: materialized.candidateSnapshot,
-                            attemptId,
-                            runnerEpochId: this.#config.runnerEpochId,
-                        });
-                    },
-                    async (executed, attemptId, logicalEffectKey) =>
-                        this.#persistMeasurement({
-                            measurement: executed.measurement,
-                            rawOutput: executed.rawOutput,
-                            attemptId,
-                            logicalEffectKey,
-                            purpose: "candidate",
-                            commandId,
-                            round: command.round,
-                            slotIndex: command.slotIndex,
-                            candidateId: command.candidateId,
-                            snapshotId: snapshot.snapshot,
-                        }),
-                    async (committed, logicalEffectKey) => {
-                        const recovered = this.#recoverMeasurementEffect({
-                            committed,
-                            logicalEffectKey,
-                            aggregate,
-                            purpose: "candidate",
-                            commandId,
-                            round: command.round,
-                            slotIndex: command.slotIndex,
-                            candidateId: command.candidateId,
-                            snapshotId: snapshot.snapshot,
-                        });
-                        return {
-                            result: {
-                                measurement: recovered.measurement,
-                                rawOutput: null,
-                            },
-                            persisted: recovered.persisted,
-                        };
-                    },
-                );
-                measurement = effect.result.measurement;
-                measurementAttemptId = effect.attemptId;
-                measurementProvenance = effect.persisted.measurementProvenance;
-            } finally {
-                removeTreeInside(materialized.dest, this.#runTempRoot);
-            }
-        }
+                schedule,
+                scheduleArtifact: scheduled.artifact,
+                attempts: replicated.attempts,
+                progress: replicated.progress,
+                rawSeries,
+            });
+        await this.#fault("after_replication_composite", {
+            commandId,
+            candidateId: command.candidateId,
+            scheduleHash: schedule.scheduleHash,
+            blockCount: replicated.progress.blockCount,
+            artifactId: replicationCompositeArtifact.artifactId,
+        });
 
         const provenance = createEvidenceProvenance({
             proposalArtifact: proposalProvenance.proposalArtifact,
             promptContextHash: proposalProvenance.promptContextHash,
-            measurementReuseArtifact,
-            measurements: [measurementProvenance],
+            replicationScheduleArtifact: scheduled.artifact,
+            replicationCompositeArtifact,
+            measurements: replicated.attempts.map((attempt) =>
+                attempt.measurementProvenance),
         }, {
             purpose: "candidate",
             command,
             contract: aggregate.contract,
         });
-
+        const streamItems = provenance.measurements.map((measurement) => ({
+            id: measurement.subjectId,
+            hash: measurement.rawStdoutHash,
+        }));
+        const stderrItems = provenance.measurements.map((measurement) => ({
+            id: measurement.subjectId,
+            hash: measurement.rawStderrHash,
+        }));
         return {
             commandId,
             observationId: this.#stableObservationId(commandId, {
@@ -3514,19 +4531,27 @@ export class AutonomousRunner {
             candidateId: command.candidateId,
             annotations: {
                 ...annotations,
-                finding: annotations.finding ?? trustedHarnessFinding(measurement.parsed),
+                finding: annotations.finding ?? null,
             },
             receipt: {
                 version: 1,
-                attemptId: measurementAttemptId,
-                runnerEpochId: reusable?.observation.receipt.runnerEpochId
-                    ?? this.#config.runnerEpochId,
-                rawStdoutHash: measurement.stdoutHash,
-                rawStderrHash: measurement.stderrHash,
+                attemptId: mainAttemptId,
+                runnerEpochId: this.#config.runnerEpochId,
+                rawStdoutHash: hashCanonical(
+                    streamItems,
+                    OBSERVATION_STREAM_HASH_ALGORITHM,
+                ),
+                rawStderrHash: hashCanonical(
+                    stderrItems,
+                    OBSERVATION_STREAM_HASH_ALGORITHM,
+                ),
                 candidateArtifactHash,
                 provenance,
             },
-            data: measurement.parsed,
+            data: {
+                version: 1,
+                series: [rawSeries],
+            },
         };
     }
 
@@ -3554,7 +4579,7 @@ export class AutonomousRunner {
                 expectedEffects: [],
                 citedEvidenceIds: [],
                 finding: null,
-                ...(command.hypotheses === undefined
+                ...(command.hypotheses === null
                     ? {}
                     : { hypotheses: command.hypotheses }),
             },
@@ -3697,6 +4722,7 @@ export class AutonomousRunner {
             hypothesisPolicy: aggregate.contract.hypothesisPolicy ?? {},
             assignedParentEvidenceIds: command.parentEvidenceIds,
             enumerandBinding: enumerandPlan.binding,
+            expectedHypotheses: command.hypotheses,
             trustedParameterizedGenerator: true,
             limits: this.#config.options.candidateLimits,
         };
@@ -3953,6 +4979,7 @@ export class AutonomousRunner {
             observableRegistry: contract.observableRegistry,
             hypothesisPolicy: contract.hypothesisPolicy,
             assignedParentEvidenceIds: command.parentEvidenceIds,
+            expectedHypotheses: command.hypotheses,
             enumerandBinding: enumerandPlan?.binding ?? null,
         });
         const request = Object.freeze({
@@ -3969,6 +4996,7 @@ export class AutonomousRunner {
             assignedParentEvidenceIds: Object.freeze([
                 ...command.parentEvidenceIds,
             ]),
+            expectedHypotheses: command.hypotheses,
             seed: command.seed,
             boundedCandidateId: command.boundedCandidateId ?? null,
             promptContext,
@@ -4493,12 +5521,20 @@ export class AutonomousRunner {
         round = null,
         slotIndex = null,
         candidateId,
+        measurementSubjectId = candidateId,
         snapshotId,
+        replication = null,
+        invalid = null,
+        harnessRole = "search",
+        measurementPhase = purpose === "validation"
+            ? "calibration"
+            : "search",
     }) {
         const candidateArtifactHash = measurementSnapshotHash(snapshotId);
         if (!receiptHasVerifiedSnapshotBytes(
             measurement.receipt,
             candidateArtifactHash,
+            { requireCompleteOutput: invalid === null },
         )) {
             throw new RuntimeIntegrityError(
                 "Measurement receipt does not bind the exact executed candidate bytes",
@@ -4510,6 +5546,37 @@ export class AutonomousRunner {
                         measurement.receipt?.candidateSnapshotHash ?? null,
                 },
             );
+        }
+        if (replication !== null) {
+            const expectedBinding = {
+                role: harnessRole,
+                phase: measurementPhase,
+                replicateIndex: replication.replicateIndex,
+                blockIndex: replication.blockIndex,
+                armIndex: replication.armIndex,
+                armId: replication.armId,
+                deterministicSeed: replication.deterministicSeed,
+                subjectId: replication.subjectId,
+                environmentIdentity:
+                    this.#contract.harnessSuite.environmentIdentity,
+                suiteIdentity: this.#contract.harnessSuiteIdentity,
+            };
+            const actualBinding = Object.fromEntries(
+                Object.keys(expectedBinding).map((key) => [
+                    key,
+                    measurement.receipt?.[key] ?? null,
+                ]),
+            );
+            if (measurement.receipt?.version !== HARNESS_SUITE_RECEIPT_VERSION
+                || !canonicalEqual(actualBinding, expectedBinding)) {
+                throw new RuntimeIntegrityError(
+                    "Measurement receipt does not match the scheduled replicate binding",
+                    {
+                        expectedBinding,
+                        actualBinding,
+                    },
+                );
+            }
         }
         if (rawOutput === null
             || !Buffer.isBuffer(rawOutput.stdout)
@@ -4525,7 +5592,7 @@ export class AutonomousRunner {
         }
         const receiptArtifact = this.#persistJsonArtifact({
             attemptId,
-            kind: `measurement-receipt-${candidateId}`,
+            kind: `measurement-receipt-${measurementSubjectId}`,
             value: measurement.receipt,
             contentType: "application/vnd.crucible.measurement-receipt+json",
         });
@@ -4533,6 +5600,8 @@ export class AutonomousRunner {
             attemptId,
             logicalEffectKey,
             purpose,
+            harnessRole,
+            measurementPhase,
             commandId,
             candidateId,
             artifactId: receiptArtifact.artifactId,
@@ -4540,23 +5609,25 @@ export class AutonomousRunner {
         });
         const rawStdoutArtifact = this.#persistBytesArtifact({
             attemptId,
-            kind: `measurement-stdout-${candidateId}`,
+            kind: `measurement-stdout-${measurementSubjectId}`,
             bytes: rawOutput.stdout,
             contentType: "application/vnd.crucible.measurement-stdout",
         });
         const rawStderrArtifact = this.#persistBytesArtifact({
             attemptId,
-            kind: `measurement-stderr-${candidateId}`,
+            kind: `measurement-stderr-${measurementSubjectId}`,
             bytes: rawOutput.stderr,
             contentType: "application/vnd.crucible.measurement-stderr",
         });
         const snapshot = this.#persistSnapshotProvenance({
             attemptId,
-            kind: `measurement-snapshot-${candidateId}`,
+            kind: `measurement-snapshot-${measurementSubjectId}`,
             snapshotId,
         });
         const measurementProvenance = createMeasurementProvenance({
-            subjectId: candidateId,
+            subjectId: measurementSubjectId,
+            role: measurement.receipt.role ?? harnessRole,
+            phase: measurement.receipt.phase ?? measurementPhase,
             receiptArtifact,
             receiptHash: hashReceipt(measurement.receipt),
             rawStdoutArtifact,
@@ -4588,17 +5659,26 @@ export class AutonomousRunner {
         });
         this.#ingestOperationalEvidence({
             attemptId,
-            evidenceKind: `measurement:${purpose}:${candidateId}`,
+            evidenceKind: replication === null
+                ? `measurement:${purpose}:${measurementSubjectId}`
+                : `measurement:${purpose}:${replication.blockIndex}:${
+                    replication.armIndex
+                }`,
             kind: "runtime:measurement",
             payload: {
                 logicalEffectKey,
                 purpose,
+                harnessRole,
+                measurementPhase,
                 commandId,
                 round,
                 slotIndex,
                 candidateId,
+                measurementSubjectId,
                 candidateArtifactHash,
                 parsed: measurement.parsed,
+                invalid,
+                replication,
                 receipt: measurement.receipt,
                 receiptHash: hashReceipt(measurement.receipt),
                 receiptArtifactId: receiptArtifact.artifactId,
@@ -4639,6 +5719,8 @@ export class AutonomousRunner {
             commandId,
             candidateId: `impossibility-${command.attemptOrdinal}`,
             snapshotId,
+            harnessRole: "impossibility_verifier",
+            measurementPhase: "impossibility_verification",
         });
         const measurementReceiptBytes = Buffer.from(
             canonicalJson(result.measurement.receipt),

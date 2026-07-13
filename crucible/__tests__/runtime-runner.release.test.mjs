@@ -57,6 +57,7 @@ import {
 } from "./measurement-fixtures.mjs";
 import {
     buildHarnessSuiteForAllowlist,
+    fakeStatisticalPolicy,
     upgradeLegacyContractInput,
 } from "./v4-contract-fixture.mjs";
 import {
@@ -353,24 +354,29 @@ function makeContract({
     harnessSuite,
     harnessSuiteIdentity,
     enumerandManifest,
+    acceptanceThreshold = hypothesisTopology === "certified_impossibility"
+        ? 90
+        : 0,
+    minBlocks = 1,
+    maxBlocks = 1,
 } = {}) {
+    const resolvedTopology = hypothesisTopology
+        ?? (boundedCandidateIds === undefined
+            ? "open_generative"
+            : "finite_enumerable");
     const input = upgradeLegacyContractInput({
         objective: "Find a candidate whose trusted score is at least 90",
         acceptancePredicate: {
-            kind: "all",
-            predicates: [
-                { kind: "harness_pass" },
-                { kind: "metric_compare", metric: "score", operator: ">=", value: 90 },
-            ],
+            kind: "metric_compare",
+            metric: "score",
+            operator: ">=",
+            value: acceptanceThreshold,
         },
         validationCases: [
             { id: "known-good", expectation: "accept", artifactHash: goodSnapshot },
             { id: "known-bad", expectation: "reject", artifactHash: badSnapshot },
         ],
-        hypothesisTopology: hypothesisTopology
-            ?? (boundedCandidateIds === undefined
-                ? "open_generative"
-                : "finite_enumerable"),
+        hypothesisTopology: resolvedTopology,
         criticality: "high",
         policyVersion: "policy-v1",
         workerModels: ["model-a", "model-b"],
@@ -397,6 +403,48 @@ function makeContract({
         },
         declaredLimits: { maxCommands },
     });
+    input.statisticalPolicy = fakeStatisticalPolicy({
+        topology: resolvedTopology,
+        searchSlots:
+            enumerandManifest?.entries.length
+            ?? candidatesPerRound * maxRounds,
+        manifest: enumerandManifest ?? null,
+        minBlocks,
+        maxBlocks,
+        control: enumerandManifest === undefined
+            ? { kind: "snapshot", identity: badSnapshot }
+            : null,
+    });
+    input.observableRegistry = [{
+        key: "score",
+        kind: "numeric",
+        minimum: 0,
+        maximum: 100,
+    }];
+    input.statisticalPolicy.metrics = [{
+        key: "score",
+        minimum: 0,
+        maximum: 100,
+        estimand: "mean score versus frozen control",
+        unit: "score",
+        direction: "max",
+        acceptanceThreshold,
+        practicalEquivalenceDelta: 1,
+        family: "primary",
+    }];
+    input.statisticalPolicy.control = {
+        ...(enumerandManifest === undefined
+            ? { kind: "snapshot", identity: badSnapshot }
+            : {
+                kind: input.statisticalPolicy.control.kind,
+                identity: input.statisticalPolicy.control.identity,
+            }),
+        tolerances: [{
+            metric: "score",
+            absolute: 0,
+            relative: 0,
+        }],
+    };
     input.harnessSuite = harnessSuite;
     input.harnessSuiteIdentity = harnessSuiteIdentity;
     return createInvestigationContract(input);
@@ -535,8 +583,13 @@ class ScriptedOrchestrationWorkerPool {
 function createControllableHarnessAdapter() {
     let nextPid = 7600;
     const children = new Map();
+    const real = createDefaultProcessAdapter();
     return {
-        spawn(_executable, _argv, options) {
+        spawn(executable, argv, options) {
+            if (path.basename(executable).toLowerCase()
+                !== path.basename(NODE_EXE).toLowerCase()) {
+                return real.spawn(executable, argv, options);
+            }
             const child = new EventEmitter();
             child.pid = ++nextPid;
             child.stdout = new PassThrough();
@@ -546,12 +599,25 @@ function createControllableHarnessAdapter() {
             setImmediate(() => {
                 if (state.terminated || state.closed) return;
                 const candidatePath = options.env.CANDIDATE_SNAPSHOT_PATH;
-                const score = Number(
-                    fs.readFileSync(path.join(candidatePath, "score.txt"), "utf8").trim(),
-                );
+                const raw = fs.readFileSync(
+                    path.join(candidatePath, "score.txt"),
+                    "utf8",
+                ).trim();
+                const score = Number(raw);
+                const stateMarker = `${path.sep}state${path.sep}`;
+                const markerIndex = candidatePath.indexOf(stateMarker);
+                if (markerIndex > 0) {
+                    fs.appendFileSync(
+                        path.join(
+                            candidatePath.slice(0, markerIndex),
+                            "harness-call-count.txt",
+                        ),
+                        "1\n",
+                    );
+                }
                 child.stdout.end(Buffer.from(JSON.stringify({
                     pass: Number.isFinite(score) && score >= 90,
-                    metrics: { score },
+                    metrics: raw === "omit" ? {} : { score },
                 }), "utf8"));
                 child.stderr.end();
                 state.closed = true;
@@ -562,7 +628,8 @@ function createControllableHarnessAdapter() {
         },
         terminateTree(pid) {
             const state = children.get(pid);
-            if (state === undefined || state.closed) return false;
+            if (state === undefined) return real.terminateTree(pid);
+            if (state.closed) return false;
             state.terminated = true;
             state.child.stdout.end();
             state.child.stderr.end();
@@ -582,6 +649,7 @@ function setupInvestigation(label, contractOptions = {}, {
     impossibilityResult = null,
     executesCandidateCode = false,
     spawnLingeringCandidateProcess = false,
+    badScore = 10,
 } = {}) {
     const root = makeRoot(label);
     const stateDir = path.join(root, "state");
@@ -589,7 +657,7 @@ function setupInvestigation(label, contractOptions = {}, {
     fs.mkdirSync(stateDir, { recursive: true });
     const store = openArtifactStore({ root: artifactRoot });
     const goodSnapshot = seedSnapshot(store, root, "good", 100);
-    const badSnapshot = seedSnapshot(store, root, "bad", 10);
+    const badSnapshot = seedSnapshot(store, root, "bad", badScore);
     const roleSnapshots = {
         search: seedSnapshot(store, root, "search-role", 91),
         confirmation: seedSnapshot(store, root, "confirmation-role", 92),
@@ -977,12 +1045,14 @@ describe("Crucible autonomous runner", () => {
             replayed.aggregate.observationOrder.find((id) =>
                 replayed.aggregate.observations[id].purpose === "validation")
         ];
-        expect(validationObservation.data.caseMap).toMatchObject({
-            "known-good": { expectation: "accept", outcome: "accept", matched: true },
-            "known-bad": { expectation: "reject", outcome: "reject", matched: true },
+        expect(validationObservation.data).toMatchObject({
+            version: 1,
+            attemptIndex: 0,
+            series: expect.any(Array),
         });
-        expect(validationObservation.data.compositeReceiptHash).toMatch(
-            /^sha256:crucible-runtime-validation-receipts-v1:[a-f0-9]{64}$/,
+        expect(validationObservation.data.series).toHaveLength(2);
+        expect(JSON.stringify(validationObservation.data)).not.toMatch(
+            /expectation|matched|outcome|statistics|statisticalState/u,
         );
         expect(harnessCandidateEvidenceItems(replayed.aggregate)).toHaveLength(4);
         const validationEvidence = replayed.aggregate.evidence[
@@ -996,6 +1066,14 @@ describe("Crucible autonomous runner", () => {
             },
         });
         expect(validationEvidence.receipt.provenance.measurements).toHaveLength(2);
+        expect(validationEvidence.validationSatisfied).toBe(true);
+        expect(validationEvidence.validationEvaluation.evaluations).toHaveLength(8);
+        expect(validationEvidence.validationEvaluation.evaluations
+            .filter((item) => item.caseId === "known-good")
+            .every((item) => item.actualState === "SUPPORTED")).toBe(true);
+        expect(validationEvidence.validationEvaluation.evaluations
+            .filter((item) => item.caseId === "known-bad")
+            .every((item) => item.actualState === "REFUTED")).toBe(true);
         const candidateEvidence = harnessCandidateEvidenceItems(replayed.aggregate)[0];
         expect(candidateEvidence.receipt.provenance).toMatchObject({
             proposalArtifact: {
@@ -1005,6 +1083,28 @@ describe("Crucible autonomous runner", () => {
             promptContextHash: expect.stringMatching(
                 /^sha256:[a-z0-9][a-z0-9._-]*:[a-f0-9]{64}$/,
             ),
+            replicationScheduleArtifact: {
+                artifactId: expect.any(String),
+            },
+            replicationCompositeArtifact: {
+                artifactId: expect.any(String),
+            },
+        });
+        expect(candidateEvidence.receipt.provenance.measurements).toHaveLength(2);
+        expect(candidateEvidence).toMatchObject({
+            acceptanceSatisfied: true,
+            outcomeClass: "accepted",
+            statisticalEvaluation: {
+                requiredState: "SUPPORTED",
+            },
+            novelty: {
+                content: {
+                    signature: expect.stringMatching(
+                        /^sha256:crucible-content-novelty-v1:[a-f0-9]{64}$/u,
+                    ),
+                },
+                structural: null,
+            },
         });
         expect(candidateEvidence.receipt.provenance.measurements[0]).toMatchObject({
             parserVersion: PARSER_VERSION,
@@ -1040,11 +1140,37 @@ describe("Crucible autonomous runner", () => {
         }
 
         const operational = replayed.repository.listEvents(replayed.adapter.operationalInvestigationId);
+        const schedules = operational.filter((row) =>
+            row.kind === "runtime:measurement_schedule");
+        const composites = operational.filter((row) =>
+            row.kind === "runtime:replication_composite");
+        expect(schedules).toHaveLength(4);
+        expect(composites).toHaveLength(4);
+        for (const scheduleRow of schedules) {
+            const relatedEffects = operational.filter((row) =>
+                row.payload?.commandId === scheduleRow.payload.commandId
+                && (row.kind === "runtime:model_proposal"
+                    || row.kind === "runtime:measurement"));
+            expect(relatedEffects.length).toBeGreaterThan(0);
+            expect(relatedEffects.every((row) => row.seq > scheduleRow.seq))
+                .toBe(true);
+        }
         const candidateMeasurements = operational.filter((row) =>
             row.kind === "runtime:measurement" && row.payload.purpose === "candidate");
-        expect(candidateMeasurements).toHaveLength(4);
+        expect(candidateMeasurements).toHaveLength(8);
         const persistedReceipt = candidateMeasurements[0].payload.receipt;
-        expect(persistedReceipt.version).toBe(5);
+        expect(persistedReceipt.version).toBe(7);
+        expect(persistedReceipt).toMatchObject({
+            role: "search",
+            phase: "search",
+            replicateIndex: 0,
+            blockIndex: 0,
+            armIndex: expect.any(Number),
+            armId: expect.stringMatching(/^(?:candidate|control)$/u),
+            deterministicSeed: expect.stringMatching(
+                /^sha256:crucible-replication-arm-seed-v1:[a-f0-9]{64}$/u,
+            ),
+        });
         expect(persistedReceipt.candidateSnapshotPreClosureHash).toMatch(
             /^sha256:crucible-measurement-snapshot-closure-v1:[a-f0-9]{64}$/,
         );
@@ -1069,7 +1195,7 @@ describe("Crucible autonomous runner", () => {
         const tempRoot = path.join(setup.stateDir, "runtime-temp");
         expect(fs.existsSync(tempRoot)).toBe(true);
         expect(fs.readdirSync(tempRoot)).toEqual([]);
-    }, 60_000);
+    }, 120_000);
 
     it("enforces per-attempt CAS bytes before artifact growth", async () => {
         const setup = setupInvestigation("cas-attempt-budget", {
@@ -1105,7 +1231,7 @@ describe("Crucible autonomous runner", () => {
                 runnerDependencies(new ScriptedOrchestrationWorkerPool([95]), {
                     byteBudgets: {
                         perAttemptCasBytes: 512,
-                        perInvestigationCasBytes: 1024,
+                        perInvestigationCasBytes: 8192,
                     },
                 }),
             );
@@ -1125,7 +1251,7 @@ describe("Crucible autonomous runner", () => {
             searchPolicy: {},
         });
         const store = openArtifactStore({ root: setup.artifactRoot });
-        const stored = store.putBytes(Buffer.alloc(2048, 0x61), {
+        const stored = store.putBytes(Buffer.alloc(32 * 1024, 0x61), {
             contentType: "application/octet-stream",
         });
         const repository = openRepository({
@@ -1153,7 +1279,7 @@ describe("Crucible autonomous runner", () => {
                 runnerDependencies(new ScriptedOrchestrationWorkerPool([95]), {
                     byteBudgets: {
                         perAttemptCasBytes: 1024,
-                        perInvestigationCasBytes: 1024,
+                        perInvestigationCasBytes: 16 * 1024,
                     },
                 }),
             );
@@ -1365,7 +1491,10 @@ describe("Crucible autonomous runner", () => {
     }, 60_000);
 
     it("persists a search-capacity non-result after successful validation", async () => {
-        const setup = setupInvestigation("budget", { maxRounds: 1 });
+        const setup = setupInvestigation("budget", {
+            maxRounds: 1,
+            acceptanceThreshold: 90,
+        });
         const pool = new ScriptedOrchestrationWorkerPool([20]);
         const result = await runAutonomousInvestigation(
             setup.config,
@@ -1381,6 +1510,41 @@ describe("Crucible autonomous runner", () => {
         expect(replayed.aggregate.terminal).toBeNull();
         replayed.repository.close();
     }, 60_000);
+
+    it("bounds inconclusive calibration retries and persists VALIDATION_INCONCLUSIVE", async () => {
+        const setup = setupInvestigation(
+            "validation-inconclusive",
+            {
+                maxRounds: 1,
+                maxBlocks: 2,
+            },
+            {
+                badScore: 95,
+            },
+        );
+        const pool = new ScriptedOrchestrationWorkerPool([95]);
+        const result = await runAutonomousInvestigation(
+            setup.config,
+            runnerDependencies(pool),
+        );
+        expect(result).toMatchObject({
+            kind: "NON_RESULT",
+            code: "VALIDATION_INCONCLUSIVE",
+        });
+        expect(pool.calls).toHaveLength(0);
+
+        const replayed = replaySetup(setup);
+        expect(replayed.aggregate.validation.attemptEvidenceIds).toHaveLength(2);
+        expect(replayed.aggregate.nonResults.at(-1)).toMatchObject({
+            code: "VALIDATION_INCONCLUSIVE",
+            validationAttemptCount: 2,
+            maxValidationAttempts: 2,
+        });
+        expect(replayed.adapter.listOperationalEvidence().filter((row) =>
+            row.kind === "runtime:measurement"
+            && row.payload.purpose === "candidate")).toHaveLength(0);
+        replayed.repository.close();
+    }, 90_000);
 
     it("bounds a hung worker-pool close after persisting the scientific non-result", async () => {
         const setup = setupInvestigation("runner-shutdown-bound", { maxRounds: 1 });
@@ -1518,7 +1682,7 @@ describe("Crucible autonomous runner", () => {
         });
         expect(recoveredReplay.aggregate.pause).toBeNull();
         expect(recoveredReplay.aggregate.pauseHistory).toHaveLength(1);
-        expect(harnessCallCount(setup)).toBe(3);
+        expect(harnessCallCount(setup)).toBe(4);
         const deadlineFailures = recoveredReplay.adapter.listOperationalEvidence()
             .filter((row) =>
                 row.kind === "runtime:effect_failure"
@@ -1544,7 +1708,7 @@ describe("Crucible autonomous runner", () => {
             faultInjector(point, details) {
                 if (!advanced
                     && point === "after_effect_operation"
-                    && details.command?.kind === "candidate-measurement") {
+                    && details.command?.kind === "replicate-measurement") {
                     advanced = true;
                     clock.advance(30_001);
                 }
@@ -1582,7 +1746,7 @@ describe("Crucible autonomous runner", () => {
             faultInjector(point, details) {
                 if (!advanced
                     && point === "after_effect_artifact_persistence"
-                    && details.command?.kind === "candidate-measurement") {
+                    && details.command?.kind === "replicate-measurement") {
                     advanced = true;
                     clock.advance(30_001);
                 }
@@ -1632,7 +1796,7 @@ describe("Crucible autonomous runner", () => {
             code: "DEADLINE_EXCEEDED",
             terminalEmitted: false,
         });
-        expect(harnessCallCount(setup)).toBe(3);
+        expect(harnessCallCount(setup)).toBe(4);
         const replayed = replaySetup(setup);
         expect(replayed.aggregate.terminal).toBeNull();
         expect(harnessCandidateEvidenceItems(replayed.aggregate)).toHaveLength(0);
@@ -1672,7 +1836,7 @@ describe("Crucible autonomous runner", () => {
             code: "DEADLINE_EXCEEDED",
             terminalEmitted: false,
         });
-        expect(harnessCallCount(setup)).toBe(3);
+        expect(harnessCallCount(setup)).toBe(4);
         const replayed = replaySetup(setup);
         expect(replayed.aggregate.terminal).toBeNull();
         expect(harnessCandidateEvidenceItems(replayed.aggregate)).toHaveLength(0);
@@ -1707,7 +1871,7 @@ describe("Crucible autonomous runner", () => {
             code: "DEADLINE_EXCEEDED",
             terminalEmitted: false,
         });
-        expect(harnessCallCount(setup)).toBe(3);
+        expect(harnessCallCount(setup)).toBe(4);
         const replayed = replaySetup(setup);
         expect(harnessCandidateEvidenceItems(replayed.aggregate)).toHaveLength(1);
         expect(replayed.aggregate.terminal).toBeNull();
@@ -1724,6 +1888,7 @@ describe("Crucible autonomous runner", () => {
             boundedCandidateIds: ["candidate-a", "candidate-b"],
             candidatesPerRound: 1,
             maxRounds: 2,
+            acceptanceThreshold: 90,
         });
         const pool = new ScriptedOrchestrationWorkerPool([20, 30]);
         const result = await runAutonomousInvestigation(
@@ -1779,7 +1944,7 @@ describe("Crucible autonomous runner", () => {
             tempRootCleaned: true,
         });
         expect(pool.calls).toHaveLength(1);
-        expect(harnessCallCount(setup)).toBe(4);
+        expect(harnessCallCount(setup)).toBe(5);
 
         const replayed = replaySetup(setup);
         expect(replayed.aggregate.commandOrder.map((commandId) =>
@@ -1817,7 +1982,7 @@ describe("Crucible autonomous runner", () => {
                     provenanceRoot: certificateEvidence.provenanceRoot,
                 },
             },
-            receipts: { count: 4, evidenceCount: 3 },
+            receipts: { count: 5, evidenceCount: 3 },
         });
         const operational = replayed.adapter.listOperationalEvidence();
         const certificateRow = operational.find((row) =>
@@ -1911,7 +2076,7 @@ describe("Crucible autonomous runner", () => {
         )).rejects.toMatchObject({
             code: "CRUCIBLE_RUNTIME_INJECTED_CRASH",
         });
-        expect(harnessCallCount(setup)).toBe(4);
+        expect(harnessCallCount(setup)).toBe(5);
 
         const branchA = clonePersistedSetup(setup, "certified-crash-branch-a");
         const branchB = clonePersistedSetup(setup, "certified-crash-branch-b");
@@ -1931,7 +2096,7 @@ describe("Crucible autonomous runner", () => {
             kind: "TERMINAL",
             decision: "TARGET_UNREACHABLE",
         });
-        expect(harnessCallCount(setup)).toBe(4);
+        expect(harnessCallCount(setup)).toBe(5);
         const replayedA = replaySetup(branchA);
         const replayedB = replaySetup(branchB);
         expect(replayedA.aggregate.terminal.eventHash)
@@ -1946,6 +2111,7 @@ describe("Crucible autonomous runner", () => {
         const setup = setupInvestigation("prompt-context", {
             candidatesPerRound: 1,
             maxRounds: 2,
+            acceptanceThreshold: 90,
         });
         const pool = new ScriptedOrchestrationWorkerPool([
             {
@@ -2041,7 +2207,7 @@ describe("Crucible autonomous runner", () => {
         replayed.repository.close();
     }, 60_000);
 
-    it("marks duplicate artifacts and reuses verified measurement evidence", async () => {
+    it("marks duplicate artifacts while preserving fresh raw replicate attempts", async () => {
         const setup = setupInvestigation("duplicate", {
             candidatesPerRound: 1,
             maxRounds: 2,
@@ -2062,9 +2228,9 @@ describe("Crucible autonomous runner", () => {
         const operational = replayed.adapter.listOperationalEvidence();
         expect(operational.filter((row) =>
             row.kind === "runtime:measurement" && row.payload.purpose === "candidate"))
-            .toHaveLength(1);
+            .toHaveLength(4);
         expect(operational.filter((row) => row.kind === "runtime:measurement_reuse"))
-            .toHaveLength(1);
+            .toHaveLength(0);
         replayed.repository.close();
     }, 60_000);
 
@@ -2087,8 +2253,12 @@ describe("Crucible autonomous runner", () => {
         const candidates = harnessCandidateEvidenceItems(replayed.aggregate);
         expect(candidates).toHaveLength(2);
         expect(candidates[0]).toMatchObject({
-            acceptanceSatisfied: false,
+            acceptanceSatisfied: true,
             rankable: true,
+            outcomeClass: "accepted",
+            statisticalEvaluation: {
+                requiredState: "SUPPORTED",
+            },
         });
         expect(candidates[1]).toMatchObject({
             acceptanceSatisfied: false,
@@ -2619,7 +2789,7 @@ describe("Crucible autonomous runner", () => {
                 faultInjector(point, details) {
                     if (!injected
                         && point === "after_effect_commit"
-                        && details.command?.kind === "candidate-measurement") {
+                        && details.command?.kind === "replicate-measurement") {
                         injected = true;
                         throw new InjectedCrashError(point);
                     }
@@ -2647,16 +2817,22 @@ describe("Crucible autonomous runner", () => {
         expectScientificConfirmationRequired(resultB);
         expect(recoveredPoolA.calls).toHaveLength(0);
         expect(recoveredPoolB.calls).toHaveLength(0);
-        expect(harnessCallCount(setup)).toBe(3);
+        expect(harnessCallCount(setup)).toBe(5);
 
         const replayedA = replaySetup(branchA);
         const replayedB = replaySetup(branchB);
-        expect(replayedA.aggregate.lastEventHash).toBe(
-            replayedB.aggregate.lastEventHash,
-        );
-        expect(replayedA.aggregate.nonResults.at(-1)).toEqual(
-            replayedB.aggregate.nonResults.at(-1),
-        );
+        const candidateA = harnessCandidateEvidenceItems(replayedA.aggregate)[0];
+        const candidateB = harnessCandidateEvidenceItems(replayedB.aggregate)[0];
+        expect(candidateA.replication).toEqual(candidateB.replication);
+        expect({
+            metrics: candidateA.metrics,
+            outcomeClass: candidateA.outcomeClass,
+            acceptanceSatisfied: candidateA.acceptanceSatisfied,
+        }).toEqual({
+            metrics: candidateB.metrics,
+            outcomeClass: candidateB.outcomeClass,
+            acceptanceSatisfied: candidateB.acceptanceSatisfied,
+        });
         const effects = replayedA.adapter.listOperationalEvidence().filter((row) =>
             row.kind === "runtime:model_proposal" || row.kind === "runtime:measurement");
         expect(effects.every((row) =>
@@ -2701,7 +2877,7 @@ describe("Crucible autonomous runner", () => {
             code: "CRUCIBLE_RUNTIME_INJECTED_CRASH",
         });
         expect(firstPool.calls).toHaveLength(1);
-        expect(harnessCallCount(setup)).toBe(3);
+        expect(harnessCallCount(setup)).toBe(4);
 
         const branchA = clonePersistedSetup(setup, "domain-append-branch-a");
         const branchB = clonePersistedSetup(setup, "domain-append-branch-b");
@@ -2719,13 +2895,21 @@ describe("Crucible autonomous runner", () => {
         expectScientificConfirmationRequired(resultB);
         expect(recoveredPoolA.calls).toHaveLength(0);
         expect(recoveredPoolB.calls).toHaveLength(0);
-        expect(harnessCallCount(setup)).toBe(3);
+        expect(harnessCallCount(setup)).toBe(4);
         const replayedA = replaySetup(branchA);
         const replayedB = replaySetup(branchB);
-        expect(replayedA.aggregate.lastEventHash)
-            .toBe(replayedB.aggregate.lastEventHash);
-        expect(replayedA.aggregate.nonResults.at(-1))
-            .toEqual(replayedB.aggregate.nonResults.at(-1));
+        const candidateA = harnessCandidateEvidenceItems(replayedA.aggregate)[0];
+        const candidateB = harnessCandidateEvidenceItems(replayedB.aggregate)[0];
+        expect(candidateA.replication).toEqual(candidateB.replication);
+        expect({
+            metrics: candidateA.metrics,
+            outcomeClass: candidateA.outcomeClass,
+            acceptanceSatisfied: candidateA.acceptanceSatisfied,
+        }).toEqual({
+            metrics: candidateB.metrics,
+            outcomeClass: candidateB.outcomeClass,
+            acceptanceSatisfied: candidateB.acceptanceSatisfied,
+        });
         replayedA.repository.close();
         replayedB.repository.close();
     }, 120_000);
@@ -2743,7 +2927,7 @@ describe("Crucible autonomous runner", () => {
                 faultInjector(point, details) {
                     if (!injected
                         && point === "after_effect_commit"
-                        && details.command?.kind === "candidate-measurement") {
+                        && details.command?.kind === "replicate-measurement") {
                         injected = true;
                         throw new InjectedCrashError(point);
                     }
@@ -2786,7 +2970,7 @@ describe("Crucible autonomous runner", () => {
                 faultInjector(point, details) {
                     if (!injected
                         && point === "after_effect_artifact_persistence"
-                        && details.command?.kind === "candidate-measurement") {
+                        && details.command?.kind === "replicate-measurement") {
                         injected = true;
                         throw new InjectedCrashError(point);
                     }
@@ -2814,17 +2998,116 @@ describe("Crucible autonomous runner", () => {
         expectScientificConfirmationRequired(resultB);
         expect(recoveredPoolA.calls).toHaveLength(0);
         expect(recoveredPoolB.calls).toHaveLength(0);
-        expect(harnessCallCount(setup)).toBe(3);
+        expect(harnessCallCount(setup)).toBe(5);
         expect(resultA.recovery.uncertainDispatched).toBeGreaterThanOrEqual(1);
         const replayedA = replaySetup(branchA);
         const replayedB = replaySetup(branchB);
-        expect(replayedA.aggregate.lastEventHash)
-            .toBe(replayedB.aggregate.lastEventHash);
-        expect(replayedA.aggregate.nonResults.at(-1))
-            .toEqual(replayedB.aggregate.nonResults.at(-1));
+        const candidateA = harnessCandidateEvidenceItems(replayedA.aggregate)[0];
+        const candidateB = harnessCandidateEvidenceItems(replayedB.aggregate)[0];
+        expect(candidateA.replication).toEqual(candidateB.replication);
+        expect({
+            metrics: candidateA.metrics,
+            outcomeClass: candidateA.outcomeClass,
+            acceptanceSatisfied: candidateA.acceptanceSatisfied,
+        }).toEqual({
+            metrics: candidateB.metrics,
+            outcomeClass: candidateB.outcomeClass,
+            acceptanceSatisfied: candidateB.acceptanceSatisfied,
+        });
         replayedA.repository.close();
         replayedB.repository.close();
     }, 120_000);
+
+    it.each([
+        {
+            label: "schedule",
+            point: "after_replication_schedule",
+            callsBeforeRecovery: 2,
+            recoveryProposalCount: 1,
+        },
+        {
+            label: "arm",
+            point: "after_replication_arm",
+            callsBeforeRecovery: 3,
+            recoveryProposalCount: 0,
+        },
+        {
+            label: "block",
+            point: "after_replication_block",
+            callsBeforeRecovery: 4,
+            recoveryProposalCount: 0,
+        },
+        {
+            label: "composite",
+            point: "after_replication_composite",
+            callsBeforeRecovery: 4,
+            recoveryProposalCount: 0,
+        },
+    ])(
+        "resumes the exact remaining replicate work after $point",
+        async ({
+            label,
+            point,
+            callsBeforeRecovery,
+            recoveryProposalCount,
+        }) => {
+            const setup = setupInvestigation(
+                `replication-boundary-${label}`,
+                { maxRounds: 1 },
+                { countHarnessCalls: true },
+            );
+            let injected = false;
+            let failure = null;
+            try {
+                await runAutonomousInvestigation(
+                    setup.config,
+                    runnerDependencies(new ScriptedOrchestrationWorkerPool([95]), {
+                        faultInjector(observedPoint, details) {
+                            if (injected
+                                || observedPoint !== point
+                                || (details.commandId !== undefined
+                                    && details.commandId !== "cmd-000002")) {
+                                return;
+                            }
+                            injected = true;
+                            throw new InjectedCrashError(point);
+                        },
+                    }),
+                );
+            } catch (error) {
+                failure = error;
+            }
+            expect([
+                RUNTIME_ERROR_CODES.INJECTED_CRASH,
+                RUNTIME_ERROR_CODES.CHILD_CRASH,
+            ]).toContain(failure?.code);
+            expect(injected).toBe(true);
+            expect(harnessCallCount(setup)).toBe(callsBeforeRecovery);
+
+            const recoveryPool = new ScriptedOrchestrationWorkerPool(
+                recoveryProposalCount === 0 ? [] : [95],
+            );
+            const recovered = await runAutonomousInvestigation(
+                setup.config,
+                runnerDependencies(recoveryPool),
+            );
+            expectScientificConfirmationRequired(recovered);
+            expect(recoveryPool.calls).toHaveLength(recoveryProposalCount);
+            expect(harnessCallCount(setup)).toBe(4);
+            const replayed = replaySetup(setup);
+            const measurements = replayed.adapter.listOperationalEvidence()
+                .filter((row) =>
+                    row.kind === "runtime:measurement"
+                    && row.payload?.purpose === "candidate");
+            expect(measurements).toHaveLength(2);
+            expect(new Set(measurements.map((row) =>
+                `${row.payload.replication.blockIndex}:${
+                    row.payload.replication.armIndex
+                }`)).size).toBe(2);
+            replayed.repository.close();
+        },
+        120_000,
+    );
 });
 
 describe("H7 systematic runtime failure matrix", () => {
@@ -2837,7 +3120,7 @@ describe("H7 systematic runtime failure matrix", () => {
         {
             label: "measurement effect committed",
             point: "after_effect_commit",
-            commandKind: "candidate-measurement",
+            commandKind: "replicate-measurement",
         },
         {
             label: "science gate append",
@@ -2916,7 +3199,7 @@ describe("H7 systematic runtime failure matrix", () => {
             expect(recoveredPool.calls).toHaveLength(0);
             expect(fs.readFileSync(workerCallsPath, "utf8").trim().split(/\r?\n/u))
                 .toHaveLength(1);
-            expect(harnessCallCount(setup)).toBe(3);
+            expect(harnessCallCount(setup)).toBe(4);
 
             const replayed = replaySetup(setup);
             const operational = replayed.adapter.listOperationalEvidence();
@@ -2926,7 +3209,7 @@ describe("H7 systematic runtime failure matrix", () => {
                 row.kind === "runtime:candidate_snapshot")).toHaveLength(1);
             expect(operational.filter((row) =>
                 row.kind === "runtime:measurement"
-                && row.payload.purpose === "candidate")).toHaveLength(1);
+                && row.payload.purpose === "candidate")).toHaveLength(2);
             expect(harnessCandidateEvidenceItems(replayed.aggregate)).toHaveLength(1);
             expect(replayed.repository.listEvents(
                 replayed.adapter.investigationId,
@@ -3004,7 +3287,8 @@ describe("H7 systematic runtime failure matrix", () => {
                             if (!injected
                                 && point === "after_effect_commit"
                                 && details.command?.kind
-                                    === "candidate-measurement") {
+                                    === "replicate-measurement"
+                                && details.command?.armId === "candidate") {
                                 injected = true;
                                 throw new InjectedCrashError(point);
                             }
@@ -3036,7 +3320,7 @@ describe("H7 systematic runtime failure matrix", () => {
                 );
                 expectScientificConfirmationRequired(recovered);
                 expect(recovered.tempRootCleaned).toBe(true);
-                expect(harnessCallCount(setup)).toBe(3);
+                expect(harnessCallCount(setup)).toBe(4);
                 expect(processOwners[1].closeCalls).toBe(1);
                 expect(
                     await waitForNoExactWindowsProcess(exactPaths),
@@ -3233,7 +3517,7 @@ describe("H7 systematic runtime failure matrix", () => {
                 faultInjector(point, details) {
                     if (!injected
                         && point === "after_effect_artifact_persistence"
-                        && details.command?.kind === "candidate-measurement") {
+                        && details.command?.kind === "replicate-measurement") {
                         injected = true;
                         throw new InjectedCrashError(point);
                     }
@@ -3268,7 +3552,7 @@ describe("H7 systematic runtime failure matrix", () => {
             value: JSON.parse(store.readObject(`sha256:${row.hash_value}`).toString("utf8")),
         }));
         const measurementCapsule = capsules.find((item) =>
-            item.value.command.kind === "candidate-measurement");
+            item.value.command.kind === "replicate-measurement");
         expect(measurementCapsule).toBeTruthy();
         const measurement = measurementCapsule.value.evidence.find((item) =>
             item.kind === "runtime:measurement").payload;

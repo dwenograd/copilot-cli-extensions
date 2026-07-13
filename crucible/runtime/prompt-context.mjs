@@ -51,6 +51,7 @@ const DROP_ORDER = Object.freeze([
     "lessons",
     "elites",
     "nearMisses",
+    "predictionFindings",
 ]);
 
 function asArray(value) {
@@ -118,7 +119,13 @@ function promptCap(contract, key) {
 }
 
 function assertArchiveBounds(contract, archive) {
-    for (const key of ["accepted", "nearMisses", "rejected", "invalidMetrics"]) {
+    for (const key of [
+        "accepted",
+        "nearMisses",
+        "rejected",
+        "inconclusive",
+        "invalidMetrics",
+    ]) {
         assertArrayBound(archive[key], archiveCap(contract, key), `archive.${key}`);
     }
     assertArrayBound(
@@ -131,6 +138,25 @@ function assertArchiveBounds(contract, archive) {
         archiveCap(contract, "lessonGroups"),
         "archive.lessonGroups",
     );
+    const noveltyNiches = archive.noveltyNiches;
+    if (noveltyNiches !== undefined && noveltyNiches !== null) {
+        requirePlainObject(noveltyNiches, "archive.noveltyNiches");
+        assertArrayBound(
+            noveltyNiches.content,
+            archiveCap(contract, "duplicateIndex"),
+            "archive.noveltyNiches.content",
+        );
+        assertArrayBound(
+            noveltyNiches.structural,
+            archiveCap(contract, "mechanismGroups"),
+            "archive.noveltyNiches.structural",
+        );
+        assertArrayBound(
+            noveltyNiches.behavioral,
+            archiveCap(contract, "lessonGroups"),
+            "archive.noveltyNiches.behavioral",
+        );
+    }
     const duplicateIndex = archive.duplicateIndex;
     if (duplicateIndex !== undefined
         && duplicateIndex !== null
@@ -185,6 +211,17 @@ function summarizeCandidate(evidence, keys) {
     const annotations = evidence.annotations && typeof evidence.annotations === "object"
         ? evidence.annotations
         : {};
+    const novelty = {
+        contentSignature:
+            stringOrNull(evidence.novelty?.content?.signature),
+        structuralSignature:
+            stringOrNull(
+                evidence.novelty?.structural?.structuralFingerprint,
+            ),
+        behavioralSignature:
+            stringOrNull(evidence.novelty?.behavioral?.signature),
+    };
+    const hasNovelty = Object.values(novelty).some((value) => value !== null);
     return {
         evidenceId: stringOrNull(evidence.evidenceId),
         outcomeClass: stringOrNull(evidence.outcomeClass),
@@ -204,6 +241,7 @@ function summarizeCandidate(evidence, keys) {
             ANNOTATION_LIMITS.findingBytes,
         ),
         artifactHash: stringOrNull(evidence.receipt?.candidateArtifactHash),
+        ...(hasNovelty ? { novelty } : {}),
     };
 }
 
@@ -211,6 +249,57 @@ function summarizeList(list, keys) {
     return asArray(list)
         .map((evidence) => summarizeCandidate(evidence, keys))
         .filter((summary) => summary !== null && summary.evidenceId !== null);
+}
+
+function predictionFinding(evidence, prediction) {
+    if (prediction?.status !== "SUPPORTED"
+        && prediction?.status !== "REFUTED") {
+        return null;
+    }
+    return {
+        evidenceId: evidence.evidenceId,
+        candidateId: evidence.candidateId,
+        hypothesesIdentity:
+            evidence.predictionEvaluation?.hypothesesIdentity ?? null,
+        predictionId: prediction.predictionId,
+        predictionIdentity: prediction.predictionIdentity,
+        requiredForResult: prediction.requiredForResult === true,
+        kind: prediction.prediction?.kind ?? null,
+        observable: prediction.prediction?.observable ?? null,
+        prediction: prediction.prediction ?? null,
+        status: prediction.status,
+        estimate: prediction.estimate,
+        confidenceBounds: prediction.confidenceBounds,
+        confidenceMethod: prediction.confidenceMethod ?? null,
+        evidenceReference: prediction.evidenceReference,
+        blockReference: prediction.blockReference,
+        alphaReference: prediction.alphaReference,
+        reference: prediction.reference,
+        limitations: prediction.limitations,
+    };
+}
+
+function buildPredictionFindings(evidenceItems) {
+    const seen = new Set();
+    const findings = [];
+    for (const evidence of asArray(evidenceItems)) {
+        if (evidence === null
+            || typeof evidence !== "object"
+            || seen.has(evidence.evidenceId)) {
+            continue;
+        }
+        seen.add(evidence.evidenceId);
+        for (const prediction of asArray(
+            evidence.predictionEvaluation?.predictions,
+        )) {
+            const finding = predictionFinding(evidence, prediction);
+            if (finding !== null) findings.push(finding);
+        }
+    }
+    return findings.sort((left, right) =>
+        `${left.evidenceId}\0${left.predictionId}`.localeCompare(
+            `${right.evidenceId}\0${right.predictionId}`,
+        ));
 }
 
 function orientedImprovement(metric, candidateValue, incumbentValue) {
@@ -316,8 +405,9 @@ function plateauNotice(plateau) {
             + "escape rounds complete). Propose a structurally different approach; avoid minor tweaks "
             + "to existing candidates.";
     } else if (phase === "plateau") {
-        notice = "The search remains on a plateau after the escape budget. A fundamentally novel "
-            + "mechanism is required; incremental refinement has been exhausted.";
+        notice = "The search remains on a plateau after the escape budget. A trusted structural "
+            + "fingerprint or statistically supported behavioral difference is required; "
+            + "annotation-only relabeling is not novelty.";
     } else {
         notice = "No plateau detected. Run the standard search for the assigned operator.";
     }
@@ -386,7 +476,9 @@ function enforceByteCap(body, byteCap, initialOmissions = {}) {
     while (byteLength({ ...body, omissions }) > byteCap) {
         let dropped = false;
         for (const bucket of DROP_ORDER) {
-            const entries = body.priorWork[bucket];
+            const entries = bucket === "predictionFindings"
+                ? body.codeDerivedFindings?.predictions ?? []
+                : body.priorWork[bucket];
             if (Array.isArray(entries) && entries.length > 0) {
                 entries.pop();
                 omissions[bucket] += 1;
@@ -520,6 +612,7 @@ export function buildPromptContext(input = {}) {
     const visibleAccepted = visibleList(archive.accepted);
     const visibleNearMisses = visibleList(archive.nearMisses);
     const visibleRejected = visibleList(archive.rejected);
+    const visibleInconclusive = visibleList(archive.inconclusive);
     const visibleInvalidMetrics = visibleList(archive.invalidMetrics);
     const visibleLessonGroups = visibleGroups(archive.lessonGroups);
     const elites = summarizeList(visibleAccepted, keys)
@@ -527,11 +620,48 @@ export function buildPromptContext(input = {}) {
     const nearMisses = summarizeList(visibleNearMisses, keys);
     const failures = [
         ...summarizeList(visibleRejected, keys),
+        ...summarizeList(visibleInconclusive, keys),
         ...summarizeList(visibleInvalidMetrics, keys),
     ];
     const deltas = buildDeltas(metrics, incumbent, [...nearMisses, ...elites]);
     const lessons = buildLessons(visibleLessonGroups);
     const duplicateHashes = buildDuplicateHashes(visibleDuplicateIndex);
+    const allCandidateEvidence = [
+        ...asArray(archive.accepted),
+        ...asArray(archive.nearMisses),
+        ...asArray(archive.rejected),
+        ...asArray(archive.inconclusive),
+        ...asArray(archive.invalidMetrics),
+    ];
+    const candidateById = new Map(
+        allCandidateEvidence
+            .filter((evidence) =>
+                evidence !== null
+                && typeof evidence === "object"
+                && typeof evidence.evidenceId === "string")
+            .map((evidence) => [evidence.evidenceId, evidence]),
+    );
+    const trustedNoveltyParents = assignment.parentEvidenceIds
+        .map((evidenceId) => candidateById.get(evidenceId) ?? null)
+        .filter((evidence) => evidence !== null)
+        .map((evidence) => ({
+            evidenceId: evidence.evidenceId,
+            contentSignature:
+                stringOrNull(evidence.novelty?.content?.signature),
+            structuralSignature:
+                stringOrNull(
+                    evidence.novelty?.structural?.structuralFingerprint,
+                ),
+            behavioralSignature:
+                stringOrNull(evidence.novelty?.behavioral?.signature),
+        }));
+    const visibleCandidateEvidence = allCandidateEvidence.filter(
+        visibleEvidence,
+    );
+    const allPredictionFindings =
+        buildPredictionFindings(allCandidateEvidence);
+    const predictionFindings =
+        buildPredictionFindings(visibleCandidateEvidence);
     const initialOmissions = {
         elites: Math.max(
             0,
@@ -543,6 +673,7 @@ export function buildPromptContext(input = {}) {
         failures: Math.max(
             0,
             summarizeList(archive.rejected, keys).length
+                + summarizeList(archive.inconclusive, keys).length
                 + summarizeList(archive.invalidMetrics, keys).length
                 - failures.length,
         ),
@@ -552,6 +683,15 @@ export function buildPromptContext(input = {}) {
             0,
             buildDuplicateHashes(archive.duplicateIndex).length - duplicateHashes.length,
         ),
+        ...(allPredictionFindings.length === 0
+            ? {}
+            : {
+                predictionFindings: Math.max(
+                    0,
+                    allPredictionFindings.length
+                        - predictionFindings.length,
+                ),
+            }),
     };
 
     const body = {
@@ -565,6 +705,25 @@ export function buildPromptContext(input = {}) {
         ...(harnessSuite === null ? {} : { harnessSuite }),
         assignment,
         plateau: plateauNotice(input.plateau ?? null),
+        trustedNovelty: {
+            parentCandidates: trustedNoveltyParents,
+            archiveNicheCounts: {
+                content: asArray(archive.noveltyNiches?.content).length,
+                structural:
+                    asArray(archive.noveltyNiches?.structural).length,
+                behavioral:
+                    asArray(archive.noveltyNiches?.behavioral).length,
+            },
+            annotationAuthority: "untrusted_explanatory_only",
+        },
+        ...(allPredictionFindings.length === 0
+            ? {}
+            : {
+                codeDerivedFindings: {
+                    authority: "replay_derived_statistical_kernel",
+                    predictions: predictionFindings,
+                },
+            }),
         priorWork: {
             incumbent,
             elites,

@@ -18,6 +18,12 @@ export function resolveCommandEnumerand(contract, command) {
     const hasBinding = command?.enumerand !== undefined
         && command.enumerand !== null;
     if (!hasManifest && !hasBinding) {
+        if (!Object.hasOwn(command ?? {}, "hypotheses")
+            || command.hypotheses !== null) {
+            throw new RuntimeIntegrityError(
+                "Open-generative search commands must freeze hypotheses as null",
+            );
+        }
         return null;
     }
     if (hasManifest !== hasBinding) {

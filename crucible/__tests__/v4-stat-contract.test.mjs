@@ -63,6 +63,62 @@ describe("v4 frozen statistical contract", () => {
         expect(contractHash(second)).toBe(contractHash(first));
         expect(first.statisticalPolicy.metrics.map((metric) => metric.key))
             .toEqual(["latency", "score"]);
+        expect(first.statisticalPolicy.metrics.map((metric) => metric.priority))
+            .toEqual([0, 1]);
+    });
+
+    it("freezes explicit metric priority independently of key order", () => {
+        const input = makeV4ContractInput({
+            observableRegistry: [
+                { key: "latency", kind: "numeric", minimum: 0, maximum: 1000 },
+                { key: "score", kind: "numeric", minimum: 0, maximum: 1 },
+            ],
+        });
+        input.statisticalPolicy.metrics = [
+            {
+                ...input.statisticalPolicy.metrics[0],
+                priority: 0,
+            },
+            {
+                key: "latency",
+                priority: 1,
+                minimum: 0,
+                maximum: 1000,
+                estimand: "mean latency difference versus control",
+                unit: "ms",
+                direction: "min",
+                acceptanceThreshold: 200,
+                practicalEquivalenceDelta: 5,
+                family: "secondary",
+            },
+        ];
+        input.statisticalPolicy.familyAllocations = [
+            { family: "primary", alpha: 0.03 },
+            { family: "secondary", alpha: 0.02 },
+        ];
+        input.statisticalPolicy.control.tolerances.push({
+            metric: "latency",
+            absolute: 2,
+            relative: 0.01,
+        });
+
+        const contract = createInvestigationContract(input);
+        expect(contract.statisticalPolicy.metrics.map((metric) => metric.key))
+            .toEqual(["score", "latency"]);
+        expect(contract.metrics).toEqual([
+            {
+                key: "score",
+                priority: 0,
+                direction: "max",
+                epsilon: 0.01,
+            },
+            {
+                key: "latency",
+                priority: 1,
+                direction: "min",
+                epsilon: 5,
+            },
+        ]);
     });
 
     it("requires goal/topology roles, finite bounds, and the matching control", () => {
@@ -165,6 +221,58 @@ describe("v4 frozen statistical contract", () => {
         };
         expect(() => createInvestigationContract(stopFirst))
             .toThrow(/searchPolicy.*canonical fields/u);
+    });
+
+    it("freezes operator validation states, required roles, and statistical claim sets", () => {
+        const contract = createInvestigationContract(makeV4ContractInput());
+        expect(contract.validationRoles).toEqual([
+            "calibration",
+            "search",
+            "confirmation",
+            "challenge",
+        ]);
+        expect(contract.validationCases).toEqual([
+            {
+                id: "cal-accept",
+                expectation: "accept",
+                expectedClaimState: "SUPPORTED",
+                artifactHash: snapshot("1"),
+            },
+            {
+                id: "cal-reject",
+                expectation: "reject",
+                expectedClaimState: "REFUTED",
+                artifactHash: snapshot("2"),
+            },
+        ]);
+        expect(contract.validationClaimSet).toMatchObject({
+            requiredClaimIds: ["validation.harness_pass"],
+            claims: [{
+                id: "validation.harness_pass",
+                kind: "harness_pass",
+            }],
+        });
+        expect(contract.acceptanceClaimSet.requiredClaimIds)
+            .toEqual(["metric.score.acceptance"]);
+
+        const callerLabels = makeV4ContractInput();
+        callerLabels.validationCases = [{
+            id: "cal-accept",
+            expectation: "reject",
+            artifactHash: snapshot("1"),
+        }];
+        expect(() => createInvestigationContract(callerLabels))
+            .toThrow(/canonical fields/u);
+
+        const nonStatistical = makeV4ContractInput({
+            acceptancePredicate: {
+                kind: "field_equals",
+                path: ["payload"],
+                value: true,
+            },
+        });
+        expect(() => createInvestigationContract(nonStatistical))
+            .toThrow(/statistical claim set/u);
     });
 
     it("redacts held-out case ids/snapshots and control identity from worker context", () => {

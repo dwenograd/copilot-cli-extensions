@@ -15,7 +15,7 @@ import {
 } from "./errors.mjs";
 import { isAlgorithmTaggedSha256 } from "../domain/canonical.mjs";
 
-export const PARSER_VERSION = "crucible-measurement-parser-v2";
+export const PARSER_VERSION = "crucible-measurement-parser-v3";
 
 // Absolute upper bound on parseable stdout, in bytes. This is a defensive
 // second wall behind the per-entry maxStdoutBytes cap enforced during
@@ -26,6 +26,7 @@ export const PARSER_MAX_INPUT_BYTES = 8 * 1024 * 1024;
 const RESULT_ALLOWED_KEYS = new Set([
     "pass",
     "metrics",
+    "observables",
     "validationCases",
     "searchSpaceExhausted",
     "impossibilityCertificateHash",
@@ -33,6 +34,8 @@ const RESULT_ALLOWED_KEYS = new Set([
     "phase",
     "replicateIndex",
     "blockIndex",
+    "armIndex",
+    "armId",
     "deterministicSeed",
     "subjectId",
     "environmentIdentity",
@@ -50,6 +53,8 @@ const BINDING_KEYS = Object.freeze([
     "phase",
     "replicateIndex",
     "blockIndex",
+    "armIndex",
+    "armId",
     "deterministicSeed",
     "subjectId",
     "environmentIdentity",
@@ -58,34 +63,46 @@ const BINDING_KEYS = Object.freeze([
 const BINDING_KEY_SET = new Set(BINDING_KEYS);
 const ROLE_BINDING_RULES = Object.freeze({
     calibration: Object.freeze({
-        phase: "calibration",
-        replicateIndex: "forbidden",
-        blockIndex: "forbidden",
+        phases: Object.freeze(["calibration"]),
+        replicateIndex: "required",
+        blockIndex: "required",
+        armIndex: "required",
+        armId: "required",
     }),
     search: Object.freeze({
-        phase: "search",
-        replicateIndex: "forbidden",
+        phases: Object.freeze(["calibration", "search"]),
+        replicateIndex: "required",
         blockIndex: "required",
+        armIndex: "required",
+        armId: "required",
     }),
     confirmation: Object.freeze({
-        phase: "confirmation",
+        phases: Object.freeze(["calibration", "confirmation"]),
         replicateIndex: "required",
         blockIndex: "required",
+        armIndex: "required",
+        armId: "required",
     }),
     challenge: Object.freeze({
-        phase: "challenge",
+        phases: Object.freeze(["calibration", "challenge"]),
         replicateIndex: "required",
         blockIndex: "required",
+        armIndex: "required",
+        armId: "required",
     }),
     novelty: Object.freeze({
-        phase: "novelty",
+        phases: Object.freeze(["novelty"]),
         replicateIndex: "required",
         blockIndex: "required",
+        armIndex: "required",
+        armId: "required",
     }),
     impossibility_verifier: Object.freeze({
-        phase: "impossibility_verification",
+        phases: Object.freeze(["impossibility_verification"]),
         replicateIndex: "forbidden",
         blockIndex: "forbidden",
+        armIndex: "forbidden",
+        armId: "forbidden",
     }),
 });
 const FORBIDDEN_RECORD_KEYS = new Set([
@@ -133,6 +150,7 @@ function normalizeBindingIndex(value, field, rule) {
                 `${field} is not valid for this harness role`,
             );
         }
+
         return null;
     }
     if (!Number.isSafeInteger(value) || value < 0) {
@@ -142,6 +160,26 @@ function normalizeBindingIndex(value, field, rule) {
         );
     }
     return value;
+}
+
+function normalizeBindingArmId(value, field, rule) {
+    if (rule === "forbidden") {
+        if (value !== undefined && value !== null) {
+            fail(
+                MEASUREMENT_ERROR_CODES.PARSE_SCHEMA,
+                `${field} is not valid for this harness role`,
+            );
+        }
+        return null;
+    }
+    const armId = requireBindingString(value, field, 128);
+    if (!SAFE_SUBJECT_ID.test(armId)) {
+        fail(
+            MEASUREMENT_ERROR_CODES.PARSE_SCHEMA,
+            `${field} is not a safe identifier`,
+        );
+    }
+    return armId;
 }
 
 function normalizeBindingObject(value, {
@@ -198,11 +236,11 @@ function normalizeBindingObject(value, {
         );
     }
     const phase = requireBindingString(value.phase, `${field}.phase`, 64);
-    if (phase !== rules.phase) {
+    if (!rules.phases.includes(phase)) {
         fail(
             MEASUREMENT_ERROR_CODES.PARSE_SCHEMA,
             `${field}.phase is inappropriate for role ${role}`,
-            { expected: rules.phase, actual: phase },
+            { expected: rules.phases, actual: phase },
         );
     }
     const deterministicSeed = requireBindingString(
@@ -249,6 +287,16 @@ function normalizeBindingObject(value, {
             `${field}.blockIndex`,
             rules.blockIndex,
         ),
+        armIndex: normalizeBindingIndex(
+            value.armIndex,
+            `${field}.armIndex`,
+            rules.armIndex,
+        ),
+        armId: normalizeBindingArmId(
+            value.armId,
+            `${field}.armId`,
+            rules.armId,
+        ),
         deterministicSeed,
         subjectId,
         environmentIdentity: value.environmentIdentity,
@@ -276,6 +324,7 @@ function normalizeMetrics(metrics) {
         || Object.getPrototypeOf(metrics) !== Object.prototype) {
         fail(MEASUREMENT_ERROR_CODES.PARSE_SCHEMA, "metrics must be a plain object");
     }
+
     if (Object.getOwnPropertySymbols(metrics).length > 0) {
         fail(MEASUREMENT_ERROR_CODES.PARSE_SCHEMA, "metrics must not have symbol keys");
     }
@@ -294,6 +343,57 @@ function normalizeMetrics(metrics) {
                 got: typeof value,
                 stringified: value === undefined ? "undefined" : String(value),
             });
+        }
+        out[key] = value;
+    }
+    return Object.freeze(out);
+}
+
+function normalizeObservables(observables) {
+    if (observables === undefined) return null;
+    if (observables === null
+        || typeof observables !== "object"
+        || Array.isArray(observables)
+        || Object.getPrototypeOf(observables) !== Object.prototype) {
+        fail(
+            MEASUREMENT_ERROR_CODES.PARSE_SCHEMA,
+            "observables must be a plain object",
+        );
+    }
+    const keys = Object.keys(observables);
+    if (keys.length > 4096) {
+        fail(
+            MEASUREMENT_ERROR_CODES.PARSE_SCHEMA,
+            "observables has too many keys",
+        );
+    }
+    const out = {};
+    for (const key of keys.sort()) {
+        if (!METRIC_NAME.test(key) || FORBIDDEN_RECORD_KEYS.has(key)) {
+            fail(
+                MEASUREMENT_ERROR_CODES.PARSE_SCHEMA,
+                `observables key ${JSON.stringify(key)} is not a safe identifier`,
+            );
+        }
+        const value = observables[key];
+        const validString = typeof value === "string"
+            && value.length > 0
+            && value.length <= 128
+            && Buffer.byteLength(value, "utf8") <= 256
+            && !value.includes("\0");
+        if (typeof value === "number") {
+            if (!Number.isFinite(value)) {
+                fail(
+                    MEASUREMENT_ERROR_CODES.PARSE_SCHEMA,
+                    `observables.${key} must be finite`,
+                );
+            }
+        } else if (typeof value !== "boolean" && !validString) {
+            fail(
+                MEASUREMENT_ERROR_CODES.PARSE_SCHEMA,
+                `observables.${key} must be a finite number, boolean, or bounded string`,
+                { got: typeof value },
+            );
         }
         out[key] = value;
     }
@@ -441,6 +541,18 @@ export function parseHarnessResult(raw, options = {}) {
 
     const pass = requireBoolean(parsed.pass, "pass");
     const metrics = normalizeMetrics(parsed.metrics);
+    const observables = normalizeObservables(parsed.observables);
+    if (metrics !== null && observables !== null) {
+        const overlap = Object.keys(metrics).filter((key) =>
+            Object.hasOwn(observables, key));
+        if (overlap.length > 0) {
+            fail(
+                MEASUREMENT_ERROR_CODES.PARSE_SCHEMA,
+                "metrics and observables must not define the same key",
+                { overlap },
+            );
+        }
+    }
     const validationCases = normalizeValidationCases(parsed.validationCases);
     const binding = normalizeBindingObject(parsed, {
         field: "harness result binding",
@@ -482,10 +594,10 @@ export function parseHarnessResult(raw, options = {}) {
     }
 
     if (binding !== null) {
-        if (binding.role !== "calibration" && validationCases !== null) {
+        if (binding.phase !== "calibration" && validationCases !== null) {
             fail(
                 MEASUREMENT_ERROR_CODES.PARSE_SCHEMA,
-                `validationCases is not valid for role ${binding.role}`,
+                `validationCases is not valid for phase ${binding.phase}`,
             );
         }
         if (binding.role !== "impossibility_verifier"
@@ -505,6 +617,7 @@ export function parseHarnessResult(raw, options = {}) {
     const normalized = Object.freeze({
         pass,
         metrics,
+        observables,
         validationCases,
         searchSpaceExhausted,
         impossibilityCertificateHash,
@@ -512,6 +625,8 @@ export function parseHarnessResult(raw, options = {}) {
         phase: binding?.phase ?? null,
         replicateIndex: binding?.replicateIndex ?? null,
         blockIndex: binding?.blockIndex ?? null,
+        armIndex: binding?.armIndex ?? null,
+        armId: binding?.armId ?? null,
         deterministicSeed: binding?.deterministicSeed ?? null,
         subjectId: binding?.subjectId ?? null,
         environmentIdentity: binding?.environmentIdentity ?? null,

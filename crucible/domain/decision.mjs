@@ -6,25 +6,41 @@ import {
     NON_RESULT_CODES,
 } from "./constants.mjs";
 import { impossibilitySearchEvidenceHash } from "./impossibility.mjs";
+import {
+    deriveReplicationSchedule,
+    statisticalSubjectIndex,
+} from "./replication.mjs";
 import { DecisionError, ERROR_CODES } from "./errors.mjs";
 import { detectPlateau, buildSearchCandidateCommand } from "./strategy.mjs";
 import { buildCandidateArchive } from "./archive.mjs";
+import {
+    deriveScientificConfirmationFreeze,
+    deriveScientificConfirmationState,
+    nextScientificConfirmationCommand,
+} from "./confirmation.mjs";
 import {
     assessTargetUnreachableReadiness,
     assessVerifiedResultReadiness,
 } from "./scientific-readiness.mjs";
 import {
+    deriveScientificConclusion,
+    scientificReplaySummary,
+} from "./scientific-replay.mjs";
+import {
     activeCommand,
     boundedSearchExhaustion,
+    candidateCohortState,
     currentValidationEvidence,
     impossibilityEvidenceItems,
     latestUnhandledStopRequest,
     latestApplicableImpossibilityEvidence,
-    qualifyingCandidateEvidence,
+    qualifyingCandidateCohort,
     qualifyingUnreachableEvidence,
     qualifyingValidationEvidence,
     searchProgress,
     uncommittedObservation,
+    validationAttemptIndexes,
+    validationEvidenceItems,
 } from "./state.mjs";
 
 const TERMINAL_RECEIPT_ROOTS_HASH_ALGORITHM =
@@ -38,7 +54,7 @@ const TERMINAL_BASIS_HASH_ALGORITHM =
 const TERMINAL_STRATEGY_HISTORY_HASH_ALGORITHM =
     "sha256:crucible-terminal-strategy-history-v1";
 const TERMINAL_EVIDENCE_CLOSURE_HASH_ALGORITHM =
-    "sha256:crucible-terminal-evidence-closure-v1";
+    "sha256:crucible-terminal-evidence-closure-v2";
 
 function nextCommandId(aggregate) {
     return `cmd-${String(aggregate.commandOrder.length + 1).padStart(6, "0")}`;
@@ -53,7 +69,7 @@ function budgetIsExhausted(aggregate) {
     return budget !== null && aggregate.commandOrder.length >= budget;
 }
 
-function budgetRecommendation(aggregate, reason) {
+function budgetRecommendation(aggregate, reason, details = null) {
     const budget = commandBudget(aggregate.contract);
     const payload = {
         code: NON_RESULT_CODES.BUDGET_EXHAUSTED_INCONCLUSIVE,
@@ -62,6 +78,7 @@ function budgetRecommendation(aggregate, reason) {
         commandBudget: budget,
         maxRounds: aggregate.contract.maxRounds,
         sourceStopRequestSeq: null,
+        ...(details === null ? {} : { scientificState: details }),
     };
     return {
         kind: "NON_RESULT",
@@ -99,23 +116,40 @@ function impossibilityNonResultRecommendation(aggregate, evidence) {
     };
 }
 
-function scientificConfirmationRecommendation(
+function scientificConfirmationFailureRecommendation(
     aggregate,
-    incumbent,
+    cohortEvidence,
+    cohort,
     basis,
-    readiness = assessVerifiedResultReadiness(aggregate, incumbent),
+    readiness = assessVerifiedResultReadiness(aggregate, cohort),
+    reason =
+        "The frozen provisional cohort did not independently satisfy confirmation and challenge requirements.",
 ) {
+    const candidateIds = cohortEvidence.map((evidence) => evidence.candidateId);
+    const evidenceIds = cohortEvidence.map((evidence) => evidence.evidenceId);
+    const evidenceHashes = cohortEvidence.map(
+        (evidence) => evidence.commitEventHash,
+    );
     const payload = {
-        code: NON_RESULT_CODES.SCIENTIFIC_CONFIRMATION_REQUIRED,
-        reason:
-            "Search evidence identified an incumbent, but trusted confirmation, challenge, and any required prediction evaluations are not closed.",
+        code: NON_RESULT_CODES.SCIENTIFIC_CONFIRMATION_FAILED,
+        reason,
         commandCount: aggregate.commandOrder.length,
         commandBudget: commandBudget(aggregate.contract),
         maxRounds: aggregate.contract.maxRounds,
         sourceStopRequestSeq: null,
-        candidateId: incumbent.candidateId,
-        evidenceId: incumbent.evidenceId,
-        evidenceHash: incumbent.commitEventHash,
+        cohortStatus: cohort.status,
+        candidateIds,
+        evidenceIds,
+        evidenceHashes,
+        cohortComparisonHash: cohort.comparisonHash,
+        relationEvidenceHash: cohort.relationEvidenceHash,
+        ...(cohort.status === "UNIQUE_BEST"
+            ? {
+                candidateId: cohortEvidence[0].candidateId,
+                evidenceId: cohortEvidence[0].evidenceId,
+                evidenceHash: cohortEvidence[0].commitEventHash,
+            }
+            : {}),
         basis,
         readiness,
     };
@@ -124,6 +158,41 @@ function scientificConfirmationRecommendation(
         ...payload,
         event: {
             type: EVENT_TYPES.NON_RESULT_RECORDED,
+            payload,
+        },
+    };
+}
+
+function freezeScientificConfirmationRecommendation(
+    aggregate,
+    cohortEvidence,
+    cohort,
+    basis,
+) {
+    let payload;
+    try {
+        payload = deriveScientificConfirmationFreeze({
+            aggregate,
+            cohort,
+            cohortEvidence,
+            basis,
+        });
+    } catch (error) {
+        return scientificConfirmationFailureRecommendation(
+            aggregate,
+            cohortEvidence,
+            cohort,
+            basis,
+            assessVerifiedResultReadiness(aggregate, cohort),
+            error?.message
+                ?? "The provisional cohort cannot fit the frozen confirmation allocation.",
+        );
+    }
+    return {
+        kind: "DECISION",
+        decision: "SCIENTIFIC_CONFIRMATION_FROZEN",
+        event: {
+            type: EVENT_TYPES.SCIENTIFIC_CONFIRMATION_FROZEN,
             payload,
         },
     };
@@ -173,7 +242,7 @@ function projectArchiveEvidence(evidence) {
     };
 }
 
-function terminalEvidenceClosure(
+export function deriveTerminalEvidenceClosure(
     aggregate,
     {
         basis,
@@ -181,6 +250,12 @@ function terminalEvidenceClosure(
         decisiveEvidence = null,
     },
 ) {
+    const decisiveEvidenceItems = Array.isArray(decisiveEvidence)
+        ? decisiveEvidence
+        : decisiveEvidence === null
+            ? []
+            : [decisiveEvidence];
+    const candidateCohort = candidateCohortState(aggregate);
     const validation = currentValidationEvidence(aggregate);
     const receiptRoots = aggregate.evidenceOrder.flatMap((evidenceId) => {
         const evidence = aggregate.evidence[evidenceId];
@@ -234,7 +309,10 @@ function terminalEvidenceClosure(
         validation: evidenceReference(validation),
         decisive: {
             kind: decisiveKind,
-            evidence: decisiveEvidence === null ? null : evidenceReference(decisiveEvidence),
+            evidence: decisiveEvidenceItems.length === 1
+                ? evidenceReference(decisiveEvidenceItems[0])
+                : null,
+            cohort: decisiveEvidenceItems.map(evidenceReference),
         },
         termination: {
             kind: basis.kind,
@@ -271,6 +349,38 @@ function terminalEvidenceClosure(
                 TERMINAL_ARCHIVE_HASH_ALGORITHM,
             ),
         },
+        scientificReplay: scientificReplaySummary(
+            aggregate.scientificReplay,
+        ),
+        scientificConfirmation:
+            aggregate.scientificReplay?.confirmationState ?? null,
+        candidateCohort: decisiveKind === "candidate_cohort"
+            ? candidateCohort
+            : null,
+        relationEvidence: decisiveKind === "candidate_cohort"
+            ? {
+                comparisonHash: candidateCohort?.comparisonHash ?? null,
+                relationEvidenceHash:
+                    candidateCohort?.relationEvidenceHash ?? null,
+                status: candidateCohort?.status ?? null,
+                decisiveRelations:
+                    candidateCohort?.decisiveRelations ?? [],
+            }
+            : null,
+        scientificConclusion: decisiveKind === "winner"
+            && decisiveEvidenceItems.length === 1
+            ? deriveScientificConclusion(
+                aggregate,
+                decisiveEvidenceItems[0].evidenceId,
+            )
+            : null,
+        scientificConclusions: decisiveKind === "candidate_cohort"
+            ? decisiveEvidenceItems.map((evidence) =>
+                deriveScientificConclusion(
+                    aggregate,
+                    evidence.evidenceId,
+                ))
+            : [],
     };
     return {
         ...core,
@@ -278,34 +388,57 @@ function terminalEvidenceClosure(
     };
 }
 
-function verifiedRecommendation(aggregate, incumbent, basis) {
-    const readiness = assessVerifiedResultReadiness(aggregate, incumbent);
+function verifiedRecommendation(aggregate, cohortEvidence, cohort, basis) {
+    const readiness = assessVerifiedResultReadiness(aggregate, cohort);
     if (!readiness.ready) {
-        return scientificConfirmationRecommendation(
+        return scientificConfirmationFailureRecommendation(
             aggregate,
-            incumbent,
+            cohortEvidence,
+            cohort,
             basis,
             readiness,
         );
     }
+    const candidateIds = cohortEvidence.map((evidence) => evidence.candidateId);
+    const evidenceIds = cohortEvidence.map((evidence) => evidence.evidenceId);
+    const evidenceHashes = cohortEvidence.map(
+        (evidence) => evidence.commitEventHash,
+    );
     const payload = {
         decision: "VERIFIED_RESULT",
-        candidateId: incumbent.candidateId,
-        evidenceId: incumbent.evidenceId,
-        evidenceHash: incumbent.commitEventHash,
+        cohortStatus: cohort.status,
+        candidateIds,
+        evidenceIds,
+        evidenceHashes,
+        cohortComparisonHash: cohort.comparisonHash,
+        relationEvidenceHash: cohort.relationEvidenceHash,
+        ...(cohort.status === "UNIQUE_BEST"
+            ? {
+                candidateId: cohortEvidence[0].candidateId,
+                evidenceId: cohortEvidence[0].evidenceId,
+                evidenceHash: cohortEvidence[0].commitEventHash,
+            }
+            : {
+                candidateId: null,
+                evidenceId: null,
+                evidenceHash: null,
+            }),
         contractHash: aggregate.contractHash,
         basis,
-        evidenceClosure: terminalEvidenceClosure(aggregate, {
+        evidenceClosure: deriveTerminalEvidenceClosure(aggregate, {
             basis,
-            decisiveKind: "winner",
-            decisiveEvidence: incumbent,
+            decisiveKind: "candidate_cohort",
+            decisiveEvidence: cohortEvidence,
         }),
     };
     return {
         kind: "TERMINAL",
         decision: "VERIFIED_RESULT",
-        candidateId: incumbent.candidateId,
-        evidenceId: incumbent.evidenceId,
+        cohortStatus: cohort.status,
+        candidateIds,
+        evidenceIds,
+        candidateId: payload.candidateId,
+        evidenceId: payload.evidenceId,
         basis,
         event: {
             type: EVENT_TYPES.VERIFIED_RESULT,
@@ -351,7 +484,7 @@ function unreachableRecommendation(aggregate) {
         candidateCount: verifierCommand.request.trigger.candidateCount,
         candidateEvidenceHash: verifierCommand.request.trigger.candidateEvidenceHash,
     };
-    const evidenceClosure = terminalEvidenceClosure(aggregate, {
+    const evidenceClosure = deriveTerminalEvidenceClosure(aggregate, {
         basis,
         decisiveKind: "impossibility_certificate",
         decisiveEvidence: evidence,
@@ -389,18 +522,130 @@ function pauseRecommendation(stopRequest) {
     };
 }
 
+function validationSeries(contract, contractHash) {
+    const groups = new Map();
+    for (const role of contract.validationRoles) {
+        const spec = contract.harnessSuite.roles[role];
+        const identity = hashCanonical({
+            harnessId: spec.harnessId,
+            harnessEntryHash: spec.harnessEntryHash,
+            executableHash: spec.executableHash,
+            parser: spec.parser,
+            dependencies: spec.dependencies,
+            configHash: spec.configHash,
+            observableSchemaHash: spec.observableSchemaHash,
+            sandboxIdentity: spec.sandboxIdentity,
+        }, "sha256:crucible-validation-execution-role-v1");
+        const group = groups.get(identity) ?? [];
+        group.push(role);
+        groups.set(identity, group);
+    }
+    let ordinal = 0;
+    return [...groups.entries()].flatMap(([executionIdentity, roles]) => {
+        roles.sort();
+        const role = roles[0];
+        return contract.validationCases.map((validationCase) => {
+            const seriesOrdinal = ordinal;
+            ordinal += 1;
+            const subjectId = `validation-${seriesOrdinal}-${validationCase.id}`;
+            const subjectIdentity = hashCanonical({
+                contractHash,
+                executionIdentity,
+                coveredRoles: roles,
+                caseId: validationCase.id,
+                artifactHash: validationCase.artifactHash,
+            }, "sha256:crucible-validation-subject-v1");
+            return {
+                role,
+                coveredRoles: roles,
+                caseId: validationCase.id,
+                artifactHash: validationCase.artifactHash,
+                replicationSchedule: deriveReplicationSchedule({
+                    contractHash,
+                    statisticalPolicy: contract.statisticalPolicy,
+                    subject: {
+                        kind: "calibration",
+                        index: statisticalSubjectIndex(
+                            "calibration",
+                            seriesOrdinal,
+                        ),
+                        id: subjectId,
+                        identity: subjectIdentity,
+                    },
+                    arms: [{
+                        armId: "candidate",
+                        armIndex: 0,
+                        logicalSubjectId: subjectId,
+                        subjectKind: "calibration",
+                        subjectIdentity,
+                    }],
+                }),
+            };
+        });
+    });
+}
+
+function nextValidationAttemptIndex(aggregate) {
+    const occupied = new Set(validationAttemptIndexes(aggregate));
+    for (
+        let index = 0;
+        index < aggregate.contract.statisticalPolicy.maxBlocks;
+        index += 1
+    ) {
+        if (!occupied.has(index)) return index;
+    }
+    return null;
+}
+
+function validationInconclusiveRecommendation(aggregate) {
+    const attempts = validationEvidenceItems(aggregate);
+    const latest = attempts.at(-1) ?? null;
+    const payload = {
+        code: NON_RESULT_CODES.VALIDATION_INCONCLUSIVE,
+        reason:
+            "The operator-signed calibration suite did not resolve every required role/case claim to its expected state within the frozen block limit.",
+        commandCount: aggregate.commandOrder.length,
+        commandBudget: commandBudget(aggregate.contract),
+        maxRounds: aggregate.contract.maxRounds,
+        sourceStopRequestSeq: null,
+        validationAttemptCount: attempts.length,
+        maxValidationAttempts: aggregate.contract.statisticalPolicy.maxBlocks,
+        latestValidationEvidenceId: latest?.evidenceId ?? null,
+        latestValidationEvidenceHash: latest?.commitEventHash ?? null,
+    };
+    return {
+        kind: "NON_RESULT",
+        ...payload,
+        event: {
+            type: EVENT_TYPES.NON_RESULT_RECORDED,
+            payload,
+        },
+    };
+}
+
 function reserveCommandRecommendation(aggregate) {
     const commandId = nextCommandId(aggregate);
     const validationEvidence = currentValidationEvidence(aggregate);
     let command;
     if (validationEvidence === null) {
+        const attemptIndex = nextValidationAttemptIndex(aggregate);
+        if (attemptIndex === null) {
+            throw new DecisionError(
+                ERROR_CODES.NO_DECISION_EVENT,
+                "Validation attempts are exhausted",
+            );
+        }
         command = {
             kind: "run_validation",
-            harnessRole: "calibration",
-            harnessId: aggregate.contract.harnessSuite.roles.calibration.harnessId,
+            harnessRole: "suite_calibration",
+            harnessId: aggregate.contract.harnessSuite.id,
             parserVersion:
                 aggregate.contract.harnessSuite.roles.calibration.parser.version,
-            validationCases: aggregate.contract.validationCases,
+            attemptIndex,
+            validationSeries: validationSeries(
+                aggregate.contract,
+                aggregate.contractHash,
+            ),
         };
     } else {
         command = buildSearchCandidateCommand(aggregate, searchProgress(aggregate));
@@ -411,6 +656,22 @@ function reserveCommandRecommendation(aggregate) {
             );
         }
     }
+    return {
+        kind: "COMMAND",
+        commandId,
+        command,
+        event: {
+            type: EVENT_TYPES.COMMAND_RESERVED,
+            payload: {
+                commandId,
+                command,
+            },
+        },
+    };
+}
+
+function reserveFrozenScientificCommand(aggregate, command) {
+    const commandId = nextCommandId(aggregate);
     return {
         kind: "COMMAND",
         commandId,
@@ -571,6 +832,9 @@ export function decideNext(aggregate) {
     const validationCurrent = currentValidation !== null
         && latestCompletion?.evidenceId === currentValidation.evidenceId;
     if (!validationCurrent) {
+        if (nextValidationAttemptIndex(aggregate) === null) {
+            return validationInconclusiveRecommendation(aggregate);
+        }
         if (budgetIsExhausted(aggregate)) {
             return budgetRecommendation(
                 aggregate,
@@ -580,7 +844,10 @@ export function decideNext(aggregate) {
         return reserveCommandRecommendation(aggregate);
     }
 
-    const incumbent = qualifyingCandidateEvidence(aggregate);
+    const candidateCohort = candidateCohortState(aggregate);
+    const cohortEvidence = qualifyingCandidateCohort(aggregate);
+    const supportedCohort = candidateCohort?.resolved === true
+        && cohortEvidence.length > 0;
 
     const unreachable = unreachableRecommendation(aggregate);
     if (unreachable !== null) {
@@ -592,7 +859,6 @@ export function decideNext(aggregate) {
         (evidence) => evidence.acceptanceSatisfied === true,
     );
     if (aggregate.contract.hypothesisTopology === "certified_impossibility"
-        && incumbent === null
         && !targetObserved
         && progress.roundsExhausted) {
         const certificateEvidence = latestApplicableImpossibilityEvidence(aggregate);
@@ -600,46 +866,154 @@ export function decideNext(aggregate) {
             return impossibilityNonResultRecommendation(aggregate, certificateEvidence);
         }
     }
+
+    const frozenConfirmation = aggregate.confirmation?.freeze?.payload ?? null;
+    if (frozenConfirmation !== null) {
+        const confirmationState = deriveScientificConfirmationState(aggregate);
+        const frozenEvidence = frozenConfirmation.members
+            .map((member) => aggregate.evidence[member.evidenceId] ?? null)
+            .filter((evidence) => evidence !== null);
+        const frozenCohort = {
+            status: frozenConfirmation.discoveryClosure.cohortStatus,
+            resolved: true,
+            comparisonHash:
+                frozenConfirmation.discoveryClosure.cohortComparisonHash,
+            relationEvidenceHash:
+                frozenConfirmation.discoveryClosure.relationEvidenceHash,
+            cohort: frozenConfirmation.members,
+            provisionalWinner:
+                frozenConfirmation.discoveryClosure.cohortStatus === "UNIQUE_BEST"
+                    ? frozenConfirmation.members[0]
+                    : null,
+        };
+        if (confirmationState.failed) {
+            return scientificConfirmationFailureRecommendation(
+                aggregate,
+                frozenEvidence,
+                frozenCohort,
+                frozenConfirmation.discoveryClosure.basis,
+                assessVerifiedResultReadiness(aggregate, frozenCohort),
+                "At least one frozen cohort member was refuted, invalid, unresolved at its block limit, invalidated, or no longer bound to the frozen discovery closure.",
+            );
+        }
+        const scientificCommand =
+            nextScientificConfirmationCommand(aggregate);
+        if (scientificCommand !== null) {
+            if (budgetIsExhausted(aggregate)) {
+                return scientificConfirmationFailureRecommendation(
+                    aggregate,
+                    frozenEvidence,
+                    frozenCohort,
+                    frozenConfirmation.discoveryClosure.basis,
+                    assessVerifiedResultReadiness(aggregate, frozenCohort),
+                    "The declared command budget was exhausted after discovery froze and before every confirmation/challenge role closed.",
+                );
+            }
+            return reserveFrozenScientificCommand(
+                aggregate,
+                scientificCommand,
+            );
+        }
+        if (confirmationState.ready) {
+            return verifiedRecommendation(
+                aggregate,
+                cohortEvidence,
+                candidateCohort,
+                {
+                    kind: "scientific_confirmation_closed",
+                    discoveryBasis:
+                        frozenConfirmation.discoveryClosure.basis,
+                    confirmationFreezeHash:
+                        frozenConfirmation.freezeHash,
+                    confirmationClosureHash:
+                        confirmationState.closureHash,
+                },
+            );
+        }
+        return scientificConfirmationFailureRecommendation(
+            aggregate,
+            frozenEvidence,
+            frozenCohort,
+            frozenConfirmation.discoveryClosure.basis,
+            assessVerifiedResultReadiness(aggregate, frozenCohort),
+            "The frozen confirmation protocol reached an impossible incomplete state.",
+        );
+    }
+
     if (budgetIsExhausted(aggregate)) {
-        return incumbent === null
+        return !supportedCohort
             ? budgetRecommendation(
                 aggregate,
-                "Declared command budget was exhausted without a qualifying incumbent.",
+                candidateCohort?.tieResolution?.required === true
+                    ? "Declared command budget was exhausted before the preregistered candidate relations resolved."
+                    : "Declared command budget was exhausted without a supported candidate cohort.",
+                candidateCohort,
             )
-            : verifiedRecommendation(aggregate, incumbent, {
-                kind: "budget_exhausted_with_incumbent",
-                commandCount: aggregate.commandOrder.length,
-                commandBudget: commandBudget(aggregate.contract),
-            });
+            : freezeScientificConfirmationRecommendation(
+                aggregate,
+                cohortEvidence,
+                candidateCohort,
+                {
+                    kind: "budget_exhausted_with_supported_cohort",
+                    commandCount: aggregate.commandOrder.length,
+                    commandBudget: commandBudget(aggregate.contract),
+                    cohortComparisonHash:
+                        candidateCohort.comparisonHash,
+                    relationEvidenceHash:
+                        candidateCohort.relationEvidenceHash,
+                },
+            );
     }
 
     if (aggregate.contract.hypothesisTopology === "certified_impossibility"
-        && incumbent === null
         && !targetObserved
         && progress.roundsExhausted) {
         return reserveImpossibilityRecommendation(aggregate, progress);
     }
 
     if (progress.roundsExhausted) {
-        return incumbent === null
+        return !supportedCohort
             ? budgetRecommendation(
                 aggregate,
-                "Frozen search rounds were exhausted without a qualifying incumbent.",
+                candidateCohort?.tieResolution?.exhausted === true
+                    ? "Frozen search and preregistered tie-resolution blocks were exhausted without a supported unique or equivalent cohort."
+                    : "Frozen search rounds were exhausted without a supported candidate cohort.",
+                candidateCohort,
             )
-            : verifiedRecommendation(aggregate, incumbent, {
-                kind: "rounds_exhausted_with_incumbent",
-                maxRounds: aggregate.contract.maxRounds,
-            });
+            : freezeScientificConfirmationRecommendation(
+                aggregate,
+                cohortEvidence,
+                candidateCohort,
+                {
+                    kind: "rounds_exhausted_with_supported_cohort",
+                    maxRounds: aggregate.contract.maxRounds,
+                    cohortStatus: candidateCohort.status,
+                    cohortComparisonHash:
+                        candidateCohort.comparisonHash,
+                    relationEvidenceHash:
+                        candidateCohort.relationEvidenceHash,
+                },
+            );
     }
 
     const plateau = detectPlateau(aggregate);
-    if (incumbent !== null && plateau.plateauComplete) {
-        return verifiedRecommendation(aggregate, incumbent, {
-            kind: "plateau_after_mandatory_escape",
-            triggerRound: plateau.triggerRound,
-            escapeRoundsCompleted: plateau.escapeRoundsCompleted,
-            mandatoryEscapeRounds: plateau.escapeRoundsRequired,
-        });
+    if (supportedCohort && plateau.plateauComplete) {
+        return freezeScientificConfirmationRecommendation(
+            aggregate,
+            cohortEvidence,
+            candidateCohort,
+            {
+                kind: "plateau_after_mandatory_escape",
+                triggerRound: plateau.triggerRound,
+                escapeRoundsCompleted: plateau.escapeRoundsCompleted,
+                mandatoryEscapeRounds: plateau.escapeRoundsRequired,
+                cohortStatus: candidateCohort.status,
+                cohortComparisonHash:
+                    candidateCohort.comparisonHash,
+                relationEvidenceHash:
+                    candidateCohort.relationEvidenceHash,
+            },
+        );
     }
 
     return reserveCommandRecommendation(aggregate);

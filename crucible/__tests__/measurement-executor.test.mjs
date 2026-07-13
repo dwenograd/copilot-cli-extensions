@@ -77,6 +77,7 @@ function scriptedProcess({
     hang = false,
 } = {}) {
     const terminations = [];
+    const launches = [];
     let child = null;
     let closed = false;
     const close = (code, signal) => {
@@ -89,7 +90,8 @@ function scriptedProcess({
     return {
         terminations,
         adapter: {
-            spawn() {
+            spawn(executable, argv, options) {
+                launches.push({ executable, argv, options });
                 child = new EventEmitter();
                 child.pid = 6101;
                 child.stdout = new PassThrough();
@@ -109,10 +111,11 @@ function scriptedProcess({
                 return true;
             },
         },
+        launches,
     };
 }
 
-function runFixture(fixture, process, options = {}) {
+function runFixture(fixture, process, options = {}, runInput = {}) {
     const executor = createMeasurementExecutor({
         allowlist: fixture.allowlist,
         processAdapter: process.adapter,
@@ -124,6 +127,7 @@ function runFixture(fixture, process, options = {}) {
         verifiedEntry: fixture.verifiedEntry,
         candidateSnapshot: fixture.candidateSnapshot,
         ...fixedIds(),
+        ...runInput,
     });
 }
 
@@ -138,6 +142,7 @@ describe("MeasurementExecutor fast component coverage", () => {
             pass: true,
             metrics: { component: 1 },
         });
+
         expect(result.receipt).toMatchObject({
             version: 5,
             exit: { code: 0, signal: null, timedOut: false },
@@ -148,6 +153,59 @@ describe("MeasurementExecutor fast component coverage", () => {
         expect(process.terminations).toEqual([]);
         expect(fs.readdirSync(fixture.root)
             .filter((name) => name.startsWith(".crucible-stage-"))).toEqual([]);
+    });
+
+    it("passes deterministic block/arm bindings in argv, env, and receipt", async () => {
+        const fixture = makeFixture("binding");
+        const process = scriptedProcess();
+        const measurementBinding = {
+            role: "search",
+            phase: "search",
+            replicateIndex: 3,
+            blockIndex: 3,
+            armIndex: 1,
+            armId: "control",
+            deterministicSeed:
+                `sha256:crucible-replication-arm-seed-v1:${"a".repeat(64)}`,
+            subjectId: "rep-b000003-a01-abcdef123456",
+            environmentIdentity:
+                `sha256:crucible-harness-environment-v4:${"b".repeat(64)}`,
+            suiteIdentity:
+                `sha256:crucible-harness-suite-v4:${"c".repeat(64)}`,
+        };
+
+        const result = await runFixture(
+            fixture,
+            process,
+            {},
+            { measurementBinding },
+        );
+
+        expect(result.receipt).toMatchObject({
+            version: 7,
+            ...measurementBinding,
+        });
+        expect(process.launches).toHaveLength(1);
+        const launch = process.launches[0];
+        expect(launch.argv).toEqual(expect.arrayContaining([
+            "--crucible-role=search",
+            "--crucible-replicate-index=3",
+            "--crucible-block-index=3",
+            "--crucible-arm-index=1",
+            "--crucible-arm-id=control",
+            `--crucible-deterministic-seed=${
+                measurementBinding.deterministicSeed
+            }`,
+        ]));
+        expect(launch.options.env).toMatchObject({
+            CRUCIBLE_ROLE: "search",
+            CRUCIBLE_REPLICATE_INDEX: "3",
+            CRUCIBLE_BLOCK_INDEX: "3",
+            CRUCIBLE_ARM_INDEX: "1",
+            CRUCIBLE_ARM_ID: "control",
+            CRUCIBLE_DETERMINISTIC_SEED:
+                measurementBinding.deterministicSeed,
+        });
     });
 
     it("terminates and awaits a synthetic process at the executor timeout", async () => {
