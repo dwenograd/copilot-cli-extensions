@@ -7,6 +7,8 @@ export default defineConfig({
             "crucible/__tests__/domain-enumerands.test.mjs",
             "crucible/__tests__/domain-hypotheses.test.mjs",
             "crucible/__tests__/domain-statistics.test.mjs",
+            "crucible/__tests__/domain-cohort.test.mjs",
+            "crucible/__tests__/domain-confirmation-protocol.test.mjs",
             "crucible/__tests__/domain-archive-strategy.test.mjs",
             "crucible/__tests__/v4-stat-contract.test.mjs",
             "crucible/__tests__/measurement-parser.test.mjs",
