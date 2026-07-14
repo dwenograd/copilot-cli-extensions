@@ -892,7 +892,7 @@ describe("crucible_start lifecycle preflight", () => {
         expect(plan.experimentId).toBe(args.experiment_id);
         expect(plan.hashes).toMatchObject({
             contractHash: expect.stringMatching(/^sha256:crucible-contract-v4:[a-f0-9]{64}$/u),
-            experimentIdentity: expect.stringMatching(/^sha256:crucible-operator-experiment-v5:[a-f0-9]{64}$/u),
+            experimentIdentity: expect.stringMatching(/^sha256:crucible-operator-experiment-v6:[a-f0-9]{64}$/u),
             experimentAuthorityIdentity: expect.stringMatching(/^sha256:crucible-experiment-authority-v1:[a-f0-9]{64}$/u),
             authorityManifestIdentity: expect.stringMatching(/^sha256:crucible-experiment-authority-manifest-v1:[a-f0-9]{64}$/u),
             trustFingerprint: expect.stringMatching(/^sha256:crucible-experiment-public-key-v1:[a-f0-9]{64}$/u),

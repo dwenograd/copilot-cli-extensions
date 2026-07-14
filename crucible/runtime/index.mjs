@@ -130,8 +130,39 @@ export {
     RESOURCE_CATALOG_FILENAME,
     ResourceBroker,
     openResourceBroker,
+    openResourceBrokerFromStateRoot,
+    openResourceBrokerReadOnlyFromStateRoot,
+    readResourceBrokerConfiguration,
     resourceCatalogPath,
 } from "./resource-broker.mjs";
+
+export {
+    SDK_AVAILABILITY_CODES,
+    probeNoninteractiveSdkAvailability,
+} from "./sdk-availability.mjs";
+
+export {
+    createProcessIdentityAdapter,
+    readProcessStartId,
+} from "./process-identity.mjs";
+
+export {
+    RECOVERY_DISCOVERY_CODES,
+    buildRecoveryReservation,
+    classifyRecoveryAggregate,
+    discoverCatalogInvestigations,
+    evaluateRecoveryBrokerCapacity,
+    inspectRecoveryInvestigation,
+    recoveryReservationForCommand,
+    verifyInvestigationArtifactIntegrity,
+} from "./discovery.mjs";
+
+export {
+    RECOVERY_DAEMON_CODES,
+    recoveryDaemonPublicSummary,
+    runRecoveryCycle,
+    runRecoveryDaemon,
+} from "./recovery-daemon.mjs";
 
 export {
     SUBMIT_CANDIDATE_TOOL_NAME,

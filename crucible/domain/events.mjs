@@ -25,6 +25,7 @@ import {
     EVENT_VOCABULARY,
     EXTERNAL_EVENT_TYPES,
     IMPOSSIBILITY_CERTIFICATE_VERSION,
+    NON_RESULT_CODES,
     SOURCE_KINDS,
 } from "./constants.mjs";
 import { decideNext } from "./decision.mjs";
@@ -1089,6 +1090,31 @@ export function normalizeStopRequestedPayload(payload) {
     });
 }
 
+export function normalizeStorageBudgetExhaustedPayload(payload) {
+    const input = requirePlainObject(payload, "payload");
+    const expectedKeys = [
+        "globalBytes",
+        "globalLimitBytes",
+        "investigationBytes",
+        "investigationLimitBytes",
+        "requestedBytes",
+    ];
+    if (!canonicalEqual(Object.keys(input).sort(), expectedKeys)) {
+        throw new TransitionError(
+            ERROR_CODES.INVALID_EVENT,
+            "storage-budget exhaustion payload must contain only aggregate byte telemetry",
+        );
+    }
+    const output = {};
+    for (const key of expectedKeys) {
+        output[key] = requireNonNegativeInteger(
+            input[key],
+            `storage.${key}`,
+        );
+    }
+    return immutableCanonical(output);
+}
+
 export function normalizeExternalEventPayload(type, payload, aggregate = null, options = {}) {
     switch (type) {
         case EVENT_TYPES.CAPABILITY_EPOCH_RECORDED:
@@ -1099,6 +1125,8 @@ export function normalizeExternalEventPayload(type, payload, aggregate = null, o
             return normalizeCommandObservedPayload(payload, aggregate, options);
         case EVENT_TYPES.EVIDENCE_INVALIDATED:
             return normalizeEvidenceInvalidatedPayload(payload);
+        case EVENT_TYPES.STORAGE_BUDGET_EXHAUSTED:
+            return normalizeStorageBudgetExhaustedPayload(payload);
         case EVENT_TYPES.STOP_REQUESTED:
             return normalizeStopRequestedPayload(payload);
         default:
@@ -1208,6 +1236,30 @@ export function constructInvestigationResumedEvent(aggregate) {
         pausedSeq: aggregate.pause.seq,
         sourceStopRequestSeq: aggregate.pause.sourceStopRequestSeq,
     });
+}
+
+export function constructStorageBudgetNonResultEvent(aggregate) {
+    if (aggregate?.storageBudgetExhaustion === null
+        || aggregate?.storageBudgetExhaustion === undefined) {
+        throw new TransitionError(
+            ERROR_CODES.ILLEGAL_TRANSITION,
+            "Storage-budget non-result requires a persisted exhaustion signal",
+        );
+    }
+    const recommendation = decideNext(aggregate);
+    if (recommendation.code
+        !== NON_RESULT_CODES.STORAGE_BUDGET_INCONCLUSIVE
+        || recommendation.event?.type !== EVENT_TYPES.NON_RESULT_RECORDED) {
+        throw new TransitionError(
+            ERROR_CODES.UNAUTHORIZED_DECISION,
+            "Storage-budget signal is not the current deterministic decision",
+        );
+    }
+    return makeEnvelope(
+        aggregate,
+        recommendation.event.type,
+        recommendation.event.payload,
+    );
 }
 
 export function createExternalEvent(aggregate, type, payload, options = {}) {

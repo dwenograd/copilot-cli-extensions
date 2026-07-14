@@ -109,6 +109,74 @@ function openAdapter(label) {
 }
 
 describe("Crucible domain repository adapter fast component coverage", () => {
+    it("persists storage exhaustion as a non-result without terminal authority", () => {
+        const { repository, adapter } = openAdapter("storage-budget");
+        try {
+            const appended = adapter.appendStorageBudgetNonResult({
+                investigationBytes: 100,
+                investigationLimitBytes: 100,
+                globalBytes: 200,
+                globalLimitBytes: 200,
+                requestedBytes: 1,
+            });
+            expect(appended.aggregate).toMatchObject({
+                status: "non_result",
+                terminal: null,
+                nonResults: [{
+                    code: "STORAGE_BUDGET_INCONCLUSIVE",
+                    storage: {
+                        investigationBytes: 100,
+                        globalBytes: 200,
+                    },
+                }],
+            });
+            expect(adapter.appendStorageBudgetNonResult({
+                investigationBytes: 100,
+                investigationLimitBytes: 100,
+                globalBytes: 200,
+                globalLimitBytes: 200,
+                requestedBytes: 1,
+            }).domainEvent).toBeNull();
+        } finally {
+            repository.close();
+        }
+    });
+
+    it("replays the same v4 aggregate after the repository opening event is sealed", () => {
+        const { repository, adapter } = openAdapter("segments");
+        try {
+            const before = adapter.replay();
+            const rotated = adapter.rotateSegmentsAtQuiescence({
+                includeOperational: false,
+                eventThreshold: 1,
+                byteThreshold: Number.POSITIVE_INFINITY,
+            });
+            expect(rotated).toMatchObject({
+                domain: {
+                    rotated: true,
+                    entry: {
+                        investigationId: adapter.investigationId,
+                        firstSeq: 1,
+                        lastSeq: 1,
+                        domainVersion: 4,
+                    },
+                },
+                operational: null,
+            });
+            const after = adapter.replay();
+            expect(after.aggregate).toEqual(before.aggregate);
+            expect(after.domainEvents).toEqual(before.domainEvents);
+            expect(after.repositoryReport.ok).toBe(true);
+            expect(repository.getSegmentCatalog({ verify: true }).segments)
+                .toHaveLength(1);
+            const appended = adapter.appendKernelDecision();
+            expect(appended.domainEvent.seq).toBe(2);
+            expect(adapter.replay().aggregate).toEqual(appended.aggregate);
+        } finally {
+            repository.close();
+        }
+    });
+
     it("requires the opaque verified capability and persists only its signed envelope", () => {
         const root = fs.mkdtempSync(
             path.join(HERE, ".runtime-adapter-capability-"),

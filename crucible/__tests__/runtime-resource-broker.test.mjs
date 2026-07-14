@@ -8,6 +8,7 @@ import { DatabaseSync } from "../persistence/sqlite.mjs";
 import {
     ERROR_CODES,
     RESOURCE_CATALOG_SCHEMA_FINGERPRINT,
+    RESOURCE_CATALOG_SCHEMA_VERSION,
 } from "../persistence/index.mjs";
 import {
     RESOURCE_BROKER_CONFIG_VERSION,
@@ -76,6 +77,7 @@ function brokerConfig(overrides = {}) {
         outputBytes: 1_000,
         receiptBytes: 1_000,
         casBytes: 2_000,
+        storageBytes: 4_000,
         modelCostUnits: 100_000,
         ...(overrides.capacities ?? {}),
     };
@@ -104,6 +106,7 @@ function investigationLimits(config, overrides = {}) {
         outputBytes: Math.min(500, config.capacities.outputBytes),
         receiptBytes: Math.min(500, config.capacities.receiptBytes),
         casBytes: Math.min(1_000, config.capacities.casBytes),
+        storageBytes: Math.min(2_000, config.capacities.storageBytes),
         modelCostUnits: Math.min(50_000, config.capacities.modelCostUnits),
         ...overrides,
     };
@@ -237,7 +240,7 @@ describe("resource broker configuration and catalog", () => {
                 config,
             ));
         expect(broker.verifyIntegrity()).toEqual({
-            version: 1,
+            version: RESOURCE_CATALOG_SCHEMA_VERSION,
             fingerprint: RESOURCE_CATALOG_SCHEMA_FINGERPRINT,
         });
 
@@ -246,7 +249,7 @@ describe("resource broker configuration and catalog", () => {
             expect(raw.prepare("PRAGMA journal_mode").get().journal_mode)
                 .toBe("wal");
             expect(raw.prepare("PRAGMA user_version").get().user_version)
-                .toBe(1);
+                .toBe(RESOURCE_CATALOG_SCHEMA_VERSION);
             expect(raw.prepare(`
                 SELECT value
                 FROM schema_meta
@@ -260,7 +263,7 @@ describe("resource broker configuration and catalog", () => {
             ).get().config_fingerprint).toBe(broker.configFingerprint);
             expect(raw.prepare(
                 "SELECT COUNT(*) AS count FROM resource_definitions",
-            ).get().count).toBe(8);
+            ).get().count).toBe(9);
         } finally {
             raw.close();
         }
@@ -533,6 +536,93 @@ describe("transactional admission and fencing", () => {
             deficit.scope === "global"
             && deficit.resourceKey === "output_bytes")).toBe(true);
         expect(broker.listActiveLeases()).toEqual([]);
+        broker.close();
+    });
+
+    it("admits the exact storage boundary and pauses before one byte beyond it", () => {
+        const root = makeRoot("storage-boundary");
+        const config = brokerConfig({
+            capacities: { storageBytes: 100 },
+        });
+        const broker = openBroker({ stateRoot: root, config });
+        register(broker, "storage-inv", investigationLimits(config, {
+            storageBytes: 100,
+        }));
+
+        const exact = acquire(
+            broker,
+            "storage-inv",
+            { storageBytes: 100 },
+            {
+                attemptId: "storage-exact",
+                logicalEffectId: "storage-exact",
+            },
+        );
+        expect(exact.status).toBe("acquired");
+        broker.release({
+            lease: exact.lease,
+            usage: { storageBytes: 100 },
+        });
+        expect(broker.getStorageBudgetSnapshot("storage-inv"))
+            .toMatchObject({
+                investigation: {
+                    committedUnits: 100,
+                    availableUnits: 0,
+                },
+                global: {
+                    committedUnits: 100,
+                    availableUnits: 0,
+                },
+            });
+
+        broker.reconcileStorageUsage({
+            investigationId: "storage-inv",
+            supervisorGeneration: 1,
+            runnerIncarnation: "incarnation-storage-inv-1",
+            actualBytes: 40,
+            reconciliationId: "storage-maintenance-1",
+        });
+        expect(broker.getStorageBudgetSnapshot("storage-inv"))
+            .toMatchObject({
+                investigation: {
+                    committedUnits: 40,
+                    availableUnits: 60,
+                },
+                global: {
+                    committedUnits: 40,
+                    availableUnits: 60,
+                },
+            });
+        const refill = acquire(
+            broker,
+            "storage-inv",
+            { storageBytes: 60 },
+            {
+                attemptId: "storage-refill",
+                logicalEffectId: "storage-refill",
+            },
+        );
+        expect(refill.status).toBe("acquired");
+        broker.release({
+            lease: refill.lease,
+            usage: { storageBytes: 100 },
+        });
+
+        const beyond = acquire(
+            broker,
+            "storage-inv",
+            { storageBytes: 1 },
+            {
+                attemptId: "storage-beyond",
+                logicalEffectId: "storage-beyond",
+            },
+        );
+        expect(beyond).toMatchObject({
+            status: "pause",
+            deficit: {
+                resourceKey: "storage_bytes",
+            },
+        });
         broker.close();
     });
 

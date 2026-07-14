@@ -61,6 +61,7 @@ import {
     SCHEMA_VERSION,
     configureConnection,
 } from "./schema.mjs";
+import { inspectSegmentStorage } from "./segment-manager.mjs";
 import {
     ArtifactStore,
     openArtifactStoreReadOnly,
@@ -76,6 +77,7 @@ export const BUNDLE_VERSION = 4;
 const INVENTORY_NAME = "inventory.sha256";
 const MANIFEST_NAME = "manifest.json";
 const DB_RELPATH = "db/database.sqlite";
+const SEGMENT_CATALOG_RELPATH = "db/database.segments.json";
 const SNAPSHOT_CONTENT_TYPE = "application/vnd.crucible.snapshot+json";
 const COPY_CHUNK = 1 << 16;
 const MAX_MANIFEST_BYTES = 8 * 2 ** 20;
@@ -117,10 +119,38 @@ const MANIFEST_KEYS = Object.freeze([
     "type",
     "version",
 ]);
+const SEGMENTED_MANIFEST_KEYS = Object.freeze([
+    "algo",
+    "artifacts",
+    "createdAt",
+    "database",
+    "investigation",
+    "metadata",
+    "objects",
+    "scientificReplay",
+    "segments",
+    "snapshots",
+    "type",
+    "version",
+]);
 const DATABASE_KEYS = Object.freeze([
     "path",
     "schemaFingerprint",
     "schemaVersion",
+    "sha256",
+    "size",
+]);
+const SEGMENTS_KEYS = Object.freeze([
+    "catalogGeneration",
+    "catalogPath",
+    "catalogSha256",
+    "catalogSize",
+    "files",
+    "segmentCount",
+]);
+const SEGMENT_FILE_KEYS = Object.freeze([
+    "index",
+    "path",
     "sha256",
     "size",
 ]);
@@ -1298,7 +1328,9 @@ function assertCanonicalObjectId(value, context, ErrorClass = BundleManifestErro
 }
 
 export function validateBundleManifest(value, rawBytes = null) {
-    if (!hasExactKeys(value, MANIFEST_KEYS)
+    const hasLegacyShape = hasExactKeys(value, MANIFEST_KEYS);
+    const hasSegmentedShape = hasExactKeys(value, SEGMENTED_MANIFEST_KEYS);
+    if ((!hasLegacyShape && !hasSegmentedShape)
         || value.type !== BUNDLE_TYPE
         || value.version !== BUNDLE_VERSION
         || value.algo !== ALGO
@@ -1316,7 +1348,7 @@ export function validateBundleManifest(value, rawBytes = null) {
             actualKeys: value && typeof value === "object" && !Array.isArray(value)
                 ? Object.keys(value).sort()
                 : [],
-            expectedKeys: MANIFEST_KEYS,
+            expectedKeys: [MANIFEST_KEYS, SEGMENTED_MANIFEST_KEYS],
         });
     }
     const created = new Date(value.createdAt);
@@ -1333,6 +1365,41 @@ export function validateBundleManifest(value, rawBytes = null) {
         || !Number.isSafeInteger(value.database.size)
         || value.database.size < 0) {
         throw new BundleManifestError("manifest database binding is invalid");
+    }
+    if (hasSegmentedShape) {
+        const segments = value.segments;
+        if (!hasExactKeys(segments, SEGMENTS_KEYS)
+            || segments.catalogPath !== SEGMENT_CATALOG_RELPATH
+            || !HEX64_RE.test(segments.catalogSha256)
+            || !Number.isSafeInteger(segments.catalogSize)
+            || segments.catalogSize < 1
+            || !Number.isSafeInteger(segments.catalogGeneration)
+            || segments.catalogGeneration < 0
+            || !Number.isSafeInteger(segments.segmentCount)
+            || segments.segmentCount < 0
+            || segments.segmentCount !== segments.catalogGeneration
+            || !Array.isArray(segments.files)
+            || segments.files.length !== segments.segmentCount) {
+            throw new BundleManifestError("manifest segment catalog binding is invalid");
+        }
+        for (const [index, file] of segments.files.entries()) {
+            const expectedSuffix = `.${index}.sqlite`;
+            if (!hasExactKeys(file, SEGMENT_FILE_KEYS)
+                || file.index !== index
+                || typeof file.path !== "string"
+                || !file.path.startsWith("db/")
+                || !file.path.endsWith(expectedSuffix)
+                || file.path.includes("\\")
+                || file.path.includes("/../")
+                || !HEX64_RE.test(file.sha256)
+                || !Number.isSafeInteger(file.size)
+                || file.size < 1) {
+                throw new BundleManifestError("manifest sealed segment binding is invalid", {
+                    index,
+                    file,
+                });
+            }
+        }
     }
     if (!hasExactKeys(value.investigation, INVESTIGATION_KEYS)
         || typeof value.investigation.id !== "string"
@@ -1709,6 +1776,9 @@ function inspectDatabaseBinding(dbFile, requestedInvestigationId = null) {
                     artifact.contentType === SNAPSHOT_CONTENT_TYPE)
                 .map((artifact) => artifact.object),
         )].sort(compareStable);
+        const segments = segmentBundleBinding(
+            repo.getSegmentStorageSnapshot({ verify: true }),
+        );
         return {
             investigationId,
             domainVersion,
@@ -1716,6 +1786,7 @@ function inspectDatabaseBinding(dbFile, requestedInvestigationId = null) {
             scientificReplay,
             artifacts,
             snapshotRoots,
+            segments,
         };
     } catch (err) {
         if (err instanceof CruciblePersistenceError) {
@@ -1964,10 +2035,82 @@ function onlineBackupDatabase(dbFile, stageContext, control) {
     return { path: dbDest, hash: hashed.hash, size: hashed.size };
 }
 
+function segmentBundleBinding(snapshot) {
+    if (!snapshot.present) return null;
+    return {
+        catalogPath: SEGMENT_CATALOG_RELPATH,
+        catalogSha256: sha256Bytes(snapshot.catalogBytes),
+        catalogSize: snapshot.catalogBytes.length,
+        catalogGeneration: snapshot.catalog.generation,
+        segmentCount: snapshot.catalog.segments.length,
+        files: snapshot.files.map((file) => ({
+            index: file.index,
+            path: `db/${file.name}`,
+            sha256: file.sha256,
+            size: file.size,
+        })),
+    };
+}
+
+function stageSegmentStorage(dbFile, stageContext, control) {
+    const snapshot = inspectSegmentStorage({ databaseFile: dbFile });
+    if (!snapshot.present) return null;
+    const sourceRoot = path.dirname(path.resolve(dbFile));
+    const catalogCopy = copyStableFile({
+        srcAbs: snapshot.catalogFile,
+        sourceRoot,
+        relPath: SEGMENT_CATALOG_RELPATH,
+        stageContext,
+        control,
+        maxBytes: MAX_MANIFEST_BYTES,
+    });
+    const expectedCatalogHash = sha256Bytes(snapshot.catalogBytes);
+    if (catalogCopy.hash !== expectedCatalogHash
+        || catalogCopy.size !== snapshot.catalogBytes.length) {
+        throw new BundleSourceChangedError(
+            "segment catalog changed while it was copied",
+            {
+                expectedHash: expectedCatalogHash,
+                actualHash: catalogCopy.hash,
+                expectedSize: snapshot.catalogBytes.length,
+                actualSize: catalogCopy.size,
+            },
+        );
+    }
+    for (const file of snapshot.files) {
+        const copied = copyStableFile({
+            srcAbs: file.file,
+            sourceRoot,
+            relPath: `db/${file.name}`,
+            stageContext,
+            control,
+        });
+        if (copied.hash !== file.sha256 || copied.size !== file.size) {
+            throw new BundleSourceChangedError(
+                "sealed segment changed while it was copied",
+                {
+                    index: file.index,
+                    expectedHash: file.sha256,
+                    actualHash: copied.hash,
+                    expectedSize: file.size,
+                    actualSize: copied.size,
+                },
+            );
+        }
+    }
+    return segmentBundleBinding(snapshot);
+}
+
 function expectedBundlePaths(manifest) {
     return [
         DB_RELPATH,
         MANIFEST_NAME,
+        ...(manifest.segments === undefined
+            ? []
+            : [
+                manifest.segments.catalogPath,
+                ...manifest.segments.files.map((file) => file.path),
+            ]),
         ...manifest.objects.map((object) => object.path),
     ].sort(compareStable);
 }
@@ -3056,6 +3199,16 @@ function verifyBundleStage(
             },
         );
     }
+    if (!canonicalEqual(manifest.segments ?? null, binding.segments)) {
+        throw new BundleError(
+            BUNDLE_ERROR_CODES.CLOSURE_INVALID,
+            "manifest sealed-segment binding disagrees with the database chain",
+            {
+                manifest: manifest.segments ?? null,
+                database: binding.segments,
+            },
+        );
+    }
     if (!canonicalEqual(
         manifest.scientificReplay,
         binding.scientificReplay,
@@ -3291,6 +3444,7 @@ export function exportBundle(options = {}) {
 
     return withPrivateStage(destDir, control, (stageContext) => {
         const dbInfo = onlineBackupDatabase(dbFile, stageContext, control);
+        stageSegmentStorage(dbFile, stageContext, control);
         const binding = inspectDatabaseBinding(dbInfo.path, investigationId);
         assertCallerClosureHints(binding, objectIds, snapshots);
 
@@ -3357,6 +3511,7 @@ export function exportBundle(options = {}) {
             scientificReplay: binding.scientificReplay,
             snapshots: binding.snapshotRoots,
             metadata,
+            ...(binding.segments === null ? {} : { segments: binding.segments }),
         });
         const manifestBytes = Buffer.from(canonicalize(manifest) + "\n", "utf8");
         writeStageBytes(stageContext, MANIFEST_NAME, manifestBytes, control);
@@ -3534,6 +3689,77 @@ export function importBundle(options = {}) {
             domainHead: verification.binding.domainHead,
             scientificReplay: verification.binding.scientificReplay,
         };
+    });
+}
+
+export function verifyBundleInPlace(options = {}) {
+    const {
+        bundleDir,
+        expectedInvestigationId = null,
+        requiredDomainVersion = DOMAIN_VERSION,
+    } = options;
+    if (typeof bundleDir !== "string" || bundleDir.trim().length === 0) {
+        throw new InvalidArgumentError(
+            "bundleDir must be a non-empty string",
+            { bundleDir },
+        );
+    }
+    if (expectedInvestigationId !== null
+        && (typeof expectedInvestigationId !== "string"
+            || expectedInvestigationId.length === 0)) {
+        throw new InvalidArgumentError(
+            "expectedInvestigationId must be null or a non-empty string",
+        );
+    }
+    if (requiredDomainVersion !== null
+        && (!Number.isSafeInteger(requiredDomainVersion)
+            || requiredDomainVersion < 1)) {
+        throw new InvalidArgumentError(
+            "requiredDomainVersion must be null or a positive integer",
+        );
+    }
+    const root = assertSafeExistingPath(
+        assertLocalDatabasePath(bundleDir),
+        "directory",
+    );
+    const first = verifyBundleStage(
+        root.path,
+        expectedInvestigationId,
+        requiredDomainVersion,
+    );
+    const trustLevel = authenticateBundleVerification(first, options);
+    const second = verifyBundleStage(
+        root.path,
+        expectedInvestigationId,
+        requiredDomainVersion,
+    );
+    assertSameVerifiedBundle(first, second);
+    const authenticated = trustLevel === "authenticated";
+    return Object.freeze({
+        bundleDir: root.path,
+        fileCount: second.inventory.length,
+        objectCount: second.manifest.objects.length,
+        selfConsistent: true,
+        authenticated,
+        verified: authenticated,
+        trustLevel,
+        digest: second.digest,
+        investigationId: second.binding.investigationId,
+        domainVersion: second.binding.domainVersion,
+        domainHead: second.binding.domainHead,
+        scientificReplay: second.binding.scientificReplay,
+    });
+}
+
+export function removeVerifiedBundle(options = {}) {
+    const verification = verifyBundleInPlace(options);
+    const root = assertSafeExistingPath(verification.bundleDir, "directory");
+    const parent = path.dirname(root.path);
+    removeTreeNoFollow(root.path, root.anchor);
+    fsyncDirectory(parent, QUIET_DURABILITY_CONTROL, "archive deletion parent");
+    return Object.freeze({
+        ...verification,
+        removed: !fs.existsSync(root.path),
     });
 }
 

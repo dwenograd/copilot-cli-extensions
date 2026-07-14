@@ -3161,7 +3161,14 @@ describe("crucible_status", () => {
         const invoke = (name) => {
             const response = registration.tools
                 .find((tool) => tool.name === name)
-                .handler({ investigation_id: investigationId });
+                .handler({
+                    ...(name === "crucible_status"
+                        ? { operation: "get" }
+                        : name === "crucible_stop"
+                            ? { operation: "pause" }
+                            : {}),
+                    investigation_id: investigationId,
+                });
             expect(response.resultType).toBe("success");
             return JSON.parse(response.textResultForLlm);
         };
@@ -3222,7 +3229,7 @@ describe("crucible_status", () => {
         expect(status.next_recommendation.kind).toBeTruthy();
     });
 
-    it("restarts a missing supervisor from persisted config when nonterminal", () => {
+    it("keeps status read-only when a nonterminal supervisor is missing", () => {
         const workspace = makeWorkspace("status-restart");
         const { deps } = makeDeps(workspace.env);
         const started = startInvestigation(startArgs(workspace), deps);
@@ -3238,10 +3245,9 @@ describe("crucible_status", () => {
         });
 
         const status = statusInvestigation({ investigation_id: started.investigation_id }, statusDeps);
-        expect(restartCalls).toHaveLength(1);
-        expect(restartCalls[0].runner.investigationId)
-            .toBe(started.investigation_id);
-        expect(status.supervisor_health.ensure_action.action).toBe("started");
+        expect(restartCalls).toHaveLength(0);
+        expect(status.supervisor_health.ensure_action).toBeNull();
+        expect(status.supervisor_health.alive).toBe(false);
     });
 
     it("does not restart when the supervisor is alive", () => {
@@ -3900,6 +3906,11 @@ describe("crucible_result", () => {
         const invoke = async (name) => {
             const tool = registration.tools.find((candidate) => candidate.name === name);
             const response = await tool.handler({
+                ...(name === "crucible_status"
+                    ? { operation: "get" }
+                    : name === "crucible_stop"
+                        ? { operation: "pause" }
+                        : {}),
                 investigation_id: seeded.investigationId,
             });
             return {

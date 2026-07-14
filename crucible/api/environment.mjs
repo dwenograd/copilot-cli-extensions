@@ -36,6 +36,11 @@ const DEFAULT_ALLOWLIST_FILENAME = "harnesses.json";
 const DEFAULT_CASE_STORE_DIRNAME = "operator-corpus";
 const DEFAULT_INVESTIGATIONS_DIRNAME = "investigations";
 const DEFAULT_RUNTIME_CACHE_DIRNAME = "runtime-cache";
+const RETENTION_DIRNAME = ".retention";
+const ARCHIVES_DIRNAME = "archives";
+const ARCHIVE_STAGING_DIRNAME = "staging";
+const TOMBSTONES_DIRNAME = "tombstones";
+const TOMBSTONE_KEYS_DIRNAME = "keys";
 const IDENTIFIER_RE = /^[A-Za-z0-9][A-Za-z0-9._@-]{0,127}$/u;
 const TAGGED_SHA256 = /^sha256:[a-z0-9][a-z0-9._-]*:[a-f0-9]{64}$/u;
 const PREFLIGHT_WORKSPACES = new WeakSet();
@@ -99,6 +104,171 @@ export function resolveStateRoot(env) {
         ? env.CRUCIBLE_STATE_ROOT
         : path.join(localAppData(env), DEFAULT_ROOT_DIRNAME, DEFAULT_INVESTIGATIONS_DIRNAME);
     return requireAbsoluteLocalPath(raw, "CRUCIBLE_STATE_ROOT", env);
+}
+
+function isPathInside(candidate, root) {
+    const relative = path.relative(path.resolve(root), path.resolve(candidate));
+    return relative === ""
+        || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
+function samePath(left, right) {
+    const a = path.resolve(left);
+    const b = path.resolve(right);
+    return process.platform === "win32"
+        ? a.toLowerCase() === b.toLowerCase()
+        : a === b;
+}
+
+function requireRetentionPath(candidate, root, label, env) {
+    const resolved = requireAbsoluteLocalPath(candidate, label, env);
+    if (!isPathInside(resolved, root) || samePath(resolved, root)) {
+        throw new EnvironmentError(
+            `${label} must be a child of the state-root archive retention directory`,
+            { label, value: candidate, root },
+        );
+    }
+    if (!samePath(path.dirname(resolved), root)) {
+        throw new EnvironmentError(
+            `${label} must be a direct child of the state-root archive retention directory`,
+            { label, value: candidate, root },
+        );
+    }
+    if (!IDENTIFIER_RE.test(path.basename(resolved))) {
+        throw new EnvironmentError(
+            `${label} leaf must be a filesystem-safe identifier`,
+            { label, value: candidate },
+        );
+    }
+    return resolved;
+}
+
+export function resolveArchiveTrustPolicy(env) {
+    const policy = hasText(env?.CRUCIBLE_ARCHIVE_TRUST_POLICY)
+        ? env.CRUCIBLE_ARCHIVE_TRUST_POLICY.trim()
+        : "authenticated";
+    if (!["authenticated", "self-consistent"].includes(policy)) {
+        throw new EnvironmentError(
+            "CRUCIBLE_ARCHIVE_TRUST_POLICY must be authenticated or self-consistent",
+            {
+                variable: "CRUCIBLE_ARCHIVE_TRUST_POLICY",
+                value: policy,
+            },
+        );
+    }
+    return policy;
+}
+
+export function resolveRetentionPaths(
+    stateRoot,
+    investigationId,
+    {
+        authenticatedBundleDestination = null,
+        env = process.env,
+    } = {},
+) {
+    const active = resolveInvestigationPaths(stateRoot, investigationId);
+    const retentionRoot = requireAbsoluteLocalPath(
+        path.join(stateRoot, RETENTION_DIRNAME),
+        "Crucible retention root",
+        env,
+    );
+    if (!isPathInside(retentionRoot, stateRoot)) {
+        throw new EnvironmentError(
+            "Crucible retention root escaped the configured state root",
+            { stateRoot, retentionRoot },
+        );
+    }
+    const archiveRoot = path.join(retentionRoot, ARCHIVES_DIRNAME);
+    const stagingRoot = path.join(retentionRoot, ARCHIVE_STAGING_DIRNAME);
+    const tombstoneRoot = path.join(retentionRoot, TOMBSTONES_DIRNAME);
+    const tombstoneKeyRoot = path.join(retentionRoot, TOMBSTONE_KEYS_DIRNAME);
+    const archiveDir = authenticatedBundleDestination === null
+        ? path.join(archiveRoot, investigationId)
+        : requireRetentionPath(
+            authenticatedBundleDestination,
+            archiveRoot,
+            "authenticated_bundle_destination",
+            env,
+        );
+    if (isPathInside(archiveDir, active.investigationDir)
+        || isPathInside(active.investigationDir, archiveDir)) {
+        throw new EnvironmentError(
+            "archive destination must not overlap active investigation state",
+            {
+                archiveDir,
+                investigationDir: active.investigationDir,
+            },
+        );
+    }
+    let relativeArchivePath = path.relative(stateRoot, archiveDir)
+        .split(path.sep)
+        .join("/");
+    if (process.platform === "win32") {
+        relativeArchivePath = relativeArchivePath.toLowerCase();
+    }
+    if (relativeArchivePath.length === 0
+        || relativeArchivePath.startsWith("../")
+        || path.posix.isAbsolute(relativeArchivePath)) {
+        throw new EnvironmentError(
+            "archive destination could not be represented safely under the state root",
+            { archiveDir, stateRoot },
+        );
+    }
+    return Object.freeze({
+        ...active,
+        retentionRoot,
+        archiveRoot,
+        stagingRoot,
+        tombstoneRoot,
+        tombstoneKeyRoot,
+        archiveDir,
+        relativeArchivePath,
+        tombstonePath: path.join(tombstoneRoot, `${investigationId}.json`),
+    });
+}
+
+export function resolveCatalogRetentionPath(
+    stateRoot,
+    relativePath,
+    {
+        kind = "archive",
+        env = process.env,
+    } = {},
+) {
+    if (typeof relativePath !== "string"
+        || relativePath.length < 1
+        || relativePath.length > 4096
+        || relativePath.includes("\\")
+        || path.posix.isAbsolute(relativePath)
+        || relativePath.split("/").some((segment) =>
+            segment.length === 0 || segment === "." || segment === "..")) {
+        throw new EnvironmentError(
+            "catalog retention path must be a canonical relative POSIX path",
+            { relativePath },
+        );
+    }
+    const root = requireAbsoluteLocalPath(
+        path.join(
+            stateRoot,
+            RETENTION_DIRNAME,
+            kind === "tombstone" ? TOMBSTONES_DIRNAME : ARCHIVES_DIRNAME,
+        ),
+        `Crucible ${kind} retention root`,
+        env,
+    );
+    const resolved = requireAbsoluteLocalPath(
+        path.join(stateRoot, ...relativePath.split("/")),
+        `catalog ${kind} path`,
+        env,
+    );
+    if (!isPathInside(resolved, root) || samePath(resolved, root)) {
+        throw new EnvironmentError(
+            `catalog ${kind} path escaped its state-root retention directory`,
+            { relativePath, resolved, root },
+        );
+    }
+    return resolved;
 }
 
 // Copilot SDK path: COPILOT_SDK_PATH (required, no default).

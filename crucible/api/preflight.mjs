@@ -75,6 +75,7 @@ import {
     StartPreflightError,
 } from "./errors.mjs";
 import { crucibleStartSpec } from "./schema.mjs";
+import { assertInvestigationIdentityAvailable } from "./lifecycle.mjs";
 
 const PREFLIGHT_PLANS = new WeakSet();
 const DISPOSED_PLANS = new WeakSet();
@@ -1370,10 +1371,20 @@ function finalizePreflight({
 export function preflightStartInvestigation(rawArgs, deps) {
     const args = crucibleStartSpec.parse(rawArgs);
     if (args.investigation_id !== undefined) {
+        assertInvestigationIdentityAvailable({
+            deps,
+            stateRoot: resolveStateRoot(deps.env),
+            investigationId: args.investigation_id,
+        });
         return preflightReattachInvestigation(args, deps);
     }
     const preapproved = loadPreapprovedExperiment(args, deps);
     const reattachStateRoot = resolveStateRoot(deps.env);
+    assertInvestigationIdentityAvailable({
+        deps,
+        stateRoot: reattachStateRoot,
+        investigationId: preapproved.investigationId,
+    });
     const reattachPaths = resolveInvestigationPaths(
         reattachStateRoot,
         preapproved.investigationId,

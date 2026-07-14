@@ -1,5 +1,8 @@
 import { createHash } from "node:crypto";
 
+import {
+    normalizeWorkingSetPolicy,
+} from "../domain/working-set-policy.mjs";
 import { RuntimeConfigError } from "./errors.mjs";
 
 const SUPERVISOR_HEARTBEAT_OPERATION_MARGIN_MS = 1_000;
@@ -198,6 +201,19 @@ export function deriveRunnerExecutionLimits(contract) {
     const impossibilityEffects =
         contract.hypothesisTopology === "certified_impossibility" ? 1 : 0;
     const statisticalPolicy = contract.statisticalPolicy;
+    let workingSetPolicy;
+    try {
+        workingSetPolicy = normalizeWorkingSetPolicy(
+            contract.workingSetPolicy,
+        );
+    } catch (error) {
+        throw new RuntimeConfigError(
+            `frozen working-set policy is invalid: ${
+                error?.message ?? String(error)
+            }`,
+            { cause: error?.code ?? null },
+        );
+    }
     const evaluationBudget = statisticalPolicy?.evaluationBudget;
     const byteBudgets = statisticalPolicy?.resourceBudget;
     const maxBlocks = statisticalPolicy?.maxBlocks;
@@ -335,11 +351,12 @@ export function deriveRunnerExecutionLimits(contract) {
         safetyMargin: effectSafetyMargin,
         minimumByteBudgets: Object.freeze(minimumByteBudgets),
         byteBudgets: Object.freeze({ ...byteBudgets }),
+        workingSetPolicy,
     });
 }
 
 export const RESOURCE_BROKER_CONFIG_VERSION =
-    "crucible-resource-broker-config-v1";
+    "crucible-resource-broker-config-v2";
 export const MODEL_COST_POLICY_VERSION =
     "crucible-model-cost-units-v1";
 const DEFAULT_GLOBAL_RESOURCE_UNITS = 8_000_000_000_000_000;
@@ -352,6 +369,7 @@ export const RESOURCE_KEYS = Object.freeze({
     OUTPUT_BYTES: "output_bytes",
     RECEIPT_BYTES: "receipt_bytes",
     CAS_BYTES: "cas_bytes",
+    STORAGE_BYTES: "storage_bytes",
     MODEL_COST_UNITS: "model_cost_units",
 });
 
@@ -363,6 +381,7 @@ const RESOURCE_CAPACITY_KEYS = Object.freeze([
     "outputBytes",
     "receiptBytes",
     "casBytes",
+    "storageBytes",
     "modelCostUnits",
 ]);
 const RESOURCE_CAPACITY_KEY_SET = new Set(RESOURCE_CAPACITY_KEYS);
@@ -432,6 +451,7 @@ export const DEFAULT_RESOURCE_BROKER_CONFIG = Object.freeze({
         outputBytes: DEFAULT_GLOBAL_RESOURCE_UNITS,
         receiptBytes: DEFAULT_GLOBAL_RESOURCE_UNITS,
         casBytes: DEFAULT_GLOBAL_RESOURCE_UNITS,
+        storageBytes: DEFAULT_GLOBAL_RESOURCE_UNITS,
         modelCostUnits: DEFAULT_GLOBAL_RESOURCE_UNITS,
     }),
     costPolicy: DEFAULT_MODEL_COST_POLICY,
@@ -699,6 +719,11 @@ export function normalizeResourceBrokerConfig(input) {
                 "resource broker capacities.casBytes",
                 { minimum: 1 },
             ),
+            storageBytes: configInteger(
+                input.capacities.storageBytes,
+                "resource broker capacities.storageBytes",
+                { minimum: 1 },
+            ),
             modelCostUnits: configInteger(
                 input.capacities.modelCostUnits,
                 "resource broker capacities.modelCostUnits",
@@ -730,7 +755,7 @@ function fingerprintConfig(algorithm, value) {
 export function resourceBrokerConfigFingerprint(config) {
     const normalized = normalizeResourceBrokerConfig(config);
     return fingerprintConfig(
-        "sha256:crucible-resource-broker-config-v1",
+        "sha256:crucible-resource-broker-config-v2",
         normalized,
     );
 }
@@ -772,6 +797,13 @@ export function resourceDefinitionsFromConfig(config) {
             resourceName: null,
             resourceMode: "consumable",
             capacityUnits: normalized.capacities.casBytes,
+        },
+        {
+            resourceKey: RESOURCE_KEYS.STORAGE_BYTES,
+            resourceFamily: "storage_bytes",
+            resourceName: null,
+            resourceMode: "consumable",
+            capacityUnits: normalized.capacities.storageBytes,
         },
         {
             resourceKey: RESOURCE_KEYS.MODEL_COST_UNITS,
@@ -880,6 +912,11 @@ export function normalizeInvestigationResourceLimits(input, config) {
             "investigation resource limits.casBytes",
             capacities.casBytes,
         ),
+        storageBytes: limitScalar(
+            input.storageBytes,
+            "investigation resource limits.storageBytes",
+            capacities.storageBytes,
+        ),
         modelCostUnits: limitScalar(
             input.modelCostUnits,
             "investigation resource limits.modelCostUnits",
@@ -891,7 +928,7 @@ export function normalizeInvestigationResourceLimits(input, config) {
 export function investigationResourceLimitsFingerprint(limits, config) {
     const normalized = normalizeInvestigationResourceLimits(limits, config);
     return fingerprintConfig(
-        "sha256:crucible-investigation-resource-limits-v1",
+        "sha256:crucible-investigation-resource-limits-v2",
         {
             limits: normalized,
             entries: resourceLimitEntries(normalized, config),
@@ -917,6 +954,10 @@ export function resourceLimitEntries(limits, config) {
             units: normalized.receiptBytes,
         },
         { resourceKey: RESOURCE_KEYS.CAS_BYTES, units: normalized.casBytes },
+        {
+            resourceKey: RESOURCE_KEYS.STORAGE_BYTES,
+            units: normalized.storageBytes,
+        },
         {
             resourceKey: RESOURCE_KEYS.MODEL_COST_UNITS,
             units: normalized.modelCostUnits,
@@ -999,6 +1040,11 @@ export function normalizeResourceReservation(input, config) {
             "casBytes",
             "resource reservation",
         ),
+        storageBytes: normalizeOptionalReservationScalar(
+            input,
+            "storageBytes",
+            "resource reservation",
+        ),
         modelCostUnits: normalizeOptionalReservationScalar(
             input,
             "modelCostUnits",
@@ -1036,6 +1082,7 @@ export function resourceReservationEntries(reservation, config) {
     push(RESOURCE_KEYS.OUTPUT_BYTES, reservation.outputBytes ?? 0);
     push(RESOURCE_KEYS.RECEIPT_BYTES, reservation.receiptBytes ?? 0);
     push(RESOURCE_KEYS.CAS_BYTES, reservation.casBytes ?? 0);
+    push(RESOURCE_KEYS.STORAGE_BYTES, reservation.storageBytes ?? 0);
     push(RESOURCE_KEYS.MODEL_COST_UNITS, reservation.modelCostUnits ?? 0);
     const cpu = reservation.cpuSlots ?? {};
     const gpu = reservation.gpuSlots ?? {};
@@ -1065,6 +1112,7 @@ const USAGE_KEYS = new Set([
     "outputBytes",
     "receiptBytes",
     "casBytes",
+    "storageBytes",
     "modelCostUnits",
 ]);
 
@@ -1074,6 +1122,7 @@ export function resourceUsageEntries(input = {}) {
         ["outputBytes", RESOURCE_KEYS.OUTPUT_BYTES],
         ["receiptBytes", RESOURCE_KEYS.RECEIPT_BYTES],
         ["casBytes", RESOURCE_KEYS.CAS_BYTES],
+        ["storageBytes", RESOURCE_KEYS.STORAGE_BYTES],
         ["modelCostUnits", RESOURCE_KEYS.MODEL_COST_UNITS],
     ];
     const entries = [];
@@ -1315,6 +1364,9 @@ export function deriveRuntimeResourceAdmission({
         outputBytes: byteBudgets.perInvestigationOutputBytes,
         receiptBytes: byteBudgets.perInvestigationReceiptBytes,
         casBytes: byteBudgets.perInvestigationCasBytes,
+        storageBytes:
+            limits.workingSetPolicy?.perInvestigationBytes
+            ?? byteBudgets.perInvestigationCasBytes,
         modelCostUnits: investigationModelCostUnits,
     }, config);
     const sdkRetryPolicy = Object.freeze({

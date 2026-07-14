@@ -22,11 +22,44 @@ import {
     configureResourceCatalogReadOnlyConnection,
     verifyResourceCatalogSchema,
 } from "./resource-catalog-schema.mjs";
+import { verifyDatabaseIntegrity } from "./schema.mjs";
 import { DatabaseSync } from "./sqlite.mjs";
 
 const DEFAULT_BUSY_TIMEOUT_MS = 5_000;
+const STORAGE_RESOURCE_KEY = "storage_bytes";
 const LEASE_STATUSES = new Set(["active", "released", "reclaimed"]);
 const RESOURCE_MODES = new Set(["concurrency", "consumable"]);
+const INVESTIGATION_LIFECYCLE_STATES = new Set([
+    "active",
+    "archived",
+    "tombstoned",
+]);
+const LIFECYCLE_OPERATION_KINDS = new Set(["archive", "delete"]);
+const ARCHIVE_TRUST_LEVELS = new Set([
+    "authenticated",
+    "self-consistent",
+]);
+const ARCHIVE_INTEGRITY_STATUSES = new Set(["verified", "blocked"]);
+const ARCHIVE_DIGEST_RE = /^sha256:[a-f0-9]{64}$/u;
+const TAGGED_HASH_RE =
+    /^sha256:[a-z0-9][a-z0-9._-]*:[a-f0-9]{64}$/u;
+const RAW_SHA256_RE = /^[a-f0-9]{64}$/u;
+const RETENTION_RELATIVE_PATH_RE =
+    /^(?!.*(?:^|\/)\.\.(?:\/|$))(?!\/)[A-Za-z0-9._@/-]+$/u;
+const ARCHIVE_RELATIVE_PATH_RE =
+    /^\.retention\/archives\/(?![^/]*\.\.)[A-Za-z0-9][A-Za-z0-9._@-]{0,127}$/u;
+const TOMBSTONE_RELATIVE_PATH_RE =
+    /^\.retention\/tombstones\/(?![^/]*\.\.)[A-Za-z0-9][A-Za-z0-9._@-]{0,127}\.json$/u;
+const RECOVERY_OPERATION_STATES = new Set([
+    "eligible",
+    "running",
+    "started",
+    "waiting",
+    "skipped",
+    "blocked",
+    "failed",
+]);
+const MAX_RECOVERY_DAEMON_LEASE_MS = 10 * 60_000;
 
 function requireString(value, field, maximum = 512) {
     if (typeof value !== "string"
@@ -38,6 +71,7 @@ function requireString(value, field, maximum = 512) {
             { field },
         );
     }
+
     return value;
 }
 
@@ -60,6 +94,83 @@ function requirePlainObject(value, field) {
         throw new InvalidArgumentError(`${field} must be a plain object`, { field });
     }
     return value;
+}
+
+function requireArchiveDigest(value, field = "archiveDigest") {
+    if (typeof value !== "string" || !ARCHIVE_DIGEST_RE.test(value)) {
+        throw new InvalidArgumentError(
+            `${field} must be sha256:<64 lowercase hex>`,
+            { field, value },
+        );
+    }
+    return value;
+}
+
+function isRetentionRelativePath(value) {
+    return typeof value === "string"
+        && value.length >= 1
+        && value.length <= 4096
+        && !value.includes("\\")
+        && RETENTION_RELATIVE_PATH_RE.test(value)
+        && !value.split("/").some((segment) =>
+            segment.length === 0 || segment === "." || segment === "..");
+}
+
+function requireRetentionRelativePath(value, field) {
+    if (!isRetentionRelativePath(value)) {
+        throw new InvalidArgumentError(
+            `${field} must be a canonical relative POSIX retention path`,
+            { field, value },
+        );
+    }
+    return value;
+}
+
+function requireArchiveRelativePath(value, field = "archiveRelativePath") {
+    requireRetentionRelativePath(value, field);
+    if (!ARCHIVE_RELATIVE_PATH_RE.test(value)) {
+        throw new InvalidArgumentError(
+            `${field} must be a direct state-root archive retention path`,
+            { field, value },
+        );
+    }
+    return value;
+}
+
+function requireTombstoneRelativePath(
+    value,
+    field = "tombstoneRelativePath",
+) {
+    requireRetentionRelativePath(value, field);
+    if (!TOMBSTONE_RELATIVE_PATH_RE.test(value)) {
+        throw new InvalidArgumentError(
+            `${field} must be a direct state-root tombstone retention path`,
+            { field, value },
+        );
+    }
+    return value;
+}
+
+function normalizeDomainHead(value, field = "domainHead") {
+    const head = requirePlainObject(value, field);
+    const keys = Object.keys(head).sort();
+    if (keys.length !== 2 || keys[0] !== "eventHash" || keys[1] !== "seq") {
+        throw new InvalidArgumentError(
+            `${field} must contain exactly seq and eventHash`,
+        );
+    }
+    const seq = requireSafeInteger(head.seq, `${field}.seq`);
+    if ((seq === 0 && head.eventHash !== null)
+        || (seq > 0
+            && (typeof head.eventHash !== "string"
+                || (!TAGGED_HASH_RE.test(head.eventHash)
+                    && !RAW_SHA256_RE.test(head.eventHash))))) {
+        throw new InvalidArgumentError(
+            `${field}.eventHash is inconsistent with seq`,
+            { seq, eventHash: head.eventHash },
+        );
+    }
+    return Object.freeze({ seq, eventHash: head.eventHash });
 }
 
 function documentFingerprint(algorithm, value) {
@@ -185,6 +296,73 @@ export function openResourceCatalogReadOnly(options = {}) {
     return ResourceCatalogRepository.open({ ...options, readOnly: true });
 }
 
+export function readStoredResourceCatalogConfiguration({
+    file,
+    busyTimeoutMs = DEFAULT_BUSY_TIMEOUT_MS,
+    denyRoots,
+    env,
+    integrityCheckAdapter = undefined,
+} = {}) {
+    requireSafeInteger(busyTimeoutMs, "busyTimeoutMs");
+    const resolved = assertLocalDatabasePath(file, { denyRoots, env });
+    let db;
+    try {
+        db = new DatabaseSync(resolved, { readOnly: true });
+        configureResourceCatalogReadOnlyConnection(db, { busyTimeoutMs });
+        verifyDatabaseIntegrity(db, { adapter: integrityCheckAdapter });
+        const row = db.prepare(`
+            SELECT config_json, config_fingerprint
+            FROM catalog_config
+            WHERE singleton_id = 1
+        `).get();
+        if (row === undefined) {
+            throw new SchemaIntegrityError(
+                "resource catalog singleton configuration is missing",
+            );
+        }
+        let config;
+        try {
+            config = JSON.parse(row.config_json);
+        } catch (error) {
+            throw new SchemaIntegrityError(
+                "resource catalog configuration is not valid JSON",
+                { message: error?.message ?? null },
+            );
+        }
+        const canonical = canonicalize(config);
+        const fingerprint = documentFingerprint(
+            RESOURCE_CATALOG_CONFIG_HASH_ALGORITHM,
+            config,
+        );
+        if (canonical !== row.config_json
+            || fingerprint !== row.config_fingerprint) {
+            throw new SchemaIntegrityError(
+                "resource catalog stored configuration failed integrity verification",
+                {
+                    expectedFingerprint: fingerprint,
+                    storedFingerprint: row.config_fingerprint,
+                },
+            );
+        }
+        return Object.freeze({
+            file: resolved,
+            config: Object.freeze(config),
+            configFingerprint: fingerprint,
+        });
+    } catch (error) {
+        if (error instanceof CruciblePersistenceError) throw error;
+        if (isSqliteError(error)) {
+            throw new StorageError(
+                `failed to read resource catalog configuration at ${resolved}: ${error.message}`,
+                error,
+            );
+        }
+        throw error;
+    } finally {
+        db?.close();
+    }
+}
+
 export class ResourceCatalogRepository {
     #db;
     #file;
@@ -194,6 +372,7 @@ export class ResourceCatalogRepository {
     #definitionsByKey;
     #now;
     #isOwnerAlive;
+    #isRecoveryOwnerAlive;
     #readOnly;
     #busyTimeoutMs;
     #integrityCheckAdapter;
@@ -205,6 +384,7 @@ export class ResourceCatalogRepository {
         definitions,
         now,
         isOwnerAlive,
+        isRecoveryOwnerAlive,
         readOnly,
         busyTimeoutMs,
         integrityCheckAdapter,
@@ -219,6 +399,7 @@ export class ResourceCatalogRepository {
         );
         this.#now = now;
         this.#isOwnerAlive = isOwnerAlive;
+        this.#isRecoveryOwnerAlive = isRecoveryOwnerAlive;
         this.#readOnly = readOnly;
         this.#busyTimeoutMs = busyTimeoutMs;
         this.#integrityCheckAdapter = integrityCheckAdapter;
@@ -232,6 +413,7 @@ export class ResourceCatalogRepository {
             busyTimeoutMs = DEFAULT_BUSY_TIMEOUT_MS,
             now = Date.now,
             isOwnerAlive = null,
+            isRecoveryOwnerAlive = null,
             denyRoots,
             env,
             readOnly = false,
@@ -244,6 +426,12 @@ export class ResourceCatalogRepository {
         if (isOwnerAlive !== null && typeof isOwnerAlive !== "function") {
             throw new InvalidArgumentError(
                 "isOwnerAlive must be a synchronous function or null",
+            );
+        }
+        if (isRecoveryOwnerAlive !== null
+            && typeof isRecoveryOwnerAlive !== "function") {
+            throw new InvalidArgumentError(
+                "isRecoveryOwnerAlive must be a synchronous function or null",
             );
         }
         requireSafeInteger(busyTimeoutMs, "busyTimeoutMs");
@@ -286,6 +474,7 @@ export class ResourceCatalogRepository {
                 definitions: normalizedDefinitions,
                 now,
                 isOwnerAlive,
+                isRecoveryOwnerAlive,
                 readOnly: readOnly === true,
                 busyTimeoutMs,
                 integrityCheckAdapter,
@@ -479,11 +668,138 @@ export class ResourceCatalogRepository {
                 },
             );
         }
+        const storageDefinition = this.#definitionsByKey.get(
+            STORAGE_RESOURCE_KEY,
+        );
+        if (storageDefinition === undefined
+            || storageDefinition.resourceMode !== "consumable") {
+            throw new SchemaIntegrityError(
+                "resource catalog requires a consumable storage_bytes definition",
+            );
+        }
         for (const investigation of this.#db.prepare(
             "SELECT * FROM investigations ORDER BY investigation_id",
         ).all()) {
             this.#assertInvestigationLimitsIntegrity(investigation);
             this.#assertInvestigationAuthorityIntegrity(investigation);
+            const lifecycle =
+                this.#assertInvestigationLifecycleIntegrity(investigation);
+            const operation = this.#db.prepare(`
+                SELECT *
+                FROM lifecycle_operations
+                WHERE investigation_id = ?
+            `).get(investigation.investigation_id);
+            const archive = this.#db.prepare(`
+                SELECT *
+                FROM investigation_archives
+                WHERE investigation_id = ?
+            `).get(investigation.investigation_id);
+            if (operation !== undefined) {
+                const parsed = this.#rowToLifecycleOperation(operation);
+                const expectedState = parsed.operationKind === "archive"
+                    ? "active"
+                    : "archived";
+                if (lifecycle.lifecycle_state !== expectedState) {
+                    throw new SchemaIntegrityError(
+                        "catalog lifecycle operation is inconsistent with lifecycle state",
+                        {
+                            investigationId:
+                                investigation.investigation_id,
+                            operationKind: parsed.operationKind,
+                            lifecycleState: lifecycle.lifecycle_state,
+                        },
+                    );
+                }
+            }
+            if (archive !== undefined) {
+                this.#rowToArchive(archive);
+                if (lifecycle.lifecycle_state !== "archived") {
+                    throw new SchemaIntegrityError(
+                        "catalog archive exists outside archived lifecycle state",
+                        {
+                            investigationId:
+                                investigation.investigation_id,
+                            lifecycleState: lifecycle.lifecycle_state,
+                        },
+                    );
+                }
+            }
+        }
+        for (const tombstone of this.#db.prepare(`
+            SELECT *
+            FROM investigation_tombstones
+            ORDER BY investigation_id
+        `).all()) {
+            this.#rowToTombstone(tombstone);
+            if (this.#db.prepare(`
+                SELECT 1 AS present
+                FROM investigations
+                WHERE investigation_id = ?
+            `).get(tombstone.investigation_id) !== undefined) {
+                throw new SchemaIntegrityError(
+                    "catalog contains both a live investigation and tombstone for one identity",
+                    { investigationId: tombstone.investigation_id },
+                );
+            }
+        }
+        this.#verifyRecoveryCatalogIntegrity();
+    }
+
+    #verifyRecoveryCatalogIntegrity() {
+        const authorityRows = this.#db.prepare(`
+            SELECT *
+            FROM recovery_daemon_authority
+            ORDER BY singleton_id
+        `).all();
+        if (authorityRows.length > 1) {
+            throw new SchemaIntegrityError(
+                "resource catalog has multiple recovery daemon authorities",
+            );
+        }
+        const activeHistory = this.#db.prepare(`
+            SELECT *
+            FROM recovery_daemon_incarnations
+            WHERE retired_at_ms IS NULL
+            ORDER BY daemon_generation
+        `).all();
+        if (authorityRows.length !== activeHistory.length
+            || (authorityRows.length === 1
+                && (authorityRows[0].daemon_incarnation
+                    !== activeHistory[0].daemon_incarnation
+                    || Number(authorityRows[0].daemon_generation)
+                        !== Number(activeHistory[0].daemon_generation)
+                    || authorityRows[0].lease_nonce
+                        !== activeHistory[0].lease_nonce
+                    || Number(authorityRows[0].owner_process_id)
+                        !== Number(activeHistory[0].owner_process_id)
+                    || authorityRows[0].owner_process_start_id
+                        !== activeHistory[0].owner_process_start_id))) {
+            throw new SchemaIntegrityError(
+                "recovery daemon authority does not match incarnation history",
+                {
+                    authorityCount: authorityRows.length,
+                    activeHistoryCount: activeHistory.length,
+                },
+            );
+        }
+        for (const row of this.#db.prepare(`
+            SELECT o.*, d.daemon_generation AS incarnation_generation
+            FROM recovery_operations AS o
+            JOIN recovery_daemon_incarnations AS d
+              ON d.daemon_incarnation = o.daemon_incarnation
+            ORDER BY investigation_id
+        `).all()) {
+            if (!RECOVERY_OPERATION_STATES.has(row.operation_state)
+                || typeof row.operation_code !== "string"
+                || row.operation_code.length < 1
+                || row.operation_code.length > 128
+                || Number(row.daemon_generation)
+                    !== Number(row.incarnation_generation)) {
+                throw new SchemaIntegrityError(
+                    "recovery operation state is invalid",
+                    { investigationId: row.investigation_id },
+                );
+            }
         }
     }
 
@@ -514,6 +830,20 @@ export class ResourceCatalogRepository {
         );
 
         return this.#tx(() => {
+            const tombstone = this.#db.prepare(`
+                SELECT investigation_id, tombstone_digest
+                FROM investigation_tombstones
+                WHERE investigation_id = ?
+            `).get(investigationId);
+            if (tombstone !== undefined) {
+                throw new FenceRejectedError(
+                    "a durably tombstoned investigation identity cannot be registered again",
+                    {
+                        investigationId,
+                        tombstoneDigest: tombstone.tombstone_digest,
+                    },
+                );
+            }
             const existing = this.#db.prepare(
                 "SELECT * FROM investigations WHERE investigation_id = ?",
             ).get(investigationId);
@@ -545,7 +875,7 @@ export class ResourceCatalogRepository {
                 }
                 return Object.freeze({
                     created: false,
-                    investigation: this.#rowToInvestigation(existing),
+                    investigation: this.getInvestigation(investigationId),
                 });
             }
 
@@ -613,6 +943,16 @@ export class ResourceCatalogRepository {
                     updatedAt: nowMs,
                 });
             this.#db.prepare(`
+                INSERT INTO storage_usage(
+                    investigation_id, actual_units, reconciled_at_ms)
+                VALUES(?, 0, ?)
+            `).run(investigationId, nowMs);
+            this.#db.prepare(`
+                INSERT INTO investigation_lifecycle(
+                    investigation_id, lifecycle_state, updated_at_ms, reason_code)
+                VALUES(?, 'active', ?, NULL)
+            `).run(investigationId, nowMs);
+            this.#db.prepare(`
                 INSERT INTO authority_incarnations(
                     runner_incarnation, investigation_id,
                     supervisor_generation, supervisor_nonce,
@@ -649,14 +989,1009 @@ export class ResourceCatalogRepository {
             "SELECT * FROM investigations WHERE investigation_id = ?",
         ).get(investigationId);
         if (row === undefined) {
-            return null;
+            const tombstone = this.#db.prepare(`
+                SELECT *
+                FROM investigation_tombstones
+                WHERE investigation_id = ?
+            `).get(investigationId);
+            return tombstone === undefined
+                ? null
+                : this.#rowToTombstone(tombstone);
         }
         const limits = this.#assertInvestigationLimitsIntegrity(row);
         this.#assertInvestigationAuthorityIntegrity(row);
+        const lifecycle = this.#assertInvestigationLifecycleIntegrity(row);
+        const operation = this.#db.prepare(`
+            SELECT *
+            FROM lifecycle_operations
+            WHERE investigation_id = ?
+        `).get(investigationId);
+        const archive = this.#db.prepare(`
+            SELECT *
+            FROM investigation_archives
+            WHERE investigation_id = ?
+        `).get(investigationId);
         return Object.freeze({
             ...this.#rowToInvestigation(row),
             limits: Object.freeze(limits),
+            lifecycleState: lifecycle.lifecycle_state,
+            lifecycleUpdatedAtMs: numberFromSql(
+                lifecycle.updated_at_ms,
+                "lifecycleUpdatedAtMs",
+            ),
+            lifecycleReasonCode: lifecycle.reason_code ?? null,
+            lifecycleOperation: operation === undefined
+                ? null
+                : this.#rowToLifecycleOperation(operation),
+            archive: archive === undefined
+                ? null
+                : this.#rowToArchive(archive),
+            tombstone: null,
         });
+    }
+
+    listInvestigations({
+        lifecycleState = null,
+        excludeFenced = false,
+        afterInvestigationId = null,
+        limit = null,
+    } = {}) {
+        if (lifecycleState !== null
+            && !INVESTIGATION_LIFECYCLE_STATES.has(lifecycleState)) {
+            throw new InvalidArgumentError(
+                "lifecycleState is invalid",
+                { lifecycleState },
+            );
+        }
+        if (typeof excludeFenced !== "boolean") {
+            throw new InvalidArgumentError("excludeFenced must be boolean");
+        }
+        if (afterInvestigationId !== null) {
+            requireString(
+                afterInvestigationId,
+                "afterInvestigationId",
+                128,
+            );
+        }
+        if (limit !== null) {
+            requireSafeInteger(limit, "limit", {
+                minimum: 1,
+                maximum: 1000,
+            });
+        }
+        const ids = this.#db.prepare(`
+            SELECT investigation_id
+            FROM (
+                SELECT i.investigation_id AS investigation_id,
+                       l.lifecycle_state AS lifecycle_state,
+                       CASE WHEN o.investigation_id IS NULL
+                            THEN 0 ELSE 1 END AS lifecycle_fenced
+                FROM investigations AS i
+                JOIN investigation_lifecycle AS l
+                  ON l.investigation_id = i.investigation_id
+                LEFT JOIN lifecycle_operations AS o
+                  ON o.investigation_id = i.investigation_id
+
+                UNION ALL
+
+                SELECT investigation_id,
+                       'tombstoned' AS lifecycle_state,
+                       0 AS lifecycle_fenced
+                FROM investigation_tombstones
+            )
+            WHERE (:lifecycleState IS NULL
+                   OR lifecycle_state = :lifecycleState)
+              AND (:excludeFenced = 0 OR lifecycle_fenced = 0)
+              AND (:afterId IS NULL OR investigation_id > :afterId)
+            ORDER BY investigation_id
+            LIMIT :limit
+        `).all({
+            lifecycleState,
+            excludeFenced: excludeFenced ? 1 : 0,
+            afterId: afterInvestigationId,
+            limit: limit ?? -1,
+        });
+        return Object.freeze(ids.map((entry) =>
+            this.getInvestigation(entry.investigation_id)));
+    }
+
+    setInvestigationLifecycle({
+        investigationId,
+        lifecycleState,
+        reasonCode = null,
+    } = {}) {
+        requireString(investigationId, "investigationId", 128);
+        if (!INVESTIGATION_LIFECYCLE_STATES.has(lifecycleState)) {
+            throw new InvalidArgumentError(
+                "lifecycleState is invalid",
+                { lifecycleState },
+            );
+        }
+        const normalizedReason = reasonCode === null
+            ? null
+            : requireString(reasonCode, "reasonCode", 128);
+        return this.#tx(() => {
+            const investigation =
+                this.#requireInvestigationInTransaction(investigationId);
+            const current =
+                this.#assertInvestigationLifecycleIntegrity(investigation);
+            if (current.lifecycle_state === "tombstoned"
+                && lifecycleState !== "tombstoned") {
+                throw new FenceRejectedError(
+                    "a tombstoned investigation cannot be reactivated",
+                    { investigationId, lifecycleState },
+                );
+            }
+            if (current.lifecycle_state === "archived"
+                && lifecycleState === "active"
+                && this.#db.prepare(`
+                    SELECT 1 AS present
+                    FROM investigation_archives
+                    WHERE investigation_id = ?
+                `).get(investigationId) !== undefined) {
+                throw new FenceRejectedError(
+                    "a verified archived investigation cannot be reactivated",
+                    { investigationId },
+                );
+            }
+            if (lifecycleState !== "active") {
+                const activeLeaseCount = Number(this.#db.prepare(`
+                    SELECT COUNT(*) AS count
+                    FROM leases
+                    WHERE investigation_id = ? AND status = 'active'
+                `).get(investigationId)?.count ?? 0);
+                if (activeLeaseCount !== 0) {
+                    throw new FenceRejectedError(
+                        "an investigation with active resource leases cannot be archived or tombstoned",
+                        { investigationId, activeLeaseCount },
+                    );
+                }
+            }
+            if (current.lifecycle_state === lifecycleState
+                && current.reason_code === normalizedReason) {
+                return Object.freeze({
+                    changed: false,
+                    investigation: this.getInvestigation(investigationId),
+                });
+            }
+            const nowMs = this.#timestamp();
+            this.#db.prepare(`
+                UPDATE investigation_lifecycle
+                SET lifecycle_state = ?, updated_at_ms = ?, reason_code = ?
+                WHERE investigation_id = ?
+            `).run(
+                lifecycleState,
+                nowMs,
+                normalizedReason,
+                investigationId,
+            );
+            return Object.freeze({
+                changed: true,
+                investigation: this.getInvestigation(investigationId),
+            });
+        });
+    }
+
+    beginLifecycleOperation({
+        investigationId,
+        operationKind,
+        operationToken,
+        ownerProcessId,
+        ownerProcessStartId,
+        archiveRelativePath = null,
+        expectedArchiveDigest = null,
+    } = {}) {
+        requireString(investigationId, "investigationId", 128);
+        if (!LIFECYCLE_OPERATION_KINDS.has(operationKind)) {
+            throw new InvalidArgumentError(
+                "operationKind must be archive or delete",
+                { operationKind },
+            );
+        }
+        requireString(operationToken, "operationToken", 256);
+        const processId = requireSafeInteger(
+            ownerProcessId,
+            "ownerProcessId",
+            { minimum: 1 },
+        );
+        const processStartId = requireString(
+            ownerProcessStartId,
+            "ownerProcessStartId",
+            256,
+        );
+        const expectedDigest = expectedArchiveDigest === null
+            ? null
+            : requireArchiveDigest(
+                expectedArchiveDigest,
+                "expectedArchiveDigest",
+            );
+        if ((operationKind === "delete") !== (expectedDigest !== null)) {
+            throw new InvalidArgumentError(
+                "delete lifecycle operations require expectedArchiveDigest and archive operations forbid it",
+                { operationKind },
+            );
+        }
+        const reservedArchivePath = archiveRelativePath === null
+            ? null
+            : requireArchiveRelativePath(
+                archiveRelativePath,
+                "archiveRelativePath",
+            );
+        if ((operationKind === "archive")
+            !== (reservedArchivePath !== null)) {
+            throw new InvalidArgumentError(
+                "archive lifecycle operations require archiveRelativePath and delete operations forbid it",
+                { operationKind },
+            );
+        }
+        return this.#tx(() => {
+            if (this.#db.prepare(`
+                SELECT 1 AS present
+                FROM investigation_tombstones
+                WHERE investigation_id = ?
+            `).get(investigationId) !== undefined) {
+                throw new FenceRejectedError(
+                    "a tombstoned investigation has no live lifecycle operation",
+                    { investigationId, operationKind },
+                );
+            }
+            const investigation =
+                this.#requireInvestigationInTransaction(investigationId);
+            const lifecycle =
+                this.#assertInvestigationLifecycleIntegrity(investigation);
+            const requiredState = operationKind === "archive"
+                ? "active"
+                : "archived";
+            if (lifecycle.lifecycle_state !== requiredState) {
+                throw new FenceRejectedError(
+                    `${operationKind} requires lifecycle state ${requiredState}`,
+                    {
+                        investigationId,
+                        lifecycleState: lifecycle.lifecycle_state,
+                    },
+                );
+            }
+            const existing = this.#db.prepare(`
+                SELECT *
+                FROM lifecycle_operations
+                WHERE investigation_id = ?
+            `).get(investigationId);
+            if (existing !== undefined) {
+                if (existing.operation_kind === operationKind
+                    && existing.operation_token === operationToken
+                    && Number(existing.owner_process_id) === processId
+                    && existing.owner_process_start_id === processStartId
+                    && (existing.archive_relpath ?? null)
+                        === reservedArchivePath
+                    && (existing.expected_archive_digest ?? null)
+                        === expectedDigest) {
+                    return Object.freeze({
+                        created: false,
+                        operation:
+                            this.#rowToLifecycleOperation(existing),
+                    });
+                }
+                throw new FenceRejectedError(
+                    "another lifecycle operation already fences this investigation",
+                    {
+                        investigationId,
+                        operationKind: existing.operation_kind,
+                    },
+                );
+            }
+            const activeLeaseCount = Number(this.#db.prepare(`
+                SELECT COUNT(*) AS count
+                FROM leases
+                WHERE investigation_id = ? AND status = 'active'
+            `).get(investigationId)?.count ?? 0);
+            if (activeLeaseCount !== 0) {
+                throw new FenceRejectedError(
+                    "lifecycle operation requires zero active resource leases",
+                    { investigationId, activeLeaseCount },
+                );
+            }
+            if (operationKind === "delete") {
+                const archive = this.#db.prepare(`
+                    SELECT archive_digest
+                    FROM investigation_archives
+                    WHERE investigation_id = ?
+                `).get(investigationId);
+                if (archive === undefined) {
+                    throw new SchemaIntegrityError(
+                        "archived lifecycle state has no verified archive record",
+                        { investigationId },
+                    );
+                }
+                if (archive.archive_digest !== expectedDigest) {
+                    throw new FenceRejectedError(
+                        "expected archive digest does not match the catalog",
+                        {
+                            investigationId,
+                            expectedArchiveDigest: expectedDigest,
+                            actualArchiveDigest: archive.archive_digest,
+                        },
+                    );
+                }
+            } else {
+                const operationOwner = this.#db.prepare(`
+                    SELECT investigation_id
+                    FROM lifecycle_operations
+                    WHERE archive_relpath = ?
+                `).get(reservedArchivePath);
+                if (operationOwner !== undefined
+                    && operationOwner.investigation_id
+                        !== investigationId) {
+                    throw new FenceRejectedError(
+                        "archive retention path is reserved by another lifecycle operation",
+                        {
+                            investigationId,
+                            archiveRelativePath:
+                                reservedArchivePath,
+                            ownerInvestigationId:
+                                operationOwner.investigation_id,
+                        },
+                    );
+                }
+                const archiveOwner = this.#db.prepare(`
+                    SELECT investigation_id
+                    FROM investigation_archives
+                    WHERE archive_relpath = ?
+                `).get(reservedArchivePath);
+                if (archiveOwner !== undefined
+                    && archiveOwner.investigation_id
+                        !== investigationId) {
+                    throw new FenceRejectedError(
+                        "archive retention path is already owned by another investigation",
+                        {
+                            investigationId,
+                            archiveRelativePath:
+                                reservedArchivePath,
+                            ownerInvestigationId:
+                                archiveOwner.investigation_id,
+                        },
+                    );
+                }
+            }
+            const startedAtMs = this.#timestamp();
+            this.#db.prepare(`
+                INSERT INTO lifecycle_operations(
+                    investigation_id, operation_kind, operation_token,
+                    owner_process_id, owner_process_start_id,
+                    archive_relpath, expected_archive_digest, started_at_ms)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+            `).run(
+                investigationId,
+                operationKind,
+                operationToken,
+                processId,
+                processStartId,
+                reservedArchivePath,
+                expectedDigest,
+                startedAtMs,
+            );
+            return Object.freeze({
+                created: true,
+                operation: this.#rowToLifecycleOperation(
+                    this.#db.prepare(`
+                        SELECT *
+                        FROM lifecycle_operations
+                        WHERE investigation_id = ?
+                    `).get(investigationId),
+                ),
+            });
+        });
+    }
+
+    abortLifecycleOperation({
+        investigationId,
+        operationToken,
+    } = {}) {
+        requireString(investigationId, "investigationId", 128);
+        requireString(operationToken, "operationToken", 256);
+        return this.#tx(() => {
+            const existing = this.#db.prepare(`
+                SELECT *
+                FROM lifecycle_operations
+                WHERE investigation_id = ?
+            `).get(investigationId);
+            if (existing === undefined) {
+                return Object.freeze({ changed: false });
+            }
+            if (existing.operation_token !== operationToken) {
+                throw new FenceRejectedError(
+                    "lifecycle operation token is stale",
+                    { investigationId },
+                );
+            }
+            this.#db.prepare(`
+                DELETE FROM lifecycle_operations
+                WHERE investigation_id = ? AND operation_token = ?
+            `).run(investigationId, operationToken);
+            return Object.freeze({ changed: true });
+        });
+    }
+
+    commitArchive({
+        investigationId,
+        operationToken,
+        archiveRelativePath,
+        archiveDigest,
+        trustLevel,
+        domainVersion,
+        terminalAvailable,
+        integrityStatus = "verified",
+        sizeBytes,
+        domainHead,
+        reasonCode = "operator_archive",
+    } = {}) {
+        requireString(investigationId, "investigationId", 128);
+        requireString(operationToken, "operationToken", 256);
+        const relativePath = requireArchiveRelativePath(
+            archiveRelativePath,
+            "archiveRelativePath",
+        );
+        const digest = requireArchiveDigest(archiveDigest);
+        if (!ARCHIVE_TRUST_LEVELS.has(trustLevel)) {
+            throw new InvalidArgumentError(
+                "trustLevel is invalid",
+                { trustLevel },
+            );
+        }
+        const version = requireSafeInteger(
+            domainVersion,
+            "domainVersion",
+            { minimum: 1 },
+        );
+        if (typeof terminalAvailable !== "boolean") {
+            throw new InvalidArgumentError(
+                "terminalAvailable must be boolean",
+            );
+        }
+        if (!ARCHIVE_INTEGRITY_STATUSES.has(integrityStatus)) {
+            throw new InvalidArgumentError(
+                "integrityStatus is invalid",
+                { integrityStatus },
+            );
+        }
+        const size = requireSafeInteger(sizeBytes, "sizeBytes");
+        const head = normalizeDomainHead(domainHead);
+        const reason = requireString(reasonCode, "reasonCode", 128);
+        return this.#tx(() => {
+            const investigation =
+                this.#requireInvestigationInTransaction(investigationId);
+            const lifecycle =
+                this.#assertInvestigationLifecycleIntegrity(investigation);
+            const operation = this.#db.prepare(`
+                SELECT *
+                FROM lifecycle_operations
+                WHERE investigation_id = ?
+            `).get(investigationId);
+            if (lifecycle.lifecycle_state !== "active"
+                || operation === undefined
+                || operation.operation_kind !== "archive"
+                || operation.operation_token !== operationToken
+                || operation.archive_relpath !== relativePath) {
+                throw new FenceRejectedError(
+                    "archive publication lost its catalog fence",
+                    { investigationId },
+                );
+            }
+            const activeLeaseCount = Number(this.#db.prepare(`
+                SELECT COUNT(*) AS count
+                FROM leases
+                WHERE investigation_id = ? AND status = 'active'
+            `).get(investigationId)?.count ?? 0);
+            if (activeLeaseCount !== 0) {
+                throw new FenceRejectedError(
+                    "archive publication requires zero active resource leases",
+                    { investigationId, activeLeaseCount },
+                );
+            }
+            const archivedAtMs = this.#timestamp();
+            this.#db.prepare(`
+                INSERT INTO investigation_archives(
+                    investigation_id, archive_relpath, archive_digest,
+                    trust_level, domain_version, terminal_available,
+                    integrity_status, size_bytes, domain_head_seq,
+                    domain_head_hash, archived_at_ms)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            `).run(
+                investigationId,
+                relativePath,
+                digest,
+                trustLevel,
+                version,
+                terminalAvailable ? 1 : 0,
+                integrityStatus,
+                size,
+                head.seq,
+                head.eventHash,
+                archivedAtMs,
+            );
+            this.#db.prepare(`
+                UPDATE investigation_lifecycle
+                SET lifecycle_state = 'archived',
+                    updated_at_ms = ?,
+                    reason_code = ?
+                WHERE investigation_id = ?
+            `).run(archivedAtMs, reason, investigationId);
+            const storageUpdated = this.#db.prepare(`
+                UPDATE storage_usage
+                SET actual_units = ?, reconciled_at_ms = ?
+                WHERE investigation_id = ?
+            `).run(size, archivedAtMs, investigationId);
+            if (Number(storageUpdated.changes) !== 1) {
+                throw new SchemaIntegrityError(
+                    "archive publication could not reconcile retained storage",
+                    { investigationId },
+                );
+            }
+            this.#db.prepare(`
+                DELETE FROM lifecycle_operations
+                WHERE investigation_id = ? AND operation_token = ?
+            `).run(investigationId, operationToken);
+            return Object.freeze({
+                changed: true,
+                investigation: this.getInvestigation(investigationId),
+            });
+        });
+    }
+
+    commitDelete({
+        investigationId,
+        operationToken,
+        expectedArchiveDigest,
+        tombstoneRelativePath,
+        tombstoneDigest,
+        signingKeyFingerprint,
+        signature,
+        tombstoneSizeBytes,
+        deletedAtMs,
+    } = {}) {
+        requireString(investigationId, "investigationId", 128);
+        requireString(operationToken, "operationToken", 256);
+        const expectedDigest = requireArchiveDigest(
+            expectedArchiveDigest,
+            "expectedArchiveDigest",
+        );
+        const relativePath = requireTombstoneRelativePath(
+            tombstoneRelativePath,
+            "tombstoneRelativePath",
+        );
+        const durableDigest = requireArchiveDigest(
+            tombstoneDigest,
+            "tombstoneDigest",
+        );
+        requireString(
+            signingKeyFingerprint,
+            "signingKeyFingerprint",
+            256,
+        );
+        requireString(signature, "signature", 4096);
+        const sizeBytes = requireSafeInteger(
+            tombstoneSizeBytes,
+            "tombstoneSizeBytes",
+            { minimum: 1 },
+        );
+        const deleted = requireSafeInteger(
+            deletedAtMs,
+            "deletedAtMs",
+        );
+        return this.#tx(() => {
+            const investigation =
+                this.#requireInvestigationInTransaction(investigationId);
+            const lifecycle =
+                this.#assertInvestigationLifecycleIntegrity(investigation);
+            const operation = this.#db.prepare(`
+                SELECT *
+                FROM lifecycle_operations
+                WHERE investigation_id = ?
+            `).get(investigationId);
+            const archive = this.#db.prepare(`
+                SELECT *
+                FROM investigation_archives
+                WHERE investigation_id = ?
+            `).get(investigationId);
+            if (lifecycle.lifecycle_state !== "archived"
+                || operation === undefined
+                || operation.operation_kind !== "delete"
+                || operation.operation_token !== operationToken
+                || operation.expected_archive_digest !== expectedDigest
+                || archive === undefined
+                || archive.archive_digest !== expectedDigest) {
+                throw new FenceRejectedError(
+                    "delete publication lost its exact archived catalog fence",
+                    { investigationId },
+                );
+            }
+            const activeLeaseCount = Number(this.#db.prepare(`
+                SELECT COUNT(*) AS count
+                FROM leases
+                WHERE investigation_id = ? AND status = 'active'
+            `).get(investigationId)?.count ?? 0);
+            if (activeLeaseCount !== 0) {
+                throw new FenceRejectedError(
+                    "delete requires zero active resource leases",
+                    { investigationId, activeLeaseCount },
+                );
+            }
+            const createdAtMs = numberFromSql(
+                investigation.registered_at_ms,
+                "registeredAtMs",
+            );
+            if (deleted < createdAtMs) {
+                throw new InvalidArgumentError(
+                    "deletedAtMs predates investigation creation",
+                    { deletedAtMs: deleted, createdAtMs },
+                );
+            }
+            this.#db.prepare(`
+                INSERT INTO investigation_tombstones(
+                    investigation_id, created_at_ms, deleted_at_ms,
+                    domain_version, archive_digest, tombstone_relpath,
+                    tombstone_digest, signing_key_fingerprint, signature,
+                    size_bytes, integrity_status, domain_head_seq,
+                    domain_head_hash)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'verified', ?, ?)
+            `).run(
+                investigationId,
+                createdAtMs,
+                deleted,
+                archive.domain_version,
+                archive.archive_digest,
+                relativePath,
+                durableDigest,
+                signingKeyFingerprint,
+                signature,
+                sizeBytes,
+                archive.domain_head_seq,
+                archive.domain_head_hash,
+            );
+            this.#db.prepare(`
+                DELETE FROM usage_reconciliations
+                WHERE fencing_token IN (
+                    SELECT fencing_token FROM leases
+                    WHERE investigation_id = ?
+                )
+            `).run(investigationId);
+            this.#db.prepare(`
+                DELETE FROM lease_allocations
+                WHERE fencing_token IN (
+                    SELECT fencing_token FROM leases
+                    WHERE investigation_id = ?
+                )
+            `).run(investigationId);
+            this.#db.prepare(
+                "DELETE FROM leases WHERE investigation_id = ?",
+            ).run(investigationId);
+            for (const table of [
+                "recovery_operations",
+                "storage_reconciliations",
+                "storage_usage",
+                "investigation_limits",
+                "authority_incarnations",
+                "investigation_archives",
+                "lifecycle_operations",
+                "investigation_lifecycle",
+            ]) {
+                this.#db.prepare(
+                    `DELETE FROM ${table} WHERE investigation_id = ?`,
+                ).run(investigationId);
+            }
+            this.#db.prepare(
+                "DELETE FROM investigations WHERE investigation_id = ?",
+            ).run(investigationId);
+            return Object.freeze({
+                changed: true,
+                investigation: this.getInvestigation(investigationId),
+            });
+        });
+    }
+
+    acquireRecoveryDaemonLease({
+        daemonIncarnation,
+        leaseNonce,
+        ownerProcessId,
+        ownerProcessStartId,
+        ttlMs,
+    } = {}) {
+        requireString(daemonIncarnation, "daemonIncarnation", 256);
+        requireString(leaseNonce, "leaseNonce", 256);
+        const processId = requireSafeInteger(
+            ownerProcessId,
+            "ownerProcessId",
+            { minimum: 1 },
+        );
+        const processStartId = requireString(
+            ownerProcessStartId,
+            "ownerProcessStartId",
+            256,
+        );
+        const leaseTtlMs = requireSafeInteger(ttlMs, "ttlMs", {
+            minimum: 1,
+            maximum: MAX_RECOVERY_DAEMON_LEASE_MS,
+        });
+        return this.#tx(() => {
+            const nowMs = this.#timestamp();
+            const current = this.#db.prepare(`
+                SELECT *
+                FROM recovery_daemon_authority
+                WHERE singleton_id = 1
+            `).get();
+            if (current !== undefined) {
+                let retirementReason = null;
+                if (Number(current.expires_at_ms) <= nowMs) {
+                    retirementReason = "expired";
+                } else if (this.#isRecoveryOwnerAlive !== null) {
+                    const alive = this.#isRecoveryOwnerAlive(Object.freeze({
+                        kind: "recovery-daemon",
+                        processId: numberFromSql(
+                            current.owner_process_id,
+                            "recoveryDaemon.ownerProcessId",
+                        ),
+                        processStartId: current.owner_process_start_id,
+                        daemonGeneration: numberFromSql(
+                            current.daemon_generation,
+                            "recoveryDaemon.daemonGeneration",
+                        ),
+                        daemonIncarnation: current.daemon_incarnation,
+                    }));
+                    if (typeof alive !== "boolean") {
+                        throw new InvalidArgumentError(
+                            "isRecoveryOwnerAlive must return a boolean synchronously",
+                        );
+                    }
+                    if (!alive) retirementReason = "owner_dead";
+                }
+                if (retirementReason === null) {
+                    return Object.freeze({
+                        acquired: false,
+                        reason: "held",
+                        lease: this.#rowToRecoveryDaemonLease(current),
+                    });
+                }
+                this.#retireRecoveryDaemonInTransaction(
+                    current,
+                    nowMs,
+                    retirementReason,
+                );
+            }
+
+            const previousGeneration = numberFromSql(
+                this.#db.prepare(`
+                    SELECT COALESCE(MAX(daemon_generation), 0) AS generation
+                    FROM recovery_daemon_incarnations
+                `).get()?.generation ?? 0,
+                "recoveryDaemon.previousGeneration",
+            );
+            if (previousGeneration >= Number.MAX_SAFE_INTEGER) {
+                throw new SchemaIntegrityError(
+                    "recovery daemon generation exhausted the safe integer range",
+                );
+            }
+            const daemonGeneration = previousGeneration + 1;
+            const existingIncarnation = this.#db.prepare(`
+                SELECT daemon_generation
+                FROM recovery_daemon_incarnations
+                WHERE daemon_incarnation = ?
+            `).get(daemonIncarnation);
+            if (existingIncarnation !== undefined) {
+                throw new FenceRejectedError(
+                    "recovery daemon incarnation has already been used",
+                    {
+                        daemonIncarnation,
+                        daemonGeneration:
+                            Number(existingIncarnation.daemon_generation),
+                    },
+                );
+            }
+            const expiresAtMs = nowMs + leaseTtlMs;
+            if (!Number.isSafeInteger(expiresAtMs)) {
+                throw new InvalidArgumentError(
+                    "recovery daemon lease expiry exceeds safe integer range",
+                );
+            }
+            this.#db.prepare(`
+                INSERT INTO recovery_daemon_incarnations(
+                    daemon_incarnation, daemon_generation, lease_nonce,
+                    owner_process_id, owner_process_start_id,
+                    claimed_at_ms, retired_at_ms, retirement_reason)
+                VALUES(?, ?, ?, ?, ?, ?, NULL, NULL)
+            `).run(
+                daemonIncarnation,
+                daemonGeneration,
+                leaseNonce,
+                processId,
+                processStartId,
+                nowMs,
+            );
+            this.#db.prepare(`
+                INSERT INTO recovery_daemon_authority(
+                    singleton_id, daemon_generation, daemon_incarnation,
+                    lease_nonce, owner_process_id, owner_process_start_id,
+                    heartbeat_at_ms, expires_at_ms)
+                VALUES(1, ?, ?, ?, ?, ?, ?, ?)
+            `).run(
+                daemonGeneration,
+                daemonIncarnation,
+                leaseNonce,
+                processId,
+                processStartId,
+                nowMs,
+                expiresAtMs,
+            );
+            return Object.freeze({
+                acquired: true,
+                reason: current === undefined ? "created" : "reclaimed",
+                lease: this.getRecoveryDaemonLease(),
+            });
+        });
+    }
+
+    getRecoveryDaemonLease() {
+        const row = this.#db.prepare(`
+            SELECT *
+            FROM recovery_daemon_authority
+            WHERE singleton_id = 1
+        `).get();
+        return row === undefined
+            ? null
+            : this.#rowToRecoveryDaemonLease(row);
+    }
+
+    renewRecoveryDaemonLease({
+        lease,
+        ttlMs,
+    } = {}) {
+        const credentials = this.#normalizeRecoveryDaemonCredentials(lease);
+        const leaseTtlMs = requireSafeInteger(ttlMs, "ttlMs", {
+            minimum: 1,
+            maximum: MAX_RECOVERY_DAEMON_LEASE_MS,
+        });
+        return this.#tx(() => {
+            const nowMs = this.#timestamp();
+            const current = this.#assertCurrentRecoveryDaemonInTransaction(
+                credentials,
+                nowMs,
+            );
+            const expiresAtMs = nowMs + leaseTtlMs;
+            if (!Number.isSafeInteger(expiresAtMs)) {
+                throw new InvalidArgumentError(
+                    "recovery daemon lease expiry exceeds safe integer range",
+                );
+            }
+            this.#db.prepare(`
+                UPDATE recovery_daemon_authority
+                SET heartbeat_at_ms = ?, expires_at_ms = ?
+                WHERE singleton_id = 1
+            `).run(nowMs, expiresAtMs);
+            return Object.freeze({
+                ...this.#rowToRecoveryDaemonLease(current),
+                heartbeatAtMs: nowMs,
+                expiresAtMs,
+            });
+        });
+    }
+
+    releaseRecoveryDaemonLease({
+        lease,
+        reason = "released",
+    } = {}) {
+        const credentials = this.#normalizeRecoveryDaemonCredentials(lease);
+        const retirementReason = requireString(reason, "reason", 128);
+        return this.#tx(() => {
+            const nowMs = this.#timestamp();
+            const current = this.#assertCurrentRecoveryDaemonInTransaction(
+                credentials,
+                nowMs,
+                { allowExpired: true },
+            );
+            this.#retireRecoveryDaemonInTransaction(
+                current,
+                nowMs,
+                retirementReason,
+            );
+            return Object.freeze({
+                released: true,
+                lease: this.#rowToRecoveryDaemonLease(current),
+                reason: retirementReason,
+                retiredAtMs: nowMs,
+            });
+        });
+    }
+
+    recordRecoveryOperation({
+        lease,
+        investigationId,
+        state,
+        code,
+        supervisorGeneration = null,
+        runnerIncarnation = null,
+    } = {}) {
+        const credentials = this.#normalizeRecoveryDaemonCredentials(lease);
+        requireString(investigationId, "investigationId", 128);
+        if (!RECOVERY_OPERATION_STATES.has(state)) {
+            throw new InvalidArgumentError(
+                "recovery operation state is invalid",
+                { state },
+            );
+        }
+        const operationCode = requireString(code, "code", 128);
+        const hasSupervisorGeneration = supervisorGeneration !== null;
+        const hasRunnerIncarnation = runnerIncarnation !== null;
+        if (hasSupervisorGeneration !== hasRunnerIncarnation) {
+            throw new InvalidArgumentError(
+                "supervisorGeneration and runnerIncarnation must be provided together",
+            );
+        }
+        const normalizedGeneration = hasSupervisorGeneration
+            ? requireSafeInteger(
+                supervisorGeneration,
+                "supervisorGeneration",
+                { minimum: 1 },
+            )
+            : null;
+        const normalizedIncarnation = hasRunnerIncarnation
+            ? requireString(
+                runnerIncarnation,
+                "runnerIncarnation",
+                256,
+            )
+            : null;
+        return this.#tx(() => {
+            const nowMs = this.#timestamp();
+            this.#assertCurrentRecoveryDaemonInTransaction(
+                credentials,
+                nowMs,
+            );
+            this.#requireInvestigationInTransaction(investigationId);
+            this.#db.prepare(`
+                INSERT INTO recovery_operations(
+                    investigation_id, daemon_generation, daemon_incarnation,
+                    operation_state, operation_code, supervisor_generation,
+                    runner_incarnation, attempt_count, updated_at_ms)
+                VALUES(?, ?, ?, ?, ?, ?, ?, 1, ?)
+                ON CONFLICT(investigation_id) DO UPDATE SET
+                    daemon_generation = excluded.daemon_generation,
+                    daemon_incarnation = excluded.daemon_incarnation,
+                    operation_state = excluded.operation_state,
+                    operation_code = excluded.operation_code,
+                    supervisor_generation = excluded.supervisor_generation,
+                    runner_incarnation = excluded.runner_incarnation,
+                    attempt_count = recovery_operations.attempt_count + 1,
+                    updated_at_ms = excluded.updated_at_ms
+            `).run(
+                investigationId,
+                credentials.daemonGeneration,
+                credentials.daemonIncarnation,
+                state,
+                operationCode,
+                normalizedGeneration,
+                normalizedIncarnation,
+                nowMs,
+            );
+            return this.getRecoveryOperation(investigationId);
+        });
+    }
+
+    getRecoveryOperation(investigationId) {
+        requireString(investigationId, "investigationId", 128);
+        const row = this.#db.prepare(`
+            SELECT *
+            FROM recovery_operations
+            WHERE investigation_id = ?
+        `).get(investigationId);
+        return row === undefined
+            ? null
+            : this.#rowToRecoveryOperation(row);
+    }
+
+    listRecoveryOperations() {
+        return Object.freeze(this.#db.prepare(`
+            SELECT *
+            FROM recovery_operations
+            ORDER BY investigation_id
+        `).all().map((row) => this.#rowToRecoveryOperation(row)));
     }
 
     #rowToInvestigation(row) {
@@ -678,6 +2013,168 @@ export class ResourceCatalogRepository {
         });
     }
 
+    #rowToLifecycleOperation(row) {
+        if (row === undefined
+            || !LIFECYCLE_OPERATION_KINDS.has(row.operation_kind)
+            || typeof row.operation_token !== "string"
+            || row.operation_token.length < 1
+            || row.operation_token.length > 256
+            || !Number.isSafeInteger(Number(row.owner_process_id))
+            || Number(row.owner_process_id) < 1
+            || typeof row.owner_process_start_id !== "string"
+            || row.owner_process_start_id.length < 1
+            || row.owner_process_start_id.length > 256
+            || (row.operation_kind === "archive"
+                ? !ARCHIVE_RELATIVE_PATH_RE.test(
+                    row.archive_relpath ?? "",
+                )
+                : row.archive_relpath !== null)
+            || (row.operation_kind === "delete"
+                ? !ARCHIVE_DIGEST_RE.test(
+                    row.expected_archive_digest ?? "",
+                )
+                : row.expected_archive_digest !== null)) {
+            throw new SchemaIntegrityError(
+                "catalog lifecycle operation is invalid",
+                { investigationId: row?.investigation_id ?? null },
+            );
+        }
+        return Object.freeze({
+            investigationId: row.investigation_id,
+            operationKind: row.operation_kind,
+            operationToken: row.operation_token,
+            ownerProcessId: Number(row.owner_process_id),
+            ownerProcessStartId: row.owner_process_start_id,
+            archiveRelativePath: row.archive_relpath ?? null,
+            expectedArchiveDigest:
+                row.expected_archive_digest ?? null,
+            startedAtMs: numberFromSql(
+                row.started_at_ms,
+                "lifecycleOperation.startedAtMs",
+            ),
+        });
+    }
+
+    #rowToArchive(row) {
+        if (row === undefined
+            || !ARCHIVE_TRUST_LEVELS.has(row.trust_level)
+            || !ARCHIVE_INTEGRITY_STATUSES.has(row.integrity_status)
+            || !ARCHIVE_DIGEST_RE.test(row.archive_digest ?? "")
+            || !ARCHIVE_RELATIVE_PATH_RE.test(
+                row.archive_relpath ?? "",
+            )
+            || ![0, 1].includes(Number(row.terminal_available))) {
+            throw new SchemaIntegrityError(
+                "catalog archive record is invalid",
+                { investigationId: row?.investigation_id ?? null },
+            );
+        }
+        const head = normalizeDomainHead({
+            seq: numberFromSql(
+                row.domain_head_seq,
+                "archive.domainHead.seq",
+            ),
+            eventHash: row.domain_head_hash ?? null,
+        }, "archive.domainHead");
+        return Object.freeze({
+            investigationId: row.investigation_id,
+            relativePath: row.archive_relpath,
+            digest: row.archive_digest,
+            trustLevel: row.trust_level,
+            domainVersion: requireSafeInteger(
+                Number(row.domain_version),
+                "archive.domainVersion",
+                { minimum: 1 },
+            ),
+            terminalAvailable: Number(row.terminal_available) === 1,
+            integrityStatus: row.integrity_status,
+            sizeBytes: numberFromSql(
+                row.size_bytes,
+                "archive.sizeBytes",
+            ),
+            domainHead: head,
+            archivedAtMs: numberFromSql(
+                row.archived_at_ms,
+                "archive.archivedAtMs",
+            ),
+        });
+    }
+
+    #rowToTombstone(row) {
+        if (row === undefined
+            || !ARCHIVE_DIGEST_RE.test(row.archive_digest ?? "")
+            || !ARCHIVE_DIGEST_RE.test(row.tombstone_digest ?? "")
+            || row.integrity_status !== "verified"
+            || !TOMBSTONE_RELATIVE_PATH_RE.test(
+                row.tombstone_relpath ?? "",
+            )
+            || typeof row.signing_key_fingerprint !== "string"
+            || row.signing_key_fingerprint.length < 1
+            || typeof row.signature !== "string"
+            || row.signature.length < 1) {
+            throw new SchemaIntegrityError(
+                "catalog tombstone record is invalid",
+                { investigationId: row?.investigation_id ?? null },
+            );
+        }
+        const createdAtMs = numberFromSql(
+            row.created_at_ms,
+            "tombstone.createdAtMs",
+        );
+        const deletedAtMs = numberFromSql(
+            row.deleted_at_ms,
+            "tombstone.deletedAtMs",
+        );
+        if (deletedAtMs < createdAtMs) {
+            throw new SchemaIntegrityError(
+                "catalog tombstone predates investigation creation",
+                { investigationId: row.investigation_id },
+            );
+        }
+        const tombstone = Object.freeze({
+            relativePath: row.tombstone_relpath,
+            digest: row.tombstone_digest,
+            signingKeyFingerprint: row.signing_key_fingerprint,
+            signature: row.signature,
+            archiveDigest: row.archive_digest,
+            domainVersion: requireSafeInteger(
+                Number(row.domain_version),
+                "tombstone.domainVersion",
+                { minimum: 1 },
+            ),
+            domainHead: normalizeDomainHead({
+                seq: numberFromSql(
+                    row.domain_head_seq,
+                    "tombstone.domainHead.seq",
+                ),
+                eventHash: row.domain_head_hash ?? null,
+            }, "tombstone.domainHead"),
+            sizeBytes: numberFromSql(
+                row.size_bytes,
+                "tombstone.sizeBytes",
+            ),
+            deletedAtMs,
+            integrityStatus: "verified",
+        });
+        return Object.freeze({
+            investigationId: row.investigation_id,
+            limitsDocument: null,
+            limitsFingerprint: null,
+            supervisorGeneration: null,
+            supervisorNonce: null,
+            runnerIncarnation: null,
+            registeredAtMs: createdAtMs,
+            authorityUpdatedAtMs: deletedAtMs,
+            limits: null,
+            lifecycleState: "tombstoned",
+            lifecycleUpdatedAtMs: deletedAtMs,
+            lifecycleReasonCode: "operator_delete",
+            lifecycleOperation: null,
+            archive: null,
+            tombstone,
+        });
+    }
+
     claimAuthority({
         investigationId,
         supervisorGeneration,
@@ -695,6 +2192,25 @@ export class ResourceCatalogRepository {
 
         return this.#tx(() => {
             const current = this.#requireInvestigationInTransaction(investigationId);
+            const lifecycle =
+                this.#assertInvestigationLifecycleIntegrity(current);
+            const lifecycleOperation = this.#db.prepare(`
+                SELECT operation_kind
+                FROM lifecycle_operations
+                WHERE investigation_id = ?
+            `).get(investigationId);
+            if (lifecycle.lifecycle_state !== "active"
+                || lifecycleOperation !== undefined) {
+                throw new FenceRejectedError(
+                    "runtime authority cannot be claimed outside an unfenced active lifecycle",
+                    {
+                        investigationId,
+                        lifecycleState: lifecycle.lifecycle_state,
+                        lifecycleOperation:
+                            lifecycleOperation?.operation_kind ?? null,
+                    },
+                );
+            }
             const currentGeneration = Number(current.supervisor_generation);
             if (generation < currentGeneration) {
                 throw new FenceRejectedError(
@@ -1221,13 +2737,25 @@ export class ResourceCatalogRepository {
                         || allocation.resource_key === "model_cost_units") {
                         continue;
                     }
+                    const reservedUnits = numberFromSql(
+                        allocation.reserved_units,
+                        `reserved:${allocation.resource_key}`,
+                    );
+                    const reportedUnits =
+                        allocation.resource_key === STORAGE_RESOURCE_KEY
+                            ? numberFromSql(
+                                this.#db.prepare(`
+                                    SELECT actual_units
+                                    FROM storage_usage
+                                    WHERE investigation_id = ?
+                                `).get(row.investigation_id)?.actual_units ?? 0,
+                                "storage_usage.actual_units",
+                            ) + reservedUnits
+                            : reservedUnits;
                     this.#reconcileAllocationInTransaction({
                         fencingToken: credentials.fencingToken,
                         resourceKey: allocation.resource_key,
-                        reportedUnits: numberFromSql(
-                            allocation.reserved_units,
-                            `reserved:${allocation.resource_key}`,
-                        ),
+                        reportedUnits,
                         reconciliationId:
                             `${releaseId}:${allocation.resource_key}:reservation-fallback`,
                         source: "reservation_fallback",
@@ -1304,6 +2832,95 @@ export class ResourceCatalogRepository {
         });
     }
 
+    reconcileStorageUsage({
+        investigationId,
+        supervisorGeneration,
+        runnerIncarnation,
+        actualUnits,
+        reconciliationId,
+        source,
+    } = {}) {
+        requireString(investigationId, "investigationId", 128);
+        const generation = requireSafeInteger(
+            supervisorGeneration,
+            "supervisorGeneration",
+            { minimum: 1 },
+        );
+        requireString(runnerIncarnation, "runnerIncarnation", 256);
+        const reported = requireSafeInteger(
+            actualUnits,
+            "actualUnits",
+            { minimum: 0 },
+        );
+        requireString(reconciliationId, "reconciliationId", 256);
+        requireString(source, "source", 128);
+        return this.#tx(() => {
+            const investigation = this.#requireInvestigationInTransaction(
+                investigationId,
+            );
+            if (Number(investigation.supervisor_generation) !== generation
+                || investigation.runner_incarnation !== runnerIncarnation) {
+                throw new FenceRejectedError(
+                    "storage reconciliation authority is stale",
+                    {
+                        investigationId,
+                        supervisorGeneration: generation,
+                        runnerIncarnation,
+                    },
+                );
+            }
+            const existing = this.#db.prepare(`
+                SELECT reported_units, source
+                FROM storage_reconciliations
+                WHERE investigation_id = ? AND reconciliation_id = ?
+            `).get(investigationId, reconciliationId);
+            if (existing !== undefined) {
+                if (Number(existing.reported_units) !== reported
+                    || existing.source !== source) {
+                    throw new CasConflictError(
+                        "storage reconciliation id was reused with different content",
+                        { investigationId, reconciliationId },
+                    );
+                }
+                return Object.freeze({
+                    deduplicated: true,
+                    actualUnits: reported,
+                    snapshot: Object.freeze(
+                        this.#usageSnapshotInTransaction(investigationId),
+                    ),
+                });
+            }
+            const nowMs = this.#timestamp();
+            this.#db.prepare(`
+                UPDATE storage_usage
+                SET actual_units = ?, reconciled_at_ms = ?
+                WHERE investigation_id = ?
+            `).run(reported, nowMs, investigationId);
+            this.#db.prepare(`
+                INSERT INTO storage_reconciliations(
+                    investigation_id, reconciliation_id, reported_units,
+                    source, reconciled_at_ms)
+                VALUES(?, ?, ?, ?, ?)
+            `).run(
+                investigationId,
+                reconciliationId,
+                reported,
+                source,
+                nowMs,
+            );
+            return Object.freeze({
+                deduplicated: false,
+                actualUnits: reported,
+                snapshot: Object.freeze(
+                    this.#usageSnapshotInTransaction(investigationId),
+                ),
+                overruns: Object.freeze(
+                    this.#overrunsInTransaction(investigationId),
+                ),
+            });
+        });
+    }
+
     reclaimStale() {
         return this.#tx(() => {
             const nowMs = this.#timestamp();
@@ -1356,6 +2973,152 @@ export class ResourceCatalogRepository {
             this.#requireInvestigationInTransaction(investigationId);
         }
         return Object.freeze(this.#usageSnapshotInTransaction(investigationId));
+    }
+
+    #normalizeRecoveryDaemonCredentials(value) {
+        const lease = requirePlainObject(value, "lease");
+        return Object.freeze({
+            daemonGeneration: requireSafeInteger(
+                lease.daemonGeneration,
+                "lease.daemonGeneration",
+                { minimum: 1 },
+            ),
+            daemonIncarnation: requireString(
+                lease.daemonIncarnation,
+                "lease.daemonIncarnation",
+                256,
+            ),
+            leaseNonce: requireString(
+                lease.leaseNonce,
+                "lease.leaseNonce",
+                256,
+            ),
+            ownerProcessId: requireSafeInteger(
+                lease.ownerProcessId,
+                "lease.ownerProcessId",
+                { minimum: 1 },
+            ),
+            ownerProcessStartId: requireString(
+                lease.ownerProcessStartId,
+                "lease.ownerProcessStartId",
+                256,
+            ),
+        });
+    }
+
+    #assertCurrentRecoveryDaemonInTransaction(
+        credentials,
+        nowMs,
+        { allowExpired = false } = {},
+    ) {
+        const current = this.#db.prepare(`
+            SELECT *
+            FROM recovery_daemon_authority
+            WHERE singleton_id = 1
+        `).get();
+        if (current === undefined
+            || Number(current.daemon_generation)
+                !== credentials.daemonGeneration
+            || current.daemon_incarnation
+                !== credentials.daemonIncarnation
+            || current.lease_nonce !== credentials.leaseNonce
+            || Number(current.owner_process_id)
+                !== credentials.ownerProcessId
+            || current.owner_process_start_id
+                !== credentials.ownerProcessStartId) {
+            throw new FenceRejectedError(
+                "recovery daemon lease authority is stale",
+                {
+                    presentedGeneration: credentials.daemonGeneration,
+                    currentGeneration:
+                        current === undefined
+                            ? null
+                            : Number(current.daemon_generation),
+                },
+            );
+        }
+        if (!allowExpired && Number(current.expires_at_ms) <= nowMs) {
+            throw new FenceRejectedError(
+                "recovery daemon lease has expired",
+                {
+                    daemonGeneration: credentials.daemonGeneration,
+                    expiresAtMs: Number(current.expires_at_ms),
+                    nowMs,
+                },
+            );
+        }
+        return current;
+    }
+
+    #retireRecoveryDaemonInTransaction(row, nowMs, reason) {
+        this.#db.prepare(`
+            UPDATE recovery_daemon_incarnations
+            SET retired_at_ms = ?, retirement_reason = ?
+            WHERE daemon_incarnation = ? AND retired_at_ms IS NULL
+        `).run(nowMs, reason, row.daemon_incarnation);
+        this.#db.prepare(`
+            DELETE FROM recovery_daemon_authority
+            WHERE singleton_id = 1
+              AND daemon_generation = ?
+              AND daemon_incarnation = ?
+              AND lease_nonce = ?
+        `).run(
+            row.daemon_generation,
+            row.daemon_incarnation,
+            row.lease_nonce,
+        );
+    }
+
+    #rowToRecoveryDaemonLease(row) {
+        return Object.freeze({
+            daemonGeneration: numberFromSql(
+                row.daemon_generation,
+                "recoveryDaemon.daemonGeneration",
+            ),
+            daemonIncarnation: row.daemon_incarnation,
+            leaseNonce: row.lease_nonce,
+            ownerProcessId: numberFromSql(
+                row.owner_process_id,
+                "recoveryDaemon.ownerProcessId",
+            ),
+            ownerProcessStartId: row.owner_process_start_id,
+            heartbeatAtMs: numberFromSql(
+                row.heartbeat_at_ms,
+                "recoveryDaemon.heartbeatAtMs",
+            ),
+            expiresAtMs: numberFromSql(
+                row.expires_at_ms,
+                "recoveryDaemon.expiresAtMs",
+            ),
+        });
+    }
+
+    #rowToRecoveryOperation(row) {
+        return Object.freeze({
+            investigationId: row.investigation_id,
+            daemonGeneration: numberFromSql(
+                row.daemon_generation,
+                "recoveryOperation.daemonGeneration",
+            ),
+            daemonIncarnation: row.daemon_incarnation,
+            state: row.operation_state,
+            code: row.operation_code,
+            supervisorGeneration: row.supervisor_generation === null
+                ? null
+                : numberFromSql(
+                    row.supervisor_generation,
+                    "recoveryOperation.supervisorGeneration",
+                ),
+            runnerIncarnation: row.runner_incarnation ?? null,
+            attemptCount: numberFromSql(
+                row.attempt_count,
+                "recoveryOperation.attemptCount",
+            ),
+            updatedAtMs: numberFromSql(
+                row.updated_at_ms,
+                "recoveryOperation.updatedAtMs",
+            ),
+        });
     }
 
     #normalizeLeaseCredentials({
@@ -1473,6 +3236,21 @@ export class ResourceCatalogRepository {
                 },
             );
         }
+        const storage = this.#db.prepare(`
+            SELECT actual_units, reconciled_at_ms
+            FROM storage_usage
+            WHERE investigation_id = ?
+        `).get(row.investigation_id);
+        if (storage === undefined
+            || !Number.isSafeInteger(Number(storage.actual_units))
+            || Number(storage.actual_units) < 0
+            || !Number.isSafeInteger(Number(storage.reconciled_at_ms))
+            || Number(storage.reconciled_at_ms) < 0) {
+            throw new SchemaIntegrityError(
+                "investigation storage usage row is missing or invalid",
+                { investigationId: row.investigation_id },
+            );
+        }
         return Object.freeze(entries);
     }
 
@@ -1499,12 +3277,54 @@ export class ResourceCatalogRepository {
         return active[0];
     }
 
+    #assertInvestigationLifecycleIntegrity(row) {
+        const lifecycle = this.#db.prepare(`
+            SELECT lifecycle_state, updated_at_ms, reason_code
+            FROM investigation_lifecycle
+            WHERE investigation_id = ?
+        `).get(row.investigation_id);
+        if (lifecycle === undefined
+            || !INVESTIGATION_LIFECYCLE_STATES.has(
+                lifecycle.lifecycle_state,
+            )
+            || !Number.isSafeInteger(Number(lifecycle.updated_at_ms))
+            || Number(lifecycle.updated_at_ms) < 0
+            || (lifecycle.reason_code !== null
+                && (typeof lifecycle.reason_code !== "string"
+                    || lifecycle.reason_code.length < 1
+                    || lifecycle.reason_code.length > 128))) {
+            throw new SchemaIntegrityError(
+                "investigation lifecycle state is missing or invalid",
+                { investigationId: row.investigation_id },
+            );
+        }
+        return lifecycle;
+    }
+
     #assertCurrentAuthorityInTransaction({
         investigationId,
         supervisorGeneration,
         runnerIncarnation,
     }) {
         const current = this.#requireInvestigationInTransaction(investigationId);
+        const lifecycle = this.#assertInvestigationLifecycleIntegrity(current);
+        const lifecycleOperation = this.#db.prepare(`
+            SELECT operation_kind
+            FROM lifecycle_operations
+            WHERE investigation_id = ?
+        `).get(investigationId);
+        if (lifecycle.lifecycle_state !== "active"
+            || lifecycleOperation !== undefined) {
+            throw new FenceRejectedError(
+                "resource acquisition is fenced by investigation lifecycle",
+                {
+                    investigationId,
+                    lifecycleState: lifecycle.lifecycle_state,
+                    lifecycleOperation:
+                        lifecycleOperation?.operation_kind ?? null,
+                },
+            );
+        }
         if (Number(current.supervisor_generation) !== supervisorGeneration
             || current.runner_incarnation !== runnerIncarnation) {
             throw new FenceRejectedError(
@@ -1617,6 +3437,27 @@ export class ResourceCatalogRepository {
     }
 
     #finalizeUnknownInTransaction(fencingToken, reason, nowMs) {
+        const storage = this.#db.prepare(`
+            SELECT l.investigation_id, a.reserved_units
+            FROM lease_allocations AS a
+            JOIN leases AS l ON l.fencing_token = a.fencing_token
+            WHERE a.fencing_token = ? AND a.resource_key = ?
+        `).get(fencingToken, STORAGE_RESOURCE_KEY);
+        if (storage !== undefined) {
+            this.#db.prepare(`
+                UPDATE storage_usage
+                SET actual_units = actual_units + ?,
+                    reconciled_at_ms = ?
+                WHERE investigation_id = ?
+            `).run(
+                numberFromSql(
+                    storage.reserved_units,
+                    "reserved:storage_bytes",
+                ),
+                nowMs,
+                storage.investigation_id,
+            );
+        }
         this.#db.prepare(`
             UPDATE lease_allocations
             SET charged_units = MAX(charged_units, reserved_units),
@@ -1643,6 +3484,44 @@ export class ResourceCatalogRepository {
     }
 
     #resourceUsageInTransaction(resourceKey, investigationId) {
+        if (resourceKey === STORAGE_RESOURCE_KEY) {
+            const committedRow = investigationId === null
+                ? this.#db.prepare(`
+                    SELECT COALESCE(SUM(actual_units), 0) AS total
+                    FROM storage_usage
+                `).get()
+                : this.#db.prepare(`
+                    SELECT actual_units AS total
+                    FROM storage_usage
+                    WHERE investigation_id = ?
+                `).get(investigationId);
+            const heldRow = investigationId === null
+                ? this.#db.prepare(`
+                    SELECT COALESCE(SUM(a.reserved_units), 0) AS total
+                    FROM lease_allocations AS a
+                    JOIN leases AS l ON l.fencing_token = a.fencing_token
+                    WHERE a.resource_key = ?
+                      AND l.status = 'active'
+                `).get(STORAGE_RESOURCE_KEY)
+                : this.#db.prepare(`
+                    SELECT COALESCE(SUM(a.reserved_units), 0) AS total
+                    FROM lease_allocations AS a
+                    JOIN leases AS l ON l.fencing_token = a.fencing_token
+                    WHERE a.resource_key = ?
+                      AND l.status = 'active'
+                      AND l.investigation_id = ?
+                `).get(STORAGE_RESOURCE_KEY, investigationId);
+            return Object.freeze({
+                committedUnits: numberFromSql(
+                    committedRow?.total ?? 0,
+                    `committed:${resourceKey}`,
+                ),
+                heldUnits: numberFromSql(
+                    heldRow?.total ?? 0,
+                    `held:${resourceKey}`,
+                ),
+            });
+        }
         const whereInvestigation = investigationId === null
             ? ""
             : "AND l.investigation_id = :investigationId";
@@ -1767,10 +3646,29 @@ export class ResourceCatalogRepository {
             FROM lease_allocations
             WHERE fencing_token = ? AND resource_key = ?
         `).get(fencingToken, resourceKey);
-        const chargedUnits = Math.max(
+        let chargedUnits = Math.max(
             numberFromSql(allocation.charged_units, `charged:${resourceKey}`),
             reportedUnits,
         );
+        if (resourceKey === STORAGE_RESOURCE_KEY) {
+            chargedUnits = reportedUnits;
+            const lease = this.#db.prepare(`
+                SELECT investigation_id
+                FROM leases
+                WHERE fencing_token = ?
+            `).get(fencingToken);
+            if (lease === undefined) {
+                throw new SchemaIntegrityError(
+                    "storage reconciliation lease is missing",
+                    { fencingToken },
+                );
+            }
+            this.#db.prepare(`
+                UPDATE storage_usage
+                SET actual_units = ?, reconciled_at_ms = ?
+                WHERE investigation_id = ?
+            `).run(reportedUnits, nowMs, lease.investigation_id);
+        }
         this.#db.prepare(`
             UPDATE lease_allocations
             SET charged_units = :chargedUnits,

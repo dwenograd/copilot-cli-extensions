@@ -60,6 +60,8 @@ function makeReadDeps({
     waitForStopAcknowledgement = undefined,
     verifyAuthority = () => {},
     quiescentStop = null,
+    storageTelemetry = null,
+    catalogEntry = null,
 } = {}) {
     const repository = {
         close() {},
@@ -91,6 +93,54 @@ function makeReadDeps({
         readStatus: () => null,
         readSupervisorLock: () => null,
         isPidAlive: () => false,
+        ...(storageTelemetry === null
+            ? {}
+            : { readWorkingSetTelemetry: () => storageTelemetry }),
+        ...(catalogEntry === null
+            ? {}
+            : {
+                resourceCatalogPath: () =>
+                    path.resolve("resource-catalog.sqlite"),
+                openResourceBrokerFromStateRoot: () => ({
+                    close() {},
+                    getInvestigation: () => catalogEntry,
+                }),
+                verifyBundleInPlace: () => ({
+                    digest: catalogEntry.archive?.digest ?? null,
+                    investigationId: INVESTIGATION_ID,
+                    domainVersion: 4,
+                    domainHead: {
+                        seq: replayAggregate.lastSeq,
+                        eventHash: replayAggregate.lastEventHash,
+                    },
+                    trustLevel: "authenticated",
+                }),
+                verifySignedTombstone: () => ({
+                    verified: true,
+                    sizeBytes:
+                        catalogEntry.tombstone?.sizeBytes ?? null,
+                    signingKeyFingerprint:
+                        catalogEntry.tombstone
+                            ?.signingKeyFingerprint ?? null,
+                    signature:
+                        catalogEntry.tombstone?.signature ?? null,
+                    payload: catalogEntry.tombstone === null
+                        ? null
+                        : {
+                            createdAtMs:
+                                catalogEntry.registeredAtMs,
+                            archiveDigest:
+                                catalogEntry.tombstone.archiveDigest,
+                            domainVersion:
+                                catalogEntry.tombstone.domainVersion,
+                            domainHead:
+                                catalogEntry.tombstone.domainHead,
+                            deletedAt: new Date(
+                                catalogEntry.tombstone.deletedAtMs,
+                            ).toISOString(),
+                        },
+                }),
+            }),
     };
 }
 
@@ -106,8 +156,14 @@ describe("compact four-tool API boundary", () => {
 
         const validArgs = {
             crucible_start: { experiment_id: "approved-experiment" },
-            crucible_status: { investigation_id: INVESTIGATION_ID },
-            crucible_stop: { investigation_id: INVESTIGATION_ID },
+            crucible_status: {
+                operation: "get",
+                investigation_id: INVESTIGATION_ID,
+            },
+            crucible_stop: {
+                operation: "pause",
+                investigation_id: INVESTIGATION_ID,
+            },
             crucible_result: { investigation_id: INVESTIGATION_ID },
         };
         for (const spec of TOOL_SPECS) {
@@ -182,7 +238,10 @@ describe("compact four-tool API boundary", () => {
 describe("compact handler safety guarantees", () => {
     it("redacts a ready terminal from status to the exact availability allowlist", () => {
         const status = statusInvestigation(
-            { investigation_id: INVESTIGATION_ID },
+            {
+                operation: "get",
+                investigation_id: INVESTIGATION_ID,
+            },
             makeReadDeps({
                 replayAggregate: aggregate({
                     status: "terminal",
@@ -200,13 +259,124 @@ describe("compact handler safety guarantees", () => {
             investigation_id: INVESTIGATION_ID,
             terminal_available: true,
         });
+
         expect(JSON.stringify(status)).not.toContain("winner-secret");
         expect(JSON.stringify(status)).not.toContain("evidence-secret");
     });
 
+    it("verifies archived bundles in place for status and result", () => {
+        const terminalAggregate = aggregate({
+            status: "terminal",
+            terminal: {
+                decision: "VERIFIED_RESULT",
+                candidateId: "archived-winner",
+                evidenceHash: "archived-evidence",
+                seq: 3,
+                eventHash: "event-secret",
+            },
+        });
+
+        const catalogEntry = {
+            investigationId: INVESTIGATION_ID,
+            lifecycleState: "archived",
+            registeredAtMs: 1_000,
+            lifecycleUpdatedAtMs: 2_000,
+            archive: {
+                relativePath:
+                    `.retention/archives/${INVESTIGATION_ID}`,
+                digest: `sha256:${"a".repeat(64)}`,
+                trustLevel: "authenticated",
+                domainVersion: 4,
+                terminalAvailable: true,
+                integrityStatus: "verified",
+                sizeBytes: 100,
+                domainHead: {
+                    seq: 3,
+                    eventHash: "event-secret",
+                },
+                archivedAtMs: 2_000,
+            },
+            tombstone: null,
+        };
+        const deps = makeReadDeps({
+            replayAggregate: terminalAggregate,
+            catalogEntry,
+        });
+        expect(statusInvestigation({
+            operation: "get",
+            investigation_id: INVESTIGATION_ID,
+        }, deps)).toEqual({
+            is_result: false,
+            investigation_id: INVESTIGATION_ID,
+            terminal_available: true,
+        });
+        expect(resultInvestigation({
+            investigation_id: INVESTIGATION_ID,
+        }, deps)).toMatchObject({
+            is_result: true,
+            investigation_id: INVESTIGATION_ID,
+            decision: "VERIFIED_RESULT",
+            candidate_id: "archived-winner",
+        });
+    });
+
+    it("reports a verified tombstone without reviving result authority", () => {
+        const catalogEntry = {
+            investigationId: INVESTIGATION_ID,
+            lifecycleState: "tombstoned",
+            registeredAtMs: 1_000,
+            lifecycleUpdatedAtMs: 2_000,
+            archive: null,
+            tombstone: {
+                relativePath:
+                    `.retention/tombstones/${INVESTIGATION_ID}.json`,
+                digest: `sha256:${"a".repeat(64)}`,
+                signingKeyFingerprint:
+                    `sha256:crucible-tombstone-signing-key-v1:${
+                        "b".repeat(64)
+                    }`,
+                signature: "signed",
+                archiveDigest: `sha256:${"c".repeat(64)}`,
+                domainVersion: 4,
+                domainHead: {
+                    seq: 3,
+                    eventHash: "event-secret",
+                },
+                sizeBytes: 100,
+                deletedAtMs: 2_000,
+                integrityStatus: "verified",
+            },
+        };
+        const deps = makeReadDeps({ catalogEntry });
+        expect(statusInvestigation({
+            operation: "get",
+            investigation_id: INVESTIGATION_ID,
+        }, deps)).toMatchObject({
+            is_result: false,
+            state: "tombstoned",
+            deleted: true,
+            integrity_status: "verified",
+            terminal_available: false,
+        });
+        const result = resultInvestigation({
+            investigation_id: INVESTIGATION_ID,
+        }, deps);
+        expect(result).toMatchObject({
+            is_result: false,
+            state: "tombstoned",
+            deleted: true,
+            non_result_code: "INVESTIGATION_TOMBSTONED",
+        });
+        expect(result).not.toHaveProperty("decision");
+        expect(result).not.toHaveProperty("evidence_hash");
+    });
+
     it("claims resumability only after pause and quiescence are durable", async () => {
         const pending = await stopInvestigation(
-            { investigation_id: INVESTIGATION_ID },
+            {
+                operation: "pause",
+                investigation_id: INVESTIGATION_ID,
+            },
             makeReadDeps({
                 requestStop: () => ({
                     appended: true,
@@ -232,7 +402,10 @@ describe("compact handler safety guarantees", () => {
         });
 
         const persisted = await stopInvestigation(
-            { investigation_id: INVESTIGATION_ID },
+            {
+                operation: "pause",
+                investigation_id: INVESTIGATION_ID,
+            },
             makeReadDeps({
                 requestStop: () => ({
                     appended: true,
@@ -262,7 +435,10 @@ describe("compact handler safety guarantees", () => {
 
     it("reports pause-pending status as non-quiescent and non-resumable", () => {
         const status = statusInvestigation(
-            { investigation_id: INVESTIGATION_ID },
+            {
+                operation: "get",
+                investigation_id: INVESTIGATION_ID,
+            },
             makeReadDeps({
                 replayAggregate: aggregate({
                     contract: null,
@@ -286,9 +462,122 @@ describe("compact handler safety guarantees", () => {
         });
     });
 
+    it("keeps public status read-only when the supervisor is absent", () => {
+        let ensureCalls = 0;
+        const status = statusInvestigation(
+            {
+                operation: "get",
+                investigation_id: INVESTIGATION_ID,
+            },
+            {
+                ...makeReadDeps({
+                    replayAggregate: aggregate({
+                        contract: null,
+                        status: "running",
+                    }),
+                }),
+                ensureSupervisor() {
+                    ensureCalls += 1;
+                    throw new Error("status must not launch a supervisor");
+                },
+            },
+        );
+        expect(ensureCalls).toBe(0);
+        expect(status.supervisor_health).toMatchObject({
+            present: false,
+            alive: false,
+            ensure_action: null,
+        });
+    });
+
+    it("exposes aggregate storage telemetry without result details", () => {
+            const budget = {
+                currentBytes: 42,
+                limitBytes: 100,
+                effectiveLimitBytes: 95,
+                remainingBytes: 53,
+                warningBytes: 90,
+                pressure: "normal",
+            };
+            const status = statusInvestigation(
+                {
+                    operation: "get",
+                    investigation_id: INVESTIGATION_ID,
+                },
+                makeReadDeps({
+                    replayAggregate: aggregate({
+                        contract: null,
+                        status: "paused",
+                        pause: { reason: "storage telemetry test" },
+                    }),
+                    storageTelemetry: {
+                        investigation: {
+                            bytes: 42,
+                            files: 3,
+                            directories: 2,
+                            unsafeEntries: 0,
+                            budget,
+                        },
+                        global: {
+                            bytes: 84,
+                            files: 6,
+                            directories: 4,
+                            unsafeEntries: 0,
+                            budget: {
+                                ...budget,
+                                currentBytes: 84,
+                                limitBytes: 200,
+                                effectiveLimitBytes: 200,
+                                remainingBytes: 116,
+                                warningBytes: 180,
+                            },
+                        },
+                        repository: null,
+                        artifacts: null,
+                        thresholds: {
+                            perAttemptBytes: 10,
+                            perInvestigationBytes: 100,
+                            globalBytes: 200,
+                        },
+                        diagnostics: {
+                            retentionMode: "defer",
+                            cleanupDeferred: true,
+                        },
+                    },
+                }),
+            );
+            expect(status.storage).toMatchObject({
+                investigation: {
+                    bytes: 42,
+                    files: 3,
+                    budget: {
+                        limit_bytes: 100,
+                        pressure: "normal",
+                    },
+                },
+                global: {
+                    bytes: 84,
+                },
+            });
+            const serialized = JSON.stringify(status);
+            for (const forbidden of [
+                "winner",
+                "candidate_id",
+                "evidence_id",
+                "evidence_hash",
+                "VERIFIED_RESULT",
+                "TARGET_UNREACHABLE",
+            ]) {
+                expect(serialized).not.toContain(forbidden);
+            }
+    });
+
     it("reports bounded acknowledgement timeout as non-quiescent and non-resumable", async () => {
         const stopped = await stopInvestigation(
-            { investigation_id: INVESTIGATION_ID },
+            {
+                operation: "pause",
+                investigation_id: INVESTIGATION_ID,
+            },
             makeReadDeps({
                 requestStop: () => ({
                     appended: true,

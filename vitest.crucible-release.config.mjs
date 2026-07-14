@@ -5,6 +5,7 @@ export default defineConfig({
         include: [
             "crucible/__tests__/**/*.release.test.mjs",
         ],
+        passWithNoTests: false,
         testTimeout: 360_000,
         hookTimeout: 180_000,
     },

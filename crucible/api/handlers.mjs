@@ -5,8 +5,8 @@
 //
 //   * Internal handlers THROW typed errors; only `runToolBoundary` catches, at
 //     the SDK edge, converting to a structured `{ textResultForLlm, resultType }`.
-//   * All environment/state resolution goes through api/environment.mjs; no tool
-//     argument ever selects a filesystem path, harness allowlist, or CLI.
+//   * Environment/state roots come from api/environment.mjs. The optional archive
+//     destination is accepted only inside the state-root retention directory.
 //   * crucible_result accepts a persisted terminal only after reducer replay has
 //     re-derived and closure-bound statistics from raw blocks and receipts.
 //   * Diagnostics go only through the injected `log` (session.log), never stdout.
@@ -33,6 +33,16 @@ import {
     openArtifactStoreReadOnly,
     openRepository,
     openRepositoryReadOnly,
+    createWorkingSetController,
+    publicWorkingSetTelemetry,
+    exportBundle,
+    importBundle,
+    verifyBundleInPlace,
+    removeVerifiedBundle,
+    writeSignedTombstone,
+    verifySignedTombstone,
+    measureRetainedTree,
+    removeRetainedTree,
 } from "../persistence/index.mjs";
 import {
     loadHarnessAllowlist,
@@ -40,20 +50,18 @@ import {
 } from "../measurement/index.mjs";
 import {
     RUNTIME_ERROR_CODES,
-    assertSupervisorConfigMatchesRuntimeAuthority,
     createDomainRepositoryAdapter,
     ensureSupervisor,
     isExactPidAlive,
     loadSupervisorConfig,
     normalizeSupervisorConfig,
-    resolveNodeExecutable,
+    openResourceBrokerFromStateRoot,
     readSupervisorLock,
     readStatus,
+    resourceCatalogPath,
     requestStop,
     waitForStopAcknowledgement,
     supervisorPaths,
-    supervisorConfigFromRuntimeAuthority,
-    verifyRuntimeConfigAuthority,
     validateSupervisorAdmission,
 } from "../runtime/index.mjs";
 
@@ -87,6 +95,16 @@ import {
     InvestigationNotFoundError,
     CrucibleApiError,
 } from "./errors.mjs";
+import {
+    activeCatalogSummary,
+    archiveInvestigation,
+    deleteInvestigation,
+    listLifecycleInvestigations,
+    resolveLifecycleTarget,
+    resultTombstonePayload,
+    statusTombstonePayload,
+    verifyArchivedTarget,
+} from "./lifecycle.mjs";
 
 const TERMINAL_DECISIONS = Object.freeze(["VERIFIED_RESULT", "TARGET_UNREACHABLE"]);
 
@@ -107,16 +125,27 @@ export function makeDefaultDeps(env = process.env, log = () => {}) {
         openRepositoryReadOnly,
         openArtifactStore,
         openArtifactStoreReadOnly,
+        exportBundle,
+        importBundle,
+        verifyBundleInPlace,
+        removeVerifiedBundle,
+        writeSignedTombstone,
+        verifySignedTombstone,
+        measureRetainedTree,
+        removeRetainedTree,
         createDomainRepositoryAdapter,
         ensureSupervisor,
         readStatus,
         requestStop,
         waitForStopAcknowledgement,
         normalizeSupervisorConfig,
+        openResourceBrokerFromStateRoot,
         loadSupervisorConfig,
         readSupervisorLock,
+        resourceCatalogPath,
         validateSupervisorAdmission,
         verifyExperimentAuthority,
+        now: Date.now,
     };
 }
 
@@ -124,7 +153,10 @@ function openInvestigationForRead(
     deps,
     investigationId,
     paths,
-    { verifyTerminalArtifacts = false } = {},
+    {
+        verifyTerminalArtifacts = false,
+        includeStorageTelemetry = true,
+    } = {},
 ) {
     const { eventsDbPath, artifactRoot } = paths;
     if (!(deps.pathExists ?? fs.existsSync)(eventsDbPath)) {
@@ -177,11 +209,60 @@ function openInvestigationForRead(
             typeof repository.getQuiescentStop === "function"
                 ? repository.getQuiescentStop(investigationId)
                 : null;
+        let storageTelemetry = includeStorageTelemetry
+            && typeof deps.readWorkingSetTelemetry === "function"
+                ? deps.readWorkingSetTelemetry({
+                    repository,
+                    artifactStore,
+                    investigationId,
+                    paths,
+                    aggregate: replay.aggregate,
+                })
+                : null;
+        if (includeStorageTelemetry
+            && storageTelemetry === null
+            && replay.aggregate.contract?.workingSetPolicy !== undefined
+            && typeof repository.getStorageTelemetry === "function"
+            && typeof artifactStore.storageTelemetry === "function") {
+            const policy = replay.aggregate.contract.workingSetPolicy;
+            const globalLimitBytes =
+                replay.aggregate.runtimeConfigAuthority
+                    ?.securityConfig?.runner?.resourceBroker
+                    ?.config?.capacities?.storageBytes
+                ?? policy.perInvestigationBytes;
+            storageTelemetry = createWorkingSetController({
+                repository,
+                artifactStore,
+                investigationId,
+                investigationDir: paths.investigationDir,
+                stateRoot: path.dirname(paths.investigationDir),
+                policy,
+                globalLimitBytes,
+            }).telemetry();
+        }
         return {
             aggregate: replay.aggregate,
+            repositoryHead:
+                typeof repository.getHead === "function"
+                    ? repository.getHead(investigationId)
+                    : {
+                        seq: replay.aggregate.lastSeq,
+                        eventHash: replay.aggregate.lastEventHash,
+                    },
+            updatedAtMs:
+                replay.aggregate.lastSeq > 0
+                && typeof repository.getEvent === "function"
+                    ? Date.parse(
+                        repository.getEvent(
+                            investigationId,
+                            replay.aggregate.lastSeq,
+                        )?.createdAt ?? "",
+                    )
+                    : null,
             operationalNonResult,
             quiescentStop,
             artifactClosureReport: replay.artifactClosureReport ?? null,
+            storageTelemetry,
         };
     } finally {
         repository.close();
@@ -412,64 +493,6 @@ function buildSupervisorHealth(status, lock, isPidAlive, now = Date.now(), stale
     };
 }
 
-function tryRestartSupervisor(
-    deps,
-    env,
-    paths,
-    investigationId,
-    aggregate,
-) {
-    const configPath = supervisorPaths(paths.stateDir, investigationId).configPath;
-    if (!(deps.pathExists ?? fs.existsSync)(configPath)) {
-        return { action: "no-persisted-config" };
-    }
-    try {
-        const runtimeAuthority = aggregate.runtimeConfigAuthority;
-        if (runtimeAuthority === null
-            || runtimeAuthority.fingerprint
-                !== aggregate.runtimeConfigFingerprint) {
-            throw new Error(
-                "persisted investigation has no immutable runtime config authority",
-            );
-        }
-        if (runtimeAuthority.sandbox?.required === true) {
-            return { action: "explicit-reattach-required" };
-        }
-        const persisted = deps.loadSupervisorConfig(configPath, { env });
-        const matched = assertSupervisorConfigMatchesRuntimeAuthority(
-            persisted,
-            runtimeAuthority,
-            { env },
-        );
-        const config = supervisorConfigFromRuntimeAuthority(
-            runtimeAuthority,
-            {
-                deadlineMs: matched.runner.deadlineMs,
-                env,
-            },
-        );
-        const admission = (deps.validateSupervisorAdmission
-            ?? validateSupervisorAdmission)(config, { env });
-        const admittedConfig = admission?.config ?? config;
-        const nodeExecutable =
-            admission?.nodeExecutable
-            ?? (deps.resolveNodeExecutable ?? resolveNodeExecutable)(env);
-        verifyRuntimeConfigAuthority(runtimeAuthority, {
-            env,
-            deadlineMs: matched.runner.deadlineMs,
-            expectedInvestigationId: investigationId,
-            expectedStateDir: paths.stateDir,
-            expectedArtifactRoot: paths.artifactRoot,
-            nodeExecutable,
-        });
-        const result = deps.ensureSupervisor(admittedConfig, { env });
-        return summarizeSupervisorAction(result);
-    } catch (error) {
-        deps.log?.(`[crucible] crucible_status supervisor restart failed: ${error?.message ?? String(error)}`);
-        return { action: "restart-failed", code: error?.code ?? null, error: error?.message ?? String(error) };
-    }
-}
-
 function integrityBlockedPayload(investigationId) {
     return {
         is_result: false,
@@ -542,7 +565,10 @@ function readInvestigationOrIntegrityBlock(
     deps,
     investigationId,
     paths,
-    { verifyTerminalArtifacts = false } = {},
+    {
+        verifyTerminalArtifacts = false,
+        includeStorageTelemetry = true,
+    } = {},
 ) {
     try {
         return {
@@ -552,7 +578,10 @@ function readInvestigationOrIntegrityBlock(
                 deps,
                 investigationId,
                 paths,
-                { verifyTerminalArtifacts },
+                {
+                    verifyTerminalArtifacts,
+                    includeStorageTelemetry,
+                },
             ),
         };
     } catch (error) {
@@ -578,21 +607,101 @@ function readInvestigationOrIntegrityBlock(
     }
 }
 
+function probeActiveCatalogEntry(entry, stateRoot, deps) {
+    const paths = resolveInvestigationPaths(
+        stateRoot,
+        entry.investigationId,
+    );
+    const verifiedRead = readInvestigationOrIntegrityBlock(
+        deps,
+        entry.investigationId,
+        paths,
+        {
+            verifyTerminalArtifacts: true,
+            includeStorageTelemetry: false,
+        },
+    );
+    if (verifiedRead.blocked !== null) {
+        return activeCatalogSummary({
+            entry,
+            stateRoot,
+            read: null,
+            integrityStatus: "blocked",
+            deps,
+        });
+    }
+    if (verifiedRead.legacy !== null) {
+        return activeCatalogSummary({
+            entry,
+            stateRoot,
+            read: null,
+            integrityStatus: "blocked",
+            domainVersion:
+                verifiedRead.legacy.actual_domain_version ?? null,
+            deps,
+        });
+    }
+    return activeCatalogSummary({
+        entry,
+        stateRoot,
+        read: verifiedRead.read,
+        integrityStatus: "verified",
+        deps,
+    });
+}
+
 export function statusInvestigation(args, deps) {
-    const env = deps.env;
+    if (args.operation === "list") {
+        return listLifecycleInvestigations(args, deps, {
+            probeActive: (entry, stateRoot) =>
+                probeActiveCatalogEntry(entry, stateRoot, deps),
+        });
+    }
     const investigationId = args.investigation_id;
-    const stateRoot = resolveStateRoot(env);
-    const paths = resolveInvestigationPaths(stateRoot, investigationId);
+    const target = resolveLifecycleTarget({
+        deps,
+        investigationId,
+        verifyArchive: false,
+    });
+    if (target.state === "tombstoned") {
+        return statusTombstonePayload(target);
+    }
+    const paths = target.paths;
+    const lifecycleState = target.state;
+    if (lifecycleState === "archived") {
+        try {
+            verifyArchivedTarget(target, deps);
+        } catch (error) {
+            deps.log?.(
+                `[crucible] archived bundle verification blocked status for ${investigationId}: ${
+                    error?.message ?? String(error)
+                }`,
+            );
+            return {
+                ...integrityBlockedPayload(investigationId),
+                lifecycle_state: "archived",
+                terminal_available: false,
+                paused: false,
+                status: "integrity_blocked",
+                note:
+                    "Archived bundle verification failed; status cannot expose or trust a terminal decision.",
+            };
+        }
+    }
 
     const verifiedRead = readInvestigationOrIntegrityBlock(
         deps,
         investigationId,
         paths,
-        { verifyTerminalArtifacts: true },
+        {
+            verifyTerminalArtifacts: true,
+            includeStorageTelemetry: lifecycleState === "active",
+        },
     );
     if (verifiedRead.blocked !== null) {
         return {
             ...verifiedRead.blocked,
+            lifecycle_state: lifecycleState,
             terminal_available: false,
             paused: false,
             status: "integrity_blocked",
@@ -602,6 +711,7 @@ export function statusInvestigation(args, deps) {
     if (verifiedRead.legacy !== null) {
         return {
             ...verifiedRead.legacy,
+            lifecycle_state: lifecycleState,
             paused: false,
             status: "legacy_incompatible",
             note:
@@ -612,6 +722,7 @@ export function statusInvestigation(args, deps) {
         aggregate,
         operationalNonResult,
         quiescentStop,
+        storageTelemetry,
     } = verifiedRead.read;
     if (aggregate.terminal !== null) {
         const readiness = (
@@ -630,11 +741,6 @@ export function statusInvestigation(args, deps) {
         ? null
         : summarizeRecommendation(decideNext(aggregate));
 
-    const domainNonterminal = aggregate.terminal === null
-        && aggregate.pause === null
-        && aggregate.nonResults.length === 0
-        && operationalNonResult === null;
-
     const status = deps.readStatus({ stateDir: paths.stateDir, investigationId });
     let lock = null;
     try {
@@ -645,22 +751,11 @@ export function statusInvestigation(args, deps) {
         lock = null;
     }
     const health = buildSupervisorHealth(status, lock, deps.isPidAlive);
-    const supervisorMissing = status === null || health.alive === false;
-
-    let ensureAction = null;
-    if (domainNonterminal && supervisorMissing) {
-        ensureAction = tryRestartSupervisor(
-            deps,
-            env,
-            paths,
-            investigationId,
-            aggregate,
-        );
-    }
 
     return {
         is_result: false,
         investigation_id: investigationId,
+        lifecycle_state: lifecycleState,
         integrity_blocked: false,
         terminal_available: false,
         non_result: aggregate.nonResults.length > 0 || operationalNonResult !== null,
@@ -681,7 +776,8 @@ export function statusInvestigation(args, deps) {
             quiescentStop?.interventionRequired === true,
         status: aggregate.status,
         progress: buildProgress(aggregate),
-        supervisor_health: { ...health, ensure_action: ensureAction },
+        storage: publicWorkingSetTelemetry(storageTelemetry),
+        supervisor_health: { ...health, ensure_action: null },
         next_recommendation: recommendation,
         note: operationalNonResult !== null
                 ? "An operational non-result is recorded; reattach by investigation_id with any required recovery inputs."
@@ -698,7 +794,7 @@ export function statusInvestigation(args, deps) {
 
 // --- crucible_stop ------------------------------------------------------------
 
-export function stopInvestigation(args, deps) {
+function pauseInvestigation(args, deps) {
     const env = deps.env;
     const investigationId = args.investigation_id;
     const stateRoot = resolveStateRoot(env);
@@ -911,6 +1007,39 @@ export function stopInvestigation(args, deps) {
     })).then(finishStop);
 }
 
+export function stopInvestigation(args, deps) {
+    if (args.operation === "archive") {
+        return archiveInvestigation(args, deps, {
+            readActive: (investigationId, paths) => {
+                const verifiedRead = readInvestigationOrIntegrityBlock(
+                    deps,
+                    investigationId,
+                    paths,
+                    {
+                        verifyTerminalArtifacts: true,
+                        includeStorageTelemetry: false,
+                    },
+                );
+                if (verifiedRead.blocked !== null) {
+                    throw new Error(
+                        "active investigation integrity verification failed before archive",
+                    );
+                }
+                if (verifiedRead.legacy !== null) {
+                    throw new Error(
+                        "legacy investigation cannot enter the v4 archive lifecycle",
+                    );
+                }
+                return verifiedRead.read;
+            },
+        });
+    }
+    if (args.operation === "delete") {
+        return deleteInvestigation(args, deps);
+    }
+    return pauseInvestigation(args, deps);
+}
+
 // --- crucible_result ----------------------------------------------------------
 
 function describeNonResult(aggregate, operationalNonResult) {
@@ -930,16 +1059,42 @@ function describeNonResult(aggregate, operationalNonResult) {
 }
 
 export function resultInvestigation(args, deps) {
-    const env = deps.env;
     const investigationId = args.investigation_id;
-    const stateRoot = resolveStateRoot(env);
-    const paths = resolveInvestigationPaths(stateRoot, investigationId);
+    const target = resolveLifecycleTarget({
+        deps,
+        investigationId,
+        verifyArchive: false,
+    });
+    if (target.state === "tombstoned") {
+        return {
+            ...resultTombstonePayload(target),
+            banner: NON_RESULT_BANNER,
+            message: NON_RESULT_BANNER,
+        };
+    }
+    const paths = target.paths;
+    const lifecycleState = target.state;
+    if (lifecycleState === "archived") {
+        try {
+            verifyArchivedTarget(target, deps);
+        } catch (error) {
+            deps.log?.(
+                `[crucible] archived bundle verification blocked result for ${investigationId}: ${
+                    error?.message ?? String(error)
+                }`,
+            );
+            return integrityBlockedPayload(investigationId);
+        }
+    }
 
     const verifiedRead = readInvestigationOrIntegrityBlock(
         deps,
         investigationId,
         paths,
-        { verifyTerminalArtifacts: true },
+        {
+            verifyTerminalArtifacts: true,
+            includeStorageTelemetry: lifecycleState === "active",
+        },
     );
     if (verifiedRead.blocked !== null) {
         return verifiedRead.blocked;
@@ -1072,6 +1227,7 @@ export function resultInvestigation(args, deps) {
         is_result: false,
         banner: NON_RESULT_BANNER,
         investigation_id: investigationId,
+        lifecycle_state: lifecycleState,
         status: aggregate.status,
         paused: aggregate.pause !== null,
         non_result: aggregate.nonResults.length > 0 || operationalNonResult !== null,
@@ -1113,6 +1269,7 @@ export function runToolBoundary(spec, handler, rawArgs, deps) {
                 verifiedTerminalAvailable =
                     typeof investigationId === "string"
                     && statusInvestigation({
+                        operation: "get",
                         investigation_id: investigationId,
                     }, deps).terminal_available === true;
             } catch {

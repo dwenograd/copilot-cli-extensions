@@ -24,8 +24,14 @@ const VALID_START_ARGS = Object.freeze({
 
 const VALID_ARGS = Object.freeze({
     crucible_start: VALID_START_ARGS,
-    crucible_status: { investigation_id: "inv-abc123" },
-    crucible_stop: { investigation_id: "inv-abc123" },
+    crucible_status: {
+        operation: "get",
+        investigation_id: "inv-abc123",
+    },
+    crucible_stop: {
+        operation: "pause",
+        investigation_id: "inv-abc123",
+    },
     crucible_result: { investigation_id: "inv-abc123" },
 });
 
@@ -147,6 +153,7 @@ describe("crucible API registration", () => {
                 code: "CRUCIBLE_API_PUBLIC_PAYLOAD_INVARIANT",
                 tool: spec.name,
             });
+
         }
 
         const nonterminalResultLeak = await runToolBoundary(
@@ -165,6 +172,44 @@ describe("crucible API registration", () => {
             code: "CRUCIBLE_API_PUBLIC_PAYLOAD_INVARIANT",
             tool: "crucible_result",
         });
+    });
+
+    it("allows only redacted lifecycle metadata in status list pages", async () => {
+        const result = await runToolBoundary(
+            crucibleStatusSpec,
+            () => ({
+                is_result: false,
+                operation: "list",
+                investigations: [{
+                    investigation_id: "archived-investigation",
+                    state: "archived",
+                    created_at: "2026-07-14T00:00:00.000Z",
+                    updated_at: "2026-07-14T01:00:00.000Z",
+                    domain_version: 4,
+                    terminal_available: true,
+                    integrity_status: "verified",
+                    size_bytes: 100,
+                }],
+                next_cursor: null,
+                has_more: false,
+            }),
+            { operation: "list" },
+            { log: () => {} },
+        );
+        expect(result.resultType).toBe("success");
+        const payload = JSON.parse(result.textResultForLlm);
+        expect(payload).toMatchObject({
+            ok: true,
+            is_result: false,
+            operation: "list",
+            investigations: [{
+                state: "archived",
+                terminal_available: true,
+            }],
+        });
+        expect(JSON.stringify(payload)).not.toMatch(
+            /decision|candidate|cohort|evidence|statistics/u,
+        );
     });
 
     it("converts asynchronous start preflight failures at the SDK boundary", async () => {

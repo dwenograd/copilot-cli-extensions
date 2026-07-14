@@ -77,6 +77,32 @@ function budgetRecommendation(aggregate, reason, details = null) {
     };
 }
 
+function storageBudgetRecommendation(aggregate) {
+    const storage = aggregate.storageBudgetExhaustion;
+    const payload = {
+        code: NON_RESULT_CODES.STORAGE_BUDGET_INCONCLUSIVE,
+        reason:
+            "The frozen active-storage budget was exhausted before a scientifically ready terminal could be persisted.",
+        commandCount: aggregate.commandOrder.length,
+        sourceStopRequestSeq: null,
+        storage: {
+            investigationBytes: storage.investigationBytes,
+            investigationLimitBytes: storage.investigationLimitBytes,
+            globalBytes: storage.globalBytes,
+            globalLimitBytes: storage.globalLimitBytes,
+            requestedBytes: storage.requestedBytes,
+        },
+    };
+    return {
+        kind: "NON_RESULT",
+        ...payload,
+        event: {
+            type: EVENT_TYPES.NON_RESULT_RECORDED,
+            payload,
+        },
+    };
+}
+
 function impossibilityNonResultRecommendation(aggregate, evidence) {
     const observation = aggregate.observations[evidence.observationId];
     const certificateVerdict = observation?.data?.certificateVerdict ?? "invalid";
@@ -812,6 +838,11 @@ export function decideNext(aggregate) {
             recorded: true,
             event: null,
         };
+    }
+
+    if (aggregate.storageBudgetExhaustion !== null
+        && aggregate.storageBudgetExhaustion !== undefined) {
+        return storageBudgetRecommendation(aggregate);
     }
 
     const stopRequest = latestUnhandledStopRequest(aggregate);

@@ -12,8 +12,8 @@
 //
 // Tool surface (four tools, no more):
 //   crucible_start  — select an operator-preapproved experiment, stage snapshots, start
-//   crucible_status — read-only progress + supervisor health (never a result)
-//   crucible_stop   — request a resumable pause (never manufactures a terminal)
+//   crucible_status — get/list active, archived, or tombstoned state (never a result)
+//   crucible_stop   — pause/archive/delete lifecycle operations (never a result)
 //   crucible_result — the ONLY tool that may emit a terminal result
 
 import { joinSession } from "@github/copilot-sdk/extension";

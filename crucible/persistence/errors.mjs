@@ -26,6 +26,9 @@ export const ERROR_CODES = Object.freeze({
     EVENT_PAYLOAD_NOT_CANONICAL: "CRUCIBLE_PERSIST_EVENT_PAYLOAD_NOT_CANONICAL",
     TERMINAL_EXISTS: "CRUCIBLE_PERSIST_TERMINAL_EXISTS",
     EVIDENCE_CONFLICT: "CRUCIBLE_PERSIST_EVIDENCE_CONFLICT",
+    SEGMENT_INTEGRITY_VIOLATION: "CRUCIBLE_PERSIST_SEGMENT_INTEGRITY_VIOLATION",
+    SEGMENT_ROTATION_CONFLICT: "CRUCIBLE_PERSIST_SEGMENT_ROTATION_CONFLICT",
+    WAL_CHECKPOINT_UNSAFE: "CRUCIBLE_PERSIST_WAL_CHECKPOINT_UNSAFE",
 
     // Command lifecycle / fencing.
     ILLEGAL_TRANSITION: "CRUCIBLE_PERSIST_ILLEGAL_TRANSITION",
@@ -118,6 +121,27 @@ export class TerminalExistsError extends CruciblePersistenceError {
     constructor(message, details) {
         super(ERROR_CODES.TERMINAL_EXISTS, message, details);
         this.name = "TerminalExistsError";
+    }
+}
+
+export class SegmentIntegrityError extends CruciblePersistenceError {
+    constructor(message, details) {
+        super(ERROR_CODES.SEGMENT_INTEGRITY_VIOLATION, message, details);
+        this.name = "SegmentIntegrityError";
+    }
+}
+
+export class SegmentRotationError extends CruciblePersistenceError {
+    constructor(message, details) {
+        super(ERROR_CODES.SEGMENT_ROTATION_CONFLICT, message, details);
+        this.name = "SegmentRotationError";
+    }
+}
+
+export class WalCheckpointUnsafeError extends CruciblePersistenceError {
+    constructor(message, details) {
+        super(ERROR_CODES.WAL_CHECKPOINT_UNSAFE, message, details);
+        this.name = "WalCheckpointUnsafeError";
     }
 }
 

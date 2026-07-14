@@ -3,6 +3,7 @@ import path from "node:path";
 
 import {
     DEFAULT_SEARCH_POLICY,
+    DEFAULT_WORKING_SET_POLICY,
     canonicalEqual,
     canonicalJson,
     contractHash,
@@ -42,9 +43,9 @@ import {
 } from "./experiment-authority.mjs";
 
 export const EXPERIMENT_REGISTRY_VERSION = 2;
-export const EXPERIMENT_ENTRY_VERSION = 5;
+export const EXPERIMENT_ENTRY_VERSION = 6;
 export const EXPERIMENT_ENTRY_IDENTITY_ALGORITHM =
-    "sha256:crucible-operator-experiment-v5";
+    "sha256:crucible-operator-experiment-v6";
 export const EXPERIMENT_REGISTRY_IDENTITY_ALGORITHM =
     "sha256:crucible-operator-experiment-registry-v2";
 export const EXPERIMENT_REGISTRY_FILE_HASH_ALGORITHM =
@@ -440,6 +441,8 @@ function prepareExperimentCore(rawConfig, options = {}) {
             observableRegistry: config.observable_registry,
             hypothesisPolicy: config.hypothesis_policy,
             statisticalPolicy: statisticalPolicyInput(config, enumerandManifest),
+            workingSetPolicy:
+                config.working_set_policy ?? DEFAULT_WORKING_SET_POLICY,
         });
     } catch (error) {
         fail(

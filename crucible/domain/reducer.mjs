@@ -861,10 +861,25 @@ function applyStopRequested(next, event) {
     if (next.stopRequests.some((request) => request.requestId === event.payload.requestId)) {
         duplicate("stop request", event.payload.requestId);
     }
+
     next.stopRequests.push({
         ...event.payload,
         seq: event.seq,
     });
+}
+
+function applyStorageBudgetExhausted(next, event) {
+    if (next.storageBudgetExhaustion !== null
+        && next.storageBudgetExhaustion !== undefined) {
+        throw new TransitionError(
+            ERROR_CODES.ILLEGAL_TRANSITION,
+            "Storage-budget exhaustion is already recorded",
+        );
+    }
+    next.storageBudgetExhaustion = {
+        ...event.payload,
+        seq: event.seq,
+    };
 }
 
 function applyInvestigationPaused(next, event) {
@@ -955,6 +970,9 @@ function applyTransition(next, event) {
             break;
         case EVENT_TYPES.SEARCH_STRATEGY_REVISED:
             applySearchStrategyRevised(next, event);
+            break;
+        case EVENT_TYPES.STORAGE_BUDGET_EXHAUSTED:
+            applyStorageBudgetExhausted(next, event);
             break;
         case EVENT_TYPES.STOP_REQUESTED:
             applyStopRequested(next, event);

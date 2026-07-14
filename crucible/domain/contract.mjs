@@ -49,6 +49,9 @@ import {
     normalizeRuntimeIdentityPolicy,
     runtimeIdentityPolicyIdentity,
 } from "./runtime-authority.mjs";
+import {
+    normalizeWorkingSetPolicy,
+} from "./working-set-policy.mjs";
 
 const COMPARISON_OPERATORS = Object.freeze(["<", "<=", "==", ">=", ">"]);
 const VALIDATION_EXPECTATIONS = Object.freeze(["accept", "reject"]);
@@ -170,6 +173,7 @@ const CONTRACT_INPUT_REQUIRED_KEYS = Object.freeze([
     "runtimeIdentityRoot",
     "searchPolicy",
     "statisticalPolicy",
+    "workingSetPolicy",
     "workerModels",
 ]);
 const CONTRACT_INPUT_OPTIONAL_KEYS = Object.freeze([
@@ -207,6 +211,7 @@ const CONTRACT_OUTPUT_REQUIRED_KEYS = Object.freeze([
     "validationCases",
     "validationClaimSet",
     "validationRoles",
+    "workingSetPolicy",
     "workerModels",
 ]);
 const CONTRACT_OUTPUT_OPTIONAL_KEYS = Object.freeze([
@@ -2206,6 +2211,7 @@ export function createInvestigationContract(input) {
             observableRegistry: input.observableRegistry,
             hypothesisPolicy: input.hypothesisPolicy,
             statisticalPolicy: input.statisticalPolicy,
+            workingSetPolicy: input.workingSetPolicy,
             ...(input.enumerandManifest === undefined
                 ? {}
                 : { enumerandManifest: input.enumerandManifest }),
@@ -2305,6 +2311,9 @@ export function createInvestigationContract(input) {
     const runtimeIdentityPolicy = normalizeRuntimeIdentityPolicy(
         input.runtimeIdentityPolicy,
     );
+    const workingSetPolicy = normalizeWorkingSetPolicy(
+        input.workingSetPolicy,
+    );
     const normalizedRuntimeIdentityPolicyIdentity =
         runtimeIdentityPolicyIdentity(runtimeIdentityPolicy);
     if (input.runtimeIdentityPolicyIdentity
@@ -2395,6 +2404,7 @@ export function createInvestigationContract(input) {
             statisticalPolicy,
             STATISTICAL_POLICY_HASH_ALGORITHM,
         ),
+        workingSetPolicy,
         searchPolicy,
         scientificTerminalPolicy: DEFAULT_SCIENTIFIC_TERMINAL_POLICY,
         ...(impossibilityPolicy === null ? {} : { impossibilityPolicy }),

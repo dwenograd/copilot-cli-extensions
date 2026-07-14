@@ -4,6 +4,8 @@ import { randomBytes, randomUUID } from "node:crypto";
 
 import {
     openResourceCatalog,
+    openResourceCatalogReadOnly,
+    readStoredResourceCatalogConfiguration,
 } from "../persistence/resource-catalog.mjs";
 import { assertLocalDatabasePath } from "../persistence/paths.mjs";
 import {
@@ -40,9 +42,11 @@ export const RESOURCE_BROKER_INTEGRATION_NOTES = Object.freeze({
     heartbeat:
         "Renew active leases before expiry. Exact process identity may be supplied for dead-owner reclamation; PID-only liveness is not sufficient because of PID reuse.",
     accounting:
-        "Release with observed byte usage. If SDK usage is unavailable, the reserved deterministic model-cost estimate is charged; later SDK reports reconcile monotonically upward and never reduce an existing charge.",
+        "Release byte resources with observed usage and storage_bytes with the measured current investigation working set. Storage reconciliation may move downward after checkpoint/GC; the broker atomically combines current physical bytes with active reservations. If SDK usage is unavailable, the reserved deterministic model-cost estimate is charged; later SDK reports reconcile monotonically upward and never reduce an existing charge.",
     outcomes:
         "throttle and pause are operational admission outcomes only. They must never be converted into verified_result, target_unreachable, or any other scientific conclusion.",
+    recovery:
+        "The same catalog owns one expiring recovery-daemon generation/incarnation lease per state root, active/archived/tombstoned investigation lifecycle, crash-reclaimable archive/delete fences, and fenced operational recovery codes. Recovery records never contain terminal details.",
 });
 
 function requireFunction(value, field) {
@@ -146,6 +150,48 @@ export function openResourceBroker(options = {}) {
     return ResourceBroker.open(options);
 }
 
+export function readResourceBrokerConfiguration({
+    stateRoot,
+    ...options
+} = {}) {
+    const root = requireAbsolutePath(stateRoot, "stateRoot");
+    return readStoredResourceCatalogConfiguration({
+        file: path.join(root, RESOURCE_CATALOG_FILENAME),
+        ...options,
+    });
+}
+
+export function openResourceBrokerFromStateRoot({
+    stateRoot,
+    ...options
+} = {}) {
+    const stored = readResourceBrokerConfiguration({
+        stateRoot,
+        ...options,
+    });
+    return ResourceBroker.open({
+        stateRoot,
+        ...options,
+        config: stored.config,
+    });
+}
+
+export function openResourceBrokerReadOnlyFromStateRoot({
+    stateRoot,
+    ...options
+} = {}) {
+    const stored = readResourceBrokerConfiguration({
+        stateRoot,
+        ...options,
+    });
+    return ResourceBroker.open({
+        stateRoot,
+        ...options,
+        config: stored.config,
+        readOnly: true,
+    });
+}
+
 export class ResourceBroker {
     #catalog;
     #config;
@@ -172,10 +218,12 @@ export class ResourceBroker {
         busyTimeoutMs = 5_000,
         now = Date.now,
         isOwnerAlive = null,
+        isRecoveryOwnerAlive = null,
         idFactory = randomUUID,
         nonceFactory = () => randomBytes(24).toString("hex"),
         denyRoots,
         env,
+        readOnly = false,
         integrityCheckAdapter = undefined,
     } = {}) {
         const normalizedConfig = normalizeResourceBrokerConfig(config);
@@ -190,19 +238,31 @@ export class ResourceBroker {
             path.join(root, RESOURCE_CATALOG_FILENAME),
             { denyRoots, env },
         );
-        const durableRoot = ensureDirectory(root);
+        const durableRoot = readOnly
+            ? root
+            : ensureDirectory(root);
+        if (readOnly && (!fs.existsSync(durableRoot)
+            || !fs.statSync(durableRoot).isDirectory())) {
+            throw new RuntimeConfigError(
+                "read-only resource broker stateRoot must already exist",
+                { stateRoot: durableRoot },
+            );
+        }
         const normalizedIdFactory = requireFunction(idFactory, "idFactory");
         const normalizedNonceFactory = requireFunction(
             nonceFactory,
             "nonceFactory",
         );
-        const catalog = openResourceCatalog({
+        const catalog = (readOnly
+            ? openResourceCatalogReadOnly
+            : openResourceCatalog)({
             file: path.join(durableRoot, RESOURCE_CATALOG_FILENAME),
             config: normalizedConfig,
             definitions: resourceDefinitionsFromConfig(normalizedConfig),
             busyTimeoutMs,
             now,
             isOwnerAlive,
+            isRecoveryOwnerAlive,
             denyRoots,
             env,
             integrityCheckAdapter,
@@ -270,6 +330,60 @@ export class ResourceBroker {
         return this.#catalog.getInvestigation(
             requireIdentifier(investigationId, "investigationId"),
         );
+    }
+
+    listInvestigations(options = {}) {
+        return this.#catalog.listInvestigations(options);
+    }
+
+    setInvestigationLifecycle(options = {}) {
+        return this.#catalog.setInvestigationLifecycle(options);
+    }
+
+    beginLifecycleOperation(options = {}) {
+        return this.#catalog.beginLifecycleOperation(options);
+    }
+
+    abortLifecycleOperation(options = {}) {
+        return this.#catalog.abortLifecycleOperation(options);
+    }
+
+    commitArchive(options = {}) {
+        return this.#catalog.commitArchive(options);
+    }
+
+    commitDelete(options = {}) {
+        return this.#catalog.commitDelete(options);
+    }
+
+    acquireRecoveryDaemonLease(options = {}) {
+        return this.#catalog.acquireRecoveryDaemonLease(options);
+    }
+
+    getRecoveryDaemonLease() {
+        return this.#catalog.getRecoveryDaemonLease();
+    }
+
+    renewRecoveryDaemonLease(options = {}) {
+        return this.#catalog.renewRecoveryDaemonLease(options);
+    }
+
+    releaseRecoveryDaemonLease(options = {}) {
+        return this.#catalog.releaseRecoveryDaemonLease(options);
+    }
+
+    recordRecoveryOperation(options = {}) {
+        return this.#catalog.recordRecoveryOperation(options);
+    }
+
+    getRecoveryOperation(investigationId) {
+        return this.#catalog.getRecoveryOperation(
+            requireIdentifier(investigationId, "investigationId"),
+        );
+    }
+
+    listRecoveryOperations() {
+        return this.#catalog.listRecoveryOperations();
     }
 
     claimAuthority({
@@ -423,6 +537,36 @@ export class ResourceBroker {
         });
     }
 
+    reconcileStorageUsage({
+        investigationId,
+        supervisorGeneration,
+        runnerIncarnation,
+        actualBytes,
+        reconciliationId,
+        source = "working_set_measurement",
+    } = {}) {
+        const authority = normalizeAuthority({
+            investigationId,
+            supervisorGeneration,
+            runnerIncarnation,
+        });
+        if (!Number.isSafeInteger(actualBytes) || actualBytes < 0) {
+            throw new RuntimeConfigError(
+                "actualBytes must be a non-negative safe integer",
+                { actualBytes },
+            );
+        }
+        return this.#catalog.reconcileStorageUsage({
+            ...authority,
+            actualUnits: actualBytes,
+            reconciliationId: requireIdentifier(
+                reconciliationId,
+                "reconciliationId",
+            ),
+            source: requireIdentifier(source, "source"),
+        });
+    }
+
     estimateModelCost(input) {
         return estimateDeterministicModelCostUnits(
             input,
@@ -453,6 +597,29 @@ export class ResourceBroker {
             investigationId: investigationId === null
                 ? null
                 : requireIdentifier(investigationId, "investigationId"),
+        });
+    }
+
+    getStorageBudgetSnapshot(investigationId) {
+        const normalizedInvestigationId = requireIdentifier(
+            investigationId,
+            "investigationId",
+        );
+        const select = (rows) => rows.find(
+            (row) => row.resourceKey === "storage_bytes",
+        ) ?? null;
+        const investigation = select(this.getUsageSnapshot({
+            investigationId: normalizedInvestigationId,
+        }));
+        const global = select(this.getUsageSnapshot());
+        if (investigation === null || global === null) {
+            throw new RuntimeConfigError(
+                "resource broker has no storage_bytes definition",
+            );
+        }
+        return Object.freeze({
+            investigation,
+            global,
         });
     }
 }

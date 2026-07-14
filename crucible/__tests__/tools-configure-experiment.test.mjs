@@ -209,7 +209,7 @@ describe("configure-experiment operator CLI", () => {
             /^sha256:crucible-contract-v4:[a-f0-9]{64}$/u,
         );
         expect(first.experimentIdentity).toMatch(
-            /^sha256:crucible-operator-experiment-v5:[a-f0-9]{64}$/u,
+            /^sha256:crucible-operator-experiment-v6:[a-f0-9]{64}$/u,
         );
 
         const second = configure(ws, experimentConfig(ws, "experiment-b"));

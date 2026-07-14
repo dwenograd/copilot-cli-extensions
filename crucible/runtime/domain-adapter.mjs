@@ -2762,6 +2762,33 @@ export class DomainRepositoryAdapter {
         });
     }
 
+    rotateSegmentsAtQuiescence({
+        includeOperational = true,
+        ...options
+    } = {}) {
+        if (typeof this.#repository.rotateEventSegment !== "function") {
+            throw new RuntimeConfigError(
+                "repository does not expose immutable event segmentation",
+            );
+        }
+        if (typeof includeOperational !== "boolean") {
+            throw new RuntimeConfigError("includeOperational must be boolean");
+        }
+        const domain = this.#repository.rotateEventSegment({
+            ...options,
+            investigationId: this.#investigationId,
+            quiescent: true,
+        });
+        const operational = includeOperational
+            ? this.#repository.rotateEventSegment({
+                ...options,
+                investigationId: this.#operationalInvestigationId,
+                quiescent: true,
+            })
+            : null;
+        return { domain, operational };
+    }
+
     domainFactIdentity(domainEvent) {
         return domainFactIdentity(domainEvent);
     }
@@ -3221,6 +3248,37 @@ export class DomainRepositoryAdapter {
 
     appendKernelDecision() {
         return this.appendFromFactory((aggregate) => constructKernelDecisionEvent(aggregate));
+    }
+
+    appendStorageBudgetNonResult(telemetry) {
+        const signaled = this.appendFromFactory((aggregate) => {
+            if (aggregate.terminal !== null
+                || aggregate.pause !== null
+                || aggregate.nonResults.length > 0
+                || (aggregate.storageBudgetExhaustion !== null
+                    && aggregate.storageBudgetExhaustion !== undefined)) {
+                return null;
+            }
+            return createExternalEvent(
+                aggregate,
+                EVENT_TYPES.STORAGE_BUDGET_EXHAUSTED,
+                telemetry,
+            );
+        });
+        if (signaled.domainEvent === null) {
+            const replayed = this.replay();
+            return {
+                aggregate: replayed.aggregate,
+                domainEvent: null,
+                repositoryEvent: null,
+                signal: null,
+            };
+        }
+        const decision = this.appendKernelDecision();
+        return {
+            ...decision,
+            signal: signaled,
+        };
     }
 
     appendKernelDecisionFenced({

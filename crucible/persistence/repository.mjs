@@ -19,6 +19,8 @@
 // Every failure throws a typed CruciblePersistenceError subclass; there is no
 // broad catch-that-returns-success anywhere.
 
+import fs from "node:fs";
+
 import { DatabaseSync } from "./sqlite.mjs";
 
 import {
@@ -34,6 +36,7 @@ import {
     AttemptIdentityError,
     ArtifactNotDurableError,
     StorageError,
+    WalCheckpointUnsafeError,
 } from "./errors.mjs";
 import { assertLocalDatabasePath } from "./paths.mjs";
 import {
@@ -55,8 +58,19 @@ import {
     verifyDatabaseIntegrity,
     verifySchema,
 } from "./schema.mjs";
+import { EventSegmentManager } from "./segment-manager.mjs";
 
 const DEFAULT_BUSY_TIMEOUT_MS = 5000;
+const DEFAULT_WAL_CHECKPOINT_BYTES = 16 * 1024 * 1024;
+const DEFAULT_WAL_CHECKPOINT_INTERVAL_MS = 60_000;
+const EFFECT_RECOVERY_CAPSULE_CONTENT_TYPE =
+    "application/vnd.crucible.effect-recovery+json";
+const WAL_CHECKPOINT_MODES = new Set([
+    "PASSIVE",
+    "FULL",
+    "RESTART",
+    "TRUNCATE",
+]);
 const QUIESCENT_STOP_STATES = Object.freeze({
     BARRIER_PERSISTED: "STOP_BARRIER_PERSISTED",
     RECONCILING: "STOP_RECONCILING",
@@ -175,6 +189,27 @@ function isUniqueViolation(err) {
             || err.errcode === SQLITE_ERRCODE.CONSTRAINT_PRIMARYKEY);
 }
 
+function fileBytesOrZero(file) {
+    try {
+        const stat = fs.lstatSync(file);
+        return stat.isFile() && !stat.isSymbolicLink() ? stat.size : 0;
+    } catch (error) {
+        if (error?.code === "ENOENT") return 0;
+        throw error;
+    }
+}
+
+function positiveSafeInteger(value, field, fallback) {
+    const resolved = value === undefined ? fallback : value;
+    if (!Number.isSafeInteger(resolved) || resolved < 1) {
+        throw new InvalidArgumentError(
+            `${field} must be a positive safe integer`,
+            { field, value: resolved },
+        );
+    }
+    return resolved;
+}
+
 export function openRepository(options = {}) {
     return EventRepository.open(options);
 }
@@ -189,18 +224,34 @@ export class EventRepository {
     #file;
     #readOnly;
     #integrityCheckAdapter;
+    #segments;
+    #wallClock;
+    #walCheckpointBytes;
+    #walCheckpointIntervalMs;
+    #lastWalCheckpointAtMs;
+    #lastWalCheckpoint = null;
+    #lastWalCheckpointError = null;
 
     constructor(db, {
         now,
         file,
         readOnly = false,
         integrityCheckAdapter = undefined,
+        segments,
+        wallClock,
+        walCheckpointBytes,
+        walCheckpointIntervalMs,
     }) {
         this.#db = db;
         this.#now = now;
         this.#file = file;
         this.#readOnly = readOnly;
         this.#integrityCheckAdapter = integrityCheckAdapter;
+        this.#segments = segments;
+        this.#wallClock = wallClock;
+        this.#walCheckpointBytes = walCheckpointBytes;
+        this.#walCheckpointIntervalMs = walCheckpointIntervalMs;
+        this.#lastWalCheckpointAtMs = wallClock();
     }
 
     static open(options = {}) {
@@ -212,10 +263,30 @@ export class EventRepository {
             env,
             readOnly = false,
             integrityCheckAdapter = undefined,
+            segmentCatalogFile = undefined,
+            segmentEventThreshold = undefined,
+            segmentByteThreshold = undefined,
+            segmentFaultInjector = null,
+            wallClock = Date.now,
+            walCheckpointBytes = DEFAULT_WAL_CHECKPOINT_BYTES,
+            walCheckpointIntervalMs = DEFAULT_WAL_CHECKPOINT_INTERVAL_MS,
         } = options;
         if (typeof now !== "function") {
             throw new InvalidArgumentError("now must be a function");
         }
+        if (typeof wallClock !== "function") {
+            throw new InvalidArgumentError("wallClock must be a function");
+        }
+        const normalizedWalCheckpointBytes = positiveSafeInteger(
+            walCheckpointBytes,
+            "walCheckpointBytes",
+            DEFAULT_WAL_CHECKPOINT_BYTES,
+        );
+        const normalizedWalCheckpointIntervalMs = positiveSafeInteger(
+            walCheckpointIntervalMs,
+            "walCheckpointIntervalMs",
+            DEFAULT_WAL_CHECKPOINT_INTERVAL_MS,
+        );
 
         const resolved = assertLocalDatabasePath(file, { denyRoots, env });
 
@@ -226,6 +297,7 @@ export class EventRepository {
             throw new StorageError(`failed to open database at ${resolved}: ${err.message}`, err);
         }
 
+        let segments;
         try {
             if (readOnly === true) {
                 configureReadOnlyConnection(db, { busyTimeoutMs });
@@ -234,6 +306,16 @@ export class EventRepository {
                 configureConnection(db, { busyTimeoutMs });
                 applySchema(db, { busyTimeoutMs, integrityCheckAdapter });
             }
+            segments = EventSegmentManager.open({
+                db,
+                databaseFile: resolved,
+                catalogFile: segmentCatalogFile,
+                readOnly: readOnly === true,
+                eventThreshold: segmentEventThreshold,
+                byteThreshold: segmentByteThreshold,
+                now,
+                faultInjector: segmentFaultInjector,
+            });
         } catch (err) {
             db.close();
             if (!(err instanceof CruciblePersistenceError) && isSqliteError(err)) {
@@ -250,6 +332,10 @@ export class EventRepository {
             file: resolved,
             readOnly: readOnly === true,
             integrityCheckAdapter,
+            segments,
+            wallClock,
+            walCheckpointBytes: normalizedWalCheckpointBytes,
+            walCheckpointIntervalMs: normalizedWalCheckpointIntervalMs,
         });
     }
 
@@ -265,6 +351,36 @@ export class EventRepository {
         return this.#readOnly;
     }
 
+    get segmentCatalogFile() {
+        return this.#segments.catalogFile;
+    }
+
+    configureWorkingSet(policy) {
+        if (policy === null || typeof policy !== "object" || Array.isArray(policy)) {
+            throw new InvalidArgumentError("working-set policy must be an object");
+        }
+        this.#walCheckpointBytes = positiveSafeInteger(
+            policy.walCheckpointBytes,
+            "workingSetPolicy.walCheckpointBytes",
+            this.#walCheckpointBytes,
+        );
+        this.#walCheckpointIntervalMs = positiveSafeInteger(
+            policy.walCheckpointIntervalMs,
+            "workingSetPolicy.walCheckpointIntervalMs",
+            this.#walCheckpointIntervalMs,
+        );
+        const segments = this.#segments.configureThresholds({
+            eventThreshold: policy.segmentEventThreshold,
+            byteThreshold: policy.segmentByteThreshold,
+        });
+        return Object.freeze({
+            walCheckpointBytes: this.#walCheckpointBytes,
+            walCheckpointIntervalMs: this.#walCheckpointIntervalMs,
+            segmentEventThreshold: segments.eventThreshold,
+            segmentByteThreshold: segments.byteThreshold,
+        });
+    }
+
     close() {
         this.#db.close();
     }
@@ -272,6 +388,9 @@ export class EventRepository {
     // --- transaction helper ------------------------------------------------
 
     #tx(fn) {
+        if (!this.#readOnly) {
+            this.#segments.recoverPending();
+        }
         let began = false;
         try {
             this.#db.exec("BEGIN IMMEDIATE;");
@@ -279,6 +398,7 @@ export class EventRepository {
             const result = fn();
             this.#db.exec("COMMIT;");
             began = false;
+            this.#maybeCheckpointWal("transaction");
             return result;
         } catch (err) {
             if (began) {
@@ -287,11 +407,26 @@ export class EventRepository {
                 } catch (rollbackErr) {
                     err.rollbackError = rollbackErr;
                 }
+
             }
             if (isSqliteError(err)) {
                 throw new StorageError(`transaction failed: ${err.message}`, err);
             }
             throw err;
+        }
+    }
+
+    #maybeCheckpointWal(reason) {
+        if (this.#readOnly) return null;
+        try {
+            return this.checkpointWal({ reason });
+        } catch (error) {
+            this.#lastWalCheckpointError = Object.freeze({
+                code: error?.code ?? null,
+                message: error?.message ?? String(error),
+                atMs: this.#wallClock(),
+            });
+            return null;
         }
     }
 
@@ -355,29 +490,48 @@ export class EventRepository {
 
     getHead(investigationId) {
         requireNonEmptyString(investigationId, "investigationId");
+        const sealed = this.#segments.sealedHead(investigationId);
         const row = this.#db
-            .prepare("SELECT seq, event_hash FROM events WHERE investigation_id = ? ORDER BY seq DESC LIMIT 1")
-            .get(investigationId);
+            .prepare(`
+                SELECT seq, event_hash
+                FROM events
+                WHERE investigation_id = ? AND seq > ?
+                ORDER BY seq DESC
+                LIMIT 1
+            `)
+            .get(investigationId, sealed.seq);
         if (!row) {
-            return { seq: 0, eventHash: null };
+            return sealed;
         }
         return { seq: Number(row.seq), eventHash: row.event_hash };
     }
 
     listEvents(investigationId, { fromSeq = 1, toSeq } = {}) {
         requireNonEmptyString(investigationId, "investigationId");
-        const params = { inv: investigationId, from: fromSeq };
+        const sealedRows = this.#segments.listRows(investigationId, {
+            fromSeq,
+            toSeq,
+        });
+        const floor = this.#segments.sealedFloor(investigationId);
+        const params = { inv: investigationId, from: Math.max(fromSeq, floor + 1) };
         let sql = "SELECT * FROM events WHERE investigation_id = :inv AND seq >= :from";
         if (toSeq !== undefined) {
             sql += " AND seq <= :to";
             params.to = toSeq;
         }
         sql += " ORDER BY seq ASC";
-        return this.#db.prepare(sql).all(params).map((r) => this.#rowToEvent(r));
+        return [
+            ...sealedRows,
+            ...this.#db.prepare(sql).all(params),
+        ].map((r) => this.#rowToEvent(r));
     }
 
     getEvent(investigationId, seq) {
         requireNonEmptyString(investigationId, "investigationId");
+        const sealed = this.#segments.getRow(investigationId, seq);
+        if (sealed) return this.#rowToEvent(sealed);
+        const floor = this.#segments.sealedFloor(investigationId);
+        if (seq <= floor) return null;
         const row = this.#db
             .prepare("SELECT * FROM events WHERE investigation_id = ? AND seq = ?")
             .get(investigationId, seq);
@@ -386,18 +540,193 @@ export class EventRepository {
 
     getTerminalEvent(investigationId) {
         requireNonEmptyString(investigationId, "investigationId");
+        const sealed = this.#segments.terminalRow(investigationId);
+        if (sealed) return this.#rowToEvent(sealed);
+        const floor = this.#segments.sealedFloor(investigationId);
         const row = this.#db
-            .prepare("SELECT * FROM events WHERE investigation_id = ? AND is_terminal = 1 LIMIT 1")
-            .get(investigationId);
+            .prepare(`
+                SELECT *
+                FROM events
+                WHERE investigation_id = ? AND seq > ? AND is_terminal = 1
+                LIMIT 1
+            `)
+            .get(investigationId, floor);
         return row ? this.#rowToEvent(row) : null;
     }
 
     countEvents(investigationId) {
         requireNonEmptyString(investigationId, "investigationId");
+        const entries = this.#segments.entriesFor(investigationId);
+        const sealedCount = entries.reduce((sum, entry) => sum + entry.eventCount, 0);
+        const floor = entries.at(-1)?.lastSeq ?? 0;
         const row = this.#db
-            .prepare("SELECT COUNT(*) AS c FROM events WHERE investigation_id = ?")
-            .get(investigationId);
-        return Number(row.c);
+            .prepare("SELECT COUNT(*) AS c FROM events WHERE investigation_id = ? AND seq > ?")
+            .get(investigationId, floor);
+        return sealedCount + Number(row.c);
+    }
+
+    getSegmentCatalog({ verify = false } = {}) {
+        return this.#segments.catalog({ verify });
+    }
+
+    getSegmentStorageSnapshot({ verify = true } = {}) {
+        return this.#segments.snapshot({ verify });
+    }
+
+    checkpointWal({
+        force = false,
+        mode = "PASSIVE",
+        reason = "explicit",
+    } = {}) {
+        if (this.#readOnly) {
+            throw new InvalidArgumentError(
+                "read-only repositories cannot checkpoint WAL",
+            );
+        }
+        if (this.#db.isTransaction) {
+            throw new WalCheckpointUnsafeError(
+                "refusing to checkpoint WAL inside an active transaction",
+                { reason },
+            );
+        }
+        const normalizedMode = String(mode).toUpperCase();
+        if (!WAL_CHECKPOINT_MODES.has(normalizedMode)) {
+            throw new InvalidArgumentError(
+                "WAL checkpoint mode is unsupported",
+                { mode },
+            );
+        }
+        const nowMs = this.#wallClock();
+        if (!Number.isFinite(nowMs)) {
+            throw new InvalidArgumentError(
+                "wallClock must return finite epoch milliseconds",
+            );
+        }
+        const walFile = `${this.#file}-wal`;
+        const beforeBytes = fileBytesOrZero(walFile);
+        const elapsedMs = Math.max(0, nowMs - this.#lastWalCheckpointAtMs);
+        const thresholdReached = beforeBytes >= this.#walCheckpointBytes;
+        const intervalReached = elapsedMs >= this.#walCheckpointIntervalMs;
+        if (!force && !thresholdReached && !intervalReached) {
+            return Object.freeze({
+                checkpointed: false,
+                reason: "below_threshold",
+                requestedReason: reason,
+                mode: normalizedMode,
+                beforeBytes,
+                afterBytes: beforeBytes,
+                thresholdBytes: this.#walCheckpointBytes,
+                intervalMs: this.#walCheckpointIntervalMs,
+                elapsedMs,
+            });
+        }
+        let row;
+        try {
+            row = this.#db.prepare(
+                `PRAGMA wal_checkpoint(${normalizedMode});`,
+            ).get();
+        } catch (error) {
+            if (isSqliteError(error)) {
+                throw new StorageError(
+                    `WAL checkpoint failed: ${error.message}`,
+                    error,
+                );
+            }
+            throw error;
+        }
+        const result = Object.freeze({
+            checkpointed: true,
+            reason,
+            mode: normalizedMode,
+            busy: Number(row?.busy ?? 0),
+            logFrames: Number(row?.log ?? 0),
+            checkpointedFrames: Number(row?.checkpointed ?? 0),
+            beforeBytes,
+            afterBytes: fileBytesOrZero(walFile),
+            thresholdBytes: this.#walCheckpointBytes,
+            intervalMs: this.#walCheckpointIntervalMs,
+            elapsedMs,
+            atMs: nowMs,
+        });
+        this.#lastWalCheckpointAtMs = nowMs;
+        this.#lastWalCheckpoint = result;
+        this.#lastWalCheckpointError = null;
+        return result;
+    }
+
+    getStorageTelemetry(investigationId = null) {
+        const segmentTelemetry = investigationId === null
+            ? null
+            : this.#segments.storageTelemetry(
+                requireNonEmptyString(investigationId, "investigationId"),
+            );
+        const databaseBytes = fileBytesOrZero(this.#file);
+        const walBytes = fileBytesOrZero(`${this.#file}-wal`);
+        const sharedMemoryBytes = fileBytesOrZero(`${this.#file}-shm`);
+        const sealedSegmentBytes = segmentTelemetry?.sealedSegmentBytes ?? 0;
+        const catalogBytes = segmentTelemetry?.catalogBytes ?? 0;
+        const rotationJournalBytes =
+            segmentTelemetry?.rotationJournalBytes ?? 0;
+        return Object.freeze({
+            databaseBytes,
+            walBytes,
+            sharedMemoryBytes,
+            sealedSegmentBytes,
+            catalogBytes,
+            rotationJournalBytes,
+            totalBytes:
+                databaseBytes
+                + walBytes
+                + sharedMemoryBytes
+                + sealedSegmentBytes
+                + catalogBytes
+                + rotationJournalBytes,
+            activeEventCount: segmentTelemetry?.activeEventCount ?? null,
+            activeStoredBytes: segmentTelemetry?.activeStoredBytes ?? null,
+            sealedEventCount: segmentTelemetry?.sealedEventCount ?? null,
+            sealedSegmentCount: segmentTelemetry?.sealedSegmentCount ?? null,
+            catalogGeneration: segmentTelemetry?.catalogGeneration ?? null,
+            thresholds: Object.freeze({
+                walCheckpointBytes: this.#walCheckpointBytes,
+                walCheckpointIntervalMs: this.#walCheckpointIntervalMs,
+                segmentEventCount:
+                    segmentTelemetry?.thresholds.eventCount ?? null,
+                segmentStoredBytes:
+                    segmentTelemetry?.thresholds.storedBytes ?? null,
+            }),
+            lastCheckpoint: this.#lastWalCheckpoint,
+            lastCheckpointError: this.#lastWalCheckpointError,
+        });
+    }
+
+    verifySegmentChain() {
+        return this.#segments.verify();
+    }
+
+    rotateEventSegment(options = {}) {
+        const investigationId = requireNonEmptyString(
+            options.investigationId,
+            "investigationId",
+        );
+        this.#requireInvestigation(investigationId);
+        const rotated = this.#segments.rotateIfNeeded({
+            ...options,
+            investigationId,
+        });
+        const checkpoint = rotated.rotated
+            ? this.checkpointWal({
+                force: true,
+                mode: "TRUNCATE",
+                reason: "segment_rotation",
+            })
+            : this.checkpointWal({
+                reason: "segment_threshold_probe",
+            });
+        return {
+            ...rotated,
+            checkpoint,
+            storage: this.getStorageTelemetry(investigationId),
+        };
     }
 
     #rowToEvent(row) {
@@ -417,6 +746,26 @@ export class EventRepository {
             evidenceKind: row.evidence_kind ?? null,
             createdAt: requireCanonicalTimestamp(row.created_at, "stored event.createdAt"),
         };
+    }
+
+    #findEvidenceRow(investigationId, attemptId, evidenceKind) {
+        const sealed = this.#segments.evidenceRow(
+            investigationId,
+            attemptId,
+            evidenceKind,
+        );
+        if (sealed) return sealed;
+        const floor = this.#segments.sealedFloor(investigationId);
+        return this.#db
+            .prepare(`
+                SELECT *
+                FROM events
+                WHERE investigation_id = ?
+                  AND seq > ?
+                  AND attempt_id = ?
+                  AND evidence_kind = ?
+            `)
+            .get(investigationId, floor, attemptId, evidenceKind) ?? null;
     }
 
     // --- event log (write) -------------------------------------------------
@@ -452,11 +801,7 @@ export class EventRepository {
             );
         }
 
-        let hasTerminal = Boolean(
-            this.#db
-                .prepare("SELECT 1 AS present FROM events WHERE investigation_id = ? AND is_terminal = 1 LIMIT 1")
-                .get(investigationId),
-        );
+        let hasTerminal = this.getTerminalEvent(investigationId) !== null;
         if (hasTerminal) {
             throw new TerminalExistsError(
                 "terminal investigations reject subsequent events",
@@ -701,9 +1046,11 @@ export class EventRepository {
                 );
             }
 
-            const existing = this.#db
-                .prepare("SELECT * FROM events WHERE investigation_id = ? AND attempt_id = ? AND evidence_kind = ?")
-                .get(investigationId, attemptId, evidenceKind);
+            const existing = this.#findEvidenceRow(
+                investigationId,
+                attemptId,
+                evidenceKind,
+            );
             if (existing) {
                 if (existing.kind === eventKind && existing.payload === payloadCanonical) {
                     return { deduplicated: true, event: this.#rowToEvent(existing) };
@@ -971,9 +1318,11 @@ export class EventRepository {
             );
         }
 
-        const existing = normalized.map((item) => this.#db
-            .prepare("SELECT * FROM events WHERE investigation_id = ? AND attempt_id = ? AND evidence_kind = ?")
-            .get(investigationId, attemptId, item.evidenceKind) ?? null);
+        const existing = normalized.map((item) => this.#findEvidenceRow(
+            investigationId,
+            attemptId,
+            item.evidenceKind,
+        ));
         const existingCount = existing.filter((row) => row !== null).length;
         if (existingCount > 0) {
             const exact = existingCount === normalized.length
@@ -2755,6 +3104,309 @@ export class EventRepository {
 
     // --- artifacts ---------------------------------------------------------
 
+    #assertRecoveryCapsuleAttemptBinding(
+        attempt,
+        {
+            logicalEffectKey,
+            sourceAttemptId = null,
+            artifactId = null,
+            allowedStates = null,
+        },
+    ) {
+        const inspected = inspectCanonicalJson(attempt.command);
+        const metadata = inspected.ok ? inspected.value : null;
+        if (metadata?.scope !== "external-effect"
+            || metadata.logicalEffectKey !== logicalEffectKey
+            || metadata.effect === null
+            || typeof metadata.effect !== "object"
+            || Array.isArray(metadata.effect)) {
+            throw new AttemptIdentityError(
+                "recovery capsule does not match its external-effect attempt",
+                {
+                    attemptId: attempt.attempt_id,
+                    logicalEffectKey,
+                    reason: inspected.reason ?? null,
+                },
+            );
+        }
+        if (sourceAttemptId !== null
+            && attempt.attempt_id !== sourceAttemptId
+            && (metadata.recoveredFromAttemptId !== sourceAttemptId
+                || (artifactId !== null
+                    && metadata.recoveryCapsuleArtifactId !== artifactId))) {
+            throw new AttemptIdentityError(
+                "recovery resolution attempt is not bound to the source capsule",
+                {
+                    attemptId: attempt.attempt_id,
+                    sourceAttemptId,
+                    logicalEffectKey,
+                    artifactId,
+                },
+            );
+        }
+        if (allowedStates !== null && !allowedStates.includes(attempt.state)) {
+            throw new IllegalTransitionError(
+                "recovery capsule attempt is not in an allowed lifecycle state",
+                {
+                    attemptId: attempt.attempt_id,
+                    state: attempt.state,
+                    allowedStates,
+                },
+            );
+        }
+        return metadata;
+    }
+
+    // The caller holds the ArtifactStore generation lock from CAS installation
+    // through this transaction, so metadata and its GC reference appear together.
+    bindRecoveryCapsuleArtifact({
+        investigationId,
+        attemptId,
+        attemptCommand,
+        logicalEffectKey,
+        leaseId,
+        fencingToken,
+        owner,
+        supervisorGeneration = null,
+        runnerIncarnation = null,
+        artifactId,
+        algo,
+        hash,
+        sizeBytes,
+        contentType = EFFECT_RECOVERY_CAPSULE_CONTENT_TYPE,
+    } = {}) {
+        requireNonEmptyString(investigationId, "investigationId");
+        requireNonEmptyString(attemptId, "attemptId");
+        const normalizedAttemptCommand = typeof attemptCommand === "string"
+            ? requireNonEmptyString(attemptCommand, "attemptCommand")
+            : canonicalize(attemptCommand);
+        requireNonEmptyString(logicalEffectKey, "logicalEffectKey");
+        requireNonEmptyString(leaseId, "leaseId");
+        requireNonEmptyString(owner, "owner");
+        requireNonEmptyString(artifactId, "artifactId");
+        requireNonEmptyString(algo, "algo");
+        requireNonEmptyString(hash, "hash");
+        requireNonEmptyString(contentType, "contentType");
+        if (!Number.isSafeInteger(sizeBytes) || sizeBytes < 1) {
+            throw new InvalidArgumentError(
+                "sizeBytes must be a positive safe integer",
+                { sizeBytes },
+            );
+        }
+        const authority = normalizeRunnerAuthority(
+            supervisorGeneration,
+            runnerIncarnation,
+        );
+
+        return this.#tx(() => {
+            const attempt = this.#assertAttemptAuthorityInTransaction({
+                authorityInvestigationId: investigationId,
+                attemptId,
+                attemptCommand: normalizedAttemptCommand,
+                leaseId,
+                fencingToken,
+                owner,
+                ...authority,
+                expectedStates: ["observed"],
+            });
+            this.#assertRecoveryCapsuleAttemptBinding(attempt, {
+                logicalEffectKey,
+                allowedStates: ["observed"],
+            });
+
+            const createdAt = this.#timestamp("artifact.createdAt");
+            let artifact = this.#db
+                .prepare("SELECT * FROM artifacts WHERE artifact_id = ?")
+                .get(artifactId);
+            if (artifact === undefined) {
+                try {
+                    this.#db.prepare(`
+                        INSERT INTO artifacts(
+                            artifact_id, investigation_id, storage, content_type,
+                            size_bytes, inline_blob, hash_algo, hash_value,
+                            durable, created_at)
+                        VALUES(
+                            :id, :inv, 'external', :ct, :size, NULL, :algo,
+                            :hash, 1, :at)`).run({
+                        id: artifactId,
+                        inv: investigationId,
+                        ct: contentType,
+                        size: sizeBytes,
+                        algo,
+                        hash,
+                        at: createdAt,
+                    });
+                } catch (error) {
+                    throw this.#translateArtifactInsert(error, artifactId);
+                }
+                artifact = this.#db
+                    .prepare("SELECT * FROM artifacts WHERE artifact_id = ?")
+                    .get(artifactId);
+            } else if (artifact.investigation_id !== investigationId
+                || artifact.storage !== "external"
+                || artifact.content_type !== contentType
+                || Number(artifact.size_bytes) !== sizeBytes
+                || artifact.hash_algo !== algo
+                || artifact.hash_value !== hash) {
+                throw new CruciblePersistenceError(
+                    ERROR_CODES.ARTIFACT_CONFLICT,
+                    "recovery capsule artifact metadata conflicts with its logical effect",
+                    { investigationId, attemptId, logicalEffectKey, artifactId },
+                );
+            } else if (artifact.durable !== 1) {
+                this.#db
+                    .prepare("UPDATE artifacts SET durable = 1 WHERE artifact_id = ?")
+                    .run(artifactId);
+                artifact = this.#db
+                    .prepare("SELECT * FROM artifacts WHERE artifact_id = ?")
+                    .get(artifactId);
+            }
+
+            const reference = this.#referenceArtifactInTransaction({
+                investigationId,
+                artifactId,
+                seq: null,
+                createdAt: this.#timestamp("artifactReference.createdAt"),
+            });
+            return {
+                artifact: this.#rowToArtifactMeta(artifact),
+                reference,
+                attempt: this.#rowToAttempt(attempt),
+            };
+        });
+    }
+
+    ensureRecoveryCapsuleReference({
+        investigationId,
+        attemptId,
+        logicalEffectKey,
+        artifactId,
+    } = {}) {
+        requireNonEmptyString(investigationId, "investigationId");
+        requireNonEmptyString(attemptId, "attemptId");
+        requireNonEmptyString(logicalEffectKey, "logicalEffectKey");
+        requireNonEmptyString(artifactId, "artifactId");
+        return this.#tx(() => {
+            this.#requireInvestigation(investigationId);
+            const attempt = this.#db
+                .prepare("SELECT * FROM command_attempts WHERE attempt_id = ?")
+                .get(attemptId);
+            if (attempt === undefined
+                || attempt.investigation_id !== investigationId) {
+                throw new NotFoundError(
+                    ERROR_CODES.NOT_FOUND,
+                    `unknown command attempt '${attemptId}'`,
+                    { investigationId, attemptId },
+                );
+            }
+            this.#assertRecoveryCapsuleAttemptBinding(attempt, {
+                logicalEffectKey,
+                allowedStates: ["dispatched", "observed", "abandoned"],
+            });
+            const artifact = this.#db
+                .prepare("SELECT * FROM artifacts WHERE artifact_id = ?")
+                .get(artifactId);
+            if (artifact === undefined
+                || artifact.investigation_id !== investigationId
+                || artifact.storage !== "external"
+                || artifact.content_type
+                    !== EFFECT_RECOVERY_CAPSULE_CONTENT_TYPE) {
+                throw new NotFoundError(
+                    ERROR_CODES.ARTIFACT_NOT_FOUND,
+                    `unknown recovery capsule artifact '${artifactId}'`,
+                    { investigationId, attemptId, artifactId },
+                );
+            }
+            if (artifact.durable !== 1) {
+                throw new ArtifactNotDurableError(
+                    "recovery capsule must be durable before it can protect an unresolved effect",
+                    { investigationId, attemptId, artifactId },
+                );
+            }
+            return this.#referenceArtifactInTransaction({
+                investigationId,
+                artifactId,
+                seq: null,
+                createdAt: this.#timestamp("artifactReference.createdAt"),
+            });
+        });
+    }
+
+    releaseRecoveryCapsuleReference({
+        investigationId,
+        sourceAttemptId,
+        resolutionAttemptId,
+        logicalEffectKey,
+        artifactId,
+    } = {}) {
+        requireNonEmptyString(investigationId, "investigationId");
+        requireNonEmptyString(sourceAttemptId, "sourceAttemptId");
+        requireNonEmptyString(resolutionAttemptId, "resolutionAttemptId");
+        requireNonEmptyString(logicalEffectKey, "logicalEffectKey");
+        requireNonEmptyString(artifactId, "artifactId");
+        return this.#tx(() => {
+            this.#requireInvestigation(investigationId);
+            const source = this.#db
+                .prepare("SELECT * FROM command_attempts WHERE attempt_id = ?")
+                .get(sourceAttemptId);
+            if (source === undefined
+                || source.investigation_id !== investigationId) {
+                throw new NotFoundError(
+                    ERROR_CODES.NOT_FOUND,
+                    `unknown source command attempt '${sourceAttemptId}'`,
+                    { investigationId, sourceAttemptId },
+                );
+            }
+            this.#assertRecoveryCapsuleAttemptBinding(source, {
+                logicalEffectKey,
+            });
+            const resolution = this.#db
+                .prepare("SELECT * FROM command_attempts WHERE attempt_id = ?")
+                .get(resolutionAttemptId);
+            if (resolution === undefined
+                || resolution.investigation_id !== investigationId) {
+                throw new NotFoundError(
+                    ERROR_CODES.NOT_FOUND,
+                    `unknown resolution command attempt '${resolutionAttemptId}'`,
+                    { investigationId, resolutionAttemptId },
+                );
+            }
+            this.#assertRecoveryCapsuleAttemptBinding(resolution, {
+                logicalEffectKey,
+                sourceAttemptId,
+                artifactId,
+                allowedStates: ["committed"],
+            });
+            const artifact = this.#db
+                .prepare("SELECT * FROM artifacts WHERE artifact_id = ?")
+                .get(artifactId);
+            if (artifact === undefined
+                || artifact.investigation_id !== investigationId
+                || artifact.content_type
+                    !== EFFECT_RECOVERY_CAPSULE_CONTENT_TYPE) {
+                throw new NotFoundError(
+                    ERROR_CODES.ARTIFACT_NOT_FOUND,
+                    `unknown recovery capsule artifact '${artifactId}'`,
+                    { investigationId, artifactId },
+                );
+            }
+            const removed = this.#db.prepare(`
+                DELETE FROM artifact_refs
+                WHERE investigation_id = ?
+                  AND artifact_id = ?
+                  AND seq IS NULL`).run(investigationId, artifactId);
+            return {
+                investigationId,
+                sourceAttemptId,
+                resolutionAttemptId,
+                logicalEffectKey,
+                artifactId,
+                released: Number(removed.changes) > 0,
+                releasedReferences: Number(removed.changes),
+            };
+        });
+    }
+
     putInlineArtifact({ investigationId, artifactId, bytes, contentType = null } = {}) {
         requireNonEmptyString(investigationId, "investigationId");
         requireNonEmptyString(artifactId, "artifactId");
@@ -2886,9 +3538,7 @@ export class EventRepository {
             );
         }
         if (seq !== null) {
-            const ev = this.#db
-                .prepare("SELECT 1 AS present FROM events WHERE investigation_id = ? AND seq = ?")
-                .get(investigationId, seq);
+            const ev = this.getEvent(investigationId, seq);
             if (!ev) {
                 throw new NotFoundError(
                     ERROR_CODES.NOT_FOUND,
@@ -2898,7 +3548,16 @@ export class EventRepository {
             }
         }
         const existing = seq === null
-            ? null
+            ? this.#db
+                .prepare(`
+                    SELECT ref_id, created_at
+                    FROM artifact_refs
+                    WHERE investigation_id = ?
+                      AND artifact_id = ?
+                      AND seq IS NULL
+                    ORDER BY ref_id ASC
+                    LIMIT 1`)
+                .get(investigationId, artifactId)
             : this.#db
                 .prepare(`
                     SELECT ref_id, created_at
@@ -3104,16 +3763,28 @@ export class EventRepository {
     verifyInvestigation(investigationId) {
         requireNonEmptyString(investigationId, "investigationId");
         verifyDatabaseIntegrity(this.#db, { adapter: this.#integrityCheckAdapter });
+        this.#segments.verify();
         this.#requireInvestigation(investigationId);
 
         const violations = [];
-        const events = this.#db
-            .prepare("SELECT * FROM events WHERE investigation_id = ? ORDER BY seq ASC")
-            .all(investigationId);
+        const floor = this.#segments.sealedFloor(investigationId);
+        const events = [
+            ...this.#segments.listRows(investigationId),
+            ...this.#db
+                .prepare(`
+                    SELECT *
+                    FROM events
+                    WHERE investigation_id = ? AND seq > ?
+                    ORDER BY seq ASC
+                `)
+                .all(investigationId, floor),
+        ];
 
         let expectedSeq = 1;
         let expectedPrev = GENESIS_PREV_HASH;
         let terminalCount = 0;
+        const eventHashes = new Set();
+        const evidenceKeys = new Set();
 
         for (const row of events) {
             const seq = Number(row.seq);
@@ -3178,6 +3849,25 @@ export class EventRepository {
             if (row.is_terminal === 1) {
                 terminalCount += 1;
             }
+            if (eventHashes.has(row.event_hash)) {
+                violations.push({
+                    code: ERROR_CODES.EVENT_HASH_MISMATCH,
+                    seq,
+                    detail: "event_hash is duplicated across active/sealed storage",
+                });
+            }
+            eventHashes.add(row.event_hash);
+            if (row.evidence_kind !== null) {
+                const evidenceKey = `${row.attempt_id}\0${row.evidence_kind}`;
+                if (evidenceKeys.has(evidenceKey)) {
+                    violations.push({
+                        code: ERROR_CODES.EVIDENCE_CONFLICT,
+                        seq,
+                        detail: "evidence idempotency key is duplicated across active/sealed storage",
+                    });
+                }
+                evidenceKeys.add(evidenceKey);
+            }
             expectedSeq = seq + 1;
             expectedPrev = row.event_hash;
         }
@@ -3231,9 +3921,7 @@ export class EventRepository {
                 }
             }
             if (ref.seq !== null) {
-                const ev = this.#db
-                    .prepare("SELECT 1 AS present FROM events WHERE investigation_id = ? AND seq = ?")
-                    .get(investigationId, ref.seq);
+                const ev = this.getEvent(investigationId, Number(ref.seq));
                 if (!ev) {
                     violations.push({
                         code: ERROR_CODES.INTEGRITY_VIOLATION,

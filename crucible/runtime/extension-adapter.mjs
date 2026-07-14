@@ -476,6 +476,7 @@ export function requestStop({
     investigationId,
     reason = "Stop requested by the Crucible extension adapter.",
     pauseRequested = true,
+    forceQuiescence = false,
     requestId = null,
     repositoryFactory = openRepository,
     artifactStoreFactory = openArtifactStore,
@@ -489,6 +490,9 @@ export function requestStop({
         isoNow: () => new Date().toISOString(),
     },
 } = {}) {
+    if (typeof forceQuiescence !== "boolean") {
+        throw new TypeError("forceQuiescence must be boolean");
+    }
     const repository = repositoryFactory({
         file: path.join(stateDir, "events.sqlite"),
     });
@@ -506,13 +510,14 @@ export function requestStop({
         const operationalNonResult = adapter.latestOperationalNonResult();
         const initial = adapter.replay();
         const existingStop = repository.getQuiescentStop(investigationId);
-        if (initial.aggregate.terminal !== null
+        if (!forceQuiescence && (
+            initial.aggregate.terminal !== null
             || initial.aggregate.nonResults.length > 0
             || operationalNonResult !== null
             || (
                 initial.aggregate.pause !== null
                 && existingStop?.state === "PAUSED_QUIESCENT"
-            )) {
+            ))) {
             return {
                 appended: false,
                 aggregate: initial.aggregate,
@@ -532,9 +537,12 @@ export function requestStop({
         let status = null;
         try {
             lock = readLock(paths.lockPath);
-            status = readSupervisorState(stateDir, investigationId);
         } catch {
             lock = null;
+        }
+        try {
+            status = readSupervisorState(stateDir, investigationId);
+        } catch {
             status = null;
         }
         const exactLiveOwner = lock !== null
@@ -584,11 +592,11 @@ export function requestStop({
                 reason:
                     "resource broker authority could not be reconstructed",
             };
+            const repositoryAuthority =
+                repository.getSupervisorAuthority(investigationId);
             try {
                 const runtimeAuthority =
                     initial.aggregate.runtimeConfigAuthority;
-                const repositoryAuthority =
-                    repository.getSupervisorAuthority(investigationId);
                 if (runtimeAuthority !== null
                     && repositoryAuthority !== null) {
                     const runtimeConfig = supervisorConfigFromRuntimeAuthority(
@@ -687,44 +695,125 @@ export function requestStop({
                     reason: error?.message ?? String(error),
                 };
             }
+            const retiredOwner = status !== null
+                && repositoryAuthority !== null
+                && status.supervisorGeneration
+                    === repositoryAuthority.supervisorGeneration
+                && status.nonce
+                    === repositoryAuthority.supervisorNonce
+                && lock === null
+                && !isPidAlive(status.pid)
+                ? {
+                    pid: status.pid,
+                    nonce: status.nonce,
+                    supervisorGeneration:
+                        status.supervisorGeneration,
+                    runnerIncarnation:
+                        status.runnerIncarnation ?? null,
+                    state: status.state ?? "stopped",
+                }
+                : null;
+            const childPid = Number.isSafeInteger(status?.childPid)
+                && status.childPid > 0
+                ? status.childPid
+                : null;
+            const childInactive = childPid === null
+                || !isPidAlive(childPid);
+            const offlineProofAvailable = retiredOwner !== null
+                && childInactive
+                && brokerProbe.verified === true
+                && brokerProbe.authorityRetired === true
+                && Array.isArray(brokerProbe.activeLeases)
+                && brokerProbe.activeLeases.length === 0;
             const proof = buildQuiescenceSnapshot({
                 repository,
                 investigationId,
-                supervisorStatus: {
-                    verified: false,
-                    reason:
-                        status === null
-                            ? "supervisor status is missing"
-                            : "supervisor status/lock ownership is not exact and live",
-                },
-                processes: {
-                    verified: false,
-                    reason:
-                        "extension adapter cannot enumerate exact supervisor-owned process trees",
-                },
-                sdkSessions: {
-                    verified: false,
-                    reason:
-                        "extension adapter cannot prove exact SDK session ownership",
-                },
-                runnerChild: {
-                    verified: false,
-                    reason:
-                        Number.isSafeInteger(status?.childPid)
-                        && status.childPid > 0
-                        && isPidAlive(status.childPid)
-                            ? "recorded runner child is still live"
-                            : "runner child generation/incarnation is unverified",
-                },
+                supervisorStatus: offlineProofAvailable
+                    ? {
+                        verified: true,
+                        pid: retiredOwner.pid,
+                        supervisorGeneration:
+                            retiredOwner.supervisorGeneration,
+                        supervisorNonce: retiredOwner.nonce,
+                        runnerIncarnation:
+                            retiredOwner.runnerIncarnation,
+                        state: retiredOwner.state,
+                    }
+                    : {
+                        verified: false,
+                        reason:
+                            status === null
+                                ? "supervisor status is missing"
+                                : "supervisor status/lock ownership is not exact and retired",
+                    },
+                processes: offlineProofAvailable
+                    ? { verified: true, activePids: [] }
+                    : {
+                        verified: false,
+                        reason:
+                            "extension adapter cannot prove exact supervisor-owned process trees",
+                    },
+                sdkSessions: offlineProofAvailable
+                    ? {
+                        verified: true,
+                        activeCount: 0,
+                        source:
+                            "retired_supervisor_and_runner_processes",
+                    }
+                    : {
+                        verified: false,
+                        reason:
+                            "extension adapter cannot prove exact SDK session ownership",
+                    },
+                runnerChild: offlineProofAvailable
+                    ? {
+                        verified: true,
+                        active: false,
+                        pid: childPid,
+                        runnerIncarnation:
+                            retiredOwner.runnerIncarnation,
+                    }
+                    : {
+                        verified: false,
+                        reason:
+                            childPid !== null && isPidAlive(childPid)
+                                ? "recorded runner child is still live"
+                                : "runner child generation/incarnation is unverified",
+                    },
                 resourceBroker: brokerProbe,
             });
-            stop = persistPausePending({
-                repository,
-                stop,
-                proof,
-                reason:
-                    "No exact live supervisor could prove and atomically commit quiescence.",
-            });
+            const terminalOrNonResult =
+                initial.aggregate.terminal !== null
+                || initial.aggregate.nonResults.length > 0
+                || operationalNonResult !== null;
+            stop = proof.quiescent === true && terminalOrNonResult
+                ? repository.completeQuiescentStop({
+                    investigationId,
+                    requestId: stop.requestId,
+                    state: "STOP_SUPERSEDED",
+                    quiescent: false,
+                    interventionRequired: false,
+                    nonResultCode:
+                        operationalNonResult?.payload?.code
+                        ?? initial.aggregate.nonResults.at(-1)?.code
+                        ?? null,
+                    details: {
+                        supersededBy:
+                            initial.aggregate.terminal !== null
+                                ? "terminal"
+                                : operationalNonResult !== null
+                                    ? "operational_non_result"
+                                    : "domain_non_result",
+                        proof,
+                    },
+                })
+                : persistPausePending({
+                    repository,
+                    stop,
+                    proof,
+                    reason:
+                        "No exact live supervisor could prove and atomically commit quiescence.",
+                });
         }
         const final = adapter.replay();
         return {

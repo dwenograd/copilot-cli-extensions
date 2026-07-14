@@ -1,4 +1,12 @@
 export {
+    DEFAULT_WORKING_SET_POLICY,
+    DIAGNOSTIC_RETENTION_MODES,
+    WORKING_SET_POLICY_VERSION,
+    diagnosticOriginalDeletionAllowed,
+    normalizeWorkingSetPolicy,
+} from "./working-set-policy.mjs";
+
+export {
     CANONICAL_HASH_ALGORITHM,
     CANONICAL_JSON_VERSION,
     CONTRACT_HASH_ALGORITHM,
@@ -386,6 +394,7 @@ export {
     constructInvestigationResumedEvent,
     constructKernelDecisionEvent,
     constructModelObservedEvent,
+    constructStorageBudgetNonResultEvent,
     createExternalEvent,
     createInvestigationOpenedEvent,
     normalizeCapabilityEpochPayload,
@@ -395,6 +404,7 @@ export {
     normalizeEvidenceInvalidatedPayload,
     normalizeExternalEventPayload,
     normalizeStopRequestedPayload,
+    normalizeStorageBudgetExhaustedPayload,
 } from "./events.mjs";
 
 export {

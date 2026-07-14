@@ -120,15 +120,57 @@ describe("crucible API schema", () => {
     });
 
     it("keeps status, stop, and result parsers strict", () => {
+        expect(crucibleStatusSpec.parameters.properties.operation.enum)
+            .toEqual(["get", "list"]);
+        expect(crucibleStatusSpec.parameters.required)
+            .toEqual(["operation"]);
+        expect(crucibleStatusSpec.parameters.oneOf.map((branch) =>
+            branch.properties.operation.enum[0]))
+            .toEqual(["get", "list"]);
+        expect(crucibleStopSpec.parameters.properties.operation.enum)
+            .toEqual(["pause", "archive", "delete"]);
+        expect(crucibleStopSpec.parameters.required)
+            .toEqual(["operation"]);
+        expect(crucibleStopSpec.parameters.oneOf.map((branch) =>
+            branch.properties.operation.enum[0]))
+            .toEqual(["pause", "archive", "delete"]);
         expect(crucibleStatusSpec.parse({
+            operation: "get",
             investigation_id: "inv-1",
-        })).toEqual({ investigation_id: "inv-1" });
+        })).toEqual({
+            operation: "get",
+            investigation_id: "inv-1",
+        });
+        expect(crucibleStatusSpec.parse({
+            operation: "list",
+        })).toEqual({
+            operation: "list",
+            limit: 50,
+        });
         expect(crucibleStopSpec.parse({
+            operation: "pause",
             investigation_id: "inv-1",
             reason: "operator pause",
         })).toEqual({
+            operation: "pause",
             investigation_id: "inv-1",
             reason: "operator pause",
+        });
+        expect(crucibleStopSpec.parse({
+            operation: "archive",
+            investigation_id: "inv-1",
+        })).toEqual({
+            operation: "archive",
+            investigation_id: "inv-1",
+        });
+        expect(crucibleStopSpec.parse({
+            operation: "delete",
+            investigation_id: "inv-1",
+            expected_archive_digest: `sha256:${"a".repeat(64)}`,
+        })).toEqual({
+            operation: "delete",
+            investigation_id: "inv-1",
+            expected_archive_digest: `sha256:${"a".repeat(64)}`,
         });
         expect(crucibleResultSpec.parse({
             investigation_id: "inv-1",
@@ -139,9 +181,30 @@ describe("crucible API schema", () => {
             crucibleResultSpec,
         ]) {
             expect(() => spec.parse({
+                ...(spec === crucibleStatusSpec
+                    ? { operation: "get" }
+                    : spec === crucibleStopSpec
+                        ? { operation: "pause" }
+                        : {}),
                 investigation_id: "inv-1",
                 extra: true,
             })).toThrow(SchemaValidationError);
         }
+        expect(() => crucibleStatusSpec.parse({
+            investigation_id: "inv-1",
+        })).toThrow(SchemaValidationError);
+        expect(() => crucibleStopSpec.parse({
+            investigation_id: "inv-1",
+        })).toThrow(SchemaValidationError);
+        expect(() => crucibleStatusSpec.parse({
+            operation: "list",
+            investigation_id: "inv-1",
+        })).toThrow(SchemaValidationError);
+        expect(() => crucibleStopSpec.parse({
+            operation: "delete",
+            investigation_id: "inv-1",
+            expected_archive_digest: `sha256:${"a".repeat(64)}`,
+            reason: "not valid for delete",
+        })).toThrow(SchemaValidationError);
     });
 });

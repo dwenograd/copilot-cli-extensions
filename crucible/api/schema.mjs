@@ -24,6 +24,11 @@ import {
     HYPOTHESIS_LIMITS,
     PREDICTION_KINDS,
 } from "../domain/hypotheses.mjs";
+import {
+    DEFAULT_WORKING_SET_POLICY,
+    DIAGNOSTIC_RETENTION_MODES,
+    WORKING_SET_POLICY_VERSION,
+} from "../domain/working-set-policy.mjs";
 import { STRICT_ISO_TIMESTAMP_PATTERN_SOURCE } from "../runtime/config-validation.mjs";
 import { SchemaValidationError } from "./errors.mjs";
 
@@ -454,6 +459,50 @@ function discriminatedObjectUnion({
             return Object.hasOwn(rawArgs, discriminant)
                 ? present.parse(rawArgs, pathLabel)
                 : absent.parse(rawArgs, pathLabel);
+        },
+    });
+}
+
+function strictDiscriminatedObjectUnion({
+    discriminant,
+    variants,
+    description,
+}) {
+    const entries = Object.entries(variants);
+    if (entries.length < 2) {
+        throw new TypeError("strict discriminated unions require at least two variants");
+    }
+    const mergedProperties = {};
+    for (const [, variant] of entries) {
+        Object.assign(mergedProperties, variant.jsonSchema.properties);
+    }
+    mergedProperties[discriminant] = {
+        type: "string",
+        enum: entries.map(([name]) => name),
+    };
+    const jsonSchema = {
+        type: "object",
+        additionalProperties: false,
+        ...(description === undefined ? {} : { description }),
+        properties: mergedProperties,
+        required: [discriminant],
+        oneOf: entries.map(([, variant]) => variant.jsonSchema),
+    };
+    return Object.freeze({
+        jsonSchema,
+        toJsonSchema: () => structuredClone(jsonSchema),
+        parse(rawArgs, pathLabel = "args") {
+            if (!isPlainObject(rawArgs)) {
+                fail(pathLabel, "must be a JSON object");
+            }
+            const operation = rawArgs[discriminant];
+            if (typeof operation !== "string" || !Object.hasOwn(variants, operation)) {
+                fail(
+                    `${pathLabel}.${discriminant}`,
+                    `must be one of ${entries.map(([name]) => name).join(", ")}`,
+                );
+            }
+            return variants[operation].parse(rawArgs, pathLabel);
         },
     });
 }
@@ -902,6 +951,71 @@ const statisticalPolicyField = object({
     }),
 });
 
+const workingSetPolicyField = makeField({
+    ...object({
+        version: enumField([WORKING_SET_POLICY_VERSION]),
+        perAttemptBytes: integer({
+            minimum: 1,
+            maximum: CONTRACT_LIMITS.maxResourceBytes,
+        }),
+        perInvestigationBytes: integer({
+            minimum: 1,
+            maximum: CONTRACT_LIMITS.maxResourceBytes,
+        }),
+        warningBasisPoints: integer({ minimum: 1, maximum: 9_999 }),
+        terminalReserveBytes: integer({
+            minimum: 1,
+            maximum: CONTRACT_LIMITS.maxResourceBytes,
+        }),
+        walCheckpointBytes: integer({
+            minimum: 1,
+            maximum: CONTRACT_LIMITS.maxResourceBytes,
+        }),
+        walCheckpointIntervalMs: integer({
+            minimum: 1,
+            maximum: 24 * 60 * 60 * 1000,
+        }),
+        segmentEventThreshold: integer({
+            minimum: 1,
+            maximum: 10_000_000,
+        }),
+        segmentByteThreshold: integer({
+            minimum: 1,
+            maximum: CONTRACT_LIMITS.maxResourceBytes,
+        }),
+        maintenanceIntervalMs: integer({
+            minimum: 1,
+            maximum: 24 * 60 * 60 * 1000,
+        }),
+        orphanGraceMs: integer({
+            minimum: 0,
+            maximum: 365 * 24 * 60 * 60 * 1000,
+        }),
+        diagnosticRetention: object({
+            mode: enumField(DIAGNOSTIC_RETENTION_MODES),
+            maxOriginalAgeMs: integer({
+                minimum: 0,
+                maximum: 365 * 24 * 60 * 60 * 1000,
+            }),
+            maxOriginalBytes: integer({
+                minimum: 0,
+                maximum: CONTRACT_LIMITS.maxResourceBytes,
+            }),
+            nonAuthoritativeContentTypes: array(
+                string({ maxLength: 255, maxBytes: 255 }),
+                { maxItems: 64, uniqueItems: true },
+            ),
+            bundleRequiredContentTypes: array(
+                string({ maxLength: 255, maxBytes: 255 }),
+                { maxItems: 64, uniqueItems: true },
+            ),
+        }),
+    }),
+    optional: true,
+    hasDefault: true,
+    defaultValue: DEFAULT_WORKING_SET_POLICY,
+});
+
 const operatorExperimentConfigShape = object({
         experiment_id: experimentIdField,
         objective: string({
@@ -936,6 +1050,7 @@ const operatorExperimentConfigShape = object({
         observable_registry: observableRegistryField,
         hypothesis_policy: hypothesisPolicyField,
         statistical_policy: statisticalPolicyField,
+        working_set_policy: workingSetPolicyField,
         worker_models: array(
             identifier({ description: "A proposer/worker model id." }),
             {
@@ -1081,21 +1196,95 @@ export const crucibleStartSpec = defineTool({
 export const crucibleStatusSpec = defineTool({
     name: "crucible_status",
     description:
-        "Read-only progress for a Crucible investigation. V3/non-v4 state is reported as legacy_incompatible and restart-required without kernel replay. V4 state is replayed and integrity-checked; terminal state exposes only terminal_available. Never a result.",
-    args: object({ investigation_id: investigationIdField }),
+        "Read-only Crucible lifecycle status. operation:get replays and integrity-checks one active or archived investigation while preserving terminal redaction; operation:list reads the verified global catalog with deterministic pagination and lifecycle-only metadata. Never a result.",
+    args: strictDiscriminatedObjectUnion({
+        discriminant: "operation",
+        variants: {
+            get: object({
+                operation: enumField(["get"]),
+                investigation_id: investigationIdField,
+            }),
+            list: object({
+                operation: enumField(["list"]),
+                cursor: string({
+                    description:
+                        "Opaque cursor returned by the previous deterministic catalog page.",
+                    minLength: 1,
+                    maxLength: 1024,
+                    pattern: "^[A-Za-z0-9_-]+$",
+                    optional: true,
+                }),
+                limit: integer({
+                    description: "Maximum catalog entries to return.",
+                    minimum: 1,
+                    maximum: 100,
+                    default: 50,
+                }),
+                state_filter: enumField(
+                    ["active", "archived", "tombstoned"],
+                    {
+                        description:
+                            "Optional lifecycle-state filter bound into the pagination cursor.",
+                        optional: true,
+                    },
+                ),
+            }),
+        },
+        description:
+            "Exactly one mandatory operation is accepted: get one investigation, or list the global lifecycle catalog.",
+    }),
 });
 
 export const crucibleStopSpec = defineTool({
     name: "crucible_stop",
     description:
-        "Request a Crucible PAUSE through the runtime. Reports resumable:true only after the kernel-owned pause and a zero-active-resource quiescence proof are durably persisted; timeout/non-quiescent calls retain authority and remain non-resumable. It never manufactures a terminal decision.",
-    args: object({
-        investigation_id: investigationIdField,
-        reason: string({
-            description: "Optional operator note recorded with the pause request.",
-            maxLength: 4096,
-            optional: true,
-        }),
+        "Perform one mandatory Crucible lifecycle operation without manufacturing a scientific result: pause an active investigation, archive an eligible quiescent terminal/domain-non-result/paused investigation into a verified bundle, or delete an archived bundle only with its exact digest while preserving a durable signed tombstone.",
+    args: strictDiscriminatedObjectUnion({
+        discriminant: "operation",
+        variants: {
+            pause: object({
+                operation: enumField(["pause"]),
+                investigation_id: investigationIdField,
+                reason: string({
+                    description: "Optional operator note recorded with the pause request.",
+                    maxLength: 4096,
+                    optional: true,
+                }),
+            }),
+            archive: object({
+                operation: enumField(["archive"]),
+                investigation_id: investigationIdField,
+                expected_head: string({
+                    description:
+                        "Optional exact persisted or algorithm-tagged domain event head used as an optimistic concurrency fence.",
+                    minLength: 64,
+                    maxLength: 192,
+                    pattern:
+                        "^(?:[a-f0-9]{64}|sha256:[a-z0-9][a-z0-9._-]*:[a-f0-9]{64})$",
+                    optional: true,
+                }),
+                authenticated_bundle_destination: string({
+                    description:
+                        "Optional absolute local archive destination. It must remain inside the state-root authenticated archive retention directory.",
+                    minLength: 1,
+                    maxLength: 4096,
+                    optional: true,
+                }),
+            }),
+            delete: object({
+                operation: enumField(["delete"]),
+                investigation_id: investigationIdField,
+                expected_archive_digest: string({
+                    description:
+                        "Exact authenticated SHA-256 inventory digest of the archived bundle.",
+                    minLength: 71,
+                    maxLength: 71,
+                    pattern: "^sha256:[a-f0-9]{64}$",
+                }),
+            }),
+        },
+        description:
+            "Exactly one mandatory lifecycle operation is accepted: pause, archive, or delete.",
     }),
 });
 

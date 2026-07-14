@@ -15,15 +15,22 @@ import {
 } from "./schema.mjs";
 import { DatabaseSync } from "./sqlite.mjs";
 
-export const RESOURCE_CATALOG_SCHEMA_VERSION = 1;
+export const RESOURCE_CATALOG_SCHEMA_VERSION = 4;
 export const RESOURCE_CATALOG_SCHEMA_HASH_ALGORITHM =
-    "sha256:crucible-resource-catalog-schema-v1";
+    "sha256:crucible-resource-catalog-schema-v4";
 export const RESOURCE_CATALOG_CONFIG_HASH_ALGORITHM =
-    "sha256:crucible-resource-broker-config-v1";
+    "sha256:crucible-resource-broker-config-v2";
 export const RESOURCE_LIMITS_HASH_ALGORITHM =
-    "sha256:crucible-investigation-resource-limits-v1";
+    "sha256:crucible-investigation-resource-limits-v2";
 
-const DDL = `
+const V2_SCHEMA_VERSION = 2;
+const V2_SCHEMA_HASH_ALGORITHM =
+    "sha256:crucible-resource-catalog-schema-v2";
+const V3_SCHEMA_VERSION = 3;
+const V3_SCHEMA_HASH_ALGORITHM =
+    "sha256:crucible-resource-catalog-schema-v3";
+
+const V2_DDL = `
 CREATE TABLE schema_meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -80,6 +87,21 @@ CREATE TABLE investigation_limits (
     resource_key     TEXT    NOT NULL REFERENCES resource_definitions(resource_key),
     limit_units      INTEGER NOT NULL CHECK (limit_units >= 0),
     PRIMARY KEY (investigation_id, resource_key)
+);
+
+CREATE TABLE storage_usage (
+    investigation_id TEXT PRIMARY KEY REFERENCES investigations(investigation_id),
+    actual_units     INTEGER NOT NULL CHECK (actual_units >= 0),
+    reconciled_at_ms INTEGER NOT NULL CHECK (reconciled_at_ms >= 0)
+);
+
+CREATE TABLE storage_reconciliations (
+    investigation_id  TEXT    NOT NULL REFERENCES investigations(investigation_id),
+    reconciliation_id TEXT    NOT NULL,
+    reported_units    INTEGER NOT NULL CHECK (reported_units >= 0),
+    source            TEXT    NOT NULL,
+    reconciled_at_ms  INTEGER NOT NULL CHECK (reconciled_at_ms >= 0),
+    PRIMARY KEY (investigation_id, reconciliation_id)
 );
 
 CREATE TABLE leases (
@@ -145,6 +167,151 @@ CREATE TABLE usage_reconciliations (
 );
 `;
 
+const RECOVERY_DDL = `
+CREATE TABLE investigation_lifecycle (
+    investigation_id TEXT PRIMARY KEY REFERENCES investigations(investigation_id),
+    lifecycle_state  TEXT    NOT NULL
+        CHECK (lifecycle_state IN ('active', 'archived', 'tombstoned')),
+    updated_at_ms    INTEGER NOT NULL CHECK (updated_at_ms >= 0),
+    reason_code      TEXT
+);
+
+CREATE INDEX ix_investigation_lifecycle_state
+    ON investigation_lifecycle(lifecycle_state, investigation_id);
+
+CREATE TABLE recovery_daemon_incarnations (
+    daemon_incarnation    TEXT    PRIMARY KEY,
+    daemon_generation     INTEGER NOT NULL UNIQUE CHECK (daemon_generation > 0),
+    lease_nonce           TEXT    NOT NULL,
+    owner_process_id      INTEGER NOT NULL CHECK (owner_process_id > 0),
+    owner_process_start_id TEXT   NOT NULL,
+    claimed_at_ms         INTEGER NOT NULL CHECK (claimed_at_ms >= 0),
+    retired_at_ms         INTEGER,
+    retirement_reason     TEXT,
+    CHECK (
+        (retired_at_ms IS NULL AND retirement_reason IS NULL)
+        OR
+        (retired_at_ms IS NOT NULL
+            AND retired_at_ms >= claimed_at_ms
+            AND retirement_reason IS NOT NULL)
+    )
+);
+
+CREATE TABLE recovery_daemon_authority (
+    singleton_id          INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+    daemon_generation     INTEGER NOT NULL UNIQUE CHECK (daemon_generation > 0),
+    daemon_incarnation    TEXT    NOT NULL UNIQUE
+        REFERENCES recovery_daemon_incarnations(daemon_incarnation),
+    lease_nonce           TEXT    NOT NULL,
+    owner_process_id      INTEGER NOT NULL CHECK (owner_process_id > 0),
+    owner_process_start_id TEXT   NOT NULL,
+    heartbeat_at_ms       INTEGER NOT NULL CHECK (heartbeat_at_ms >= 0),
+    expires_at_ms         INTEGER NOT NULL CHECK (expires_at_ms > heartbeat_at_ms)
+);
+
+CREATE TABLE recovery_operations (
+    investigation_id      TEXT PRIMARY KEY REFERENCES investigations(investigation_id),
+    daemon_generation     INTEGER NOT NULL CHECK (daemon_generation > 0),
+    daemon_incarnation    TEXT    NOT NULL
+        REFERENCES recovery_daemon_incarnations(daemon_incarnation),
+    operation_state       TEXT    NOT NULL
+        CHECK (operation_state IN (
+            'eligible', 'running', 'started', 'waiting',
+            'skipped', 'blocked', 'failed'
+        )),
+    operation_code        TEXT    NOT NULL,
+    supervisor_generation INTEGER,
+    runner_incarnation    TEXT,
+    attempt_count         INTEGER NOT NULL CHECK (attempt_count > 0),
+    updated_at_ms         INTEGER NOT NULL CHECK (updated_at_ms >= 0),
+    CHECK (
+        (supervisor_generation IS NULL AND runner_incarnation IS NULL)
+        OR
+        (supervisor_generation > 0 AND runner_incarnation IS NOT NULL)
+    )
+);
+
+CREATE INDEX ix_recovery_operations_state
+    ON recovery_operations(operation_state, updated_at_ms, investigation_id);
+`;
+
+const LIFECYCLE_DDL = `
+CREATE TABLE lifecycle_operations (
+    investigation_id       TEXT PRIMARY KEY REFERENCES investigations(investigation_id),
+    operation_kind         TEXT    NOT NULL
+        CHECK (operation_kind IN ('archive', 'delete')),
+    operation_token        TEXT    NOT NULL UNIQUE,
+    owner_process_id       INTEGER NOT NULL CHECK (owner_process_id > 0),
+    owner_process_start_id TEXT    NOT NULL,
+    archive_relpath        TEXT    UNIQUE,
+    expected_archive_digest TEXT,
+    started_at_ms          INTEGER NOT NULL CHECK (started_at_ms >= 0),
+    CHECK (
+        (operation_kind = 'archive'
+            AND archive_relpath IS NOT NULL
+            AND expected_archive_digest IS NULL)
+        OR
+        (operation_kind = 'delete'
+            AND archive_relpath IS NULL
+            AND expected_archive_digest IS NOT NULL)
+    )
+);
+
+CREATE INDEX ix_lifecycle_operations_kind
+    ON lifecycle_operations(operation_kind, started_at_ms, investigation_id);
+
+CREATE TABLE investigation_archives (
+    investigation_id       TEXT PRIMARY KEY REFERENCES investigations(investigation_id),
+    archive_relpath        TEXT    NOT NULL UNIQUE,
+    archive_digest         TEXT    NOT NULL UNIQUE,
+    trust_level            TEXT    NOT NULL
+        CHECK (trust_level IN ('authenticated', 'self-consistent')),
+    domain_version         INTEGER NOT NULL CHECK (domain_version > 0),
+    terminal_available     INTEGER NOT NULL CHECK (terminal_available IN (0, 1)),
+    integrity_status       TEXT    NOT NULL
+        CHECK (integrity_status IN ('verified', 'blocked')),
+    size_bytes             INTEGER NOT NULL CHECK (size_bytes >= 0),
+    domain_head_seq        INTEGER NOT NULL CHECK (domain_head_seq >= 0),
+    domain_head_hash       TEXT,
+    archived_at_ms         INTEGER NOT NULL CHECK (archived_at_ms >= 0),
+    CHECK (
+        (domain_head_seq = 0 AND domain_head_hash IS NULL)
+        OR
+        (domain_head_seq > 0 AND domain_head_hash IS NOT NULL)
+    )
+);
+
+CREATE INDEX ix_investigation_archives_time
+    ON investigation_archives(archived_at_ms, investigation_id);
+
+CREATE TABLE investigation_tombstones (
+    investigation_id       TEXT PRIMARY KEY,
+    created_at_ms          INTEGER NOT NULL CHECK (created_at_ms >= 0),
+    deleted_at_ms          INTEGER NOT NULL CHECK (deleted_at_ms >= created_at_ms),
+    domain_version         INTEGER NOT NULL CHECK (domain_version > 0),
+    archive_digest         TEXT    NOT NULL,
+    tombstone_relpath      TEXT    NOT NULL UNIQUE,
+    tombstone_digest       TEXT    NOT NULL UNIQUE,
+    signing_key_fingerprint TEXT   NOT NULL,
+    signature              TEXT    NOT NULL,
+    size_bytes             INTEGER NOT NULL CHECK (size_bytes > 0),
+    integrity_status       TEXT    NOT NULL CHECK (integrity_status = 'verified'),
+    domain_head_seq        INTEGER NOT NULL CHECK (domain_head_seq >= 0),
+    domain_head_hash       TEXT,
+    CHECK (
+        (domain_head_seq = 0 AND domain_head_hash IS NULL)
+        OR
+        (domain_head_seq > 0 AND domain_head_hash IS NOT NULL)
+    )
+);
+
+CREATE INDEX ix_investigation_tombstones_deleted
+    ON investigation_tombstones(deleted_at_ms, investigation_id);
+`;
+
+const V3_DDL = `${V2_DDL}\n${RECOVERY_DDL}`;
+const DDL = `${V3_DDL}\n${LIFECYCLE_DDL}`;
+
 function normalizeSql(sql) {
     return String(sql ?? "")
         .replace(/\s+/gu, " ")
@@ -166,27 +333,49 @@ function schemaManifest(db) {
     }));
 }
 
-function fingerprintManifest(manifest) {
+function fingerprintManifest(
+    manifest,
+    {
+        version = RESOURCE_CATALOG_SCHEMA_VERSION,
+        algorithm = RESOURCE_CATALOG_SCHEMA_HASH_ALGORITHM,
+    } = {},
+) {
     const digest = createHash("sha256")
         .update(canonicalize({
-            version: RESOURCE_CATALOG_SCHEMA_VERSION,
+            version,
             manifest,
         }))
         .digest("hex");
-    return `${RESOURCE_CATALOG_SCHEMA_HASH_ALGORITHM}:${digest}`;
+    return `${algorithm}:${digest}`;
 }
 
-function expectedManifest() {
+function expectedManifest(ddl = DDL) {
     const db = new DatabaseSync(":memory:");
     try {
         db.exec("PRAGMA foreign_keys = ON;");
-        db.exec(DDL);
+        db.exec(ddl);
         return schemaManifest(db);
     } finally {
         db.close();
     }
 }
 
+const V2_EXPECTED_MANIFEST = Object.freeze(expectedManifest(V2_DDL));
+const V2_SCHEMA_FINGERPRINT = fingerprintManifest(
+    V2_EXPECTED_MANIFEST,
+    {
+        version: V2_SCHEMA_VERSION,
+        algorithm: V2_SCHEMA_HASH_ALGORITHM,
+    },
+);
+const V3_EXPECTED_MANIFEST = Object.freeze(expectedManifest(V3_DDL));
+const V3_SCHEMA_FINGERPRINT = fingerprintManifest(
+    V3_EXPECTED_MANIFEST,
+    {
+        version: V3_SCHEMA_VERSION,
+        algorithm: V3_SCHEMA_HASH_ALGORITHM,
+    },
+);
 const EXPECTED_MANIFEST = Object.freeze(expectedManifest());
 export const RESOURCE_CATALOG_SCHEMA_FINGERPRINT =
     fingerprintManifest(EXPECTED_MANIFEST);
@@ -212,7 +401,13 @@ function rollbackQuietly(db) {
     }
 }
 
-function verifyConnection(db, { busyTimeoutMs } = {}) {
+function verifyConnection(
+    db,
+    {
+        busyTimeoutMs,
+        schemaVersion = RESOURCE_CATALOG_SCHEMA_VERSION,
+    } = {},
+) {
     const observed = {
         foreignKeys: Number(pragmaScalar(db, "foreign_keys")),
         journalMode: String(pragmaScalar(db, "journal_mode") ?? "").toLowerCase(),
@@ -223,7 +418,7 @@ function verifyConnection(db, { busyTimeoutMs } = {}) {
         foreignKeys: 1,
         journalMode: "wal",
         synchronous: 2,
-        userVersion: RESOURCE_CATALOG_SCHEMA_VERSION,
+        userVersion: schemaVersion,
     };
     if (canonicalize(observed) !== canonicalize(expected)) {
         throw new SchemaIntegrityError(
@@ -231,6 +426,7 @@ function verifyConnection(db, { busyTimeoutMs } = {}) {
             { expected, observed },
         );
     }
+
     if (busyTimeoutMs !== undefined
         && Number(pragmaScalar(db, "busy_timeout")) !== busyTimeoutMs) {
         throw new SchemaIntegrityError(
@@ -240,6 +436,201 @@ function verifyConnection(db, { busyTimeoutMs } = {}) {
                 observed: Number(pragmaScalar(db, "busy_timeout")),
             },
         );
+    }
+}
+
+function verifyV2SchemaForMigration(db, {
+    busyTimeoutMs,
+    integrityCheckAdapter = undefined,
+} = {}) {
+    const userVersion = Number(pragmaScalar(db, "user_version") ?? 0);
+    const storedVersion = Number(db.prepare(
+        "SELECT value FROM schema_meta WHERE key = 'schema_version'",
+    ).get()?.value ?? Number.NaN);
+    if (userVersion !== V2_SCHEMA_VERSION
+        || storedVersion !== V2_SCHEMA_VERSION) {
+        throw new SchemaVersionError(
+            "resource catalog v2 migration source version mismatch",
+            {
+                fileUserVersion: userVersion,
+                fileMetaVersion: storedVersion,
+                expected: V2_SCHEMA_VERSION,
+            },
+        );
+    }
+    verifyConnection(db, {
+        busyTimeoutMs,
+        schemaVersion: V2_SCHEMA_VERSION,
+    });
+    verifyDatabaseIntegrity(db, { adapter: integrityCheckAdapter });
+    const actual = schemaManifest(db);
+    const actualFingerprint = fingerprintManifest(actual, {
+        version: V2_SCHEMA_VERSION,
+        algorithm: V2_SCHEMA_HASH_ALGORITHM,
+    });
+    if (canonicalize(actual) !== canonicalize(V2_EXPECTED_MANIFEST)
+        || actualFingerprint !== V2_SCHEMA_FINGERPRINT) {
+        throw new SchemaIntegrityError(
+            "resource catalog v2 migration source schema is not canonical",
+            {
+                expected: V2_SCHEMA_FINGERPRINT,
+                actual: actualFingerprint,
+            },
+        );
+    }
+    const storedFingerprint = db.prepare(
+        "SELECT value FROM schema_meta WHERE key = 'schema_fingerprint'",
+    ).get()?.value ?? null;
+    if (storedFingerprint !== V2_SCHEMA_FINGERPRINT) {
+        throw new SchemaIntegrityError(
+            "resource catalog v2 migration source fingerprint does not match",
+            {
+                expected: V2_SCHEMA_FINGERPRINT,
+                stored: storedFingerprint,
+            },
+        );
+    }
+}
+
+function verifyV3SchemaForMigration(db, {
+    busyTimeoutMs,
+    integrityCheckAdapter = undefined,
+} = {}) {
+    const userVersion = Number(pragmaScalar(db, "user_version") ?? 0);
+    const storedVersion = Number(db.prepare(
+        "SELECT value FROM schema_meta WHERE key = 'schema_version'",
+    ).get()?.value ?? Number.NaN);
+    if (userVersion !== V3_SCHEMA_VERSION
+        || storedVersion !== V3_SCHEMA_VERSION) {
+        throw new SchemaVersionError(
+            "resource catalog v3 migration source version mismatch",
+            {
+                fileUserVersion: userVersion,
+                fileMetaVersion: storedVersion,
+                expected: V3_SCHEMA_VERSION,
+            },
+        );
+    }
+    verifyConnection(db, {
+        busyTimeoutMs,
+        schemaVersion: V3_SCHEMA_VERSION,
+    });
+    verifyDatabaseIntegrity(db, { adapter: integrityCheckAdapter });
+    const actual = schemaManifest(db);
+    const actualFingerprint = fingerprintManifest(actual, {
+        version: V3_SCHEMA_VERSION,
+        algorithm: V3_SCHEMA_HASH_ALGORITHM,
+    });
+    if (canonicalize(actual) !== canonicalize(V3_EXPECTED_MANIFEST)
+        || actualFingerprint !== V3_SCHEMA_FINGERPRINT) {
+        throw new SchemaIntegrityError(
+            "resource catalog v3 migration source schema is not canonical",
+            {
+                expected: V3_SCHEMA_FINGERPRINT,
+                actual: actualFingerprint,
+            },
+        );
+    }
+    const storedFingerprint = db.prepare(
+        "SELECT value FROM schema_meta WHERE key = 'schema_fingerprint'",
+    ).get()?.value ?? null;
+    if (storedFingerprint !== V3_SCHEMA_FINGERPRINT) {
+        throw new SchemaIntegrityError(
+            "resource catalog v3 migration source fingerprint does not match",
+            {
+                expected: V3_SCHEMA_FINGERPRINT,
+                stored: storedFingerprint,
+            },
+        );
+    }
+}
+
+function migrateV2Schema(db, {
+    busyTimeoutMs,
+    integrityCheckAdapter,
+    nowMs,
+}) {
+    const userVersion = Number(pragmaScalar(db, "user_version") ?? 0);
+    const storedVersion = Number(db.prepare(
+        "SELECT value FROM schema_meta WHERE key = 'schema_version'",
+    ).get()?.value ?? Number.NaN);
+    if (userVersion !== V2_SCHEMA_VERSION
+        || storedVersion !== V2_SCHEMA_VERSION) {
+        return false;
+    }
+    verifyV2SchemaForMigration(db, {
+        busyTimeoutMs,
+        integrityCheckAdapter,
+    });
+    db.exec("BEGIN IMMEDIATE;");
+    try {
+        db.exec(RECOVERY_DDL);
+        db.exec(LIFECYCLE_DDL);
+        db.prepare(`
+            INSERT INTO investigation_lifecycle(
+                investigation_id, lifecycle_state, updated_at_ms, reason_code)
+            SELECT investigation_id, 'active', ?, NULL
+            FROM investigations
+        `).run(nowMs);
+        db.prepare(
+            "UPDATE schema_meta SET value = ? WHERE key = 'schema_version'",
+        ).run(String(RESOURCE_CATALOG_SCHEMA_VERSION));
+        db.prepare(
+            "UPDATE schema_meta SET value = ? WHERE key = 'schema_fingerprint'",
+        ).run(RESOURCE_CATALOG_SCHEMA_FINGERPRINT);
+        db.prepare(`
+            INSERT OR REPLACE INTO schema_meta(key, value)
+            VALUES('recovery_schema_migrated_at_ms', ?)
+        `).run(String(nowMs));
+        db.prepare(`
+            INSERT OR REPLACE INTO schema_meta(key, value)
+            VALUES('lifecycle_schema_migrated_at_ms', ?)
+        `).run(String(nowMs));
+        db.exec(`PRAGMA user_version = ${RESOURCE_CATALOG_SCHEMA_VERSION};`);
+        db.exec("COMMIT;");
+        return true;
+    } catch (error) {
+        rollbackQuietly(db);
+        throw error;
+    }
+}
+
+function migrateV3Schema(db, {
+    busyTimeoutMs,
+    integrityCheckAdapter,
+    nowMs,
+}) {
+    const userVersion = Number(pragmaScalar(db, "user_version") ?? 0);
+    const storedVersion = Number(db.prepare(
+        "SELECT value FROM schema_meta WHERE key = 'schema_version'",
+    ).get()?.value ?? Number.NaN);
+    if (userVersion !== V3_SCHEMA_VERSION
+        || storedVersion !== V3_SCHEMA_VERSION) {
+        return false;
+    }
+    verifyV3SchemaForMigration(db, {
+        busyTimeoutMs,
+        integrityCheckAdapter,
+    });
+    db.exec("BEGIN IMMEDIATE;");
+    try {
+        db.exec(LIFECYCLE_DDL);
+        db.prepare(
+            "UPDATE schema_meta SET value = ? WHERE key = 'schema_version'",
+        ).run(String(RESOURCE_CATALOG_SCHEMA_VERSION));
+        db.prepare(
+            "UPDATE schema_meta SET value = ? WHERE key = 'schema_fingerprint'",
+        ).run(RESOURCE_CATALOG_SCHEMA_FINGERPRINT);
+        db.prepare(`
+            INSERT OR REPLACE INTO schema_meta(key, value)
+            VALUES('lifecycle_schema_migrated_at_ms', ?)
+        `).run(String(nowMs));
+        db.exec(`PRAGMA user_version = ${RESOURCE_CATALOG_SCHEMA_VERSION};`);
+        db.exec("COMMIT;");
+        return true;
+    } catch (error) {
+        rollbackQuietly(db);
+        throw error;
     }
 }
 
@@ -356,8 +747,22 @@ export function applyResourceCatalogSchema(db, {
     try {
         const initialized = assertFreshOrInitialized(db);
         let created = false;
+        let migrated = false;
         if (!initialized) {
             created = createFreshSchema(db, nowMs);
+        } else {
+            migrated = migrateV2Schema(db, {
+                busyTimeoutMs,
+                integrityCheckAdapter,
+                nowMs,
+            });
+            if (!migrated) {
+                migrated = migrateV3Schema(db, {
+                    busyTimeoutMs,
+                    integrityCheckAdapter,
+                    nowMs,
+                });
+            }
         }
         verifyResourceCatalogSchema(db, {
             busyTimeoutMs,
@@ -365,6 +770,7 @@ export function applyResourceCatalogSchema(db, {
         });
         return Object.freeze({
             created,
+            migrated,
             version: RESOURCE_CATALOG_SCHEMA_VERSION,
             fingerprint: RESOURCE_CATALOG_SCHEMA_FINGERPRINT,
         });

@@ -39,6 +39,7 @@ import {
 } from "../domain/index.mjs";
 import {
     ERROR_CODES as PERSISTENCE_ERROR_CODES,
+    createWorkingSetController,
     openArtifactStore,
     openRepository,
 } from "../persistence/index.mjs";
@@ -519,6 +520,7 @@ export class AutonomousRunner {
     #workerPool = null;
     #runtimeAuthority = null;
     #resourceBroker = null;
+    #workingSet = null;
     #activeResourceLeases = new Map();
     #runtimeDriftPersisting = false;
     #sdkSubmissionCommits = new Map();
@@ -1022,6 +1024,9 @@ export class AutonomousRunner {
         }
         this.#assertStopOpen("runner initialization");
         this.#executionLimits = deriveRunnerExecutionLimits(this.#contract);
+        this.#repository.configureWorkingSet(
+            this.#executionLimits.workingSetPolicy,
+        );
         const frozenByteBudgets = normalizeRuntimeByteBudgets(
             this.#executionLimits.byteBudgets,
         );
@@ -1144,8 +1149,41 @@ export class AutonomousRunner {
                 );
             }
         }
+        this.#workingSet = (
+            this.#dependencies.workingSetFactory
+            ?? createWorkingSetController
+        )({
+            repository: this.#repository,
+            artifactStore: this.#artifactStore,
+            investigationId: this.#config.investigationId,
+            investigationDir: path.dirname(this.#config.stateDir),
+            stateRoot:
+                this.#config.resourceBroker?.stateRoot
+                ?? path.dirname(this.#config.stateDir),
+            policy: this.#executionLimits.workingSetPolicy,
+            globalLimitBytes:
+                this.#config.resourceBroker?.config.capacities.storageBytes
+                ?? this.#executionLimits.workingSetPolicy
+                    .perInvestigationBytes,
+            now: () => this.#clock.now(),
+            ...(this.#resourceBroker === null
+                ? {}
+                : {
+                    resourceBroker: this.#resourceBroker,
+                    resourceAuthority: {
+                        supervisorGeneration:
+                            this.#config.supervisorGeneration,
+                        runnerIncarnation:
+                            this.#config.runnerIncarnation,
+                    },
+                }),
+        });
         await this.#verifyRuntimeClosure("runner_recovery");
         const unresolvedEffects = this.#unresolvedExternalEffects();
+        this.#workingSet.maintain({
+            force: true,
+            quiescent: true,
+        });
         if (unresolvedEffects.length > 0) {
             this.#recordOperationalNonResultFenced({
                 scope: "uncertain-external-effect",
@@ -2098,6 +2136,9 @@ export class AutonomousRunner {
         );
         for (let iteration = 0; iteration < maxLoopIterations; iteration += 1) {
             this.#assertStopOpen("runner control loop");
+            this.#workingSet?.maintain({
+                quiescent: this.#activeResourceLeases.size === 0,
+            });
             const { aggregate } = this.#adapter.replay();
             if (aggregate.terminal !== null) {
                 return terminalResult(aggregate);
@@ -2134,6 +2175,25 @@ export class AutonomousRunner {
                     const finalNonResult =
                         recommendation.kind === "NON_RESULT"
                         && recommendation.event.type === EVENT_TYPES.NON_RESULT_RECORDED;
+                    const terminalReady =
+                        recommendation.kind === "TERMINAL"
+                        || finalNonResult;
+                    const writeAdmission = this.#workingSet?.prepareWrite({
+                        bytes: Math.min(
+                            64 * 1024,
+                            this.#executionLimits.workingSetPolicy
+                                .perAttemptBytes,
+                        ),
+                        terminalReady,
+                        authoritative: true,
+                        quiescent: this.#activeResourceLeases.size === 0,
+                    }) ?? null;
+                    if (writeAdmission?.status === "exhausted"
+                        && !terminalReady) {
+                        return this.#recordStorageBudgetNonResult(
+                            writeAdmission,
+                        );
+                    }
                     if (recommendation.kind === "TERMINAL") {
                         await this.#fault("before_terminal_append", {
                             recommendation,
@@ -2174,6 +2234,11 @@ export class AutonomousRunner {
                         return this.#recordDeadlineNonResult(
                             this.#adapter.replay().aggregate,
                             error,
+                        );
+                    }
+                    if (error?.storageBudgetExhausted === true) {
+                        return this.#recordStorageBudgetNonResult(
+                            error.storageAdmission,
                         );
                     }
                     throw error;
@@ -2460,64 +2525,66 @@ export class AutonomousRunner {
         };
         const bytes = Buffer.from(canonicalJson(capsule), "utf8");
         const expectedObjectId = `sha256:${sha256Hex(bytes)}`;
+        const artifactId = this.#effectRecoveryCapsuleArtifactId(
+            logicalEffectKey,
+            command,
+        );
         this.#reserveCasBytes(
             attemptId,
             bytes.length,
             expectedObjectId,
             "effect-recovery-capsule",
         );
-        const stored = this.#artifactStore.putBytes(bytes, {
-            contentType: "application/vnd.crucible.effect-recovery+json",
-        });
-        if (stored.id !== expectedObjectId || stored.size !== bytes.length) {
-            throw new RuntimeIntegrityError(
-                "Effect recovery capsule CAS identity changed during persistence",
-                {
-                    expectedObjectId,
-                    actualObjectId: stored.id,
-                    expectedSize: bytes.length,
-                    actualSize: stored.size,
-                },
-            );
-        }
-        const artifactId = this.#effectRecoveryCapsuleArtifactId(
-            logicalEffectKey,
-            command,
-        );
-        const existing = this.#repository.getArtifact(artifactId);
-        if (existing === null) {
-            this.#repository.registerExternalArtifact({
+        const persisted = this.#artifactStore.withGenerationLock(() => {
+            const stored = this.#artifactStore.putBytes(bytes, {
+                contentType: "application/vnd.crucible.effect-recovery+json",
+            });
+            if (stored.id !== expectedObjectId || stored.size !== bytes.length) {
+                throw new RuntimeIntegrityError(
+                    "Effect recovery capsule CAS identity changed during persistence",
+                    {
+                        expectedObjectId,
+                        actualObjectId: stored.id,
+                        expectedSize: bytes.length,
+                        actualSize: stored.size,
+                    },
+                );
+            }
+            const verified = this.#artifactStore.readObject(stored.id, {
+                verify: true,
+            });
+            if (!verified.equals(bytes)) {
+                throw new RuntimeIntegrityError(
+                    "Effect recovery capsule changed during persistence",
+                    { artifactId, logicalEffectKey },
+                );
+            }
+            this.#assertDeadlineOpen("effect recovery capsule persistence");
+            const bound = this.#repository.bindRecoveryCapsuleArtifact({
                 investigationId: this.#config.investigationId,
+                attemptId,
+                attemptCommand: this.#attemptCommand(attemptId),
+                logicalEffectKey,
+                leaseId: this.#lease.leaseId,
+                fencingToken: this.#lease.fencingToken,
+                owner: this.#lease.owner,
+                supervisorGeneration: this.#lease.supervisorGeneration,
+                runnerIncarnation: this.#lease.runnerIncarnation,
                 artifactId,
                 algo: "sha256",
                 hash: snapshotObjectHex(stored.id),
                 sizeBytes: stored.size,
                 contentType: "application/vnd.crucible.effect-recovery+json",
             });
-            this.#repository.markArtifactDurable(artifactId);
-        } else if (existing.investigationId !== this.#config.investigationId
-            || existing.storage !== "external"
-            || existing.hashAlgo !== "sha256"
-            || existing.hashValue !== snapshotObjectHex(stored.id)
-            || existing.sizeBytes !== stored.size
-            || existing.contentType !== "application/vnd.crucible.effect-recovery+json") {
-            throw new RuntimeIntegrityError(
-                "Effect recovery capsule artifact id collision",
-                { artifactId, logicalEffectKey },
-            );
-        } else if (existing.durable !== true) {
-            this.#artifactStore.readObject(stored.id, { verify: true });
-            this.#repository.markArtifactDurable(artifactId);
-        }
-        const verified = this.#artifactStore.readObject(stored.id, { verify: true });
-        if (!verified.equals(bytes)) {
-            throw new RuntimeIntegrityError(
-                "Effect recovery capsule changed during persistence",
-                { artifactId, logicalEffectKey },
-            );
-        }
+            return {
+                artifactId,
+                objectId: stored.id,
+                capsule,
+                reference: bound.reference,
+            };
+        });
         this.#assertDeadlineOpen("effect recovery capsule persistence");
-        return { artifactId, objectId: stored.id, capsule };
+        return persisted;
     }
 
     #readEffectRecoveryCapsule(logicalEffectKey, command) {
@@ -2525,82 +2592,114 @@ export class AutonomousRunner {
             logicalEffectKey,
             command,
         );
-        const metadata = this.#repository.getArtifact(artifactId);
-        if (metadata === null) return null;
-        if (metadata.investigationId !== this.#config.investigationId
-            || metadata.storage !== "external"
-            || metadata.durable !== true
-            || metadata.hashAlgo !== "sha256"
-            || typeof metadata.hashValue !== "string"
-            || metadata.contentType !== "application/vnd.crucible.effect-recovery+json") {
-            throw new RuntimeIntegrityError(
-                "Effect recovery capsule metadata is not durable and canonical",
-                { artifactId, logicalEffectKey },
-            );
-        }
-        const objectId = `sha256:${metadata.hashValue}`;
-        let bytes;
-        try {
-            bytes = this.#artifactStore.readObject(objectId, { verify: true });
-        } catch (error) {
-            throw new RuntimeIntegrityError(
-                "Effect recovery capsule failed ArtifactStore verification",
-                { artifactId, logicalEffectKey, objectId },
-                { cause: error },
-            );
-        }
-        if (bytes.length !== metadata.sizeBytes) {
-            throw new RuntimeIntegrityError(
-                "Effect recovery capsule size disagrees with repository metadata",
-                { artifactId, logicalEffectKey },
-            );
-        }
-        let capsule;
-        try {
-            capsule = JSON.parse(bytes.toString("utf8"));
-        } catch (error) {
-            throw new RuntimeIntegrityError(
-                "Effect recovery capsule is not valid JSON",
-                { artifactId, logicalEffectKey },
-                { cause: error },
-            );
-        }
-        if (!Buffer.from(canonicalJson(capsule), "utf8").equals(bytes)
-            || capsule?.version !== EFFECT_RECOVERY_CAPSULE_VERSION
-            || capsule.kind !== "crucible-runtime-effect-recovery"
-            || capsule.investigationId !== this.#config.investigationId
-            || capsule.logicalEffectKey !== logicalEffectKey
-            || !canonicalEqual(capsule.command, command)
-            || typeof capsule.effectAttemptId !== "string"
-            || !Array.isArray(capsule.evidence)
-            || capsule.evidence.length === 0) {
-            throw new RuntimeIntegrityError(
-                "Effect recovery capsule is malformed or bound to another effect",
-                { artifactId, logicalEffectKey },
-            );
-        }
-        const expectedIdentityHash = hashCanonical({
-            investigationId: this.#config.investigationId,
+        if (this.#repository.getArtifact(artifactId) === null) return null;
+        return this.#artifactStore.withGenerationLock(() => {
+            const metadata = this.#repository.getArtifact(artifactId);
+            if (metadata === null
+                || metadata.investigationId !== this.#config.investigationId
+                || metadata.storage !== "external"
+                || metadata.durable !== true
+                || metadata.hashAlgo !== "sha256"
+                || typeof metadata.hashValue !== "string"
+                || metadata.contentType
+                    !== "application/vnd.crucible.effect-recovery+json") {
+                throw new RuntimeIntegrityError(
+                    "Effect recovery capsule metadata is not durable and canonical",
+                    { artifactId, logicalEffectKey },
+                );
+            }
+            const objectId = `sha256:${metadata.hashValue}`;
+            let bytes;
+            try {
+                bytes = this.#artifactStore.readObject(objectId, {
+                    verify: true,
+                });
+            } catch (error) {
+                throw new RuntimeIntegrityError(
+                    "Effect recovery capsule failed ArtifactStore verification",
+                    { artifactId, logicalEffectKey, objectId },
+                    { cause: error },
+                );
+            }
+            if (bytes.length !== metadata.sizeBytes) {
+                throw new RuntimeIntegrityError(
+                    "Effect recovery capsule size disagrees with repository metadata",
+                    { artifactId, logicalEffectKey },
+                );
+            }
+            let capsule;
+            try {
+                capsule = JSON.parse(bytes.toString("utf8"));
+            } catch (error) {
+                throw new RuntimeIntegrityError(
+                    "Effect recovery capsule is not valid JSON",
+                    { artifactId, logicalEffectKey },
+                    { cause: error },
+                );
+            }
+            if (!Buffer.from(canonicalJson(capsule), "utf8").equals(bytes)
+                || capsule?.version !== EFFECT_RECOVERY_CAPSULE_VERSION
+                || capsule.kind !== "crucible-runtime-effect-recovery"
+                || capsule.investigationId !== this.#config.investigationId
+                || capsule.logicalEffectKey !== logicalEffectKey
+                || !canonicalEqual(capsule.command, command)
+                || typeof capsule.effectAttemptId !== "string"
+                || !Array.isArray(capsule.evidence)
+                || capsule.evidence.length === 0) {
+                throw new RuntimeIntegrityError(
+                    "Effect recovery capsule is malformed or bound to another effect",
+                    { artifactId, logicalEffectKey },
+                );
+            }
+            const expectedIdentityHash = hashCanonical({
+                investigationId: this.#config.investigationId,
+                logicalEffectKey,
+                command,
+                effectAttemptId: capsule.effectAttemptId,
+                evidence: capsule.evidence,
+            }, EFFECT_RECOVERY_CAPSULE_HASH_ALGORITHM);
+            if (capsule.identityHash !== expectedIdentityHash
+                || new Set(capsule.evidence.map((item) => item?.evidenceKind)).size
+                    !== capsule.evidence.length
+                || capsule.evidence.some((item) =>
+                    item === null
+                    || typeof item !== "object"
+                    || typeof item.evidenceKind !== "string"
+                    || typeof item.kind !== "string"
+                    || item.payload?.logicalEffectKey !== logicalEffectKey)) {
+                throw new RuntimeIntegrityError(
+                    "Effect recovery capsule identity or evidence binding is invalid",
+                    { artifactId, logicalEffectKey },
+                );
+            }
+            this.#repository.ensureRecoveryCapsuleReference({
+                investigationId: this.#config.investigationId,
+                attemptId: capsule.effectAttemptId,
+                logicalEffectKey,
+                artifactId,
+            });
+            return { artifactId, objectId, capsule };
+        });
+    }
+
+    #releaseEffectRecoveryCapsuleReference({
+        command,
+        logicalEffectKey,
+        sourceAttemptId,
+        resolutionAttemptId,
+    }) {
+        const artifactId = this.#effectRecoveryCapsuleArtifactId(
             logicalEffectKey,
             command,
-            effectAttemptId: capsule.effectAttemptId,
-            evidence: capsule.evidence,
-        }, EFFECT_RECOVERY_CAPSULE_HASH_ALGORITHM);
-        if (capsule.identityHash !== expectedIdentityHash
-            || new Set(capsule.evidence.map((item) => item?.evidenceKind)).size
-                !== capsule.evidence.length
-            || capsule.evidence.some((item) =>
-                item === null
-                || typeof item !== "object"
-                || typeof item.evidenceKind !== "string"
-                || typeof item.kind !== "string"
-                || item.payload?.logicalEffectKey !== logicalEffectKey)) {
-            throw new RuntimeIntegrityError(
-                "Effect recovery capsule identity or evidence binding is invalid",
-                { artifactId, logicalEffectKey },
-            );
-        }
-        return { artifactId, objectId, capsule };
+        );
+        if (this.#repository.getArtifact(artifactId) === null) return null;
+        return this.#repository.releaseRecoveryCapsuleReference({
+            investigationId: this.#config.investigationId,
+            sourceAttemptId,
+            resolutionAttemptId,
+            logicalEffectKey,
+            artifactId,
+        });
     }
 
     async #recoverPersistedEffectCapsule({
@@ -2663,6 +2762,12 @@ export class AutonomousRunner {
             logicalEffectKey,
             recoveredFromCapsule: true,
         });
+        this.#releaseEffectRecoveryCapsuleReference({
+            command,
+            logicalEffectKey,
+            sourceAttemptId: capsuleRecord.capsule.effectAttemptId,
+            resolutionAttemptId: recoveryAttemptId,
+        });
         return {
             attemptId: capsuleRecord.capsule.effectAttemptId,
             result: recovered.result,
@@ -2707,6 +2812,8 @@ export class AutonomousRunner {
             outputBytes: this.#byteBudgets.perAttemptOutputBytes,
             receiptBytes: this.#byteBudgets.perAttemptReceiptBytes,
             casBytes: this.#byteBudgets.perAttemptCasBytes,
+            storageBytes:
+                this.#executionLimits.workingSetPolicy.perAttemptBytes,
         };
         if (command.kind === "sdk-proposal") {
             reservation.sdkSessions = 1;
@@ -2888,6 +2995,27 @@ export class AutonomousRunner {
             || this.#hasDurableSdkSubmission(command)) {
             return null;
         }
+        const storageAdmission = this.#workingSet?.prepareWrite({
+            bytes: this.#executionLimits.workingSetPolicy.perAttemptBytes,
+            terminalReady: false,
+            authoritative: true,
+            quiescent: true,
+        }) ?? null;
+        if (storageAdmission?.status === "exhausted") {
+            const error = new CrucibleRuntimeError(
+                RUNTIME_ERROR_CODES.STORAGE_BUDGET_EXHAUSTED,
+                "The frozen active-storage budget cannot admit another external effect",
+                {
+                    requestedBytes: storageAdmission.requestedBytes,
+                    investigation:
+                        storageAdmission.investigation.pressure,
+                    global: storageAdmission.global.pressure,
+                },
+            );
+            error.storageBudgetExhausted = true;
+            error.storageAdmission = storageAdmission;
+            throw error;
+        }
         const logicalEffectId = this.#resourceEffectId(
             command,
             logicalEffectKey,
@@ -2919,6 +3047,7 @@ export class AutonomousRunner {
                     beforeUsage: {
                         ...this.#investigationByteUsage,
                     },
+                    storageReservation: storageAdmission,
                     modelCostUnits: null,
                     attemptId,
                     command,
@@ -3000,6 +3129,13 @@ export class AutonomousRunner {
                 this.#investigationByteUsage.casBytes
                     - context.beforeUsage.casBytes,
             ),
+            ...(context.storageReservation === null
+                ? {}
+                : {
+                    storageBytes: this.#workingSet.reconcileWrite(
+                        context.storageReservation,
+                    ).telemetry.investigation.bytes,
+                }),
             ...(context.modelCostUnits === null
                 ? {}
                 : { modelCostUnits: context.modelCostUnits }),
@@ -3081,6 +3217,12 @@ export class AutonomousRunner {
                     { logicalEffectKey, command },
                 );
             }
+            this.#releaseEffectRecoveryCapsuleReference({
+                command,
+                logicalEffectKey,
+                sourceAttemptId: committed.effectAttemptId,
+                resolutionAttemptId: committed.attempt.attemptId,
+            });
             return {
                 attemptId: committed.effectAttemptId,
                 result: recovered.result,
@@ -3219,10 +3361,25 @@ export class AutonomousRunner {
                 : await persist(result, attemptId, logicalEffectKey);
             const evidence = this.#effectEvidenceBuffers.get(attemptId);
             this.#assertDeadlineOpen("effect artifact persistence");
+            await this.#verifyRuntimeClosure(
+                "external_effect_capsule_persistence",
+            );
+            this.#renewResourceLease(
+                resourceContext,
+                "external_effect_capsule_persistence",
+            );
+            const capsuleRecord = this.#persistEffectRecoveryCapsule({
+                attemptId,
+                command,
+                logicalEffectKey,
+                evidence,
+            });
             await this.#fault("after_effect_artifact_persistence", {
                 attemptId,
                 command,
                 logicalEffectKey,
+                recoveryCapsuleArtifactId: capsuleRecord.artifactId,
+                recoveryCapsuleObjectId: capsuleRecord.objectId,
             });
             await this.#verifyRuntimeClosure("external_effect_commit");
             this.#assertDeadlineOpen("effect commitment");
@@ -3230,12 +3387,6 @@ export class AutonomousRunner {
                 resourceContext,
                 "external_effect_commit",
             );
-            this.#persistEffectRecoveryCapsule({
-                attemptId,
-                command,
-                logicalEffectKey,
-                evidence,
-            });
             if (evidence.length === 0) {
                 this.#adapter.commitAttempt(attemptId, this.#lease);
             } else {
@@ -3257,6 +3408,12 @@ export class AutonomousRunner {
             attemptId,
             command,
             logicalEffectKey,
+        });
+        this.#releaseEffectRecoveryCapsuleReference({
+            command,
+            logicalEffectKey,
+            sourceAttemptId: attemptId,
+            resolutionAttemptId: attemptId,
         });
         return {
             attemptId,
@@ -7403,6 +7560,7 @@ export class AutonomousRunner {
                 contentType,
             });
             this.#repository.markArtifactDurable(artifactId);
+            this.#artifactStore.markReferenced(objectId);
             if (contentType
                 === "application/vnd.crucible.measurement-stdout"
                 || contentType
@@ -7428,6 +7586,7 @@ export class AutonomousRunner {
                 this.#artifactStore.readObject(objectId, { verify: true });
                 this.#repository.markArtifactDurable(artifactId);
             }
+            this.#artifactStore.markReferenced(objectId);
         }
         this.#assertDeadlineOpen("artifact registration");
         return { artifactId, objectId };
@@ -7451,6 +7610,7 @@ export class AutonomousRunner {
                     this.#appendKernelDecisionFenced({ deadlineExempt: true });
                     domainPausePersisted = true;
                 }
+
             }
         } catch (error) {
             if (error?.code !== RUNTIME_ERROR_CODES.DOMAIN_EVENT_INVALID) {
@@ -7481,6 +7641,54 @@ export class AutonomousRunner {
             domainPausePersisted,
             terminalEmitted: false,
         };
+    }
+
+    #recordStorageBudgetNonResult(admission) {
+        let { aggregate } = this.#adapter.replay();
+        if (aggregate.terminal !== null) {
+            return terminalResult(aggregate);
+        }
+        if (aggregate.nonResults.length > 0) {
+            return nonResult(aggregate);
+        }
+        if (aggregate.pause !== null) {
+            return pauseResult(aggregate);
+        }
+        const investigation = admission?.investigation ?? {};
+        const global = admission?.global ?? {};
+        this.#adapter.appendStorageBudgetNonResult({
+            investigationBytes:
+                investigation.currentBytes ?? 0,
+            investigationLimitBytes:
+                investigation.limitBytes
+                ?? this.#executionLimits.workingSetPolicy
+                    .perInvestigationBytes,
+            globalBytes: global.currentBytes ?? 0,
+            globalLimitBytes:
+                global.limitBytes
+                ?? this.#config.resourceBroker?.config.capacities
+                    .storageBytes
+                ?? this.#executionLimits.workingSetPolicy
+                    .perInvestigationBytes,
+            requestedBytes: admission?.requestedBytes ?? 0,
+        });
+        ({ aggregate } = this.#adapter.replay());
+        if (aggregate.terminal !== null) {
+            return terminalResult(aggregate);
+        }
+        if (aggregate.nonResults.at(-1)?.code
+            !== NON_RESULT_CODES.STORAGE_BUDGET_INCONCLUSIVE) {
+            throw new RuntimeIntegrityError(
+                "Storage exhaustion did not persist the required non-result",
+                {
+                    expected:
+                        NON_RESULT_CODES.STORAGE_BUDGET_INCONCLUSIVE,
+                    actual:
+                        aggregate.nonResults.at(-1)?.code ?? null,
+                },
+            );
+        }
+        return nonResult(aggregate);
     }
 
     async #cleanup() {

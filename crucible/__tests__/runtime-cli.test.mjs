@@ -81,6 +81,10 @@ describe("Crucible strict runtime CLIs", () => {
         }));
         expect(() => normalizeRunnerConfig({
             ...base,
+            artifactRoot: path.join(root, "other-investigation", "artifacts"),
+        })).toThrow(/owned by one investigation directory/u);
+        expect(() => normalizeRunnerConfig({
+            ...base,
             options: {
                 workerAdditionalContext:
                     "😀".repeat(MAX_TRUSTED_OPERATOR_CONTEXT_BYTES / 2),

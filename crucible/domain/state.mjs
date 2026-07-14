@@ -92,6 +92,7 @@ export function createInitialAggregate() {
             revision: 0,
             history: [],
         },
+        storageBudgetExhaustion: null,
         stopRequests: [],
         pause: null,
         pauseHistory: [],

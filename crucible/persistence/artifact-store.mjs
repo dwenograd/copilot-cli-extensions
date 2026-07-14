@@ -708,6 +708,49 @@ function compareStable(left, right) {
     return left < right ? -1 : left > right ? 1 : 0;
 }
 
+function isDisappearedTreeEntry(error) {
+    return error?.code === "ENOENT" || error?.code === "ENOTDIR";
+}
+
+function scanRegularTree(root) {
+    const report = { bytes: 0, files: 0, unsafeEntries: 0 };
+    const stack = [root];
+    while (stack.length > 0) {
+        const current = stack.pop();
+        let stat;
+        try {
+            stat = fs.lstatSync(current);
+        } catch (error) {
+            if (isDisappearedTreeEntry(error)) continue;
+            throw error;
+        }
+        if (stat.isSymbolicLink()) {
+            report.unsafeEntries += 1;
+            continue;
+        }
+        if (stat.isDirectory()) {
+            let names;
+            try {
+                names = fs.readdirSync(current).sort(compareStable);
+            } catch (error) {
+                if (isDisappearedTreeEntry(error)) continue;
+                throw error;
+            }
+            for (const name of names) {
+                stack.push(path.join(current, name));
+            }
+            continue;
+        }
+        if (!stat.isFile()) {
+            report.unsafeEntries += 1;
+            continue;
+        }
+        report.files += 1;
+        report.bytes += stat.size;
+    }
+    return report;
+}
+
 function materializationAnchor(stat, filePath) {
     const dev = stat?.dev;
     const ino = stat?.ino;
@@ -1039,6 +1082,7 @@ export class ArtifactStore {
     #now;
     #readOnly;
     #faultInjector;
+    #coordinationContext = null;
 
     constructor({ root, now, limits, readOnly = false, faultInjector = null }) {
         this.#root = root;
@@ -1511,6 +1555,13 @@ export class ArtifactStore {
     }
 
     #withCoordinationTransaction(work) {
+        if (this.#coordinationContext !== null) {
+            return {
+                result: work(this.#coordinationContext),
+                generation: this.#coordinationContext.generation,
+                changed: this.#coordinationContext.changed === true,
+            };
+        }
         const db = this.#openCoordinationDatabase();
         let began = false;
         let changed = false;
@@ -1522,8 +1573,9 @@ export class ArtifactStore {
             began = true;
             generation = this.#readCoordinationGeneration(db);
             let nextGeneration = generation;
-            result = work({
+            const context = {
                 generation,
+                changed: false,
                 bumpGeneration() {
                     if (nextGeneration >= Number.MAX_SAFE_INTEGER) {
                         throw new JournalCorruptError(
@@ -1532,9 +1584,12 @@ export class ArtifactStore {
                     }
                     nextGeneration += 1;
                     changed = true;
+                    context.changed = true;
                     return nextGeneration;
                 },
-            });
+            };
+            this.#coordinationContext = context;
+            result = work(context);
             if (changed) {
                 db.prepare(`
                     UPDATE cas_reconciliation_state
@@ -1562,6 +1617,7 @@ export class ArtifactStore {
                 path: this.#coordinationFile,
             });
         } finally {
+            this.#coordinationContext = null;
             try {
                 db.close();
             } catch (err) {
@@ -1586,6 +1642,28 @@ export class ArtifactStore {
             );
         }
         return { result, generation, changed };
+    }
+
+    withGenerationLock(work) {
+        this.#assertWritable();
+        if (typeof work !== "function") {
+            throw new InvalidArgumentError(
+                "withGenerationLock requires a synchronous function",
+            );
+        }
+        return this.#withCoordinationTransaction((context) => {
+            const result = work(Object.freeze({
+                generation: context.generation,
+            }));
+            if (result !== null
+                && typeof result === "object"
+                && typeof result.then === "function") {
+                throw new InvalidArgumentError(
+                    "withGenerationLock callback must be synchronous",
+                );
+            }
+            return result;
+        }).result;
     }
 
     #unlinkPath(filePath, action) {
@@ -2082,8 +2160,14 @@ export class ArtifactStore {
     }
 
     #commitStaged(staged, contentType = null) {
-        const prepared = this.#prepareStaged(staged);
-        return this.#finishInstall(prepared.record, contentType, prepared.stagingPath);
+        return this.withGenerationLock(() => {
+            const prepared = this.#prepareStaged(staged);
+            return this.#finishInstall(
+                prepared.record,
+                contentType,
+                prepared.stagingPath,
+            );
+        });
     }
 
     // Streaming hash of an already-stored file; null if it does not exist.
@@ -2121,7 +2205,8 @@ export class ArtifactStore {
     // second put of identical content returns { existed: true } without
     // overwriting the object.
     putBytes(input, options = {}) {
-        return this.#commitStaged(this.#stageBytes(input), options.contentType);
+        return this.withGenerationLock(() =>
+            this.#commitStaged(this.#stageBytes(input), options.contentType));
     }
 
     // Store the contents of an existing file (streamed, never fully buffered).
@@ -2136,7 +2221,8 @@ export class ArtifactStore {
         if (!lst.isFile()) {
             throw new UnsafePathError("source is not a regular file", { srcPath });
         }
-        return this.#commitStaged(this.#stageFile(srcPath), options.contentType);
+        return this.withGenerationLock(() =>
+            this.#commitStaged(this.#stageFile(srcPath), options.contentType));
     }
 
     // Store bytes drained from a Node Readable stream.
@@ -2230,6 +2316,57 @@ export class ArtifactStore {
             return { id, ok: false, reason: "corrupt", actualHash: res.hash, size: res.size };
         }
         return { id, ok: true, size: res.size };
+    }
+
+    markReferenced(id) {
+        this.#assertWritable();
+        const probe = this.verifyObject(id);
+        if (!probe.ok) {
+            throw probe.reason === "missing"
+                ? new ObjectNotFoundError(
+                    "cannot mark a missing object referenced",
+                    { id },
+                )
+                : new ObjectCorruptError(
+                    "cannot mark a corrupt object referenced",
+                    { id, actualHash: probe.actualHash ?? null },
+                );
+        }
+        const marked = this.#markObjectReferenced(id, probe.size, false);
+        return Object.freeze({
+            id,
+            size: probe.size,
+            marked: marked.marked,
+            generationProtected: true,
+        });
+    }
+
+    storageTelemetry() {
+        const total = scanRegularTree(this.#root);
+        const objects = scanRegularTree(this.#objectsRoot);
+        const staging = scanRegularTree(this.#stagingRoot);
+        const journals = scanRegularTree(this.#journalRoot);
+        const installations = scanRegularTree(this.#installationsRoot);
+        const quarantine = scanRegularTree(this.#quarantineRoot);
+        const coordination = fs.existsSync(this.#coordinationFile)
+            ? scanRegularTree(this.#coordinationFile)
+            : { bytes: 0, files: 0, unsafeEntries: 0 };
+        return Object.freeze({
+            totalBytes: total.bytes,
+            totalFiles: total.files,
+            objectBytes: objects.bytes,
+            objectCount: objects.files,
+            stagingBytes: staging.bytes,
+            stagingCount: staging.files,
+            journalBytes: journals.bytes,
+            journalCount: journals.files,
+            installationMetadataBytes: installations.bytes,
+            installationMetadataCount: installations.files,
+            quarantineBytes: quarantine.bytes,
+            quarantineCount: quarantine.files,
+            coordinationBytes: coordination.bytes,
+            unsafeEntryCount: total.unsafeEntries,
+        });
     }
 
     // --- snapshots ---------------------------------------------------------
@@ -3177,6 +3314,8 @@ export class ArtifactStore {
         installedMarker = false,
         purpose,
         observedGeneration,
+        referenceProbe = null,
+        transientReferenceProbe = null,
     }) {
         this.#inject("before-reconcile-object-delete", {
             object: id,
@@ -3187,6 +3326,36 @@ export class ArtifactStore {
         return this.#withCoordinationTransaction(({ generation, bumpGeneration }) => {
             const markerScan = this.#scanStateMarkers();
             const prefix = parseObjectId(id).hex.slice(0, 2);
+            if (referenceProbe !== null && referenceProbe(id) === true) {
+                const probe = this.verifyObject(id);
+                if (probe.ok) {
+                    const marked = this.#ensureReferencedState(
+                        id,
+                        probe.size,
+                        markerScan,
+                        false,
+                    );
+                    if (marked) bumpGeneration();
+                }
+                return {
+                    removedObject: false,
+                    removedMarker: false,
+                    protected: true,
+                    generationChanged: generation !== observedGeneration,
+                    generation,
+                };
+            }
+            if (transientReferenceProbe !== null
+                && transientReferenceProbe(id) === true) {
+                return {
+                    removedObject: false,
+                    removedMarker: false,
+                    protected: true,
+                    transient: true,
+                    generationChanged: generation !== observedGeneration,
+                    generation,
+                };
+            }
             if (markerScan.referenced.has(id)
                 || markerScan.protectedIds.has(id)
                 || markerScan.protectedPrefixes.has(prefix)) {
@@ -3232,15 +3401,43 @@ export class ArtifactStore {
     // (or aged unjournalled leftovers) are removed.
     reconcile(options = {}) {
         this.#assertWritable();
-        const { referenced = [], snapshots = [], olderThanMs, now = Date.now(), dryRun = false } = options;
+        const {
+            referenced = [],
+            transientReferenced = [],
+            snapshots = [],
+            olderThanMs,
+            now = Date.now(),
+            dryRun = false,
+            referenceProbe = null,
+            transientReferenceProbe = null,
+            removeQuarantine = true,
+        } = options;
         if (!Number.isFinite(olderThanMs) || olderThanMs < 0) {
             throw new InvalidArgumentError("olderThanMs must be a non-negative finite number", { olderThanMs });
         }
         if (!Number.isFinite(now)) {
             throw new InvalidArgumentError("now must be a finite epoch-millis number", { now });
         }
+        if (referenceProbe !== null && typeof referenceProbe !== "function") {
+            throw new InvalidArgumentError(
+                "referenceProbe must be a synchronous function or null",
+            );
+        }
+        if (transientReferenceProbe !== null
+            && typeof transientReferenceProbe !== "function") {
+            throw new InvalidArgumentError(
+                "transientReferenceProbe must be a synchronous function or null",
+            );
+        }
+        if (typeof removeQuarantine !== "boolean") {
+            throw new InvalidArgumentError(
+                "removeQuarantine must be boolean",
+            );
+        }
 
         const refSet = new Set();
+        const persistentRefSet = new Set();
+        const transientRefSet = new Set();
         const referencedReport = { ok: [], missing: [], corrupt: [] };
         const installationReport = {
             completed: [],
@@ -3250,6 +3447,7 @@ export class ArtifactStore {
             corruptRecords: [],
             markedReferenced: [],
             persistentReferenced: [],
+            transientReferenced: [],
             durableOrphans: [],
             unjournaledOrphans: [],
             removedMarkers: [],
@@ -3257,15 +3455,28 @@ export class ArtifactStore {
             removedMetadataTemps: [],
             removedCandidates: [],
             removedQuarantine: [],
+            deferredQuarantine: [],
         };
 
-        const addRef = (id) => {
+        const addRef = (id, { transient = false } = {}) => {
             const { hex } = parseObjectId(id);
-            refSet.add(objectIdFor(hex));
+            const normalized = objectIdFor(hex);
+            refSet.add(normalized);
+            if (transient) {
+                if (!persistentRefSet.has(normalized)) {
+                    transientRefSet.add(normalized);
+                }
+            } else {
+                persistentRefSet.add(normalized);
+                transientRefSet.delete(normalized);
+            }
         };
 
         for (const id of referenced) {
             addRef(id);
+        }
+        for (const id of transientReferenced) {
+            addRef(id, { transient: true });
         }
 
         // First settle aged incomplete transactions. This makes a journalled
@@ -3348,7 +3559,13 @@ export class ArtifactStore {
         for (const id of refSet) {
             const r = this.verifyObject(id);
             if (r.ok) {
-                if (!markerScan.protectedIds.has(id)
+                // Recovery capsules protect the current sweep without becoming
+                // monotonic evidence references after their effect resolves.
+                if (transientRefSet.has(id)
+                    && !persistentRefSet.has(id)) {
+                    referencedReport.ok.push(id);
+                    installationReport.transientReferenced.push(id);
+                } else if (!markerScan.protectedIds.has(id)
                     && !markerScan.protectedPrefixes.has(parseObjectId(id).hex.slice(0, 2))) {
                     try {
                         const marked = this.#markObjectReferenced(id, r.size, dryRun);
@@ -3436,11 +3653,17 @@ export class ArtifactStore {
                         installedMarker: true,
                         purpose: "durable unreferenced object",
                         observedGeneration: sweepGeneration,
+                        referenceProbe,
+                        transientReferenceProbe,
                     });
                     sweepGeneration = removal.generation;
                     if (removal.protected) {
                         refSet.add(id);
-                        installationReport.persistentReferenced.push(id);
+                        if (removal.transient === true) {
+                            installationReport.transientReferenced.push(id);
+                        } else {
+                            installationReport.persistentReferenced.push(id);
+                        }
                         installationReport.durableOrphans =
                             installationReport.durableOrphans.filter((value) => value !== id);
                         keptOrphans.push(id);
@@ -3484,11 +3707,17 @@ export class ArtifactStore {
                         installedMarker: false,
                         purpose: "unjournalled orphan object",
                         observedGeneration: sweepGeneration,
+                        referenceProbe,
+                        transientReferenceProbe,
                     });
                     sweepGeneration = removal.generation;
                     if (removal.protected) {
                         refSet.add(obj.id);
-                        installationReport.persistentReferenced.push(obj.id);
+                        if (removal.transient === true) {
+                            installationReport.transientReferenced.push(obj.id);
+                        } else {
+                            installationReport.persistentReferenced.push(obj.id);
+                        }
                         installationReport.unjournaledOrphans =
                             installationReport.unjournaledOrphans.filter(
                                 (value) => value !== obj.id,
@@ -3597,7 +3826,10 @@ export class ArtifactStore {
             }
             const filePath = path.join(this.#quarantineRoot, file.name);
             const stat = fs.statSync(filePath);
-            if (now - stat.mtimeMs >= olderThanMs) {
+            if (now - stat.mtimeMs >= olderThanMs
+                && removeQuarantine === false) {
+                installationReport.deferredQuarantine.push(file.name);
+            } else if (now - stat.mtimeMs >= olderThanMs) {
                 if (!dryRun) {
                     const removed = this.#unlinkPath(filePath, "failed to remove stale corrupt-object quarantine");
                     if (removed) {
@@ -3617,6 +3849,9 @@ export class ArtifactStore {
         referencedReport.corrupt = sortUnique(referencedReport.corrupt);
         installationReport.markedReferenced = sortUnique(installationReport.markedReferenced);
         installationReport.persistentReferenced = sortUnique(installationReport.persistentReferenced);
+        installationReport.transientReferenced = sortUnique(
+            installationReport.transientReferenced,
+        );
         installationReport.durableOrphans = sortUnique(installationReport.durableOrphans);
         installationReport.unjournaledOrphans = sortUnique(installationReport.unjournaledOrphans);
         installationReport.removedMarkers = sortUnique(installationReport.removedMarkers);
@@ -3624,6 +3859,9 @@ export class ArtifactStore {
         installationReport.removedMetadataTemps = sortUnique(installationReport.removedMetadataTemps);
         installationReport.removedCandidates = sortUnique(installationReport.removedCandidates);
         installationReport.removedQuarantine = sortUnique(installationReport.removedQuarantine);
+        installationReport.deferredQuarantine = sortUnique(
+            installationReport.deferredQuarantine,
+        );
         for (const key of ["completed", "repaired", "pending", "abandoned"]) {
             installationReport[key].sort((a, b) => a.transaction.localeCompare(b.transaction));
         }

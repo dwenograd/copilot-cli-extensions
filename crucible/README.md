@@ -270,10 +270,19 @@ persisted operational non-result.
 ### `crucible_status`
 
 ```text
-crucible_status({ investigation_id: string })
+crucible_status({ operation: "get", investigation_id: string })
+
+crucible_status({
+  operation: "list",
+  cursor?: opaque-cursor,
+  limit?: 1..100,
+  state_filter?: "active" | "archived" | "tombstoned",
+})
 ```
 
-This is never a result. A scientifically ready terminal returns only
+Both forms are read-only and never results. `get` resolves active state,
+verified archives, and signed tombstones through the global catalog. A
+scientifically ready terminal still returns only
 `{is_result:false, investigation_id, terminal_available:true}`. A legacy,
 synthetic, search-only, or scientifically incomplete terminal reports
 `terminal_available:false` and exposes no decision, candidate, evidence, or
@@ -288,25 +297,120 @@ For a normal nonterminal read, the payload contains:
   completion, plateau/escape state, operator mix, archive counts, duplicates,
   stop requests, pauses, and domain non-result count;
 - `supervisor_health`: presence/state/PIDs, ownership-qualified liveness,
-  heartbeat, restart count, and any ensure/restart action;
+  heartbeat, and restart count. `ensure_action` remains `null` for compatibility;
+- `storage`: aggregate investigation/global bytes and counts, active WAL and
+  sealed-segment bytes/counts, CAS/staging/journal/quarantine totals, and frozen
+  thresholds. It never includes object ids, artifact names, result details, or
+  evidence hashes;
 - a redacted `next_recommendation` (`kind`, `code`, `command_kind`, `recorded`)
   or `null`, plus a human-readable note.
 
 If structural replay/integrity verification fails, status returns an
 `integrity_blocked` non-result payload and does not trust terminal state.
-It attempts to ensure/restart a missing supervisor only while the domain is
-nonterminal, unpaused, and free of domain/operational non-results.
+Status is read-only and never starts or restarts a supervisor.
+
+`list` is ordered by investigation id and uses a filter-bound opaque cursor. It
+exposes only investigation id, lifecycle state, created/updated timestamps,
+domain version, terminal availability, integrity status, and retained size.
+It never returns decisions, candidates, cohorts, evidence, or statistics.
+
+### Reboot recovery daemon
+
+`runtime/recovery-daemon-cli.mjs` provides same-user unattended recovery without
+making status a liveness trigger. One daemon generation/incarnation holds the
+state-root singleton lease in `resource-catalog.sqlite`. Exact PID/start-time
+identity permits immediate takeover after reboot without waiting for lease
+expiry; Task Scheduler also uses `IgnoreNew`, so stale or duplicate invocations
+cannot both act.
+
+Each cycle discovers investigations from the verified catalog and considers only
+active v4 runs. Terminal, paused, archived, tombstoned, legacy, domain
+non-result, and operational-non-result state is skipped. Before a missing
+supervisor can launch, discovery verifies:
+
+- the event database, sealed-segment catalog/hash chain, replay, and every
+  referenced inline/external artifact;
+- the persisted Ed25519 experiment authority against the current trusted public
+  key;
+- the immutable runtime config and complete runtime identity, including the
+  exact Node, CLI, SDK, runner, allowlist, and sandbox identity;
+- resource-catalog integrity and capacity for the next effect after conservative
+  stale-lease reconciliation; and
+- noninteractive Copilot SDK authentication plus availability of every frozen
+  worker model.
+
+Any failure is fail-closed and recorded as a fenced operational code in the
+global catalog. The daemon never calls or emulates `crucible_result`, never
+assesses terminal readiness, and its one-shot output contains counts only.
+Supervisor startup still owns per-investigation generation allocation, runner
+incarnation issuance, stale process/resource reconciliation, and logical-effect
+deduplication.
+
+Windows installation uses a hidden current-user logon task with
+`InteractiveToken`, least privilege, restart-on-failure, and no stored password.
+Logon is intentional: startup/S4U would not guarantee the user's profile,
+Copilot credentials, or network credentials. Task arguments contain only local
+paths, the state root, timing, and public SHA-256 identities—never tokens or
+secrets.
+
+```powershell
+# 1. Inspect exact paths/hashes and deterministic task identity.
+node .\crucible\tools\configure-recovery-task.mjs `
+  --state-root "$env:LOCALAPPDATA\Crucible\investigations" `
+  --node-path (Get-Command node.exe).Source
+
+# 2. Install using the exact hashes printed by configure.
+node .\crucible\tools\install-recovery-task.mjs `
+  --state-root "$env:LOCALAPPDATA\Crucible\investigations" `
+  --node-path "<exact-node-path>" `
+  --daemon-path "<exact-recovery-daemon-cli-path>" `
+  --expected-node-sha256 "sha256:<hex>" `
+  --expected-daemon-sha256 "sha256:<hex>"
+
+# Manual, bounded one-shot for operator checks and tests.
+node .\crucible\runtime\recovery-daemon-cli.mjs --once `
+  --state-root "$env:LOCALAPPDATA\Crucible\investigations"
+
+# Uninstall only the action matching those exact paths/hashes.
+node .\crucible\tools\uninstall-recovery-task.mjs `
+  --state-root "$env:LOCALAPPDATA\Crucible\investigations" `
+  --node-path "<exact-node-path>" `
+  --daemon-path "<exact-recovery-daemon-cli-path>" `
+  --expected-node-sha256 "sha256:<hex>" `
+  --expected-daemon-sha256 "sha256:<hex>"
+```
+
+Installation requires an existing verified state-root catalog, the same Node
+runtime frozen into active investigations, configured experiment public-key
+trust, and same-user noninteractive Copilot authentication. Upgrades remove the
+old exact action before installing new hashes. The optional test-owned Windows
+round trip runs only when
+`CRUCIBLE_RUN_TASK_SCHEDULER_CONFORMANCE=1` at a conformance gate.
 
 ### `crucible_stop`
 
 ```text
 crucible_stop({
+  operation: "pause",
   investigation_id: string,
   reason?: string,
 })
+
+crucible_stop({
+  operation: "archive",
+  investigation_id: string,
+  expected_head?: exact-event-head,
+  authenticated_bundle_destination?: absolute-local-retention-path,
+})
+
+crucible_stop({
+  operation: "delete",
+  investigation_id: string,
+  expected_archive_digest: "sha256:<64-lowercase-hex>",
+})
 ```
 
-The response distinguishes `already_terminal`, `operational_non_result`,
+`pause` distinguishes `already_terminal`, `operational_non_result`,
 `domain_non_result`, `pause_persisted`, `pause_pending`, and
 `pause_requested`. `resumable:true` requires both the kernel-owned pause and
 the durable `PAUSED_QUIESCENT` zero-active proof. A bounded cleanup or
@@ -318,6 +422,49 @@ The runtime exports `QUIESCENT_STOP_*` protocol helpers plus
 the state-root resource broker, aborts SDK sessions, closes owned process/Job
 trees, and persists `PAUSED_QUIESCENT` only after runner leases, command
 attempts, broker leases, SDK sessions, and owned PIDs are all zero.
+
+`archive` accepts only a terminal, domain non-result, or
+`PAUSED_QUIESCENT` investigation. It fences recovery/runtime authority, proves
+zero active resources, exports the complete bundle, imports and verifies a
+private staged copy under `CRUCIBLE_ARCHIVE_TRUST_POLICY` (`authenticated` by
+default, or explicit `self-consistent`), commits the global catalog transition,
+then removes active state. All retention paths remain under the local state-root
+`.retention` directory.
+
+`delete` accepts only a verified archived catalog entry and its exact digest.
+It has no force-live mode. The archive and resource-catalog rows are removed,
+while a canonical Ed25519-signed durable tombstone remains and permanently
+blocks recreation or recovery of that deterministic investigation id.
+
+### Active working-set bounds
+
+Every signed v4 contract includes `workingSetPolicy`. It freezes per-effect and
+per-investigation disk ceilings, terminal/non-result reserve, WAL
+checkpoint/segment thresholds, orphan grace, maintenance cadence, and
+diagnostic retention. Resource-broker config v2 adds the global
+`storage_bytes` admission lane, so external effects reserve worst-case growth
+before writing and reconcile observed growth afterward.
+
+The writable active event database checkpoints WAL only after transactions.
+Commit-time interval/size probes use passive checkpoints; segment rotation
+forces a post-commit truncate checkpoint. Maintenance scans repository
+artifact metadata, active and sealed event payloads, bundle manifests, and CAS
+installation state under the CAS generation lock. Missing, corrupt, or
+ambiguous reference state defers deletion. Only aged objects that remain
+unreferenced after the final race probe are removed; proposals, receipts, raw
+blocks, controls, confirmations, proofs, and every other referenced object are
+preserved. External-effect recovery capsules are transient authoritative CAS
+references while their effect is unresolved; the runner releases that
+reference only after a durable effect/recovery commit, after which orphan grace
+controls eventual collection.
+
+Storage pressure first triggers checkpoint/rotation/reconciliation. Exhaustion
+before a scientifically ready terminal persists
+`STORAGE_BUDGET_INCONCLUSIVE`; it never fabricates or changes a scientific
+conclusion. Diagnostic originals are not rolled up by default. A future
+roll-up may delete an original only under the frozen `sealed_rollup` policy
+after a sealed summary exists and the original is explicitly non-authoritative
+and not bundle-required.
 
 ### `crucible_result`
 
@@ -421,6 +568,7 @@ Default locations:
   state\supervisor\<id>.status.json
   artifacts\
 %LOCALAPPDATA%\Crucible\investigations\resource-catalog.sqlite
+Task Scheduler: \Crucible\Recovery-<state-root-identity>
 ```
 
 `runtime/resource-broker.mjs` owns the state-root catalog. It freezes global

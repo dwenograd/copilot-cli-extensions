@@ -53,6 +53,7 @@ function config(overrides = {}) {
             outputBytes: 1_000,
             receiptBytes: 1_000,
             casBytes: 1_000,
+            storageBytes: 2_000,
             modelCostUnits: 10_000,
             ...overrides,
         },
@@ -68,6 +69,7 @@ function limits(brokerConfig) {
         outputBytes: Math.min(500, brokerConfig.capacities.outputBytes),
         receiptBytes: Math.min(500, brokerConfig.capacities.receiptBytes),
         casBytes: Math.min(500, brokerConfig.capacities.casBytes),
+        storageBytes: Math.min(1_000, brokerConfig.capacities.storageBytes),
         modelCostUnits: Math.min(
             5_000,
             brokerConfig.capacities.modelCostUnits,

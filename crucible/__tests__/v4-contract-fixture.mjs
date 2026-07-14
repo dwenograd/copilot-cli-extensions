@@ -1,6 +1,7 @@
 import {
     DEFAULT_RUNTIME_IDENTITY_POLICY,
     DEFAULT_SEARCH_POLICY,
+    DEFAULT_WORKING_SET_POLICY,
     RUNTIME_IDENTITY_ASSUMPTIONS_HASH_ALGORITHM,
     RUNTIME_IDENTITY_CLI_IDENTITY_ALGORITHM,
     RUNTIME_IDENTITY_COMMANDS_IDENTITY_ALGORITHM,
@@ -624,6 +625,7 @@ export function makeV4ContractInput(overrides = {}) {
         observableRegistry: registry,
         hypothesisPolicy: fakeHypothesisPolicy(),
         statisticalPolicy,
+        workingSetPolicy: DEFAULT_WORKING_SET_POLICY,
         ...(requestedManifest === null ? {} : { enumerandManifest: requestedManifest }),
         ...(topology === "certified_impossibility"
             ? {

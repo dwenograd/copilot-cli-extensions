@@ -10,6 +10,8 @@ import {
     openArtifactStore,
     exportBundle,
     importBundle,
+    verifyBundleInPlace,
+    removeVerifiedBundle,
     readBundleManifest,
     canonicalize,
     BUNDLE_ERROR_CODES,
@@ -340,6 +342,38 @@ describe("bundle import and round trip", () => {
             bundleDir: destDir,
             destDir: dest,
             expectedDigest: res.digest,
+        });
+
+        it("verifies an archived bundle in place and removes only the exact digest", () => {
+            const { destDir, res } = doExport("verified-in-place");
+            expect(verifyBundleInPlace({
+                bundleDir: destDir,
+                expectedDigest: res.digest,
+                expectedInvestigationId: "inv-1",
+            })).toMatchObject({
+                authenticated: true,
+                verified: true,
+                digest: res.digest,
+                investigationId: "inv-1",
+                domainVersion: 4,
+            });
+            expect(() => removeVerifiedBundle({
+                bundleDir: destDir,
+                expectedDigest: `sha256:${"f".repeat(64)}`,
+                expectedInvestigationId: "inv-1",
+            })).toThrow(expect.objectContaining({
+                code: BUNDLE_ERROR_CODES.AUTHENTICATION_FAILED,
+            }));
+            expect(fs.existsSync(destDir)).toBe(true);
+            expect(removeVerifiedBundle({
+                bundleDir: destDir,
+                expectedDigest: res.digest,
+                expectedInvestigationId: "inv-1",
+            })).toMatchObject({
+                removed: true,
+                digest: res.digest,
+            });
+            expect(fs.existsSync(destDir)).toBe(false);
         });
 
         expect(imported).toMatchObject({

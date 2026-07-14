@@ -326,6 +326,17 @@ export function normalizeRunnerConfig(input, { env = process.env } = {}) {
         stateDir,
         env,
     );
+    const investigationDir = path.dirname(stateDir);
+    if (!samePath(path.dirname(artifactRoot), investigationDir)) {
+        throw new RuntimeConfigError(
+            "stateDir and artifactRoot must be sibling paths owned by one investigation directory",
+            {
+                stateDir,
+                artifactRoot,
+                investigationDir,
+            },
+        );
+    }
     if (isPathInside(stateDir, artifactRoot)) {
         throw new RuntimeConfigError(
             "stateDir cannot be equal to or nested inside artifactRoot",
