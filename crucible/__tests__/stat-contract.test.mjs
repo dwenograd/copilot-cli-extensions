@@ -22,7 +22,7 @@ function clone(value) {
     return structuredClone(value);
 }
 
-describe("v4 frozen statistical contract", () => {
+describe("frozen statistical contract", () => {
     it("versions new search authority while preserving unversioned v1 contracts", () => {
         const current = createInvestigationContract(makeV4ContractInput());
         expect(current.searchPolicy.version)

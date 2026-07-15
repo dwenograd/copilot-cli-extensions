@@ -98,11 +98,6 @@ extensions/
 │   ├── __tests__/              # node:test in-process suite
 │   └── AGENTS.md               # agent-design notes (sub-agent file-write rule, etc.)
 ├── package.json                # workspace root (vitest + zod for the orchestrators; zerotrust uses node:test)
-├── scripts/                    # Crucible ownership, integration, unattended, conformance runners
-├── vitest.config.mjs           # safe developer-suite configuration
-├── vitest.workspace-fast.config.mjs # orchestrator/_shared workspace loop
-├── vitest.crucible-*.config.mjs # unit, release, science, unattended, integration configs
-├── vitest.windows-conformance.config.mjs # native Windows boundary config
 └── .gitignore
 ```
 
@@ -147,33 +142,11 @@ npm test
 `npm test` runs `vitest` for the orchestrators and `_shared/`, Crucible's
 curated 55-second-capped suite, then `node --test` for
 `zerotrust-sourcecheck/`.
-Native Windows containment, real SDK/CLI smoke, and Crucible's release-only
-hard-kill/multiprocess/long-process matrices are deliberately excluded.
 
-Use `npm run test:crucible` for Crucible's fast credential-free suite and
-`npm run test:crucible:release-safe` for its long safe matrices. The mandatory
-real integration gate is `npm run test:crucible:integration`; it requires
-absolute `COPILOT_SDK_PATH` and `COPILOT_CLI_PATH` values plus an authenticated
-Copilot CLI, and fails rather than skipping when they are unavailable. The
-explicit `npm run test:crucible:release` gate is four layers: safe Crucible
-tests, release-safe matrices, the science gate, and the unattended wrapper
-(authenticated SDK plus Windows containment, Task Scheduler recovery, and leak
-conformance). `npm run test:release` adds the rest of the workspace suites.
-The normal `test:crucible` command is the curated unit/component loop and is
-terminated at 55 seconds; slow host-state and recovery coverage is release-only.
-
-`npm run test:crucible:changed` maps current Crucible source, PowerShell,
-fixtures, configs, and tests to narrow owners and fails closed when no owner
-exists. Pass `-- --release <path>` for release-only fixtures or native/
-integration owners; there is no unrelated unit-suite fallback.
-
-`npm run test:crucible:unattended-release` adds the curated unattended
-lifecycle matrix, authenticated SDK smoke, and Windows conformance while
-inventory-checking test roots, processes, scheduled tasks, AppContainer
-profiles, registry state, and the task-authenticated recovery environment. On
-supported Windows hosts the Task Scheduler case is mandatory and starts a
-genuinely eligible test investigation through the exact installed action.
-It tests process/logon-task recovery, not a physical reboot.
+Use `npm run test:crucible` for Crucible. The `unit`, `changed`, and `release`
+commands are aliases for the same curated suite, and every path has the same
+55-second hard limit. Crucible no longer has separate long-running release,
+science, integration, hard-kill, Task Scheduler, or native conformance suites.
 
 If you change a packet wording deliberately in any orchestrator extension,
 regenerate vitest snapshots once with `npm run test:update`. That update command

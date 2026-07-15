@@ -1,7 +1,7 @@
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
-import { fileURLToPath } from "node:url";
 
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -15,7 +15,6 @@ import {
 import { canonicalize } from "../persistence/canonical.mjs";
 import { DatabaseSync } from "../persistence/sqlite.mjs";
 
-const HERE = path.dirname(fileURLToPath(import.meta.url));
 const roots = [];
 const brokers = [];
 
@@ -52,7 +51,7 @@ function markerDigest({
 
 function makeRoot(label) {
     const root = fs.mkdtempSync(
-        path.join(HERE, `.recovery-catalog-${label}-`),
+        path.join(os.tmpdir(), `crucible-recovery-catalog-${label}-`),
     );
     roots.push(root);
     return root;

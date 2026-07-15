@@ -1,6 +1,6 @@
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -14,12 +14,11 @@ import {
     resolveRetentionPaths,
 } from "../api/environment.mjs";
 
-const HERE = path.dirname(fileURLToPath(import.meta.url));
 const roots = [];
 
 function makeRoot(label) {
     const root = fs.mkdtempSync(
-        path.join(HERE, `.retention-${label}-`),
+        path.join(os.tmpdir(), `crucible-retention-${label}-`),
     );
     roots.push(root);
     return root;

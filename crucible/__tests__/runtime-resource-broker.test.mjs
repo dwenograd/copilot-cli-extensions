@@ -1,6 +1,6 @@
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -21,13 +21,12 @@ import {
     sdkUsageToModelCostUnits,
 } from "../runtime/index.mjs";
 
-const HERE = path.dirname(fileURLToPath(import.meta.url));
 const roots = [];
 const brokers = [];
 
 function makeRoot(label) {
     const root = fs.mkdtempSync(
-        path.join(HERE, `.resource-broker-${label}-`),
+        path.join(os.tmpdir(), `crucible-resource-broker-${label}-`),
     );
     roots.push(root);
     return root;

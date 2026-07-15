@@ -10,23 +10,16 @@
     "url": "https://github.com/dwenograd/copilot-cli-extensions"
   },
   "scripts": {
-    "test": "vitest run --config vitest.workspace-fast.config.mjs && npm run test:crucible && node --test \"zerotrust-sourcecheck/__tests__/*.test.mjs\"",
-    "test:vitest": "vitest run --config vitest.workspace-fast.config.mjs",
-    "test:crucible": "node scripts/run-crucible-fast.mjs",
-    "test:crucible:unit": "node scripts/run-crucible-fast.mjs",
-    "test:crucible:changed": "node scripts/run-crucible-related.mjs",
-    "test:crucible:science": "vitest run --config vitest.crucible-science.config.mjs && node crucible/scripts/run-v4-science-benchmark.mjs --check",
-    "benchmark:crucible:v4-science": "node crucible/scripts/run-v4-science-benchmark.mjs --check",
-    "test:crucible:release-safe": "vitest run --config vitest.crucible-release.config.mjs",
-    "test:crucible:unattended-release-safe": "node scripts/run-crucible-unattended-release.mjs --safe-only",
-    "test:crucible:unattended-release": "node scripts/run-crucible-unattended-release.mjs",
-    "test:crucible:integration": "node scripts/run-crucible-integration.mjs",
-    "test:crucible:windows-conformance": "node scripts/run-crucible-windows-conformance.mjs",
-    "test:crucible:release": "npm run test:crucible && npm run test:crucible:release-safe && npm run test:crucible:science && npm run test:crucible:unattended-release",
-    "test:release": "npm test && npm run test:crucible:release-safe && npm run test:crucible:science && npm run test:crucible:unattended-release",
+    "test": "npm run test:vitest && npm run test:crucible && node --test \"zerotrust-sourcecheck/__tests__/*.test.mjs\"",
+    "test:vitest": "vitest run _shared/__tests__ triple-duck/__tests__ triple-plan/__tests__ triple-review/__tests__ debate/__tests__ duck-council/__tests__",
+    "test:crucible": "node crucible/scripts/run-tests.mjs",
+    "test:crucible:unit": "node crucible/scripts/run-tests.mjs",
+    "test:crucible:changed": "node crucible/scripts/run-related-tests.mjs",
+    "test:crucible:release": "node crucible/scripts/run-tests.mjs",
+    "test:release": "npm test",
     "test:zerotrust": "node --test \"zerotrust-sourcecheck/__tests__/*.test.mjs\"",
-    "test:watch": "vitest",
-    "test:update": "vitest run -u --passWithNoTests"
+    "test:watch": "vitest _shared/__tests__ triple-duck/__tests__ triple-plan/__tests__ triple-review/__tests__ debate/__tests__ duck-council/__tests__",
+    "test:update": "vitest run -u --passWithNoTests _shared/__tests__ triple-duck/__tests__ triple-plan/__tests__ triple-review/__tests__ debate/__tests__ duck-council/__tests__"
   },
   "dependencies": {
     "zod": "3.23.8"

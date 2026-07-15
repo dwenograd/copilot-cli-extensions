@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 
 import {
     DEFAULT_RUNTIME_IDENTITY_POLICY,
@@ -15,7 +15,6 @@ import {
 } from "../runtime/runtime-identity.mjs";
 import { removeTrackedRoots } from "./test-cleanup.mjs";
 
-const HERE = path.dirname(fileURLToPath(import.meta.url));
 const roots = [];
 const hash = (label, character = "a") =>
     `sha256:${label}:${character.repeat(64)}`;
@@ -33,7 +32,9 @@ function write(file, content) {
 }
 
 function workspace(label) {
-    const root = fs.mkdtempSync(path.join(HERE, `.runtime-identity-${label}-`));
+    const root = fs.mkdtempSync(
+        path.join(os.tmpdir(), `crucible-runtime-identity-${label}-`),
+    );
     roots.push(root);
     const source = path.join(root, "source");
     const cliPackage = path.join(root, "cli-package");

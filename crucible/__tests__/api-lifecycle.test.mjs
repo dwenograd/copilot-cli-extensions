@@ -1,7 +1,7 @@
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
-import { fileURLToPath } from "node:url";
 
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -18,7 +18,6 @@ import {
     writeSignedTombstone,
 } from "../persistence/index.mjs";
 
-const HERE = path.dirname(fileURLToPath(import.meta.url));
 const roots = [];
 const DIGEST = `sha256:${"a".repeat(64)}`;
 const HEAD = Object.freeze({
@@ -59,7 +58,7 @@ function markerDigest({
 
 function makeRoot(label) {
     const root = fs.mkdtempSync(
-        path.join(HERE, `.api-lifecycle-${label}-`),
+        path.join(os.tmpdir(), `crucible-api-lifecycle-${label}-`),
     );
     roots.push(root);
     return root;
