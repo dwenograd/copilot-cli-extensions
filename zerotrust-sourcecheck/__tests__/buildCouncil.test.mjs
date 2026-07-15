@@ -12,17 +12,31 @@ import {
     modeIsCouncilBuild,
 } from "../modes.mjs";
 import { safeBuildHandler } from "../safeWrappers/buildWrapper.mjs";
+import { __internals as cloneInternals } from "../safeWrappers/cloneWrapper.mjs";
 import { recordOutcomeHandler } from "../safeWrappers/outcomeWrapper.mjs";
-import { __internals as stateInternals } from "../safeWrappers/state.mjs";
+import {
+    recordCouncilOutcome,
+    __internals as stateInternals,
+} from "../safeWrappers/state.mjs";
 import { runHandler } from "../handler.mjs";
-import { activateAudit, deactivateAudit, recordResolvedClonePath } from "../enforcement.mjs";
+import {
+    activateAudit,
+    deactivateAudit,
+    getActiveAudit,
+    recordResolvedClonePath,
+    recordResolvedSha,
+} from "../enforcement.mjs";
+import { ROLES, materializeCouncilManifest } from "../council/index.mjs";
+import { buildClonePath, buildQuarantinePath, buildReportPath } from "../urlParser.mjs";
 
 const SESSION = "test-session-build-council";
 const BUILD_ROOT = "C:\\test\\zerotrust-sourcecheck";
 const CLONE_PATH = nodePath.join(BUILD_ROOT, `__missing_build_council_${process.pid}__`);
 const URL = "https://github.com/octocat/Hello-World";
+const PINNED_SHA = "b".repeat(40);
 
 let cachedSafeCouncilPacket = null;
+let currentAuditId;
 
 beforeEach(() => {
     stateInternals.recordedOutcomes.clear();
@@ -31,12 +45,16 @@ beforeEach(() => {
         buildPath: BUILD_ROOT,
         mode: "audit_and_safe_build_council",
         expectedClonePath: CLONE_PATH,
+        owner: "octocat",
+        repo: "Hello-World",
     });
     // Round-6 hardening: build wrapper requires a recorded resolved clone
     // path. These tests don't actually clone; record the planned path so
     // the council-gate and mode-is-build checks (which run AFTER the
     // resolved-path check) are reached.
     recordResolvedClonePath(SESSION, CLONE_PATH);
+    recordResolvedSha(SESSION, PINNED_SHA);
+    currentAuditId = getActiveAudit(SESSION).auditId;
 });
 
 function safeBuildArgs(extra = {}) {
@@ -52,6 +70,7 @@ function safeBuildArgs(extra = {}) {
 async function recordOutcome(verdict, complete, counts = {}) {
     const r = await recordOutcomeHandler(
         {
+            audit_id: currentAuditId,
             verdict,
             critical_count: counts.critical_count ?? 0,
             high_count: counts.high_count ?? 0,
@@ -113,6 +132,49 @@ test("safeBuildHandler refuses council build when no outcome is recorded", async
     const r = await safeBuildHandler(safeBuildArgs(), { sessionId: SESSION });
     assert.equal(r.resultType, "failure");
     assert.match(r.textResultForLlm, /council-build gate CLOSED/);
+});
+
+test("delayed audit-A outcome is refused after audit B activates in the same session", async () => {
+    const auditA = currentAuditId;
+    activateAudit({
+        sessionId: SESSION,
+        buildPath: BUILD_ROOT,
+        mode: "audit_and_safe_build_council",
+        expectedClonePath: CLONE_PATH,
+        owner: "octocat",
+        repo: "Hello-World",
+    });
+    recordResolvedClonePath(SESSION, CLONE_PATH);
+    recordResolvedSha(SESSION, PINNED_SHA);
+    const auditB = getActiveAudit(SESSION).auditId;
+    assert.notEqual(auditA, auditB);
+
+    const delayed = await recordOutcomeHandler(
+        {
+            audit_id: auditA,
+            verdict: "low",
+            critical_count: 0,
+            high_count: 0,
+            complete: true,
+        },
+        { sessionId: SESSION },
+    );
+    assert.equal(delayed.resultType, "failure");
+    assert.match(delayed.textResultForLlm, /does not match the current active audit/i);
+
+    recordCouncilOutcome(SESSION, {
+        auditId: auditA,
+        owner: "octocat",
+        repo: "hello-world",
+        resolvedSha: PINNED_SHA,
+        verdict: "low",
+        criticalCount: 0,
+        highCount: 0,
+        complete: true,
+    });
+    const build = await safeBuildHandler(safeBuildArgs(), { sessionId: SESSION });
+    assert.equal(build.resultType, "failure");
+    assert.match(build.textResultForLlm, /different audit identity/i);
 });
 
 test("safeBuildHandler blocks a complete critical council outcome", async () => {
@@ -189,4 +251,65 @@ test("packet emits build instructions for audit_and_safe_build_council", () => {
 
 test("packet tells agent to record council outcome before safe build", () => {
     assert.match(getSafeCouncilPacket(), /zerotrust_record_council_outcome/);
+    assert.match(getSafeCouncilPacket(), /audit_id:\s*runtimeContext\.auditId/);
+    assert.match(
+        getSafeCouncilPacket(),
+        /immutable active-audit ID[\s\S]*[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}/i,
+    );
+    assert.match(getSafeCouncilPacket(), /runtimeContext[\s\S]*auditId = "[0-9a-f-]{36}"/i);
+});
+
+test("build wrapper identity handoff materializes concrete council prompts", () => {
+    const actualClonePath = buildClonePath(BUILD_ROOT, "octocat", "Hello-World", PINNED_SHA);
+    const boundContext = cloneInternals.buildCloneBoundContext({
+        buildRoot: BUILD_ROOT,
+        owner: "octocat",
+        repo: "Hello-World",
+        resolvedSha: PINNED_SHA,
+        clonePath: actualClonePath,
+    });
+    const role = ROLES.find((r) => r.id === "compiler-toolchain-codegen");
+    const materialized = materializeCouncilManifest([role], {
+        auditId: "11111111-1111-4111-8111-111111111111",
+        sourceKind: "build",
+        owner: "octocat",
+        repo: "Hello-World",
+        sourceCommitSha: boundContext.sourceCommitSha,
+        clonePath: boundContext.clonePath,
+        buildRoot: BUILD_ROOT,
+        nonce: "runtime-build",
+        aggregateEntries: [
+            "src/main.cpp",
+            "CMakeLists.txt",
+            "tools/codegen/generate.py",
+            "README.md",
+        ],
+        coverageSnapshot: {
+            coverageComplete: true,
+            aggregateEntryCount: 4,
+            aggregateEntriesTruncated: false,
+            coverageBlockers: [],
+        },
+    })[0];
+
+    assert.equal(boundContext.clonePath, actualClonePath);
+    assert.equal(boundContext.reportPath, buildReportPath(BUILD_ROOT, "octocat", "Hello-World", PINNED_SHA));
+    assert.equal(boundContext.quarantinePath, buildQuarantinePath(BUILD_ROOT, "octocat", "Hello-World", PINNED_SHA));
+    assert.match(materialized.renderedPrompt, new RegExp(PINNED_SHA));
+    assert.ok(materialized.renderedPrompt.includes(actualClonePath));
+    assert.match(materialized.renderedPrompt, /tools\/codegen\/generate\.py/);
+    assert.doesNotMatch(materialized.renderedPrompt, /<RESOLVED_SHA>|not yet substituted/i);
+});
+
+test("build-council orchestration consumes wrapper-returned runtime identities", () => {
+    const section = getSafeCouncilPacket().slice(
+        getSafeCouncilPacket().indexOf("## Section 5b"),
+        getSafeCouncilPacket().indexOf("## Section 6"),
+    );
+    assert.match(section, /cloneResult\.boundContext\.clonePath/);
+    assert.match(section, /runtimeContext\.reportPath/);
+    assert.match(section, /single Section 8 finalizer/);
+    assert.doesNotMatch(section, /zerotrust_finalize_report\(\{/);
+    assert.match(section, /only identities subsequent remediation, report, and cleanup instructions may consume/);
+    assert.doesNotMatch(section, /0000000|RESOLVED_SHA|not yet substituted/i);
 });

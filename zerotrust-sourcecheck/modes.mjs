@@ -10,10 +10,14 @@
 // - COUNCIL_MODES is a subset of VALID_MODES that triggers the 32-role
 //   council in packet.mjs Section 5b/5c.
 // - BUILD_MODES is a subset of VALID_MODES that permits wrapper-mediated
-//   package-manager installs / build commands (with safe-flag enforcement
-//   for non-full-build modes).
-// - FULL_BUILD_MODES is a subset of BUILD_MODES that allows lifecycle
-//   scripts (npm postinstall etc.) without the safe-mode flag check.
+//   package-manager installs / build commands.
+// - FULL_BUILD_MODES is a subset of BUILD_MODES that requires the additional
+//   `unsafe` acknowledgement. Safe/full modes currently use the same
+//   install/build wrappers. Install lifecycle scripts remain suppressed in
+//   both, while repo-controlled npm build scripts, build.rs, and MSBuild
+//   targets may execute in both. Full mode changes admission/warning posture
+//   only and reserves a future distinction; it is not a less-restricted
+//   installer today.
 // - Council-build modes are exactly COUNCIL_MODES ∩ BUILD_MODES; the
 //   safe-build wrapper refuses them until a passing council outcome is
 //   recorded.
@@ -31,6 +35,9 @@
 // This is a mode-selection fact, not a claim that wrappers intercept raw
 // built-in tool calls; they do not.
 export const DEFAULT_STRATEGY = "opt-out";
+
+export const BUILD_MODE_TAXONOMY_NOTE =
+    "Safe/full modes currently use the same install/build wrappers. Install lifecycle scripts remain suppressed. Build commands may execute repo-controlled npm build scripts, build.rs, and MSBuild targets in both modes. Full mode currently changes admission/warning posture only, still requires unsafe, and reserves a future distinction.";
 
 export function defaultStrategy() {
     return DEFAULT_STRATEGY;
@@ -124,7 +131,7 @@ export function modeIsAudit(mode) {
 }
 
 export function modeNeedsClone(mode) {
-    // v4: only build modes need a local clone. Pure audit modes
+    // Only build modes need a local clone. Pure URL audit modes
     // (`audit_source`, `audit_source_council`, `verify_release`,
     // `metadata_only`) return GitHub-API content through tool results and do
     // not intentionally create source files. Runtime/session logging is out
@@ -133,9 +140,10 @@ export function modeNeedsClone(mode) {
 }
 
 /**
- * v4 helper: does this mode use the API-direct flow (fetch via gh api,
- * never write source to disk)? True for all non-build, non-metadata,
- * non-local-source modes that need to read source.
+ * Does this mode use the API-direct flow (fetch via the GitHub API without
+ * intentionally creating a source tree)? True for all non-build,
+ * non-metadata, non-local-source modes that need to read source. Host
+ * CLI/session logging or oversized-output spill is outside this helper.
  *
  * - metadata_only is excluded because it doesn't read source at all
  *   (just GitHub metadata).

@@ -42,12 +42,63 @@
 // a passing outcome from one audit satisfying a different mode's gate.
 
 import nodePath from "node:path";
+import { randomUUID } from "node:crypto";
 import {
     BUILD_MODES_SET as SHARED_BUILD_MODES,
     FULL_BUILD_MODES_SET as SHARED_FULL_BUILD_MODES,
     modeNeedsClone as SHARED_modeNeedsClone,
+    modeUsesApiDirect,
+    modeUsesCouncil,
+    modeUsesLocalSource,
 } from "./modes.mjs";
-import { parseGithubUrl } from "./urlParser.mjs";
+import { slugForPath } from "./localPathValidator.mjs";
+import {
+    buildQuarantinePath,
+    buildReportPath,
+    parseGithubUrl,
+} from "./urlParser.mjs";
+import {
+    clearCacheBinding,
+    clearCouncilLedgerState,
+    clearRecordedOutcome,
+    getCouncilLedgerSnapshot,
+    mutateCouncilLedgerState,
+} from "./safeWrappers/state.mjs";
+import {
+    ANALYSIS_SCHEMA_VERSION,
+    ANALYSIS_STAGES,
+    createInitialAnalysisStageState,
+    validateAnalysisStageState,
+    validateAuditId,
+} from "./analysis/schemas.mjs";
+import { buildTrustedDecisionSnapshot } from "./analysis/scoring.mjs";
+import { generateRemediationPlan } from "./analysis/remediation.mjs";
+import { BehaviorGraph } from "./analysis/behaviorGraph.mjs";
+import { mergeBehaviorGraphs } from "./analysis/graphMerge.mjs";
+import { traceBehaviorGraph } from "./analysis/traceGraph.mjs";
+import {
+    buildAnalysisIndexSnapshot,
+    createAnalysisIndexState,
+    listIndexedFacts,
+} from "./analysis/indexState.mjs";
+import {
+    buildPluginCacheRecords,
+    buildPluginRunnerSnapshot,
+    createPluginRunnerState,
+    runAnalysisPlugins,
+} from "./analysis/plugins/runner.mjs";
+import {
+    buildValidationPlan,
+    buildValidationSnapshot,
+    createValidationState,
+    finalizeValidationState,
+    normalizeValidationMinSeverity,
+    pageValidationContexts,
+    storeAdjudication,
+    storeStaticDecision,
+    validateAdjudicationSubmission,
+    validateStaticDecisionSubmission,
+} from "./analysis/validation.mjs";
 
 // TTL is mode-dependent (v3 fix). The 30-min default silently expired during
 // real audit_source_council runs (15-30 min wall-clock) — once expiresAt
@@ -83,7 +134,73 @@ function ttlForMode(mode) {
 const BUILD_MODES = SHARED_BUILD_MODES;
 const FULL_BUILD_MODES = SHARED_FULL_BUILD_MODES;
 
-const activeAudits = new Map(); // sessionId -> { buildPath, mode, expiresAt, expectedClonePath }
+const activeAudits = new Map(); // sessionId -> active audit identity + lifecycle state
+
+function analysisSourceKindForMode(mode) {
+    if (mode === "metadata_only") return "metadata-only";
+    if (modeUsesLocalSource(mode)) return "local-source";
+    if (SHARED_modeNeedsClone(mode)) return "build-clone";
+    if (modeUsesApiDirect(mode)) return "api-direct";
+    return "metadata-only";
+}
+
+function sourceNamespaceForAudit(audit) {
+    if (modeUsesLocalSource(audit.mode)) return `local-audit:${audit.auditId}`;
+    if (audit.owner && audit.repo && audit.resolvedSha) {
+        return `github.com/${audit.owner}/${audit.repo}@${audit.resolvedSha}`;
+    }
+    return `audit:${audit.auditId}`;
+}
+
+function pathsEqual(left, right) {
+    const a = nodePath.resolve(left);
+    const b = nodePath.resolve(right);
+    return process.platform === "win32"
+        ? a.toLowerCase() === b.toLowerCase()
+        : a === b;
+}
+
+function deriveLocalReportIdentity(buildPath, localPath, expectedReportPath) {
+    if (!expectedReportPath) return null;
+    const slug = slugForPath(localPath);
+    const basename = nodePath.basename(nodePath.resolve(expectedReportPath));
+    const prefix = `local-${slug}-`;
+    if (!basename.startsWith(prefix)) return null;
+    const timestamp = basename.slice(prefix.length);
+    if (!/^[0-9]{14}$/.test(timestamp)) return null;
+    const canonicalPath = nodePath.resolve(
+        buildPath,
+        "_reports",
+        `local-${slug}-${timestamp}`,
+    );
+    if (!pathsEqual(canonicalPath, expectedReportPath)) return null;
+    return { slug, timestamp };
+}
+
+function normalizeCouncilRoleManifest(value) {
+    if (value === null || value === undefined) return null;
+    if (!Array.isArray(value) || value.length === 0) {
+        throw new Error("councilRoleManifest must be a non-empty array when provided");
+    }
+    const seen = new Set();
+    return Object.freeze(value.map((role, index) => {
+        const id = String(role?.id || "");
+        const category = String(role?.category || "");
+        if (!/^[a-z][a-z0-9-]{2,63}$/.test(id)) {
+            throw new Error(`invalid council role id at index ${index}`);
+        }
+        if (!/^[A-G]$/.test(category)) {
+            throw new Error(`invalid council role category for ${id}`);
+        }
+        if (seen.has(id)) throw new Error(`duplicate council role id: ${id}`);
+        seen.add(id);
+        return Object.freeze({
+            id,
+            category,
+            mandatory: role?.mandatory === true,
+        });
+    }));
+}
 
 /**
  * Activate an audit-in-progress state for a session. Called by the tool
@@ -91,9 +208,25 @@ const activeAudits = new Map(); // sessionId -> { buildPath, mode, expiresAt, ex
  *
  * `buildPath` is the canonical build root (e.g. ~/.copilot/zerotrust-sandbox).
  * `expectedClonePath` is the specific subdirectory the packet has authorized
- * for the clone (e.g. ~/.copilot/zerotrust-sandbox/owner-repo-abc1234).
+ * for the clone (e.g. ~/.copilot/zerotrust-sandbox/zt-v1-<sha256>).
  */
-export function activateAudit({ sessionId, buildPath, mode, expectedClonePath, owner, repo, ref, refType, localPath, expectedReportPath }) {
+export function activateAudit({
+    sessionId,
+    buildPath,
+    mode,
+    expectedClonePath,
+    owner,
+    repo,
+    ref,
+    refType,
+    urlKind,
+    releaseSelector,
+    localPath,
+    expectedReportPath,
+    expectedQuarantinePath,
+    councilRoleManifest,
+    validationMinSeverity = "high",
+}) {
     if (!sessionId) throw new Error("activateAudit requires sessionId");
     if (!buildPath) throw new Error("activateAudit requires buildPath");
     const effectiveMode = mode || "audit_source";
@@ -111,8 +244,22 @@ export function activateAudit({ sessionId, buildPath, mode, expectedClonePath, o
         throw new Error("activateAudit requires localPath (local-source modes)");
     }
 
-    activeAudits.set(sessionId, {
-        buildPath: nodePath.resolve(buildPath),
+    const resolvedBuildPath = nodePath.resolve(buildPath);
+    const resolvedLocalPath = localPath ? nodePath.resolve(localPath) : null;
+    const resolvedReportPath = expectedReportPath
+        ? nodePath.resolve(expectedReportPath)
+        : null;
+    const localReportIdentity = isLocal
+        ? deriveLocalReportIdentity(
+            resolvedBuildPath,
+            resolvedLocalPath,
+            resolvedReportPath,
+        )
+        : null;
+
+    const auditId = randomUUID();
+    const audit = {
+        buildPath: resolvedBuildPath,
         mode: effectiveMode,
         expiresAt: Date.now() + ttlForMode(effectiveMode),
         // URL-driven audits get expectedClonePath / owner / repo / ref / refType.
@@ -122,6 +269,8 @@ export function activateAudit({ sessionId, buildPath, mode, expectedClonePath, o
         expectedClonePath: expectedClonePath ? nodePath.resolve(expectedClonePath) : null,
         owner: owner ? String(owner).toLowerCase() : null,
         repo: repo ? String(repo).toLowerCase() : null,
+        canonicalOwner: owner ? String(owner) : null,
+        canonicalRepo: repo ? String(repo) : null,
         // Round-8 hardening (gpt-5.5 R8 F1): also pin the ref so safe_clone
         // refuses to clone a different ref of the same repo. Null ref means
         // "no specific ref pinned at activation time" (e.g. the user passed
@@ -129,14 +278,46 @@ export function activateAudit({ sessionId, buildPath, mode, expectedClonePath, o
         // accepts any ref.
         ref: ref ? String(ref) : null,
         refType: refType ? String(refType) : null,
+        urlKind: urlKind ? String(urlKind) : null,
+        releaseSelector: releaseSelector ? String(releaseSelector) : null,
         // Local-source fields.
-        localPath: localPath ? nodePath.resolve(localPath) : null,
-        expectedReportPath: expectedReportPath ? nodePath.resolve(expectedReportPath) : null,
+        localPath: resolvedLocalPath,
+        localReportSlug: localReportIdentity?.slug || null,
+        localReportTimestamp: localReportIdentity?.timestamp || null,
+        expectedReportPath: resolvedReportPath,
+        expectedQuarantinePath: expectedQuarantinePath ? nodePath.resolve(expectedQuarantinePath) : null,
+        councilRoleManifest: modeUsesCouncil(effectiveMode)
+            ? normalizeCouncilRoleManifest(councilRoleManifest)
+            : null,
+        validationMinSeverity: modeUsesCouncil(effectiveMode)
+            ? normalizeValidationMinSeverity(validationMinSeverity)
+            : "high",
+    };
+    Object.defineProperty(audit, "auditId", {
+        value: auditId,
+        enumerable: true,
+        writable: false,
+        configurable: false,
     });
+    audit.analysisStageState = createInitialAnalysisStageState(auditId);
+    audit.analysisIndexState = createAnalysisIndexState({
+        auditId,
+        sourceKind: analysisSourceKindForMode(effectiveMode),
+    });
+    audit.behaviorGraph = new BehaviorGraph({ auditId });
+    audit.analysisPluginState = createPluginRunnerState({ auditId });
+    audit.analysisTraceState = null;
+    clearRecordedOutcome(sessionId);
+    clearCouncilLedgerState(sessionId);
+    clearCacheBinding(sessionId);
+    activeAudits.set(sessionId, audit);
+    return auditId;
 }
 
 export function deactivateAudit(sessionId) {
-    activeAudits.delete(sessionId);
+    clearCouncilLedgerState(sessionId);
+    clearCacheBinding(sessionId);
+    return activeAudits.delete(sessionId);
 }
 
 /**
@@ -178,6 +359,304 @@ export function recordResolvedSha(sessionId, sha) {
     return true;
 }
 
+export function recordReleaseIdentity(sessionId, identity) {
+    const audit = activeAudits.get(sessionId);
+    if (!audit || audit.expiresAt < Date.now()) return false;
+    if (!identity || typeof identity !== "object") return false;
+    const normalized = {
+        releaseId: String(identity.releaseId || ""),
+        tagName: String(identity.tagName || ""),
+        sourceCommitSha: String(identity.sourceCommitSha || "").toLowerCase(),
+        rootTreeSha: String(identity.rootTreeSha || "").toLowerCase(),
+        tagRefSha: String(identity.tagRefSha || "").toLowerCase(),
+        tagObjectSha: identity.tagObjectSha ? String(identity.tagObjectSha).toLowerCase() : null,
+        annotatedTag: identity.annotatedTag === true,
+        tagPeelDepth: Number(identity.tagPeelDepth || 0),
+        targetCommitish: typeof identity.targetCommitish === "string"
+            && /^[A-Za-z0-9._/-]{1,255}$/.test(identity.targetCommitish)
+            ? identity.targetCommitish.slice(0, 255)
+            : null,
+    };
+    const tagSegments = normalized.tagName.split("/");
+    if (!/^[1-9][0-9]{0,19}$/.test(normalized.releaseId)
+        || !/^[A-Za-z0-9._/-]{1,255}$/.test(normalized.tagName)
+        || normalized.tagName.startsWith("/")
+        || normalized.tagName.endsWith("/")
+        || normalized.tagName.includes("//")
+        || tagSegments.some((segment) => segment === "." || segment === "..")
+        || !/^[a-f0-9]{40}$/.test(normalized.sourceCommitSha)
+        || !/^[a-f0-9]{40}$/.test(normalized.rootTreeSha)
+        || !/^[a-f0-9]{40}$/.test(normalized.tagRefSha)
+        || (normalized.tagObjectSha && !/^[a-f0-9]{40}$/.test(normalized.tagObjectSha))
+        || !Number.isSafeInteger(normalized.tagPeelDepth)
+        || normalized.tagPeelDepth < 0
+        || normalized.tagPeelDepth > 8) {
+        return false;
+    }
+    if (audit.ref && audit.ref !== normalized.tagName) return false;
+    if (audit.releaseIdentity) {
+        return JSON.stringify(audit.releaseIdentity) === JSON.stringify(normalized);
+    }
+    audit.releaseIdentity = normalized;
+    return true;
+}
+
+export function recordResolvedArtifactPaths(sessionId, { reportPath, quarantinePath } = {}) {
+    const audit = activeAudits.get(sessionId);
+    if (!audit || audit.expiresAt < Date.now()) return false;
+    if (reportPath) {
+        const resolvedReportPath = nodePath.resolve(reportPath);
+        if (audit.localPath) {
+            if (!audit.expectedReportPath
+                || !pathsEqual(resolvedReportPath, audit.expectedReportPath)) {
+                return false;
+            }
+        } else {
+            if (!audit.canonicalOwner || !audit.canonicalRepo || !audit.resolvedSha) {
+                return false;
+            }
+            const canonicalReportPath = buildReportPath(
+                audit.buildPath,
+                audit.canonicalOwner,
+                audit.canonicalRepo,
+                audit.resolvedSha,
+            );
+            if (!pathsEqual(resolvedReportPath, canonicalReportPath)) return false;
+            audit.expectedReportPath = resolvedReportPath;
+        }
+    }
+    if (quarantinePath) {
+        if (audit.localPath
+            || !audit.canonicalOwner
+            || !audit.canonicalRepo
+            || !audit.resolvedSha) {
+            return false;
+        }
+        const resolvedQuarantinePath = nodePath.resolve(quarantinePath);
+        const canonicalQuarantinePath = buildQuarantinePath(
+            audit.buildPath,
+            audit.canonicalOwner,
+            audit.canonicalRepo,
+            audit.resolvedSha,
+        );
+        if (!pathsEqual(resolvedQuarantinePath, canonicalQuarantinePath)) return false;
+        audit.expectedQuarantinePath = resolvedQuarantinePath;
+    }
+    return true;
+}
+
+export function recordReportFinalization(sessionId, finalization) {
+    const audit = activeAudits.get(sessionId);
+    if (!audit || audit.expiresAt < Date.now()) return false;
+    if (!finalization || typeof finalization !== "object") return false;
+    if (finalization.auditId !== audit.auditId) return false;
+    if (typeof finalization.reportPath !== "string"
+        || !nodePath.isAbsolute(finalization.reportPath)) {
+        return false;
+    }
+    if (typeof finalization.findingsPath !== "string"
+        || !nodePath.isAbsolute(finalization.findingsPath)) {
+        return false;
+    }
+    const reportPath = nodePath.resolve(finalization.reportPath);
+    const findingsPath = nodePath.resolve(finalization.findingsPath);
+    if (!audit.expectedReportPath
+        || !pathsEqual(nodePath.dirname(reportPath), audit.expectedReportPath)
+        || !pathsEqual(nodePath.dirname(findingsPath), audit.expectedReportPath)
+        || nodePath.basename(reportPath).toLowerCase() !== "report.md"
+        || nodePath.basename(findingsPath).toLowerCase() !== "findings.json") {
+        return false;
+    }
+    const normalized = Object.freeze({
+        auditId: audit.auditId,
+        reportPath,
+        findingsPath,
+        bytesWritten: Number(finalization.bytesWritten) || 0,
+        contentSha256: String(finalization.contentSha256 || "").toLowerCase(),
+        findingsBytesWritten: Number(finalization.findingsBytesWritten) || 0,
+        findingsSha256: String(finalization.findingsSha256 || "").toLowerCase(),
+        reportIdentity: structuredClone(finalization.reportIdentity || null),
+        flow: String(finalization.flow || ""),
+        ledgerDecisionId: finalization.ledgerDecisionId
+            ? String(finalization.ledgerDecisionId)
+            : null,
+        finalizedAt: Date.now(),
+    });
+    if (!/^[a-f0-9]{64}$/.test(normalized.contentSha256)
+        || !/^[a-f0-9]{64}$/.test(normalized.findingsSha256)
+        || !Number.isSafeInteger(normalized.bytesWritten)
+        || normalized.bytesWritten < 0
+        || !Number.isSafeInteger(normalized.findingsBytesWritten)
+        || normalized.findingsBytesWritten < 0
+        || !["v5-ledger", "legacy-v4"].includes(normalized.flow)
+        || (normalized.flow === "v5-ledger"
+            && !/^ztd-v5-[a-f0-9]{64}$/u.test(normalized.ledgerDecisionId || ""))
+        || (normalized.flow === "legacy-v4" && normalized.ledgerDecisionId !== null)) {
+        return false;
+    }
+    if (audit.reportFinalization) {
+        return audit.reportFinalization.auditId === normalized.auditId
+            && pathsEqual(audit.reportFinalization.reportPath, normalized.reportPath)
+            && pathsEqual(audit.reportFinalization.findingsPath, normalized.findingsPath)
+            && audit.reportFinalization.contentSha256 === normalized.contentSha256
+            && audit.reportFinalization.findingsSha256 === normalized.findingsSha256
+            && audit.reportFinalization.flow === normalized.flow
+            && audit.reportFinalization.ledgerDecisionId === normalized.ledgerDecisionId;
+    }
+    audit.reportFinalization = normalized;
+    return true;
+}
+
+export function getTreeEnumerationState(sessionId) {
+    const audit = sessionId ? getActiveAudit(sessionId) : null;
+    return audit?.treeEnumerationState
+        ? structuredClone(audit.treeEnumerationState)
+        : null;
+}
+
+export function recordTreeEnumerationState(sessionId, state) {
+    const audit = activeAudits.get(sessionId);
+    if (!audit || audit.expiresAt < Date.now() || !state || typeof state !== "object") {
+        return false;
+    }
+    const commitSha = String(state.commitSha || "").toLowerCase();
+    const rootTreeSha = String(state.rootTreeSha || "").toLowerCase();
+    if (!/^[a-f0-9]{40}$/.test(commitSha) || !/^[a-f0-9]{40}$/.test(rootTreeSha)) {
+        return false;
+    }
+    if (audit.resolvedSha && audit.resolvedSha !== commitSha) return false;
+    if (audit.treeEnumerationState
+        && (audit.treeEnumerationState.commitSha !== commitSha
+            || audit.treeEnumerationState.rootTreeSha !== rootTreeSha)) {
+        return false;
+    }
+    audit.treeEnumerationState = structuredClone(state);
+    return true;
+}
+
+export function getAcquisitionCoverageState(sessionId) {
+    const audit = sessionId ? getActiveAudit(sessionId) : null;
+    return audit?.acquisitionCoverageState
+        ? structuredClone(audit.acquisitionCoverageState)
+        : null;
+}
+
+export function recordAcquisitionCoverageState(sessionId, state) {
+    const audit = activeAudits.get(sessionId);
+    if (!audit || audit.expiresAt < Date.now() || !state || typeof state !== "object") {
+        return false;
+    }
+    const commitSha = String(state.commitSha || "").toLowerCase();
+    const rootTreeSha = String(state.rootTreeSha || "").toLowerCase();
+    if (!/^[a-f0-9]{40}$/.test(commitSha) || !/^[a-f0-9]{40}$/.test(rootTreeSha)) {
+        return false;
+    }
+    if (audit.resolvedSha && audit.resolvedSha !== commitSha) return false;
+    if (audit.treeEnumerationState
+        && (audit.treeEnumerationState.commitSha !== commitSha
+            || audit.treeEnumerationState.rootTreeSha !== rootTreeSha)) {
+        return false;
+    }
+    if (audit.acquisitionCoverageState
+        && (audit.acquisitionCoverageState.commitSha !== commitSha
+            || audit.acquisitionCoverageState.rootTreeSha !== rootTreeSha)) {
+        return false;
+    }
+    audit.acquisitionCoverageState = structuredClone(state);
+    return true;
+}
+
+export function mutateAcquisitionCoverageState(sessionId, {
+    commitSha,
+    rootTreeSha,
+    createState,
+} = {}, mutator) {
+    const audit = getActiveAudit(sessionId);
+    if (!audit || typeof mutator !== "function") return { ok: false };
+    const commit = String(commitSha || "").toLowerCase();
+    const root = String(rootTreeSha || "").toLowerCase();
+    if (!/^[a-f0-9]{40}$/.test(commit) || !/^[a-f0-9]{40}$/.test(root)) {
+        return { ok: false };
+    }
+    if (audit.resolvedSha && audit.resolvedSha !== commit) return { ok: false };
+    if (audit.treeEnumerationState
+        && (audit.treeEnumerationState.commitSha !== commit
+            || audit.treeEnumerationState.rootTreeSha !== root)) {
+        return { ok: false };
+    }
+    if (audit.acquisitionCoverageState
+        && (audit.acquisitionCoverageState.commitSha !== commit
+            || audit.acquisitionCoverageState.rootTreeSha !== root)) {
+        return { ok: false };
+    }
+    if (!audit.acquisitionCoverageState) {
+        if (typeof createState !== "function") return { ok: false };
+        const initialState = createState();
+        if (!initialState
+            || initialState.commitSha !== commit
+            || initialState.rootTreeSha !== root) {
+            return { ok: false };
+        }
+        audit.acquisitionCoverageState = initialState;
+    }
+    return {
+        ok: true,
+        value: mutator(audit.acquisitionCoverageState),
+    };
+}
+
+export function getReleaseAssetCoverageState(sessionId) {
+    const audit = sessionId ? getActiveAudit(sessionId) : null;
+    return audit?.releaseAssetCoverageState
+        ? structuredClone(audit.releaseAssetCoverageState)
+        : null;
+}
+
+export function mutateReleaseAssetCoverageState(sessionId, {
+    releaseId,
+    tagName,
+    sourceCommitSha,
+    createState,
+} = {}, mutator) {
+    const audit = getActiveAudit(sessionId);
+    if (!audit || audit.mode !== "verify_release" || typeof mutator !== "function") {
+        return { ok: false };
+    }
+    const normalized = {
+        releaseId: String(releaseId || ""),
+        tagName: String(tagName || ""),
+        sourceCommitSha: String(sourceCommitSha || "").toLowerCase(),
+    };
+    if (!audit.releaseIdentity
+        || audit.releaseIdentity.releaseId !== normalized.releaseId
+        || audit.releaseIdentity.tagName !== normalized.tagName
+        || audit.releaseIdentity.sourceCommitSha !== normalized.sourceCommitSha
+        || audit.resolvedSha !== normalized.sourceCommitSha) {
+        return { ok: false };
+    }
+    if (audit.releaseAssetCoverageState
+        && (audit.releaseAssetCoverageState.releaseId !== normalized.releaseId
+            || audit.releaseAssetCoverageState.tagName !== normalized.tagName
+            || audit.releaseAssetCoverageState.sourceCommitSha !== normalized.sourceCommitSha)) {
+        return { ok: false };
+    }
+    if (!audit.releaseAssetCoverageState) {
+        if (typeof createState !== "function") return { ok: false };
+        const initialState = createState();
+        if (!initialState
+            || initialState.releaseId !== normalized.releaseId
+            || initialState.tagName !== normalized.tagName
+            || initialState.sourceCommitSha !== normalized.sourceCommitSha) {
+            return { ok: false };
+        }
+        audit.releaseAssetCoverageState = initialState;
+    }
+    return {
+        ok: true,
+        value: mutator(audit.releaseAssetCoverageState),
+    };
+}
+
 // Track sessions that recently expired so we can log it once on the next
 // getActiveAudit() call. Keyed by sessionId; cleared when reported.
 const recentlyExpired = new Map(); // sessionId -> { mode, expiredAt }
@@ -207,13 +686,883 @@ export function getActiveAudit(sessionId) {
         // TTL expiry. Without this, a passing outcome from one audit could
         // satisfy the council-build gate of a *different* mode the agent
         // claims after expiry (since the outcome is keyed only on sessionId).
-        // Do a dynamic import to avoid a circular dep at module load.
-        try {
-            import("./safeWrappers/state.mjs").then((m) => m.clearRecordedOutcome(sessionId)).catch(() => {});
-        } catch { /* best-effort */ }
+        clearRecordedOutcome(sessionId);
+        clearCouncilLedgerState(sessionId);
+        clearCacheBinding(sessionId);
         return null;
     }
+    ensureAnalysisStageState(audit);
+    ensureAnalysisIndexState(audit);
+    ensureBehaviorGraph(audit);
+    ensureAnalysisPluginState(audit);
     return audit;
+}
+
+function ensureAnalysisStageState(audit) {
+    if (!audit.analysisStageState) {
+        audit.analysisStageState = createInitialAnalysisStageState(audit.auditId);
+    }
+    const state = validateAnalysisStageState(audit.analysisStageState);
+    if (state.auditId !== audit.auditId) {
+        throw new Error("analysis stage state auditId does not match active audit");
+    }
+    return state;
+}
+
+function ensureAnalysisIndexState(audit) {
+    if (!audit.analysisIndexState) {
+        audit.analysisIndexState = createAnalysisIndexState({
+            auditId: audit.auditId,
+            sourceKind: analysisSourceKindForMode(audit.mode),
+        });
+    }
+    if (audit.analysisIndexState.auditId !== audit.auditId) {
+        throw new Error("analysis index state auditId does not match active audit");
+    }
+    return audit.analysisIndexState;
+}
+
+function ensureBehaviorGraph(audit) {
+    if (!audit.behaviorGraph) {
+        audit.behaviorGraph = new BehaviorGraph({ auditId: audit.auditId });
+    }
+    if (audit.behaviorGraph.auditId !== audit.auditId) {
+        throw new Error("behavior graph auditId does not match active audit");
+    }
+    return audit.behaviorGraph;
+}
+
+function ensureAnalysisPluginState(audit) {
+    if (!audit.analysisPluginState) {
+        audit.analysisPluginState = createPluginRunnerState({ auditId: audit.auditId });
+    }
+    if (audit.analysisPluginState.auditId !== audit.auditId) {
+        throw new Error("analysis plugin state auditId does not match active audit");
+    }
+    return audit.analysisPluginState;
+}
+
+export function getAnalysisIndexState(sessionId, { auditId } = {}) {
+    const audit = getActiveAudit(sessionId);
+    if (!audit) return null;
+    if (auditId !== undefined && validateAuditId(auditId) !== audit.auditId) {
+        throw new Error("analysis index state auditId does not match active audit");
+    }
+    return structuredClone(ensureAnalysisIndexState(audit));
+}
+
+export function getAnalysisIndexSnapshot(sessionId, { auditId } = {}) {
+    const audit = getActiveAudit(sessionId);
+    if (!audit) return null;
+    if (auditId !== undefined && validateAuditId(auditId) !== audit.auditId) {
+        throw new Error("analysis index snapshot auditId does not match active audit");
+    }
+    return buildAnalysisIndexSnapshot(ensureAnalysisIndexState(audit));
+}
+
+export function getAnalysisPluginSnapshot(sessionId, { auditId } = {}) {
+    const audit = getActiveAudit(sessionId);
+    if (!audit) return null;
+    if (auditId !== undefined && validateAuditId(auditId) !== audit.auditId) {
+        throw new Error("analysis plugin snapshot auditId does not match active audit");
+    }
+
+    return buildPluginRunnerSnapshot(
+        ensureAnalysisPluginState(audit),
+        ensureBehaviorGraph(audit),
+    );
+}
+
+export function getAnalysisPluginCacheRecords(sessionId, { auditId } = {}) {
+    const audit = getActiveAudit(sessionId);
+    if (!audit) return null;
+    if (auditId !== undefined && validateAuditId(auditId) !== audit.auditId) {
+        throw new Error("analysis plugin cache records auditId does not match active audit");
+    }
+    return buildPluginCacheRecords(ensureAnalysisPluginState(audit));
+}
+
+export function getBehaviorGraphDocument(sessionId, { auditId } = {}) {
+    const audit = getActiveAudit(sessionId);
+    if (!audit) return null;
+    if (auditId !== undefined && validateAuditId(auditId) !== audit.auditId) {
+        throw new Error("behavior graph auditId does not match active audit");
+    }
+    return ensureBehaviorGraph(audit).toDocument();
+}
+
+function traceBlockerSnapshot(audit, stage, blockers, gates = {}) {
+    return Object.freeze({
+        schemaVersion: ANALYSIS_SCHEMA_VERSION,
+        auditId: audit.auditId,
+        sourceNamespace: sourceNamespaceForAudit(audit),
+        inputFingerprint: null,
+        coverageComplete: false,
+        advanced: false,
+        idempotent: false,
+        analysisStageBefore: stage.current,
+        analysisStageAfter: stage.current,
+        gates: Object.freeze({
+            stageScanned: gates.stageScanned === true,
+            candidateIngestionComplete: gates.candidateIngestionComplete === true,
+            indexComplete: gates.indexComplete === true,
+            pluginCoverageComplete: gates.pluginCoverageComplete === true,
+            graphMergeComplete: gates.graphMergeComplete === true,
+            traceAccountingComplete: gates.traceAccountingComplete === true,
+        }),
+        counts: Object.freeze({
+            inputGraphs: 0,
+            uniqueGraphs: 0,
+            mergedGraphs: 0,
+            nodes: 0,
+            edges: 0,
+            conflicts: 0,
+            unresolvedReferences: 0,
+            identityMismatches: 0,
+            semanticNodes: 0,
+            semanticEdges: 0,
+            chains: 0,
+            completeChains: 0,
+            unresolvedChains: 0,
+            contestedChains: 0,
+            cycles: 0,
+            exploredBranches: 0,
+        }),
+        truncation: Object.freeze({}),
+        blockers: Object.freeze(blockers),
+        validationQueue: Object.freeze([]),
+        cycles: Object.freeze([]),
+        chains: Object.freeze([]),
+    });
+}
+
+export function getAnalysisTraceSnapshot(sessionId, { auditId } = {}) {
+    const audit = getActiveAudit(sessionId);
+    if (!audit) return null;
+    if (auditId !== undefined && validateAuditId(auditId) !== audit.auditId) {
+        throw new Error("analysis trace snapshot auditId does not match active audit");
+    }
+    return audit.analysisTraceState?.snapshot
+        ? structuredClone(audit.analysisTraceState.snapshot)
+        : null;
+}
+
+export function traceAnalysisGraph(sessionId, { auditId } = {}) {
+    const audit = getActiveAudit(sessionId);
+    if (!audit) throw new Error("behavior trace requires an active audit");
+    const normalizedAuditId = validateAuditId(auditId);
+    if (normalizedAuditId !== audit.auditId) {
+        throw new Error("behavior trace auditId does not match active audit");
+    }
+    const stage = ensureAnalysisStageState(audit);
+    const indexState = ensureAnalysisIndexState(audit);
+    const index = buildAnalysisIndexSnapshot(indexState);
+    const plugins = buildPluginRunnerSnapshot(
+        ensureAnalysisPluginState(audit),
+        ensureBehaviorGraph(audit),
+    );
+    const councilSnapshot = modeUsesCouncil(audit.mode)
+        ? getCouncilLedgerSnapshot(sessionId, { auditId: audit.auditId })
+        : null;
+    const blockers = [];
+    const stageScanned = ["scanned", "traced", "validated", "finalized"].includes(stage.current);
+    let candidateIngestionComplete = !modeUsesCouncil(audit.mode);
+    if (modeUsesCouncil(audit.mode)) {
+        const successful = councilSnapshot?.finalization?.successfulRoleIds || [];
+        const submitted = new Set(
+            councilSnapshot?.submissions?.map((entry) => entry.roleId) || [],
+        );
+        candidateIngestionComplete = !!councilSnapshot?.finalization
+            && successful.length === submitted.size
+            && successful.every((roleId) => submitted.has(roleId));
+    }
+    if (!stageScanned) {
+        blockers.push({
+            code: "scan-stage-incomplete",
+            currentStage: stage.current,
+        });
+    }
+    if (!candidateIngestionComplete) {
+        blockers.push({ code: "candidate-ingestion-gates-incomplete" });
+    }
+    if (!index.complete) blockers.push({ code: "analysis-index-incomplete" });
+    if (!plugins.coverageComplete) blockers.push({ code: "analysis-plugin-coverage-incomplete" });
+    if (blockers.length > 0) {
+        return traceBlockerSnapshot(audit, stage, blockers, {
+            stageScanned,
+            candidateIngestionComplete,
+            indexComplete: index.complete,
+            pluginCoverageComplete: plugins.coverageComplete,
+        });
+    }
+
+    const graphs = [{
+        kind: "deterministic-plugin-seeds",
+        document: ensureBehaviorGraph(audit).toDocument(),
+    }];
+    const findings = [];
+    if (councilSnapshot) {
+        graphs.push({
+            kind: "council-fragments",
+            document: councilSnapshot.behaviorGraph,
+        });
+        findings.push(...councilSnapshot.findingLedger.findings);
+    }
+    const merged = mergeBehaviorGraphs({
+        auditId: audit.auditId,
+        sourceNamespace: sourceNamespaceForAudit(audit),
+        indexState,
+        graphs,
+        findings,
+    });
+    const traced = traceBehaviorGraph(merged);
+    const gates = Object.freeze({
+        stageScanned: true,
+        candidateIngestionComplete,
+        indexComplete: index.complete,
+        pluginCoverageComplete: plugins.coverageComplete,
+        graphMergeComplete: merged.coverageComplete,
+        traceAccountingComplete: traced.coverageComplete,
+    });
+    if (audit.analysisTraceState) {
+        if (audit.analysisTraceState.inputFingerprint !== traced.inputFingerprint) {
+            return traceBlockerSnapshot(audit, stage, [{
+                code: "trace-input-identity-changed",
+            }], {
+                stageScanned: true,
+                candidateIngestionComplete,
+                indexComplete: index.complete,
+                pluginCoverageComplete: plugins.coverageComplete,
+            });
+        }
+        return structuredClone({
+            ...audit.analysisTraceState.snapshot,
+            idempotent: true,
+        });
+    }
+
+    let snapshot = Object.freeze({
+        ...traced,
+        advanced: false,
+        idempotent: false,
+        analysisStageBefore: stage.current,
+        analysisStageAfter: stage.current,
+        gates,
+    });
+    audit.analysisTraceState = {
+        inputFingerprint: traced.inputFingerprint,
+        snapshot,
+    };
+    if (traced.coverageComplete && stage.current === "scanned") {
+        const advanced = advanceAnalysisStage(sessionId, {
+            auditId: audit.auditId,
+            from: "scanned",
+            to: "traced",
+        });
+        snapshot = Object.freeze({
+            ...snapshot,
+            advanced: true,
+            analysisStageAfter: advanced.current,
+        });
+        audit.analysisTraceState = {
+            inputFingerprint: traced.inputFingerprint,
+            snapshot,
+        };
+    }
+    return structuredClone(snapshot);
+}
+
+function validationRolesForAudit(audit) {
+    if (!Array.isArray(audit.councilRoleManifest)
+        || audit.councilRoleManifest.length === 0) {
+        throw new Error("validation requires the active council role manifest");
+    }
+    return audit.councilRoleManifest;
+}
+
+function requireValidationAudit(sessionId, auditId) {
+    const audit = getActiveAudit(sessionId);
+    if (!audit) throw new Error("validation requires an active audit");
+    if (!modeUsesCouncil(audit.mode)) {
+        throw new Error("validation is available only for council audits");
+    }
+    if (validateAuditId(auditId) !== audit.auditId) {
+        throw new Error("validation auditId does not match active audit");
+    }
+    return audit;
+}
+
+export function getAnalysisValidationSnapshot(sessionId, { auditId } = {}) {
+    const audit = getActiveAudit(sessionId);
+    if (!audit) return null;
+    if (auditId !== undefined && validateAuditId(auditId) !== audit.auditId) {
+        throw new Error("validation snapshot auditId does not match active audit");
+    }
+    return getCouncilLedgerSnapshot(sessionId, { auditId: audit.auditId })?.validation || null;
+}
+
+export function getAnalysisDecisionSnapshot(sessionId, { auditId } = {}) {
+    const audit = getActiveAudit(sessionId);
+    if (!audit) return null;
+    if (auditId !== undefined && validateAuditId(auditId) !== audit.auditId) {
+        throw new Error("decision snapshot auditId does not match active audit");
+    }
+    return getCouncilLedgerSnapshot(sessionId, {
+        auditId: audit.auditId,
+    })?.decisionSnapshot || null;
+}
+
+export function prepareAnalysisValidation(sessionId, {
+    auditId,
+    cursor = 0,
+    limit = 8,
+} = {}) {
+    const audit = requireValidationAudit(sessionId, auditId);
+    const stage = ensureAnalysisStageState(audit);
+    if (!["traced", "validated", "finalized"].includes(stage.current)) {
+        throw new Error(
+            `validation preparation requires analysis stage traced or later; current is ${stage.current}`,
+        );
+    }
+    const traceSnapshot = audit.analysisTraceState?.snapshot;
+    if (!traceSnapshot || traceSnapshot.coverageComplete !== true
+        || Object.values(traceSnapshot.truncation || {}).some(Boolean)
+        || Object.values(traceSnapshot.gates || {}).some((value) => value !== true)) {
+        throw new Error("validation preparation requires complete, untruncated graph tracing");
+    }
+    const roles = validationRolesForAudit(audit);
+    const councilSnapshot = getCouncilLedgerSnapshot(sessionId, {
+        auditId: audit.auditId,
+    });
+    if (!councilSnapshot?.finalization) {
+        throw new Error("validation preparation requires finalized council candidate ingestion");
+    }
+
+    let validationState;
+    mutateCouncilLedgerState(sessionId, {
+        auditId: audit.auditId,
+        roles,
+    }, (state) => {
+        if (!state.validationState) {
+            const findings = state.findingLedger.listFindings();
+            const invalidState = findings.find((finding) =>
+                finding.state !== "candidate" && finding.state !== "validating");
+            if (invalidState) {
+                throw new Error(
+                    `validation cannot start from finding state ${invalidState.state}: ${invalidState.id}`,
+                );
+            }
+            const plan = buildValidationPlan({
+                auditId: audit.auditId,
+                minSeverity: audit.validationMinSeverity,
+                findings,
+                candidateContexts: [...state.candidateContexts.entries()]
+                    .map(([findingId, context]) => ({ findingId, ...context })),
+                traceSnapshot,
+                graphDocuments: [
+                    ensureBehaviorGraph(audit).toDocument(),
+                    state.behaviorGraph.toDocument(),
+                ],
+                indexState: ensureAnalysisIndexState(audit),
+            });
+            for (const context of plan.contexts) {
+                state.findingLedger.beginValidation(context.finding.id, {
+                    auditId: audit.auditId,
+                });
+            }
+            state.validationState = createValidationState(plan);
+        }
+        validationState = state.validationState;
+    });
+
+    return {
+        analysisStageBefore: stage.current,
+        analysisStageAfter: ensureAnalysisStageState(audit).current,
+        validation: buildValidationSnapshot(validationState),
+        page: pageValidationContexts(validationState, { cursor, limit }),
+    };
+}
+
+export function submitAnalysisValidationDecision(sessionId, input) {
+    const audit = requireValidationAudit(sessionId, input?.audit_id);
+    const stage = ensureAnalysisStageState(audit);
+    if (!["traced", "validated", "finalized"].includes(stage.current)) {
+        throw new Error(`validation submission requires traced stage; current is ${stage.current}`);
+    }
+    const roles = validationRolesForAudit(audit);
+    let result;
+    mutateCouncilLedgerState(sessionId, {
+        auditId: audit.auditId,
+        roles,
+    }, (state) => {
+        const validationState = state.validationState;
+        if (!validationState) {
+            throw new Error("validation has not been prepared");
+        }
+        const context = validationState.contexts.get(input.finding_id);
+        if (!context) throw new Error(`finding is not in the validation queue: ${input.finding_id}`);
+        const otherType = input.decision_type === "confirm" ? "refute" : "confirm";
+        const otherDecision = validationState.decisions
+            .get(`${input.finding_id}:${otherType}`)?.decision || null;
+        const decision = validateStaticDecisionSubmission(input, {
+            context,
+            otherDecision,
+        });
+        result = storeStaticDecision(validationState, decision);
+    });
+    return {
+        analysisStageBefore: stage.current,
+        analysisStageAfter: ensureAnalysisStageState(audit).current,
+        idempotent: result.idempotent,
+        decision: result.decision,
+        validation: getAnalysisValidationSnapshot(sessionId, {
+            auditId: audit.auditId,
+        }),
+    };
+}
+
+export function adjudicateAnalysisValidation(sessionId, input) {
+    const audit = requireValidationAudit(sessionId, input?.audit_id);
+    const stage = ensureAnalysisStageState(audit);
+    if (!["traced", "validated", "finalized"].includes(stage.current)) {
+        throw new Error(`validation adjudication requires traced stage; current is ${stage.current}`);
+    }
+    const roles = validationRolesForAudit(audit);
+    let result;
+    mutateCouncilLedgerState(sessionId, {
+        auditId: audit.auditId,
+        roles,
+    }, (state) => {
+        const validationState = state.validationState;
+        if (!validationState) {
+            throw new Error("validation has not been prepared");
+        }
+        const context = validationState.contexts.get(input.finding_id);
+        if (!context) throw new Error(`finding is not in the validation queue: ${input.finding_id}`);
+        const confirmDecision = validationState.decisions
+            .get(`${input.finding_id}:confirm`)?.decision || null;
+        const refuteDecision = validationState.decisions
+            .get(`${input.finding_id}:refute`)?.decision || null;
+        const adjudication = validateAdjudicationSubmission(input, {
+            context,
+            confirmDecision,
+            refuteDecision,
+        });
+        const existing = validationState.adjudications.get(adjudication.findingId);
+        if (existing) {
+            result = storeAdjudication(validationState, adjudication);
+            return;
+        }
+        const finding = state.findingLedger.getFinding(adjudication.findingId);
+        if (!finding || finding.state !== "validating") {
+            throw new Error(
+                `finding ${adjudication.findingId} is not in validating state`,
+            );
+        }
+        state.findingLedger.applyValidationDecision({
+            schemaVersion: ANALYSIS_SCHEMA_VERSION,
+            auditId: audit.auditId,
+            findingId: adjudication.findingId,
+            validator: adjudication.adjudicatorId,
+            decision: adjudication.decision,
+            severity: adjudication.severity,
+            confidence: adjudication.confidence,
+            maliciousProjectFit: adjudication.maliciousProjectFit,
+            rationaleCode: adjudication.rationaleCode,
+            rationale: adjudication.rationale,
+            evidence: adjudication.evidence,
+        });
+        result = storeAdjudication(validationState, adjudication);
+    });
+    return {
+        analysisStageBefore: stage.current,
+        analysisStageAfter: ensureAnalysisStageState(audit).current,
+        idempotent: result.idempotent,
+        adjudication: result.decision,
+        validation: getAnalysisValidationSnapshot(sessionId, {
+            auditId: audit.auditId,
+        }),
+    };
+}
+
+export function finalizeAnalysisValidation(sessionId, { auditId } = {}) {
+    const audit = requireValidationAudit(sessionId, auditId);
+    const roles = validationRolesForAudit(audit);
+    const stage = ensureAnalysisStageState(audit);
+    let finalized;
+    mutateCouncilLedgerState(sessionId, {
+        auditId: audit.auditId,
+        roles,
+    }, (state) => {
+        if (!state.validationState) {
+            throw new Error("validation has not been prepared");
+        }
+        finalized = finalizeValidationState(state.validationState);
+        const validationSnapshot = buildValidationSnapshot(state.validationState);
+        const indexSnapshot = buildAnalysisIndexSnapshot(ensureAnalysisIndexState(audit));
+        const pluginSnapshot = buildPluginRunnerSnapshot(
+            ensureAnalysisPluginState(audit),
+            ensureBehaviorGraph(audit),
+        );
+        const traceSnapshot = audit.analysisTraceState?.snapshot || null;
+        const successfulRoleIds = state.finalization?.successfulRoleIds || [];
+        const submittedRoleIds = new Set(state.submissions.keys());
+        const councilComplete = !!state.finalization
+            && successfulRoleIds.length === submittedRoleIds.size
+            && successfulRoleIds.every((roleId) => submittedRoleIds.has(roleId));
+        const decisionSnapshot = buildTrustedDecisionSnapshot({
+            auditId: audit.auditId,
+            findings: state.findingLedger.listFindings(),
+            traceSnapshot,
+            validationSnapshot,
+            coverage: {
+                acquisitionComplete: indexSnapshot.complete,
+                indexComplete: indexSnapshot.complete,
+                pluginCoverageComplete: pluginSnapshot.coverageComplete,
+                councilComplete,
+                traceComplete: traceSnapshot?.coverageComplete === true
+                    && Object.values(traceSnapshot?.gates || {}).every(Boolean)
+                    && !Object.values(traceSnapshot?.truncation || {}).some(Boolean),
+                validationComplete: validationSnapshot.completion.complete === true
+                    && !Object.values(validationSnapshot.truncation || {}).some(Boolean)
+                    && !!validationSnapshot.finalization,
+                cacheTrackingComplete: true,
+            },
+        });
+        if (state.decisionSnapshot
+            && state.decisionSnapshot.decisionId !== decisionSnapshot.decisionId) {
+            throw new Error("validated decision snapshot identity changed");
+        }
+        state.decisionSnapshot ||= decisionSnapshot;
+        state.findingLedger.setRemediationPlan(generateRemediationPlan({
+            auditId: audit.auditId,
+            decisionSnapshot: state.decisionSnapshot,
+            traceSnapshot,
+        }));
+    });
+    let advanced = false;
+    let nextStage = ensureAnalysisStageState(audit);
+    if (nextStage.current === "traced") {
+        nextStage = advanceAnalysisStage(sessionId, {
+            auditId: audit.auditId,
+            from: "traced",
+            to: "validated",
+        });
+        advanced = true;
+    } else if (!["validated", "finalized"].includes(nextStage.current)) {
+        throw new Error(
+            `validation finalization requires traced stage; current is ${nextStage.current}`,
+        );
+    }
+    return {
+        analysisStageBefore: stage.current,
+        analysisStageAfter: nextStage.current,
+        advanced,
+        idempotent: finalized.idempotent || !advanced,
+        validation: getAnalysisValidationSnapshot(sessionId, {
+            auditId: audit.auditId,
+        }),
+        decisionSnapshot: getAnalysisDecisionSnapshot(sessionId, {
+            auditId: audit.auditId,
+        }),
+        remediation: getCouncilLedgerSnapshot(sessionId, {
+            auditId: audit.auditId,
+        })?.findingLedger.remediation || null,
+    };
+}
+
+function requireAnalysisAudit(sessionId, auditId) {
+    const audit = getActiveAudit(sessionId);
+    if (!audit) throw new Error("analysis index requires an active audit");
+    if (validateAuditId(auditId) !== audit.auditId) {
+        throw new Error("analysis index auditId does not match active audit");
+    }
+    return audit;
+}
+
+function normalizeIndexedSourcePath(path) {
+    const normalized = String(path || "").replace(/\\/g, "/").replace(/^\.\/+/, "");
+    if (!normalized || normalized.length > 1024 || normalized.startsWith("/")
+        || normalized.endsWith("/") || normalized.includes("//")
+        || normalized.split("/").some((segment) => segment === "." || segment === "..")
+        || /[\u0000-\u001f\u007f]/u.test(normalized)) {
+        throw new Error(`invalid indexed source path: ${JSON.stringify(path)}`);
+    }
+    return normalized;
+}
+
+function indexedSourceFileRecord(audit, path) {
+    const state = ensureAnalysisIndexState(audit);
+    const normalizedPath = normalizeIndexedSourcePath(path);
+    const index = state.fileIndex.get(normalizedPath);
+    const file = Number.isInteger(index) ? state.files[index] : null;
+    if (!file) throw new Error(`indexed source path was not enumerated: ${normalizedPath}`);
+    const evidenceReferences = Object.freeze(file.factIds.map((factId) => {
+        const factIndex = state.factIndex.get(factId);
+        return Number.isInteger(factIndex) ? state.facts[factIndex] : null;
+    }).filter(Boolean).map((fact) => Object.freeze({
+        startLine: fact.line,
+        endLine: fact.endLine,
+        excerptHash: fact.excerptHash,
+        factId: fact.id,
+        kind: fact.kind,
+    })));
+    return {
+        auditId: audit.auditId,
+        sourceKind: state.sourceKind,
+        path: normalizedPath,
+        size: file.size,
+        status: file.status,
+        classification: file.classification,
+        contentSha256: file.contentSha256,
+        blobSha: file.blobSha,
+        blobOrContentSha: file.blobSha || file.contentSha256,
+        lineCount: file.lineCount,
+        evidenceReferences,
+    };
+}
+
+export function listIndexedSourceFiles(sessionId, {
+    auditId,
+    cursor = 0,
+    limit = 1_000,
+} = {}) {
+    const audit = requireAnalysisAudit(sessionId, auditId);
+    if (!Number.isSafeInteger(cursor) || cursor < 0) {
+        throw new Error("indexed source cursor must be a non-negative integer");
+    }
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1_000) {
+        throw new Error("indexed source limit must be between 1 and 1000");
+    }
+    const state = ensureAnalysisIndexState(audit);
+    const paths = state.files.map((file) => file.path).sort((a, b) => a.localeCompare(b));
+    return Object.freeze({
+        auditId: audit.auditId,
+        sourceKind: state.sourceKind,
+        total: paths.length,
+        cursor,
+        nextCursor: cursor + limit < paths.length ? cursor + limit : null,
+        files: Object.freeze(paths.slice(cursor, cursor + limit).map((path) =>
+            Object.freeze(indexedSourceFileRecord(audit, path)))),
+    });
+}
+
+export function getIndexedSourceFile(sessionId, { auditId, path } = {}) {
+    const audit = requireAnalysisAudit(sessionId, auditId);
+    return Object.freeze(indexedSourceFileRecord(audit, path));
+}
+
+export function listAnalysisFacts(sessionId, {
+    auditId,
+    path = null,
+    kind = null,
+    cursor = 0,
+    limit = 256,
+} = {}) {
+    const audit = requireAnalysisAudit(sessionId, auditId);
+    const state = ensureAnalysisIndexState(audit);
+    const page = listIndexedFacts(state, { path, kind, cursor, limit });
+    return Object.freeze({
+        auditId: audit.auditId,
+        sourceKind: state.sourceKind,
+        path: path === null ? null : normalizeIndexedSourcePath(path),
+        kind,
+        ...page,
+        facts: Object.freeze(page.facts.map((fact) => Object.freeze(fact))),
+    });
+}
+
+export function validateIndexedEvidenceReference(sessionId, {
+    auditId,
+    path,
+    startLine,
+    endLine,
+    excerptHash,
+    blobSha,
+    contentSha256,
+} = {}) {
+    const file = getIndexedSourceFile(sessionId, { auditId, path });
+    if (file.status !== "indexed-text" || file.classification !== "text") {
+        throw new Error(`evidence source is not fully indexed text: ${file.path}`);
+    }
+    if (!Number.isSafeInteger(startLine) || startLine < 1
+        || !Number.isSafeInteger(endLine) || endLine < startLine
+        || !Number.isSafeInteger(file.lineCount) || endLine > file.lineCount) {
+        throw new Error(`evidence line range is outside indexed bounds for ${file.path}`);
+    }
+    const normalizedExcerptHash = String(excerptHash || "").toLowerCase();
+    if (!/^[a-f0-9]{64}$/u.test(normalizedExcerptHash)) {
+        throw new Error("evidence excerptHash must be a SHA-256 hex digest");
+    }
+    if (blobSha !== undefined && blobSha !== null
+        && String(blobSha).toLowerCase() !== file.blobOrContentSha) {
+        throw new Error(`evidence blob/content identity mismatch at ${file.path}`);
+    }
+    if (contentSha256 !== undefined && contentSha256 !== null
+        && String(contentSha256).toLowerCase() !== file.contentSha256) {
+        throw new Error(`evidence content SHA-256 mismatch at ${file.path}`);
+    }
+    const match = file.evidenceReferences.find((reference) =>
+        reference.startLine === startLine
+        && reference.endLine === endLine
+        && reference.excerptHash === normalizedExcerptHash);
+    if (!match) {
+        throw new Error(
+            `evidence excerpt hash/line range is not a trusted indexed fact: ${file.path}:${startLine}-${endLine}`,
+        );
+    }
+    return Object.freeze({
+        ok: true,
+        auditId: file.auditId,
+        sourceKind: file.sourceKind,
+        path: file.path,
+        startLine,
+        endLine,
+        excerptHash: normalizedExcerptHash,
+        blobSha: file.blobOrContentSha,
+        contentSha256: file.contentSha256,
+        factId: match.factId,
+        factKind: match.kind,
+    });
+}
+
+export function mutateAnalysisIndexState(sessionId, mutator) {
+    const audit = getActiveAudit(sessionId);
+    if (!audit || typeof mutator !== "function") return { ok: false };
+    const state = ensureAnalysisIndexState(audit);
+    return {
+        ok: true,
+        value: mutator(state),
+    };
+}
+
+export function maybeAdvanceAnalysisPrepared(sessionId) {
+    const audit = getActiveAudit(sessionId);
+    if (!audit) return null;
+    const stage = ensureAnalysisStageState(audit);
+    const index = buildAnalysisIndexSnapshot(ensureAnalysisIndexState(audit));
+    let analysisPlugins = buildPluginRunnerSnapshot(
+        ensureAnalysisPluginState(audit),
+        ensureBehaviorGraph(audit),
+    );
+    if (index.complete) {
+        analysisPlugins = runAnalysisPlugins({
+            auditId: audit.auditId,
+            indexState: ensureAnalysisIndexState(audit),
+            behaviorGraph: ensureBehaviorGraph(audit),
+            state: ensureAnalysisPluginState(audit),
+            sourceNamespace: sourceNamespaceForAudit(audit),
+        });
+    }
+    if (stage.current === "acquired" && index.complete && analysisPlugins.coverageComplete) {
+        audit.analysisStageState = validateAnalysisStageState({
+            schemaVersion: ANALYSIS_SCHEMA_VERSION,
+            auditId: audit.auditId,
+            current: "prepared",
+            history: ["acquired", "prepared"],
+        });
+    }
+    return {
+        analysisStageState: structuredClone(ensureAnalysisStageState(audit)),
+        analysisIndex: index,
+        analysisPlugins,
+        behaviorGraph: analysisPlugins.behaviorGraph,
+    };
+}
+
+export function getAnalysisStageState(sessionId, { auditId } = {}) {
+    const audit = getActiveAudit(sessionId);
+    if (!audit) return null;
+    if (auditId !== undefined && validateAuditId(auditId) !== audit.auditId) {
+        throw new Error("analysis stage state auditId does not match active audit");
+    }
+    return structuredClone(ensureAnalysisStageState(audit));
+}
+
+export function advanceAnalysisStage(sessionId, {
+    auditId,
+    from,
+    to,
+} = {}) {
+    const audit = getActiveAudit(sessionId);
+    if (!audit) throw new Error("cannot advance analysis stage without an active audit");
+    const normalizedAuditId = validateAuditId(auditId);
+    if (normalizedAuditId !== audit.auditId) {
+        throw new Error("analysis stage transition auditId does not match active audit");
+    }
+    if (!ANALYSIS_STAGES.includes(from)) {
+        throw new Error(`unknown analysis source stage: ${String(from)}`);
+    }
+    if (!ANALYSIS_STAGES.includes(to)) {
+        throw new Error(`unknown analysis target stage: ${String(to)}`);
+    }
+    const current = ensureAnalysisStageState(audit);
+    if (current.current !== from) {
+        throw new Error(
+            `stale analysis stage transition: expected ${from}, current is ${current.current}`,
+        );
+    }
+    if (to === from) return structuredClone(current);
+    const currentIndex = ANALYSIS_STAGES.indexOf(current.current);
+    if (ANALYSIS_STAGES[currentIndex + 1] !== to) {
+        throw new Error(`illegal analysis stage transition: ${current.current} -> ${to}`);
+    }
+    if (current.current === "acquired" && to === "prepared") {
+        const index = buildAnalysisIndexSnapshot(ensureAnalysisIndexState(audit));
+        if (!index.complete) {
+            throw new Error(
+                "analysis preparation incomplete: acquisition/enumeration/read/index requirements are not complete",
+            );
+        }
+        const analysisPlugins = runAnalysisPlugins({
+            auditId: audit.auditId,
+            indexState: ensureAnalysisIndexState(audit),
+            behaviorGraph: ensureBehaviorGraph(audit),
+            state: ensureAnalysisPluginState(audit),
+            sourceNamespace: sourceNamespaceForAudit(audit),
+        });
+        if (!analysisPlugins.coverageComplete) {
+            throw new Error(
+                "analysis preparation incomplete: one or more detected ecosystem plugins failed or truncated",
+            );
+        }
+    }
+    if (current.current === "scanned" && to === "traced"
+        && audit.mode !== "metadata_only") {
+        const trace = audit.analysisTraceState?.snapshot;
+        if (!trace || trace.coverageComplete !== true
+            || trace.gates?.candidateIngestionComplete !== true
+            || trace.gates?.indexComplete !== true
+            || trace.gates?.pluginCoverageComplete !== true
+            || trace.gates?.graphMergeComplete !== true
+            || trace.gates?.traceAccountingComplete !== true) {
+            throw new Error(
+                "analysis trace incomplete: scanned can advance to traced only after candidate, index, plugin, graph-merge, and bounded trace-accounting gates pass",
+            );
+        }
+    }
+    if (current.current === "traced" && to === "validated"
+        && modeUsesCouncil(audit.mode)) {
+        const validation = getCouncilLedgerSnapshot(sessionId, {
+            auditId: audit.auditId,
+        })?.validation;
+        if (!validation
+            || validation.completion?.complete !== true
+            || Object.values(validation.truncation || {}).some(Boolean)
+            || !validation.finalization) {
+            throw new Error(
+                "analysis validation incomplete: traced can advance to validated only after every required candidate has independent confirm/refute decisions and an adjudication, with no validation truncation",
+            );
+        }
+    }
+    const next = validateAnalysisStageState({
+        schemaVersion: ANALYSIS_SCHEMA_VERSION,
+        auditId: audit.auditId,
+        current: to,
+        history: [...current.history, to],
+    });
+    audit.analysisStageState = next;
+    return structuredClone(next);
 }
 
 /**
@@ -241,17 +1590,60 @@ export function getTrustedAuditContext({ sessionId, args, defaultBuildRoot }) {
         return {
             ok: true,
             buildRoot: audit.buildPath,
+            auditId: audit.auditId,
             mode: audit.mode,
             expectedClonePath: audit.expectedClonePath,
             resolvedClonePath: audit.resolvedClonePath || null,
             resolvedSha: audit.resolvedSha || null,
             owner: audit.owner || null,
             repo: audit.repo || null,
+            canonicalOwner: audit.canonicalOwner || null,
+            canonicalRepo: audit.canonicalRepo || null,
             ref: audit.ref || null,
             refType: audit.refType || null,
+            urlKind: audit.urlKind || null,
+            releaseSelector: audit.releaseSelector || null,
+            releaseIdentity: audit.releaseIdentity
+                ? structuredClone(audit.releaseIdentity)
+                : null,
+            rootTreeSha: audit.treeEnumerationState?.rootTreeSha || null,
             // Local-source audit fields. Null on URL-driven audits.
             localPath: audit.localPath || null,
+            localReportSlug: audit.localReportSlug || null,
+            localReportTimestamp: audit.localReportTimestamp || null,
             expectedReportPath: audit.expectedReportPath || null,
+            expectedQuarantinePath: audit.expectedQuarantinePath || null,
+            reportFinalization: audit.reportFinalization
+                ? structuredClone(audit.reportFinalization)
+                : null,
+            analysisStageState: structuredClone(ensureAnalysisStageState(audit)),
+            analysisIndex: buildAnalysisIndexSnapshot(ensureAnalysisIndexState(audit)),
+            analysisPlugins: buildPluginRunnerSnapshot(
+                ensureAnalysisPluginState(audit),
+                ensureBehaviorGraph(audit),
+            ),
+            behaviorGraph: {
+                auditId: audit.auditId,
+                nodeCount: ensureBehaviorGraph(audit).nodeCount,
+                edgeCount: ensureBehaviorGraph(audit).edgeCount,
+            },
+            analysisTrace: audit.analysisTraceState?.snapshot
+                ? {
+                    coverageComplete: audit.analysisTraceState.snapshot.coverageComplete,
+                    chainCount: audit.analysisTraceState.snapshot.counts.chains,
+                    conflictCount: audit.analysisTraceState.snapshot.counts.conflicts,
+                }
+                : null,
+            analysisValidation: modeUsesCouncil(audit.mode)
+                ? getCouncilLedgerSnapshot(sessionId, {
+                    auditId: audit.auditId,
+                })?.validation || null
+                : null,
+            analysisDecision: modeUsesCouncil(audit.mode)
+                ? getCouncilLedgerSnapshot(sessionId, {
+                    auditId: audit.auditId,
+                })?.decisionSnapshot || null
+                : null,
             hasActiveAudit: true,
         };
     }
@@ -274,16 +1666,31 @@ export function getTrustedAuditContext({ sessionId, args, defaultBuildRoot }) {
     return {
         ok: true,
         buildRoot: nodePath.resolve(String(fallback)),
+        auditId: null,
         mode: null,
         expectedClonePath: null,
         resolvedClonePath: null,
         resolvedSha: null,
         owner: null,
         repo: null,
+        canonicalOwner: null,
+        canonicalRepo: null,
         ref: null,
         refType: null,
+        urlKind: null,
+        releaseSelector: null,
+        releaseIdentity: null,
+        rootTreeSha: null,
         localPath: null,
+        localReportSlug: null,
+        localReportTimestamp: null,
         expectedReportPath: null,
+        expectedQuarantinePath: null,
+        reportFinalization: null,
+        analysisStageState: null,
+        analysisIndex: null,
+        analysisPlugins: null,
+        behaviorGraph: null,
         hasActiveAudit: false,
     };
 }
@@ -295,9 +1702,10 @@ const SHELL_TOOLS = new Set(["powershell", "bash", "run_command"]);
 
 // Patterns that indicate a package manager install. Each entry is
 // { pattern, requiredFlagRegex, ecosystem } — the install is denied
-// unless requiredFlagRegex matches the same command (or the audit
-// mode is audit_and_full_build, which deliberately allows lifecycle
-// scripts).
+// unless requiredFlagRegex matches the same command. The unregistered legacy
+// hook still preserves its historical full-mode exemption below, but that is
+// not the current wrapper behavior: safe/full modes use the same installer and
+// install lifecycle scripts remain suppressed.
 // v4-r2 round-5 (A-R5-1): superseded by hasSafeIgnoreScripts() etc.
 // Kept here as legacy reference; no callers remain.
 const NEVER_MATCH = /(?!)/;
@@ -1365,13 +2773,15 @@ export function inspectToolCall({ sessionId, toolName, toolArgs }) {
                 reason: `zerotrust-sourcecheck: package-manager install detected (${hit.rule.ecosystem}) but the audit mode '${audit.mode}' does not include a build step. Re-run with mode='audit_and_safe_build' or 'audit_and_full_build' to permit installation.`,
             };
         }
-        // In safe-build (not full-build) → must have the safe flag in
-        // THIS specific sub-command (per-sub-command isolation).
+        // Historical unregistered-hook behavior: safe-build (not full-build)
+        // must have the safe flag in THIS specific sub-command. This branch is
+        // retained as an executable specification only; the current safe/full
+        // wrapper path always supplies the same install safety flags.
         if (!FULL_BUILD_MODES.has(audit.mode)) {
             if (!hit.rule.safeChecker(hit.sub)) {
                 return {
                     decision: "deny",
-                    reason: `zerotrust-sourcecheck: ${hit.rule.ecosystem} install without ${hit.rule.flagHint}. The audit mode '${audit.mode}' requires this safe-flag (in the SAME sub-command as the install) to neutralize lifecycle scripts. Re-run with mode='audit_and_full_build' if you intentionally want lifecycle scripts to execute.`,
+                    reason: `zerotrust-sourcecheck: ${hit.rule.ecosystem} install without ${hit.rule.flagHint}. The audit mode '${audit.mode}' requires this safe-flag in the same sub-command. Use zerotrust_safe_install; current safe/full modes use the same installer and keep install lifecycle scripts suppressed.`,
                 };
             }
         }
@@ -1485,4 +2895,12 @@ export const __internals = {
     extractPathTokens,
     pathIsUnder,
     recordResolvedClonePath,
+    getAcquisitionCoverageState,
+    recordAcquisitionCoverageState,
+    mutateAcquisitionCoverageState,
+    getReleaseAssetCoverageState,
+    mutateReleaseAssetCoverageState,
+    ensureAnalysisStageState,
+    ensureAnalysisIndexState,
+    analysisSourceKindForMode,
 };

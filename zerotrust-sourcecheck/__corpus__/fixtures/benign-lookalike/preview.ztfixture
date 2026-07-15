@@ -1,0 +1,5 @@
+marker.fact("activation-surface","manual-preview","activation");
+marker.node("preview-start","activation","manual-preview","activation,benign");
+marker.node("preview-transform","capability","content-transform","benign,content-transform");
+marker.edge("preview-flow","invokes","preview-start","preview-transform","benign");
+marker.finding("preview-finding","refuted","low","medium","unlikely","transform","content-transform","preview-output","benign,benign-lookalike");

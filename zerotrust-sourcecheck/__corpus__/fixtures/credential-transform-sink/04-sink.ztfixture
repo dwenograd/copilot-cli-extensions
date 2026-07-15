@@ -1,0 +1,3 @@
+marker.node("sink","sink","external-send","external-send");
+marker.edge("transform-sink","flows-to","transform","sink","external-send");
+marker.finding("credential-chain","validated","high","high","strong","send","credential-read","external-sink","credential-like,encode-transform,external-send");

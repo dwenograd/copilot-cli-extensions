@@ -17,6 +17,13 @@ import { recordOutcomeHandler } from "../safeWrappers/outcomeWrapper.mjs";
 import { finalizeReportHandler } from "../safeWrappers/reportWrapper.mjs";
 import { safeInstallHandler } from "../safeWrappers/installWrapper.mjs";
 import { safeCloneHandler, __internals as cloneInternals } from "../safeWrappers/cloneWrapper.mjs";
+import {
+    activateAudit,
+    deactivateAudit,
+    getActiveAudit,
+    recordResolvedSha,
+} from "../enforcement.mjs";
+import { buildClonePath } from "../urlParser.mjs";
 
 const SESSION = "test-session-wrapper";
 const BUILD_ROOT = process.platform === "win32"
@@ -32,7 +39,16 @@ beforeEach(() => {
 // ---------- state.mjs: record / get / clear ----------
 
 test("recordCouncilOutcome stores + getRecordedOutcome retrieves", () => {
-    recordCouncilOutcome(SESSION, { verdict: "low", criticalCount: 0, highCount: 0, complete: true });
+    recordCouncilOutcome(SESSION, {
+        auditId: "state-test-audit",
+        owner: "octocat",
+        repo: "hello",
+        resolvedSha: "a".repeat(40),
+        verdict: "low",
+        criticalCount: 0,
+        highCount: 0,
+        complete: true,
+    });
     const got = getRecordedOutcome(SESSION);
     assert.equal(got.verdict, "low");
     assert.equal(got.criticalCount, 0);
@@ -40,13 +56,174 @@ test("recordCouncilOutcome stores + getRecordedOutcome retrieves", () => {
 });
 
 test("clearRecordedOutcome removes the entry", () => {
-    recordCouncilOutcome(SESSION, { verdict: "low", criticalCount: 0, highCount: 0, complete: true });
+    recordCouncilOutcome(SESSION, {
+        auditId: "state-test-audit",
+        verdict: "low",
+        criticalCount: 0,
+        highCount: 0,
+        complete: true,
+    });
     clearRecordedOutcome(SESSION);
     assert.equal(getRecordedOutcome(SESSION), null);
 });
 
 test("recordCouncilOutcome requires sessionId", () => {
     assert.throws(() => recordCouncilOutcome(null, { verdict: "low", criticalCount: 0, highCount: 0, complete: true }));
+});
+
+test("recordCouncilOutcome refuses critical-to-low overwrite", () => {
+    const identity = {
+        auditId: "immutable-critical",
+        owner: "octocat",
+        repo: "hello",
+        resolvedSha: "a".repeat(40),
+    };
+    recordCouncilOutcome(SESSION, {
+        ...identity,
+        verdict: "critical",
+        criticalCount: 1,
+        highCount: 0,
+        complete: true,
+    });
+    assert.throws(() => recordCouncilOutcome(SESSION, {
+        ...identity,
+        verdict: "low",
+        criticalCount: 0,
+        highCount: 0,
+        complete: true,
+    }), /immutable after first write/i);
+    assert.equal(getRecordedOutcome(SESSION).verdict, "critical");
+});
+
+test("recordCouncilOutcome refuses low-to-critical overwrite", () => {
+    const identity = {
+        auditId: "immutable-low",
+        owner: "octocat",
+        repo: "hello",
+        resolvedSha: "b".repeat(40),
+    };
+    recordCouncilOutcome(SESSION, {
+        ...identity,
+        verdict: "low",
+        criticalCount: 0,
+        highCount: 0,
+        complete: true,
+    });
+    assert.throws(() => recordCouncilOutcome(SESSION, {
+        ...identity,
+        verdict: "critical",
+        criticalCount: 1,
+        highCount: 0,
+        complete: true,
+    }), /immutable after first write/i);
+    assert.equal(getRecordedOutcome(SESSION).verdict, "low");
+});
+
+test("recordCouncilOutcome identical retry is idempotent", () => {
+    const outcome = {
+        auditId: "immutable-retry",
+        owner: "OctoCat",
+        repo: "Hello",
+        resolvedSha: "C".repeat(40),
+        verdict: "low",
+        criticalCount: 0,
+        highCount: 0,
+        complete: true,
+    };
+    const first = recordCouncilOutcome(SESSION, outcome);
+    const second = recordCouncilOutcome(SESSION, outcome);
+    assert.equal(second, first);
+    assert.equal(getRecordedOutcome(SESSION).recordedAt, first.recordedAt);
+});
+
+test("recordCouncilOutcome refuses identity mutation within a generation", () => {
+    recordCouncilOutcome(SESSION, {
+        auditId: "identity-one",
+        owner: "octocat",
+        repo: "hello",
+        resolvedSha: "d".repeat(40),
+        verdict: "low",
+        criticalCount: 0,
+        highCount: 0,
+        complete: true,
+    });
+    assert.throws(() => recordCouncilOutcome(SESSION, {
+        auditId: "identity-two",
+        owner: "octocat",
+        repo: "hello",
+        resolvedSha: "d".repeat(40),
+        verdict: "low",
+        criticalCount: 0,
+        highCount: 0,
+        complete: true,
+    }), /immutable after first write/i);
+});
+
+test("recordCouncilOutcome refuses count or completion mutation", () => {
+    const base = {
+        auditId: "field-mutation",
+        owner: "octocat",
+        repo: "hello",
+        resolvedSha: "e".repeat(40),
+        verdict: "medium",
+        criticalCount: 0,
+        highCount: 0,
+        complete: true,
+    };
+    recordCouncilOutcome(SESSION, base);
+    assert.throws(() => recordCouncilOutcome(SESSION, {
+        ...base,
+        highCount: 1,
+    }), /immutable after first write/i);
+    assert.throws(() => recordCouncilOutcome(SESSION, {
+        ...base,
+        complete: false,
+    }), /immutable after first write/i);
+});
+
+test("new audit generation clears the prior immutable outcome", () => {
+    activateAudit({
+        sessionId: SESSION,
+        buildPath: BUILD_ROOT,
+        mode: "audit_and_safe_build_council",
+        expectedClonePath: nodePath.join(BUILD_ROOT, "placeholder-one"),
+        owner: "octocat",
+        repo: "hello",
+    });
+    const firstAudit = getActiveAudit(SESSION);
+    recordCouncilOutcome(SESSION, {
+        auditId: firstAudit.auditId,
+        owner: firstAudit.owner,
+        repo: firstAudit.repo,
+        resolvedSha: null,
+        verdict: "critical",
+        criticalCount: 1,
+        highCount: 0,
+        complete: true,
+    });
+    activateAudit({
+        sessionId: SESSION,
+        buildPath: BUILD_ROOT,
+        mode: "audit_and_safe_build_council",
+        expectedClonePath: nodePath.join(BUILD_ROOT, "placeholder-two"),
+        owner: "octocat",
+        repo: "hello",
+    });
+    const secondAudit = getActiveAudit(SESSION);
+    assert.notEqual(secondAudit.auditId, firstAudit.auditId);
+    assert.equal(getRecordedOutcome(SESSION), null);
+    recordCouncilOutcome(SESSION, {
+        auditId: secondAudit.auditId,
+        owner: secondAudit.owner,
+        repo: secondAudit.repo,
+        resolvedSha: null,
+        verdict: "low",
+        criticalCount: 0,
+        highCount: 0,
+        complete: true,
+    });
+    assert.equal(getRecordedOutcome(SESSION).verdict, "low");
+    deactivateAudit(SESSION);
 });
 
 // ---------- evaluateCouncilGate semantics ----------
@@ -101,12 +278,31 @@ test("evaluateCouncilGate: incomplete → blocked unless overrideOnFailure (NOT 
 // ---------- recordOutcomeHandler input validation ----------
 
 test("recordOutcomeHandler accepts valid input", async () => {
-    const r = await recordOutcomeHandler(
-        { verdict: "low", critical_count: 0, high_count: 0, complete: true },
-        { sessionId: SESSION },
-    );
-    assert.equal(r.resultType, "success");
-    assert.ok(getRecordedOutcome(SESSION));
+    activateAudit({
+        sessionId: SESSION,
+        buildPath: BUILD_ROOT,
+        mode: "audit_and_safe_build_council",
+        expectedClonePath: buildClonePath(BUILD_ROOT, "octocat", "Hello", "0".repeat(40)),
+        owner: "octocat",
+        repo: "Hello",
+    });
+    recordResolvedSha(SESSION, "a".repeat(40));
+    try {
+        const r = await recordOutcomeHandler(
+            {
+                audit_id: getActiveAudit(SESSION).auditId,
+                verdict: "low",
+                critical_count: 0,
+                high_count: 0,
+                complete: true,
+            },
+            { sessionId: SESSION },
+        );
+        assert.equal(r.resultType, "success");
+        assert.ok(getRecordedOutcome(SESSION));
+    } finally {
+        deactivateAudit(SESSION);
+    }
 });
 
 test("recordOutcomeHandler rejects unknown verdict", async () => {
@@ -219,7 +415,7 @@ test("finalizeReportHandler rejects oversized markdown_body", async () => {
     const r = await finalizeReportHandler({
         owner: "octocat",
         repo: "Hello-World",
-        short_sha: "abcdef0",
+        resolved_sha: "a".repeat(40),
         markdown_body: "X".repeat(2 * 1024 * 1024),
     });
     assert.equal(r.resultType, "failure");
@@ -229,13 +425,13 @@ test("finalizeReportHandler rejects bad owner (would escape path)", async () => 
     const r = await finalizeReportHandler({
         owner: "..",
         repo: "Hello-World",
-        short_sha: "abcdef0",
+        resolved_sha: "a".repeat(40),
         markdown_body: "test",
     });
     assert.equal(r.resultType, "failure");
 });
 
-test("finalizeReportHandler rejects bad short_sha", async () => {
+test("finalizeReportHandler rejects legacy short_sha", async () => {
     const r = await finalizeReportHandler({
         owner: "octocat",
         repo: "Hello-World",
@@ -246,7 +442,7 @@ test("finalizeReportHandler rejects bad short_sha", async () => {
 });
 
 // Round-17: same defense-in-depth class as sweepWrapper. finalize_report
-// writes 1MB markdown to <build_root>/_reports/<owner>-<repo>-<sha>/REPORT.md.
+// writes 1MB markdown to <build_root>/_reports/zt-v1-<sha256-identity>/REPORT.md.
 // If sessionId is missing and the agent supplies a non-default build_root,
 // refuse — without this check, a falsy-sessionId tool invocation could
 // redirect writes anywhere on disk (creating spurious _reports/... dirs).
@@ -256,13 +452,13 @@ test("round-17: finalizeReportHandler refuses non-default build_root when sessio
             build_root: "C:\\Users\\testuser",
             owner: "octocat",
             repo: "Hello-World",
-            short_sha: "abc1234",
+            resolved_sha: "a".repeat(40),
             markdown_body: "attacker content",
         },
         {},
     );
     assert.equal(r.resultType, "failure");
-    assert.match(r.textResultForLlm, /does not match default build_root/i);
+    assert.match(r.textResultForLlm, /no active audit/i);
 });
 
 test("round-17: finalizeReportHandler refuses non-default build_root when sessionId is undefined", async () => {
@@ -271,13 +467,13 @@ test("round-17: finalizeReportHandler refuses non-default build_root when sessio
             build_root: "C:\\evil",
             owner: "foo",
             repo: "bar",
-            short_sha: "0000000",
+            resolved_sha: "a".repeat(40),
             markdown_body: "x",
         },
         { sessionId: undefined },
     );
     assert.equal(r.resultType, "failure");
-    assert.match(r.textResultForLlm, /does not match default build_root/i);
+    assert.match(r.textResultForLlm, /no active audit/i);
 });
 
 test("round-17: finalizeReportHandler refuses non-default build_root when sessionId is empty string", async () => {
@@ -286,13 +482,13 @@ test("round-17: finalizeReportHandler refuses non-default build_root when sessio
             build_root: "C:\\Windows\\Temp",
             owner: "foo",
             repo: "bar",
-            short_sha: "0000000",
+            resolved_sha: "a".repeat(40),
             markdown_body: "x",
         },
         { sessionId: "" },
     );
     assert.equal(r.resultType, "failure");
-    assert.match(r.textResultForLlm, /does not match default build_root/i);
+    assert.match(r.textResultForLlm, /no active audit/i);
 });
 
 // ---------- safeCloneHandler input validation (no network) ----------

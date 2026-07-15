@@ -15,9 +15,8 @@
 //     hardening) so a repo-planted `gh.cmd` cannot shadow-execute.
 //   - File contents are returned through the tool result. This module performs
 //     no source-file write, but host/runtime output retention is out of scope.
-//   - There is a per-fetch byte cap (configurable). Above the cap, only
-//     SHA256 + size + first-N-bytes are returned (so the audit can still
-//     reason about large files without pulling them into memory).
+//   - There is a per-fetch byte cap (configurable). Above the cap, the
+//     response stays bounded and mandatory coverage remains incomplete.
 
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -25,8 +24,8 @@ import { createHash } from "node:crypto";
 import { resolveTrustedProgram } from "./programResolver.mjs";
 
 // Per-fetch caps:
-//   - DEFAULT_MAX_FILE_BYTES (5MB): hard ceiling for any fetch attempt.
-//     Files over this return metadata + 4KB preview only.
+//   - DEFAULT_MAX_FILE_BYTES (5MB): hard ceiling for mandatory completion.
+//     Over-ceiling responses stay bounded and remain coverage gaps.
 //   - DEFAULT_TEXT_INLINE_BYTES (256KB): max text content returned inline.
 //     Larger TEXT files get truncated to this size with a `truncated: true`
 //     marker. Most source files are well under 256KB.
@@ -50,8 +49,9 @@ const GH_TIMEOUT_MS = 60_000;
 const OWNER_RE = /^[A-Za-z0-9._-]{1,100}$/;
 const REPO_RE = /^[A-Za-z0-9._-]{1,100}$/;
 const SHA_RE = /^[0-9a-f]{40}$/;
-// Path inside repo: forward-slash-separated, allowed chars only, no `..`.
-const REPO_PATH_RE = /^[A-Za-z0-9._/-]{1,1024}$/;
+// Path inside repo: forward-slash-separated, no controls or backslashes.
+// Individual path segments are URL-encoded before calling the Contents API.
+const REPO_PATH_RE = /^[^\u0000-\u001f\u007f\\]+$/u;
 
 function ensureValidOwnerRepo(owner, repo) {
     if (typeof owner !== "string" || !OWNER_RE.test(owner) || owner === "." || owner === "..") {
@@ -69,12 +69,19 @@ function ensureValidSha(sha) {
 }
 
 function ensureValidPath(path) {
-    if (typeof path !== "string" || !REPO_PATH_RE.test(path)) {
+    if (typeof path !== "string" || path.length < 1 || path.length > 1024
+        || !REPO_PATH_RE.test(path)) {
         throw new Error(`invalid repo path: ${JSON.stringify(path)}`);
     }
-    if (path.includes("..") || path.startsWith("/") || path.endsWith("/") || path.includes("//")) {
+    if (path.startsWith("/") || path.endsWith("/") || path.includes("//")
+        || path.split("/").some((segment) => segment === "." || segment === "..")) {
         throw new Error(`repo path has traversal / leading-trailing slash / double slash: ${JSON.stringify(path)}`);
     }
+}
+
+function encodeRepoPath(path) {
+    ensureValidPath(path);
+    return path.split("/").map(encodeURIComponent).join("/");
 }
 
 function runGh(args) {
@@ -99,205 +106,293 @@ function runGh(args) {
     return stdout;
 }
 
-/**
- * Resolve a ref (branch / tag / sha-prefix / "HEAD") to a 40-char SHA via the
- * GitHub API. Returns the SHA on success, throws on failure.
- *
- * refType is one of: "release_tag" | "branch_or_tag" | "pr_head" | "commit" | null
- *   - "commit": ref is already a SHA (validated by caller); we just check shape.
- *   - "release_tag": queries refs/tags/<ref>, peels annotated tags.
- *   - "branch_or_tag": queries refs/heads/<ref> first, falls back to refs/tags/<ref>.
- *   - "pr_head": ref is "refs/pull/<n>/head"; query that.
- *   - null/unknown: tries "branch_or_tag" semantics.
- */
-export function resolveRefToSha(owner, repo, ref, refType) {
-    ensureValidOwnerRepo(owner, repo);
-    if (refType === "commit" || (typeof ref === "string" && SHA_RE.test(ref))) {
-        ensureValidSha(ref);
-        return ref;
-    }
-
-    const refToResolve = ref || "HEAD";
-    if (typeof refToResolve !== "string" || !/^[A-Za-z0-9._/\-]{1,255}$/.test(refToResolve)) {
-        throw new Error(`invalid ref: ${JSON.stringify(refToResolve)}`);
-    }
-
-    // For HEAD, use the default-branch resolution path
-    if (refToResolve === "HEAD") {
-        const repoMeta = JSON.parse(runGh(["api", `repos/${owner}/${repo}`]));
-        const defaultBranch = repoMeta.default_branch;
-        if (!defaultBranch || typeof defaultBranch !== "string") {
-            throw new Error(`gh api repos/${owner}/${repo} did not return a default_branch`);
-        }
-        const branchInfo = JSON.parse(runGh(["api", `repos/${owner}/${repo}/branches/${defaultBranch}`]));
-        const sha = branchInfo?.commit?.sha;
-        if (!sha || !SHA_RE.test(sha)) {
-            throw new Error(`could not resolve HEAD for ${owner}/${repo} (default branch ${defaultBranch})`);
-        }
-        return sha;
-    }
-
-    let candidatePaths;
-    switch (refType) {
-        case "release_tag":
-            candidatePaths = [`repos/${owner}/${repo}/git/refs/tags/${refToResolve}`];
-            break;
-        case "pr_head": {
-            // ref is "refs/pull/<n>/head"; extract the number
-            const m = refToResolve.match(/^refs\/pull\/(\d+)\/head$/);
-            if (!m) throw new Error(`pr_head ref must be refs/pull/<n>/head, got ${JSON.stringify(refToResolve)}`);
-            candidatePaths = [`repos/${owner}/${repo}/pulls/${m[1]}`];
-            break;
-        }
-        case "branch_or_tag":
-        default:
-            candidatePaths = [
-                `repos/${owner}/${repo}/git/refs/heads/${refToResolve}`,
-                `repos/${owner}/${repo}/git/refs/tags/${refToResolve}`,
-            ];
-            break;
-    }
-
-    let lastError;
-    for (const apiPath of candidatePaths) {
-        let raw;
-        try {
-            raw = runGh(["api", apiPath]);
-        } catch (err) {
-            lastError = err;
-            continue;
-        }
-        let parsed;
-        try {
-            parsed = JSON.parse(raw);
-        } catch (err) {
-            lastError = err;
-            continue;
-        }
-
-        // PR-head shape
-        if (refType === "pr_head") {
-            const sha = parsed?.head?.sha;
-            if (sha && SHA_RE.test(sha)) return sha;
-            lastError = new Error(`PR API response missing head.sha`);
-            continue;
-        }
-
-        // git/refs shape
-        const objectSha = parsed?.object?.sha;
-        const objectType = parsed?.object?.type;
-        if (objectSha && SHA_RE.test(objectSha)) {
-            // Annotated tag: peel to commit by fetching the tag object
-            if (refType === "release_tag" && objectType === "tag") {
-                try {
-                    const tagObj = JSON.parse(runGh(["api", `repos/${owner}/${repo}/git/tags/${objectSha}`]));
-                    const peeled = tagObj?.object?.sha;
-                    if (peeled && SHA_RE.test(peeled)) return peeled;
-                } catch (err) {
-                    // fall through to returning the tag-object SHA as a last resort
-                }
-            }
-            return objectSha;
-        }
-        lastError = new Error(`gh api ${apiPath} returned no usable object.sha`);
-    }
-    throw new Error(`could not resolve ref ${JSON.stringify(refToResolve)} for ${owner}/${repo}: ${lastError?.message || "no candidates resolved"}`);
+function requestApiJson(apiPath, requestJson) {
+    if (typeof requestJson === "function") return requestJson(apiPath);
+    return JSON.parse(runGh(["api", apiPath]));
 }
 
-/**
- * List the repo's tree at the given SHA, recursively. Returns an array of
- * { path, type, size, sha } entries. Tree may be truncated by GitHub for
- * very large repos — caller is told via `truncated: true` in the result.
- *
- * v4.2: also enforces our own entry-count cap (default 5000) to bound the
- * response size — a malicious repo with attacker-controlled file names
- * could otherwise flood the response with payload-shaped path strings,
- * triggering a runtime spill of the tool output.
- */
-const DEFAULT_MAX_ENTRIES = 5000;
+function ensureValidRef(ref) {
+    if (typeof ref !== "string" || !/^[A-Za-z0-9._/\-]{1,255}$/.test(ref)) {
+        throw new Error(`invalid ref: ${JSON.stringify(ref)}`);
+    }
+    if (ref.startsWith("/") || ref.endsWith("/") || ref.includes("//")
+        || ref.split("/").some((segment) => segment === "." || segment === "..")) {
+        throw new Error(`invalid ref path: ${JSON.stringify(ref)}`);
+    }
+}
 
-export function listTree(owner, repo, sha, { maxEntries = DEFAULT_MAX_ENTRIES } = {}) {
+function refPath(ref) {
+    ensureValidRef(ref);
+    return ref.split("/").map(encodeURIComponent).join("/");
+}
+
+export function getCommitIdentity(owner, repo, sha, { requestJson } = {}) {
     ensureValidOwnerRepo(owner, repo);
     ensureValidSha(sha);
-    const raw = runGh(["api", `repos/${owner}/${repo}/git/trees/${sha}?recursive=1`]);
-    const parsed = JSON.parse(raw);
-    const allEntries = Array.isArray(parsed?.tree) ? parsed.tree : [];
+    const parsed = requestApiJson(`repos/${owner}/${repo}/git/commits/${sha}`, requestJson);
+    const commitSha = parsed?.sha;
+    const rootTreeSha = parsed?.tree?.sha;
+    if (!SHA_RE.test(commitSha || "") || commitSha.toLowerCase() !== sha.toLowerCase()) {
+        throw new Error(`commit identity mismatch: requested ${sha}, API returned ${JSON.stringify(commitSha)}`);
+    }
+    if (!SHA_RE.test(rootTreeSha || "")) {
+        throw new Error(`commit ${sha} response did not include a valid tree.sha`);
+    }
+    return { commitSha: commitSha.toLowerCase(), rootTreeSha: rootTreeSha.toLowerCase() };
+}
 
-    let entries = allEntries;
-    let entriesTruncated = false;
-    if (entries.length > maxEntries) {
-        entries = entries.slice(0, maxEntries);
-        entriesTruncated = true;
+function resolveTagReference(owner, repo, tagName, { requestJson, maxPeelDepth = 8 } = {}) {
+    ensureValidOwnerRepo(owner, repo);
+    ensureValidRef(tagName);
+    const expectedRef = `refs/tags/${tagName}`;
+    const refInfo = requestApiJson(
+        `repos/${owner}/${repo}/git/refs/tags/${refPath(tagName)}`,
+        requestJson,
+    );
+    if (refInfo?.ref !== expectedRef) {
+        throw new Error(`tag ref mismatch: requested ${expectedRef}, API returned ${JSON.stringify(refInfo?.ref)}`);
+    }
+
+    const tagRefSha = refInfo?.object?.sha;
+    let objectSha = tagRefSha;
+    let objectType = refInfo?.object?.type;
+    if (!SHA_RE.test(objectSha || "")) {
+        throw new Error(`tag ${tagName} response did not include a valid object.sha`);
+    }
+
+    const seen = new Set();
+    let peelDepth = 0;
+    let tagObjectSha = null;
+    while (objectType === "tag") {
+        if (peelDepth >= maxPeelDepth) {
+            throw new Error(`annotated tag ${tagName} exceeds peel-depth limit ${maxPeelDepth}`);
+        }
+        const normalized = objectSha.toLowerCase();
+        if (seen.has(normalized)) throw new Error(`annotated tag ${tagName} contains a peel cycle`);
+        seen.add(normalized);
+        if (!tagObjectSha) tagObjectSha = normalized;
+
+        const tagObject = requestApiJson(
+            `repos/${owner}/${repo}/git/tags/${normalized}`,
+            requestJson,
+        );
+        objectSha = tagObject?.object?.sha;
+        objectType = tagObject?.object?.type;
+        if (!SHA_RE.test(objectSha || "")) {
+            throw new Error(`annotated tag object ${normalized} did not include a valid target sha`);
+        }
+        peelDepth += 1;
+    }
+    if (objectType !== "commit") {
+        throw new Error(`tag ${tagName} resolves to ${JSON.stringify(objectType)}, not a commit`);
     }
 
     return {
-        sha: parsed?.sha || sha,
+        tagName,
+        tagRefSha: tagRefSha.toLowerCase(),
+        tagObjectSha,
+        annotated: peelDepth > 0,
+        peelDepth,
+        commitSha: objectSha.toLowerCase(),
+    };
+}
+
+export function resolveReleaseIdentity(owner, repo, {
+    requestedTag = null,
+    requestJson,
+} = {}) {
+    ensureValidOwnerRepo(owner, repo);
+    if (requestedTag !== null) ensureValidRef(requestedTag);
+
+    const releaseEndpoint = requestedTag
+        ? `repos/${owner}/${repo}/releases/tags/${refPath(requestedTag)}`
+        : `repos/${owner}/${repo}/releases/latest`;
+    const release = requestApiJson(releaseEndpoint, requestJson);
+    const releaseId = release?.id;
+    if ((!Number.isSafeInteger(releaseId) || releaseId <= 0)
+        && !(typeof releaseId === "string" && /^[1-9][0-9]{0,19}$/.test(releaseId))) {
+        throw new Error(`release response did not include a valid positive id`);
+    }
+    const tagName = release?.tag_name;
+    ensureValidRef(tagName);
+    if (requestedTag !== null && tagName !== requestedTag) {
+        throw new Error(`release tag mismatch: requested ${JSON.stringify(requestedTag)}, API returned ${JSON.stringify(tagName)}`);
+    }
+
+    const tag = resolveTagReference(owner, repo, tagName, { requestJson });
+    const commit = getCommitIdentity(owner, repo, tag.commitSha, { requestJson });
+    let targetCommitish = null;
+    if (typeof release?.target_commitish === "string") {
+        try {
+            ensureValidRef(release.target_commitish);
+            targetCommitish = release.target_commitish;
+        } catch {
+            targetCommitish = null;
+        }
+    }
+    return {
+        releaseId: String(releaseId),
+        tagName,
+        targetCommitish,
+        sourceCommitSha: commit.commitSha,
+        rootTreeSha: commit.rootTreeSha,
+        tagRefSha: tag.tagRefSha,
+        tagObjectSha: tag.tagObjectSha,
+        annotatedTag: tag.annotated,
+        tagPeelDepth: tag.peelDepth,
+    };
+}
+
+/**
+ * Resolve a ref (branch / tag / SHA / HEAD) to a final commit SHA.
+ * Annotated tags are peeled until a commit is reached; tag-object SHAs are
+ * never accepted as source identities.
+ */
+export function resolveRefToSha(owner, repo, ref, refType, { requestJson } = {}) {
+    ensureValidOwnerRepo(owner, repo);
+    if (refType === "commit" || (typeof ref === "string" && SHA_RE.test(ref))) {
+        ensureValidSha(ref);
+        return ref.toLowerCase();
+    }
+
+    const refToResolve = ref || "HEAD";
+    ensureValidRef(refToResolve);
+
+    if (refToResolve === "HEAD") {
+        const repoMeta = requestApiJson(`repos/${owner}/${repo}`, requestJson);
+        const defaultBranch = repoMeta?.default_branch;
+        ensureValidRef(defaultBranch);
+        const branchInfo = requestApiJson(
+            `repos/${owner}/${repo}/branches/${refPath(defaultBranch)}`,
+            requestJson,
+        );
+        const sha = branchInfo?.commit?.sha;
+        if (!SHA_RE.test(sha || "")) {
+            throw new Error(`could not resolve HEAD for ${owner}/${repo} (default branch ${defaultBranch})`);
+        }
+        return sha.toLowerCase();
+    }
+
+    if (refType === "pr_head") {
+        const match = refToResolve.match(/^refs\/pull\/(\d+)\/head$/);
+        if (!match) throw new Error(`pr_head ref must be refs/pull/<n>/head, got ${JSON.stringify(refToResolve)}`);
+        const parsed = requestApiJson(`repos/${owner}/${repo}/pulls/${match[1]}`, requestJson);
+        const sha = parsed?.head?.sha;
+        if (!SHA_RE.test(sha || "")) throw new Error(`PR API response missing head.sha`);
+        return sha.toLowerCase();
+    }
+
+    if (refType === "release_tag") {
+        return resolveTagReference(owner, repo, refToResolve, { requestJson }).commitSha;
+    }
+
+    let branchError;
+    try {
+        const parsed = requestApiJson(
+            `repos/${owner}/${repo}/git/refs/heads/${refPath(refToResolve)}`,
+            requestJson,
+        );
+        const expectedRef = `refs/heads/${refToResolve}`;
+        if (parsed?.ref !== expectedRef) {
+            throw new Error(`branch ref mismatch: requested ${expectedRef}, API returned ${JSON.stringify(parsed?.ref)}`);
+        }
+        if (parsed?.object?.type !== "commit" || !SHA_RE.test(parsed?.object?.sha || "")) {
+            throw new Error(`branch ${refToResolve} did not resolve to a commit`);
+        }
+        return parsed.object.sha.toLowerCase();
+    } catch (err) {
+        branchError = err;
+    }
+
+    try {
+        return resolveTagReference(owner, repo, refToResolve, { requestJson }).commitSha;
+    } catch (tagError) {
+        throw new Error(`could not resolve ref ${JSON.stringify(refToResolve)} for ${owner}/${repo}: branch=${branchError.message}; tag=${tagError.message}`);
+    }
+}
+
+/**
+ * List one tree object. The response SHA must exactly match the requested
+ * discovered tree SHA; callers use this to reject arbitrary-tree substitution.
+ */
+export const DEFAULT_MAX_ENTRIES = 5000;
+export const DEFAULT_MAX_DISCOVERED_SUBTREES = 10_000;
+
+export function listTreeBySha(owner, repo, treeSha, {
+    recursive = true,
+    maxEntries = DEFAULT_MAX_ENTRIES,
+    maxDiscoveredSubtrees = DEFAULT_MAX_DISCOVERED_SUBTREES,
+    requestJson,
+} = {}) {
+    ensureValidOwnerRepo(owner, repo);
+    ensureValidSha(treeSha);
+    const apiPath = `repos/${owner}/${repo}/git/trees/${treeSha}${recursive ? "?recursive=1" : ""}`;
+    const parsed = requestApiJson(apiPath, requestJson);
+    if (!SHA_RE.test(parsed?.sha || "") || parsed.sha.toLowerCase() !== treeSha.toLowerCase()) {
+        throw new Error(`tree identity mismatch: requested ${treeSha}, API returned ${JSON.stringify(parsed?.sha)}`);
+    }
+    const allEntries = Array.isArray(parsed?.tree) ? parsed.tree : [];
+    const normalizedEntries = allEntries.map((entry) => {
+        if (typeof entry?.path !== "string" || entry.path.length < 1 || entry.path.length > 1024
+            || /[\u0000-\u001f\u007f\\]/u.test(entry.path)
+            || entry.path.startsWith("/") || entry.path.endsWith("/") || entry.path.includes("//")
+            || entry.path.split("/").some((segment) => segment === "." || segment === "..")) {
+            throw new Error(`tree response contained an invalid path`);
+        }
+        if (!["blob", "tree", "commit"].includes(entry?.type) || !SHA_RE.test(entry?.sha || "")) {
+            throw new Error(`tree response contained an invalid entry for ${JSON.stringify(entry?.path)}`);
+        }
+        return {
+            path: entry.path,
+            type: entry.type,
+            size: Number.isSafeInteger(entry.size) && entry.size > 0 ? entry.size : 0,
+            sha: entry.sha.toLowerCase(),
+        };
+    });
+
+    const discovered = normalizedEntries.filter((entry) => entry.type === "tree");
+    return {
+        treeSha: treeSha.toLowerCase(),
+        recursive: !!recursive,
         truncated: !!parsed?.truncated,
-        entriesTruncated,
-        totalEntryCount: allEntries.length,
-        entries: entries.map((e) => ({
-            path: e.path,
-            type: e.type,
-            size: e.size || 0,
-            sha: e.sha,
-        })),
+        entriesTruncated: normalizedEntries.length > maxEntries,
+        totalEntryCount: normalizedEntries.length,
+        entries: normalizedEntries.slice(0, maxEntries),
+        discoveredSubtrees: discovered.slice(0, maxDiscoveredSubtrees),
+        discoveryTruncated: discovered.length > maxDiscoveredSubtrees,
+    };
+}
+
+/**
+ * Back-compatible root-tree listing helper. `sha` remains the commit SHA;
+ * `rootTreeSha` is the distinct Git tree identity used for subtree traversal.
+ */
+export function listTree(owner, repo, sha, options = {}) {
+    const commit = getCommitIdentity(owner, repo, sha, options);
+    const tree = listTreeBySha(owner, repo, commit.rootTreeSha, options);
+    return {
+        sha: commit.commitSha,
+        rootTreeSha: commit.rootTreeSha,
+        ...tree,
     };
 }
 
 /**
  * Fetch a single file's contents at the given SHA. See header for return shapes.
  *
- * Order of checks:
- *   1. Binary detection FIRST (across the WHOLE buffer, not just first 8KB —
- *      v4.2 hardening for polyglot files that put clean ASCII first then
- *      binary payload). If binary: return metadata + 256-byte preview, no
- *      base64 content. This branch ignores `maxBytes` so an attacker can't
- *      force the larger 4KB-preview branch by passing a tiny `max_bytes`.
- *   2. Hard-ceiling check (size > maxBytes). For text files only — binaries
- *      already returned above.
- *   3. Text inline-cap (size > maxTextBytes → truncate).
- *   4. Default text return.
+ * Classification is based on the fetched bytes, never the filename suffix.
+ * Known binary extensions remain available as an ordering hint only.
  */
 
-// v4.2 hardening: binary classification helper. Extracted so it's
-// independently unit-testable without mocking runGh.
-//
-// A buffer is binary if EITHER:
-//   (a) any byte in the WHOLE buffer is null (not just the first 8KB —
-//       that bound was bypassable via polyglot files with clean ASCII
-//       prefix and binary payload further in), OR
-//   (b) the file extension matches the binary allowlist (defense in
-//       depth against null-byte-free binary formats: encoded scripts,
-//       custom packers, signed certs, etc.).
-//
-// v4-r2 hardening (3/3 reviewer consensus): TEXT script formats that
-// auditors MUST be able to read in full (.ps1 / .psm1 / .psd1 / .bat /
-// .cmd / .wsf / .hta / .svg / .vbs) are deliberately EXCLUDED from
-// BINARY_EXT_RE. They're typically the primary attack surface for
-// supply-chain payloads on Windows, and the audit's Section 5 Category C
-// pattern checks (outbound-network and process-launch cmdlets, and so
-// on — no offensive cmdlet names enumerated here, see AV-safety guard
-// in the test suite) require their full text to be visible. The
-// whole-buffer null-byte scan still catches polyglot binaries that
-// masquerade with a script extension. Genuinely-encoded/obfuscated
-// scripts (.jse / .vbe) STAY in the binary set — they're designed to
-// be opaque and should be surfaced as a finding rather than decoded.
-//
-// v4-r2 round-2 hardening (gpt-5.5 R2 F4 high): UTF-16-encoded text
-// scripts contain null bytes by design (every other byte for ASCII
-// chars). Without UTF-16 handling, an attacker could save a malicious
-// install.ps1 / build.cmd as UTF-16LE and the whole-buffer null-byte
-// sniff would (correctly!) detect nulls — but then mis-classify the
-// file as binary, returning only a 256-byte preview and hiding the
-// payload from the audit. classifyAsBinary now treats files with a
-// known TEXT-script extension AND a UTF-16 BOM as text, decoding
-// occurs in fetchFile.
+// This suffix list is deliberately non-authoritative. It may prioritize likely
+// binaries for fetch order, but it must never suppress byte acquisition or
+// force binary classification: plain text named payload.exe/payload.png is
+// source text and must receive the deterministic text scan.
 const BINARY_EXT_RE = /\.(?:exe|dll|so|dylib|msi|deploy|pfx|p12|p7s|p7b|cer|crt|der|pyd|wasm|class|jar|war|ear|nupkg|whl|egg|zip|tar|gz|bz2|xz|7z|rar|cab|iso|dmg|pkg|appx|msix|ipa|apk|aab|jse|vbe|scr|cpl|com|ico|cur|ani|ttf|otf|woff|woff2|eot|jpg|jpeg|png|gif|bmp|webp|tiff|psd|mp3|mp4|mov|avi|wmv|flv|mkv|ogg|opus|wav|flac|pdf|doc|docx|xls|xlsx|ppt|pptx|odt|ods|odp|sqlite|db|mdb|bin)$/i;
 
-// Text-script extensions that the audit MUST be able to read in full.
-// When a file has one of these extensions AND a UTF-16 BOM, treat it
-// as text (decode UTF-16) instead of falling into the binary branch.
-const TEXT_SCRIPT_EXT_RE = /\.(?:ps1|psm1|psd1|bat|cmd|wsf|hta|vbs|svg|js|mjs|cjs|ts|tsx|jsx|py|rb|sh|bash|zsh|fish|pl|php|go|rs|java|kt|swift|c|h|cpp|cc|hpp|cs|fs|fsx|m|mm|sql|yaml|yml|json|xml|html|htm|css|scss|sass|less|md|txt|toml|ini|conf|env)$/i;
+export function isKnownBinaryPath(path) {
+    return BINARY_EXT_RE.test(String(path || ""));
+}
 
 // UTF-16 BOM detection. UTF-16LE = FF FE; UTF-16BE = FE FF.
 function detectUtf16Bom(buf) {
@@ -311,15 +406,211 @@ export function classifyAsBinary(buf, path) {
     if (!Buffer.isBuffer(buf)) {
         throw new Error("classifyAsBinary requires a Buffer");
     }
-    // v4-r2 round-2: a UTF-16-encoded text script has nulls by design
-    // but is text from the audit's perspective. If the path matches a
-    // known text-script extension AND the buffer starts with a UTF-16
-    // BOM, treat as text (the caller — fetchFile — will decode it).
+    return classifyActualBytes(buf, path).kind === "binary";
+}
+
+function classifyActualBytes(buf, path) {
     const utf16 = detectUtf16Bom(buf);
-    if (utf16 && TEXT_SCRIPT_EXT_RE.test(String(path || ""))) {
-        return false;
+    if (utf16) {
+        try {
+            new TextDecoder(utf16, { fatal: true }).decode(buf);
+            return { kind: "text", reason: `${utf16}_bom` };
+        } catch {
+            return { kind: "unknown", reason: `invalid_${utf16}` };
+        }
     }
-    return buf.includes(0) || BINARY_EXT_RE.test(String(path || ""));
+
+    if (hasBinaryMagic(buf)) {
+        return { kind: "binary", reason: "binary_magic" };
+    }
+
+    try {
+        new TextDecoder("utf-8", { fatal: true }).decode(buf);
+        return {
+            kind: "text",
+            reason: isKnownBinaryPath(path)
+                ? "valid_text_bytes_despite_binary_suffix"
+                : "valid_utf8",
+        };
+    } catch {
+        // Invalid UTF-8 alone is not evidence of binary content. A script or
+        // batch file with one damaged byte must remain unclassified rather
+        // than being lossy-decoded or accepted as a verified binary.
+    }
+
+    let nullBytes = 0;
+    let strongControlBytes = 0;
+    for (const byte of buf) {
+        if (byte === 0x00) nullBytes += 1;
+        if (byte === 0x00
+            || (byte >= 0x01 && byte <= 0x08)
+            || byte === 0x0B
+            || (byte >= 0x0E && byte <= 0x1A)
+            || (byte >= 0x1C && byte <= 0x1F)
+            || byte === 0x7F) {
+            strongControlBytes += 1;
+        }
+    }
+
+    const minimumStrongEvidence = Math.max(4, Math.ceil(buf.length * 0.10));
+    if ((nullBytes >= 2 && nullBytes >= Math.ceil(buf.length * 0.02))
+        || strongControlBytes >= minimumStrongEvidence) {
+        return { kind: "binary", reason: "strong_binary_byte_evidence" };
+    }
+
+    return {
+        kind: "unknown",
+        reason: "invalid_utf8_without_structural_binary_evidence",
+    };
+}
+
+const BINARY_MAGICS = Object.freeze([
+    Buffer.from([0x7F, 0x45, 0x4C, 0x46]),             // ELF
+    Buffer.from([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]), // PNG
+    Buffer.from([0xFF, 0xD8, 0xFF]),                   // JPEG
+    Buffer.from("GIF87a", "ascii"),
+    Buffer.from("GIF89a", "ascii"),
+    Buffer.from("%PDF-", "ascii"),
+    Buffer.from([0x50, 0x4B, 0x03, 0x04]),             // ZIP
+    Buffer.from([0x50, 0x4B, 0x05, 0x06]),
+    Buffer.from([0x50, 0x4B, 0x07, 0x08]),
+    Buffer.from([0x1F, 0x8B]),                         // gzip
+    Buffer.from("BZh", "ascii"),
+    Buffer.from([0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C]), // 7z
+    Buffer.from("Rar!\x1A\x07", "binary"),
+    Buffer.from("MSCF", "ascii"),                      // CAB
+    Buffer.from([0x00, 0x61, 0x73, 0x6D]),             // WebAssembly
+    Buffer.from("SQLite format 3\x00", "binary"),
+    Buffer.from([0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1]), // OLE
+    Buffer.from([0xCA, 0xFE, 0xBA, 0xBE]),             // Java class / Mach-O
+    Buffer.from([0xFE, 0xED, 0xFA, 0xCE]),             // Mach-O
+    Buffer.from([0xFE, 0xED, 0xFA, 0xCF]),
+    Buffer.from([0xCE, 0xFA, 0xED, 0xFE]),
+    Buffer.from([0xCF, 0xFA, 0xED, 0xFE]),
+]);
+
+function hasBinaryMagic(buf) {
+    // A two-byte "MZ" prefix alone is not sufficient: executable-looking
+    // script text can begin with those ASCII bytes. Require the PE signature
+    // at the DOS header's bounded e_lfanew offset.
+    if (buf.length >= 64 && buf[0] === 0x4D && buf[1] === 0x5A) {
+        const peOffset = buf.readUInt32LE(0x3C);
+        if (peOffset >= 64
+            && peOffset <= buf.length - 4
+            && buf.subarray(peOffset, peOffset + 4).equals(Buffer.from([0x50, 0x45, 0x00, 0x00]))) {
+            return true;
+        }
+    }
+    if (BINARY_MAGICS.some((magic) =>
+        buf.length >= magic.length && buf.subarray(0, magic.length).equals(magic))) {
+        return true;
+    }
+    if (buf.length >= 12 && buf.subarray(0, 4).toString("ascii") === "RIFF") {
+        const subtype = buf.subarray(8, 12).toString("ascii");
+        return ["WAVE", "AVI ", "WEBP"].includes(subtype);
+    }
+    return false;
+}
+
+function buildFetchResultFromBuffer(path, buf, {
+    blobSha = null,
+    maxBytes = DEFAULT_MAX_FILE_BYTES,
+    maxTextBytes = DEFAULT_TEXT_INLINE_BYTES,
+    previewBytes = DEFAULT_PREVIEW_BYTES,
+    binaryPreviewBytes = BINARY_PREVIEW_BYTES,
+} = {}) {
+    if (!Buffer.isBuffer(buf)) throw new Error("buildFetchResultFromBuffer requires a Buffer");
+    const sizeBytes = buf.length;
+    const sha256 = createHash("sha256").update(buf).digest("hex");
+    const classification = classifyActualBytes(buf, path);
+    const common = {
+        ok: true,
+        path,
+        sizeBytes,
+        sha256,
+        ...(typeof blobSha === "string" ? { blobSha: blobSha.toLowerCase() } : {}),
+        classification: classification.kind,
+        classificationComplete: classification.kind !== "unknown",
+        classificationReason: classification.reason,
+        classificationBytesInspected: sizeBytes,
+        likelyBinaryByExtension: isKnownBinaryPath(path),
+    };
+
+    if (sizeBytes > maxBytes) {
+        const cap = classification.kind === "binary" ? binaryPreviewBytes : previewBytes;
+        const preview = buf.subarray(0, cap);
+        return {
+            ...common,
+            ...(classification.kind === "binary" ? { encoding: "binary" } : {}),
+            contentTooLarge: true,
+            contentReturned: false,
+            previewBase64: preview.toString("base64"),
+            previewByteCount: preview.length,
+            note: `${classification.kind} file exceeds ${maxBytes} bytes; bounded metadata/preview returned and mandatory acquisition remains incomplete.`,
+        };
+    }
+
+    if (classification.kind === "binary") {
+        const preview = buf.subarray(0, binaryPreviewBytes);
+        return {
+            ...common,
+            encoding: "binary",
+            contentReturned: false,
+            previewBase64: preview.toString("base64"),
+            previewByteCount: preview.length,
+            note: `binary content not returned (bytes-on-disk minimization). previewBase64 is the first ${preview.length} bytes for magic-byte / file-type inspection only.`,
+        };
+    }
+
+    if (classification.kind === "unknown") {
+        const preview = buf.subarray(0, previewBytes);
+        return {
+            ...common,
+            contentReturned: false,
+            previewBase64: preview.toString("base64"),
+            previewByteCount: preview.length,
+            note: "bytes are neither valid supported text nor structurally verified binary; bounded preview returned without lossy decoding, and mandatory acquisition remains incomplete.",
+        };
+    }
+
+    const utf16 = detectUtf16Bom(buf);
+    if (utf16) {
+        const decoded = new TextDecoder(utf16).decode(buf);
+        const charCap = Math.floor(maxTextBytes / 2);
+        if (decoded.length > charCap) {
+            return {
+                ...common,
+                encoding: utf16,
+                contentReturned: true,
+                textTruncated: true,
+                text: decoded.substring(0, charCap),
+                note: `text content (${utf16}) truncated to ${charCap} chars; full sizeBytes is ${sizeBytes}.`,
+            };
+        }
+        return {
+            ...common,
+            encoding: utf16,
+            contentReturned: true,
+            text: decoded,
+        };
+    }
+
+    if (sizeBytes > maxTextBytes) {
+        return {
+            ...common,
+            encoding: "utf-8",
+            contentReturned: true,
+            textTruncated: true,
+            text: new TextDecoder("utf-8").decode(buf.subarray(0, maxTextBytes)),
+            note: `text content truncated to ${maxTextBytes} bytes; full sizeBytes is ${sizeBytes}. Hash matches the full file.`,
+        };
+    }
+    return {
+        ...common,
+        encoding: "utf-8",
+        contentReturned: true,
+        text: new TextDecoder("utf-8").decode(buf),
+    };
 }
 
 // Exported so fetchFile (and tests) can decide which decoder to use.
@@ -333,13 +624,17 @@ export function fetchFile(owner, repo, sha, path, {
 } = {}) {
     ensureValidOwnerRepo(owner, repo);
     ensureValidSha(sha);
-    ensureValidPath(path);
+    const encodedPath = encodeRepoPath(path);
 
     // Use the contents API which returns base64-encoded content for any file type.
-    const raw = runGh(["api", `repos/${owner}/${repo}/contents/${path}?ref=${sha}`, "-H", "Accept: application/vnd.github+json"]);
+    const raw = runGh(["api", `repos/${owner}/${repo}/contents/${encodedPath}?ref=${sha}`, "-H", "Accept: application/vnd.github+json"]);
     const parsed = JSON.parse(raw);
     if (parsed?.type !== "file") {
         throw new Error(`expected file at ${path}, got ${parsed?.type || "unknown"}`);
+    }
+    const blobSha = parsed?.sha;
+    if (typeof blobSha !== "string" || !SHA_RE.test(blobSha)) {
+        throw new Error(`file ${path} response did not include a valid blob sha`);
     }
 
     // v4-r2 round-6 (C-R6-3 high): GitHub's Contents API returns
@@ -351,22 +646,23 @@ export function fetchFile(owner, repo, sha, path, {
     // us the blob SHA in `parsed.sha`.
     let buf;
     if (parsed?.encoding === "none") {
-        const blobSha = parsed?.sha;
-        if (typeof blobSha !== "string" || !/^[a-f0-9]{40}$/i.test(blobSha)) {
-            throw new Error(`large file ${path} returned encoding=none but no usable blob sha`);
-        }
         // If the file is larger than our absolute ceiling, return
-        // metadata-only — don't even fetch via blobs, since blobs
-        // would deliver the full bytes and bloat the response.
+        // metadata-only and classification-incomplete — don't fetch via
+        // blobs, since blobs would deliver the full bytes and bloat the response.
         const apiSize = typeof parsed?.size === "number" ? parsed.size : 0;
         if (apiSize > maxBytes) {
             return {
                 ok: true,
                 path,
                 sizeBytes: apiSize,
-                blobSha,
+                blobSha: blobSha.toLowerCase(),
+                classification: "unknown",
+                classificationComplete: false,
+                classificationBytesInspected: 0,
+                likelyBinaryByExtension: isKnownBinaryPath(path),
                 contentTooLarge: true,
-                note: `text/binary file exceeds ${maxBytes} bytes (size from contents API: ${apiSize}); metadata-only response. To inspect content, request a smaller file or accept a partial preview via a different tool.`,
+                contentReturned: false,
+                note: `file exceeds ${maxBytes} bytes (size from contents API: ${apiSize}); bytes were not fetched, classification is incomplete, and mandatory acquisition cannot complete.`,
             };
         }
         const blobRaw = runGh(["api", `repos/${owner}/${repo}/git/blobs/${blobSha}`, "-H", "Accept: application/vnd.github+json"]);
@@ -383,122 +679,16 @@ export function fetchFile(owner, repo, sha, path, {
         throw new Error(`unexpected encoding ${parsed?.encoding} for ${path}`);
     }
 
-    const sizeBytes = buf.length;
-    const sha256 = createHash("sha256").update(buf).digest("hex");
-
-    // v4.2 hardening: binary detection runs FIRST and scans the WHOLE buffer
-    // (not just first 8KB). A polyglot file with clean ASCII in its first
-    // 8KB followed by binary payload would have been mis-classified as text
-    // and the attacker would get up to maxTextBytes of binary payload back
-    // as a UTF-8 string in the response (a runtime-spill vector). Scanning
-    // the whole buffer for null bytes catches that. Cost: O(N) memory scan
-    // on every fetch — fine for a single file at our 5MB ceiling.
-    //
-    // Also detect binary by file extension (defense-in-depth against
-    // null-byte-free binary formats like JSE/VBE encoded scripts, custom
-    // packers, etc.). The extension list is conservative — anything that
-    // smells like an executable/library/cert/installer/archive.
-    const isBinary = classifyAsBinary(buf, path);
-
-    if (isBinary) {
-        return {
-            ok: true,
-            path,
-            sizeBytes,
-            sha256,
-            encoding: "binary",
-            contentReturned: false,
-            previewBase64: buf.subarray(0, binaryPreviewBytes).toString("base64"),
-            note: `binary content not returned (v4.1 hardening — bytes-on-disk minimization). previewBase64 is the first ${binaryPreviewBytes} bytes for magic-byte / file-type inspection only. Surface sizeBytes + sha256 in the report; do not request the full content.`,
-        };
+    if (Number.isSafeInteger(parsed?.size) && parsed.size >= 0 && parsed.size !== buf.length) {
+        throw new Error(`file size mismatch for ${path}: contents API=${parsed.size}, decoded=${buf.length}`);
     }
-
-    // v4-r2 round-2 hardening (gpt-5.5 R2 F4 high): if classifyAsBinary
-    // returned text but the buffer is actually UTF-16-encoded, decode
-    // with the right codec. Without this the agent gets garbled bytes
-    // (every other char a null) and can't read the script.
-    const utf16 = detectUtf16Bom(buf);
-    if (utf16) {
-        // TextDecoder handles UTF-16 in all modern Node versions.
-        const decoder = new TextDecoder(utf16);
-        const decoded = decoder.decode(buf);
-        // Hard ceiling check still applies (in chars, conservatively).
-        if (sizeBytes > maxBytes) {
-            return {
-                ok: true,
-                path,
-                sizeBytes,
-                sha256,
-                contentTooLarge: true,
-                previewBase64: buf.subarray(0, previewBytes).toString("base64"),
-                note: `text file exceeds ${maxBytes} bytes; only sha256 + ${previewBytes}-byte preview returned`,
-            };
-        }
-        // Truncate by char count if over inline cap (UTF-16 is 2 bytes
-        // per BMP char, so maxTextBytes/2 is the rough character cap).
-        const charCap = Math.floor(maxTextBytes / 2);
-        if (decoded.length > charCap) {
-            return {
-                ok: true,
-                path,
-                sizeBytes,
-                sha256,
-                encoding: utf16,
-                contentReturned: true,
-                textTruncated: true,
-                text: decoded.substring(0, charCap),
-                note: `text content (${utf16}) truncated to ${charCap} chars; full sizeBytes is ${sizeBytes}.`,
-            };
-        }
-        return {
-            ok: true,
-            path,
-            sizeBytes,
-            sha256,
-            encoding: utf16,
-            contentReturned: true,
-            text: decoded,
-        };
-    }
-
-    // Hard ceiling for TEXT files (binaries already returned above).
-    if (sizeBytes > maxBytes) {
-        return {
-            ok: true,
-            path,
-            sizeBytes,
-            sha256,
-            contentTooLarge: true,
-            previewBase64: buf.subarray(0, previewBytes).toString("base64"),
-            note: `text file exceeds ${maxBytes} bytes; only sha256 + ${previewBytes}-byte preview returned`,
-        };
-    }
-
-    // Text path: if file is over the inline cap, truncate. Source files
-    // are almost always under 256KB; this only kicks in for vendored
-    // .min.js, generated JSON, etc.
-    if (sizeBytes > maxTextBytes) {
-        return {
-            ok: true,
-            path,
-            sizeBytes,
-            sha256,
-            encoding: "utf-8",
-            contentReturned: true,
-            textTruncated: true,
-            text: buf.subarray(0, maxTextBytes).toString("utf-8"),
-            note: `text content truncated to ${maxTextBytes} bytes; full sizeBytes is ${sizeBytes}. Hash matches the FULL file. To inspect bytes past the truncation point, request a specific path subrange via a follow-up call (not yet implemented; for now, treat the truncation as a finding worth noting).`,
-        };
-    }
-    return {
-        ok: true,
-        path,
-        sizeBytes,
-        sha256,
-        encoding: "utf-8",
-        contentReturned: true,
-        text: buf.toString("utf-8"),
-    };
+    return buildFetchResultFromBuffer(path, buf, {
+        blobSha,
+        maxBytes,
+        maxTextBytes,
+        previewBytes,
+        binaryPreviewBytes,
+    });
 }
 
 export const __internals = {
@@ -509,5 +699,13 @@ export const __internals = {
     ensureValidOwnerRepo,
     ensureValidSha,
     ensureValidPath,
+    encodeRepoPath,
+    ensureValidRef,
+    BINARY_EXT_RE,
+    isKnownBinaryPath,
+    classifyActualBytes,
+    buildFetchResultFromBuffer,
+    resolveTagReference,
+    requestApiJson,
     GH_TIMEOUT_MS,
 };

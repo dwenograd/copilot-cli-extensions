@@ -18,13 +18,7 @@
 //      >5000-entry repo could hide payload past the cap; agent saw
 //      `truncated: false` and assumed complete coverage.
 //
-//   3. HIGH: classifyAsBinary's extension allowlist included text
-//      script formats (.ps1/.psm1/.psd1/.bat/.cmd/.wsf/.hta/.svg) the
-//      audit MUST be able to read in full. Section 5 Category C
-//      pattern checks for outbound-network and process-launch cmdlets
-//      (no specific names enumerated here — see AV-safety hardening)
-//      only exist in those files; returning 256 bytes of base64
-//      preview blinded the audit to its primary attack surface.
+//   3. HIGH: text scripts must be classified from bytes and returned as text.
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -62,20 +56,25 @@ test("v4-r2: classifyAsBinary keeps Windows scripts (.wsf/.hta) and SVG as TEXT"
     assert.equal(classifyAsBinary(cleanText, "icon.svg"), false, ".svg must be text");
 });
 
-test("v4-r2: classifyAsBinary still treats encoded scripts (.jse/.vbe) as BINARY", () => {
+test("coverage hardening: plain text under .jse/.vbe remains TEXT", () => {
     const cleanText = Buffer.from("plain text but extension says encoded", "utf-8");
-    assert.equal(classifyAsBinary(cleanText, "evil.jse"), true,
-        ".jse stays binary — it's an encoded format requiring Microsoft's decoder");
-    assert.equal(classifyAsBinary(cleanText, "evil.vbe"), true,
-        ".vbe stays binary — same reason");
+    assert.equal(classifyAsBinary(cleanText, "evil.jse"), false);
+    assert.equal(classifyAsBinary(cleanText, "evil.vbe"), false);
 });
 
 test("v4-r2: classifyAsBinary still treats true binaries as BINARY", () => {
-    const cleanText = Buffer.from("clean ascii text", "utf-8");
-    assert.equal(classifyAsBinary(cleanText, "setup.exe"), true);
-    assert.equal(classifyAsBinary(cleanText, "lib.dll"), true);
-    assert.equal(classifyAsBinary(cleanText, "cert.pfx"), true);
-    assert.equal(classifyAsBinary(cleanText, "image.png"), true);
+    const pe = Buffer.alloc(132);
+    pe[0] = 0x4D;
+    pe[1] = 0x5A;
+    pe.writeUInt32LE(128, 0x3C);
+    pe.set([0x50, 0x45, 0x00, 0x00], 128);
+    assert.equal(classifyAsBinary(pe, "setup.exe"), true);
+    assert.equal(classifyAsBinary(Buffer.from([0x7F, 0x45, 0x4C, 0x46]), "lib.dll"), true);
+    assert.equal(classifyAsBinary(Buffer.from([0x50, 0x4B, 0x03, 0x04]), "archive.zip"), true);
+    assert.equal(classifyAsBinary(
+        Buffer.from([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]),
+        "image.png",
+    ), true);
 });
 
 // ---------- 2. safeListTreeHandler forwards truncation signals ----------
@@ -95,16 +94,17 @@ test("v4-r2: safeListTreeHandler input-validation failure still returns valid sh
 
 // We test the truncation-signal forwarding by reading the source file
 // directly and asserting the keys are emitted.
-test("v4-r2: safeListTreeHandler source forwards entriesTruncated / totalEntryCount / coverageComplete", async () => {
+test("v4-r2: safeListTreeHandler surfaces truncation and aggregate coverage fields", async () => {
     const fs = await import("node:fs");
     const url = await import("node:url");
     const path = await import("node:path");
     const here = path.dirname(url.fileURLToPath(import.meta.url));
     const src = fs.readFileSync(path.join(here, "..", "safeWrappers", "safeListTreeHandler.mjs"), "utf-8");
-    assert.match(src, /entriesTruncated:\s*!!result\.entriesTruncated/,
-        "must forward entriesTruncated");
-    assert.match(src, /totalEntryCount:/, "must forward totalEntryCount");
-    assert.match(src, /coverageComplete:/, "must surface combined coverageComplete flag");
+    assert.match(src, /entriesTruncated:\s*state\.localEntryCapSeen/,
+        "must surface local entry-cap truncation");
+    assert.match(src, /aggregateEntryCount:/, "must surface aggregate entry count");
+    assert.match(src, /unresolvedSubtrees:/, "must surface unresolved subtrees");
+    assert.match(src, /coverageComplete[,:]/, "must surface combined coverageComplete flag");
 });
 
 // ---------- 3. Git-clone bypass: ALL forms denied in audit modes ----------

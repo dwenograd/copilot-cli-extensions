@@ -1,0 +1,2 @@
+marker.node("fetch","capability","remote-fetch","remote-fetch");
+marker.edge("start-fetch","activates","start","fetch","remote-fetch");

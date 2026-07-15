@@ -1,0 +1,2 @@
+marker.node("source","sensitive-source","credential-like-source","credential-like");
+marker.edge("trigger-source","flows-to","trigger","source","credential-like");

@@ -14,7 +14,7 @@ import {
     sweepAuditScratchHandler,
     __internals as sweepInternals,
 } from "../safeWrappers/sweepWrapper.mjs";
-import { activateAudit, deactivateAudit } from "../enforcement.mjs";
+import { activateAudit, deactivateAudit, getActiveAudit } from "../enforcement.mjs";
 
 // Layout used in these tests:
 //   <tmp>/parent_<run>/
@@ -86,6 +86,7 @@ test("dry_run lists scratch files without deleting", async () => {
     setupTree();
     const r = await sweepAuditScratchHandler({
         build_root: BR,
+        also_sweep_parent: true,
         dry_run: true,
     }, { sessionId: SESSION });
     assert.equal(r.resultType, "success");
@@ -113,7 +114,7 @@ test("dry_run lists scratch files without deleting", async () => {
     assert.equal(data.foundCount, data.found.length);
 });
 
-test("default (non-dry-run) deletes scratch files", async () => {
+test("default (non-dry-run) deletes build_root scratch but never inspects the parent", async () => {
     setupTree();
     const r = await sweepAuditScratchHandler({ build_root: BR }, { sessionId: SESSION });
     assert.equal(r.resultType, "success");
@@ -125,7 +126,7 @@ test("default (non-dry-run) deletes scratch files", async () => {
     assert.ok(!existsSync(join(BR, "agent_scratch.txt")));
     assert.ok(!existsSync(join(BR, "BootEncryption.cpp")));
     assert.ok(!existsSync(join(BR, "_audit_dlgcode.c")));
-    assert.ok(!existsSync(join(PARENT, "scratch_in_parent.txt")));
+    assert.ok(existsSync(join(PARENT, "scratch_in_parent.txt")));
 
     // Legitimate files: preserved.
     assert.ok(existsSync(join(BR, "README.md")));
@@ -137,7 +138,10 @@ test("default (non-dry-run) deletes scratch files", async () => {
     assert.ok(existsSync(join(BR, "_reports", "keep_me.md")));
     assert.ok(existsSync(join(BR, "canonical-clone-abc1234", "marker.txt")));
 
-    assert.ok(data.removedCount >= 4);
+    assert.deepEqual(data.sweptDirs, [BR]);
+    assert.ok(!data.found.includes(join(PARENT, "scratch_in_parent.txt")));
+    assert.ok(data.removedCount >= 3);
+    assert.ok(getActiveAudit(SESSION), "sweep must preserve audit state until close_audit");
 });
 
 test("also_sweep_parent: false leaves parent files alone", async () => {
@@ -155,6 +159,35 @@ test("also_sweep_parent: false leaves parent files alone", async () => {
     const data = JSON.parse(r.textResultForLlm);
     assert.equal(data.sweptDirs.length, 1);
     assert.equal(data.sweptDirs[0], BR);
+});
+
+test("also_sweep_parent: true explicitly deletes parent scratch", async () => {
+    setupTree();
+    const r = await sweepAuditScratchHandler({
+        build_root: BR,
+        also_sweep_parent: true,
+    }, { sessionId: SESSION });
+    assert.equal(r.resultType, "success");
+    assert.ok(!existsSync(join(PARENT, "scratch_in_parent.txt")));
+});
+
+test("deletion errors fail and preserve active audit state for retry", async () => {
+    setupTree();
+    const r = await sweepAuditScratchHandler(
+        { build_root: BR, also_sweep_parent: false },
+        { sessionId: SESSION },
+        {
+            removeFile: () => ({
+                existed: true,
+                removed: false,
+                error: "simulated locked file",
+            }),
+        },
+    );
+    assert.equal(r.resultType, "failure");
+    assert.match(r.textResultForLlm, /simulated locked file/);
+    assert.ok(getActiveAudit(SESSION), "failed sweep must not deactivate the audit");
+    assert.ok(existsSync(join(BR, "agent_scratch.txt")), "failed deletion remains retryable");
 });
 
 test("never touches subdirectories or their contents", async () => {

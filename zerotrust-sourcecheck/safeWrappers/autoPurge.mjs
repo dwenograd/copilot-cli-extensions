@@ -15,19 +15,20 @@
 //   - 0 → disabled (operator-managed cleanup)
 //   - positive number → that many hours
 //
-// What gets purged: top-level clone directories under build_root that
-// match the standard naming convention `<owner>-<repo>-<7hex>`. We also
-// purge matching `_reports/<basename>/` and `_quarantine/<basename>/` so
-// orphans don't pile up.
+// What gets purged: stale top-level clone directories under build_root only.
+// Reports and quarantine are never side effects of auto-purge; their explicit
+// active-audit-bound cleanup tools own those artifacts.
 
 import { existsSync, readdirSync, rmSync, statSync } from "node:fs";
 import nodePath from "node:path";
+import { ARTIFACT_NAME_RE } from "../urlParser.mjs";
 
 export const DEFAULT_PURGE_HOURS = 24;
 
-// Filename shape for top-level clones: <owner>-<repo>-<7-hex-sha>.
-// owner/repo segments allow letters, digits, dots, dashes, underscores.
-const CLONE_NAME_RE = /^[A-Za-z0-9._-]+-[A-Za-z0-9._-]+-[0-9a-f]{7}$/;
+// Newly-created clone names are canonical hashed repository identities.
+const CLONE_NAME_RE = ARTIFACT_NAME_RE;
+const LEGACY_FULL_SHA_CLONE_NAME_RE = /^[A-Za-z0-9._-]+-[A-Za-z0-9._-]+-[0-9a-f]{40}$/;
+const LEGACY_CLONE_NAME_RE = /^[A-Za-z0-9._-]+-[A-Za-z0-9._-]+-[0-9a-f]{7}$/;
 
 export function getPurgeHours(env) {
     const e = env || (typeof process !== "undefined" ? process.env : {}) || {};
@@ -70,7 +71,9 @@ export function findStaleClones({ buildRoot, hoursThreshold, now, exclude = [] }
     const stale = [];
     for (const ent of listDirEntries(buildRoot)) {
         if (!ent.isDirectory()) continue;
-        if (!CLONE_NAME_RE.test(ent.name)) continue;
+        if (!CLONE_NAME_RE.test(ent.name)
+            && !LEGACY_FULL_SHA_CLONE_NAME_RE.test(ent.name)
+            && !LEGACY_CLONE_NAME_RE.test(ent.name)) continue;
         if (exclude.includes(ent.name)) continue;
         const full = nodePath.join(buildRoot, ent.name);
         let st;
@@ -87,8 +90,7 @@ export function findStaleClones({ buildRoot, hoursThreshold, now, exclude = [] }
 }
 
 /**
- * Purge stale clones from build_root and the matching _reports/ and
- * _quarantine/ subdirs. Returns a structured summary.
+ * Purge stale clone directories from build_root. Returns a structured summary.
  *
  * Containment: every path constructed and deleted is rooted at
  * `nodePath.join(buildRoot, ...)`, so we never escape build_root.
@@ -104,16 +106,10 @@ export function purgeStaleClones({ buildRoot, hoursThreshold, now, exclude = [] 
     const failed = [];
     for (const basename of stale) {
         const clonePath = nodePath.join(buildRoot, basename);
-        const reportPath = nodePath.join(buildRoot, "_reports", basename);
-        const quarantinePath = nodePath.join(buildRoot, "_quarantine", basename);
         const cloneOk = safeRemove(clonePath);
-        const reportOk = safeRemove(reportPath);
-        const quarantineOk = safeRemove(quarantinePath);
         const entry = {
             basename,
             clone: cloneOk,
-            report: reportOk,
-            quarantine: quarantineOk,
         };
         if (cloneOk) {
             purged.push(entry);
@@ -126,6 +122,8 @@ export function purgeStaleClones({ buildRoot, hoursThreshold, now, exclude = [] 
 
 export const __internals = {
     CLONE_NAME_RE,
+    LEGACY_FULL_SHA_CLONE_NAME_RE,
+    LEGACY_CLONE_NAME_RE,
     safeRemove,
     listDirEntries,
 };

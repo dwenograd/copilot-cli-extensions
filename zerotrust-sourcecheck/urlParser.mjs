@@ -11,6 +11,7 @@
 //   components — never concatenate raw user input into either
 
 import nodePath from "node:path";
+import { createHash } from "node:crypto";
 
 // GitHub username rules: 1-39 chars, alphanumeric or hyphens, can't start
 // with a hyphen. We allow consecutive hyphens since the parser only ever
@@ -64,7 +65,8 @@ function stripDotGit(repo) {
 
 /**
  * Parse and validate a GitHub URL. Returns either:
- *   { ok: true, parsed: { owner, repo, ref, refType, prNumber, kind, canonicalUrl } }
+ *   { ok: true, parsed: { owner, repo, ref, refType, prNumber, kind,
+ *                         releaseSelector, canonicalUrl } }
  *     where kind ∈ "repo" | "tree" | "commit" | "release" | "pr"
  *           refType ∈ "branch_or_tag" | "commit" | "release_tag" | "pr_head" | null
  *   { ok: false, error: "<reason>" }
@@ -153,6 +155,7 @@ export function parseGithubUrl(input) {
     let ref = null;
     let refType = null;
     let prNumber = null;
+    let releaseSelector = null;
 
     if (segments.length >= 4 && (segments[2] === "tree" || segments[2] === "blob")) {
         kind = "tree";
@@ -176,15 +179,19 @@ export function parseGithubUrl(input) {
     } else if (segments.length >= 4 && segments[2] === "releases" && segments[3] === "tag") {
         if (segments.length < 5) return { ok: false, error: "releases/tag URL missing tag name" };
         kind = "release";
+        releaseSelector = "tag";
         // Slash-containing tags ARE supported here because there's no
         // path-into-tree ambiguity for /releases/tag/<tag> (everything
         // after /tag/ is the tag name). gpt-5.5 reviewer Finding #6.
         ref = segments.slice(4).join("/");
         refType = "release_tag";
-    } else if (segments.length >= 3 && segments[2] === "releases") {
+    } else if (segments.length === 3 && segments[2] === "releases") {
         kind = "release";
+        releaseSelector = "latest";
         ref = null;
         refType = null;
+    } else if (segments.length >= 3 && segments[2] === "releases") {
+        return { ok: false, error: "unsupported releases URL; use /releases or /releases/tag/<tag>" };
     } else if (segments.length >= 4 && segments[2] === "pull") {
         kind = "pr";
         const n = Number(segments[3]);
@@ -212,17 +219,41 @@ export function parseGithubUrl(input) {
             refType,
             prNumber,
             kind,
+            releaseSelector,
             canonicalUrl: `https://github.com/${owner}/${repo}`,
         },
     };
 }
 
-function ensureValidComponents(owner, repo, shortSha) {
+function ensureValidComponents(owner, repo, resolvedSha) {
     if (!OWNER_RE.test(owner)) throw new Error(`invalid owner: ${owner}`);
     if (!REPO_RE.test(repo)) throw new Error(`invalid repo: ${repo}`);
-    if (!/^[0-9a-fA-F]{4,40}$/.test(shortSha)) {
-        throw new Error(`invalid shortSha: ${shortSha}`);
+    if (!/^[0-9a-fA-F]{40}$/.test(resolvedSha)) {
+        throw new Error(`resolvedSha must be a full 40-character commit SHA: ${resolvedSha}`);
     }
+}
+
+export const ARTIFACT_ID_PREFIX = "zt-v1-";
+export const ARTIFACT_NAME_RE = /^zt-v1-[0-9a-f]{64}$/;
+
+/**
+ * Build a compact, collision-resistant basename for one repository commit.
+ * JSON array encoding is unambiguous; lower-casing matches GitHub's
+ * case-insensitive owner/repo identity and normalized hexadecimal SHAs.
+ */
+export function buildArtifactIdentityName(owner, repo, resolvedSha) {
+    ensureValidComponents(owner, repo, resolvedSha);
+    const tuple = JSON.stringify([
+        String(owner).toLowerCase(),
+        String(repo).toLowerCase(),
+        String(resolvedSha).toLowerCase(),
+    ]);
+    const digest = createHash("sha256").update(tuple, "utf8").digest("hex");
+    return `${ARTIFACT_ID_PREFIX}${digest}`;
+}
+
+export function isCanonicalArtifactName(name) {
+    return typeof name === "string" && ARTIFACT_NAME_RE.test(name);
 }
 
 function containedJoin(buildRoot, ...subSegments) {
@@ -244,9 +275,8 @@ function containedJoin(buildRoot, ...subSegments) {
  * containment violation — failing closed is the right behavior for a
  * path-construction primitive in a security tool.
  */
-export function buildClonePath(buildRoot, owner, repo, shortSha) {
-    ensureValidComponents(owner, repo, shortSha);
-    const dirName = `${owner}-${repo}-${shortSha.toLowerCase().slice(0, 7)}`;
+export function buildClonePath(buildRoot, owner, repo, resolvedSha) {
+    const dirName = buildArtifactIdentityName(owner, repo, resolvedSha);
     if (isNtfsReserved(dirName)) {
         throw new Error(`computed dir name conflicts with NTFS reserved name: ${dirName}`);
     }
@@ -254,29 +284,28 @@ export function buildClonePath(buildRoot, owner, repo, shortSha) {
 }
 
 /**
- * Build the per-audit report directory: <buildRoot>\_reports\<owner>-<repo>-<short>.
+ * Build the per-audit report directory:
+ * <buildRoot>\_reports\<zt-v1-sha256-of-owner-repo-sha>.
  * Reports live OUTSIDE the cloned (untrusted) tree.
  */
-export function buildReportPath(buildRoot, owner, repo, shortSha) {
-    ensureValidComponents(owner, repo, shortSha);
+export function buildReportPath(buildRoot, owner, repo, resolvedSha) {
     return containedJoin(
         buildRoot,
         "_reports",
-        `${owner}-${repo}-${shortSha.toLowerCase().slice(0, 7)}`,
+        buildArtifactIdentityName(owner, repo, resolvedSha),
     );
 }
 
 /**
  * Build the per-audit quarantine directory for release assets:
- *   <buildRoot>\_quarantine\<owner>-<repo>-<short>
+ *   <buildRoot>\_quarantine\<zt-v1-sha256-of-owner-repo-sha>
  * Same containment guarantees as buildReportPath.
  */
-export function buildQuarantinePath(buildRoot, owner, repo, shortSha) {
-    ensureValidComponents(owner, repo, shortSha);
+export function buildQuarantinePath(buildRoot, owner, repo, resolvedSha) {
     return containedJoin(
         buildRoot,
         "_quarantine",
-        `${owner}-${repo}-${shortSha.toLowerCase().slice(0, 7)}`,
+        buildArtifactIdentityName(owner, repo, resolvedSha),
     );
 }
 
@@ -288,4 +317,5 @@ export const __internals = {
     isNtfsReserved,
     validateRef,
     stripDotGit,
+    ARTIFACT_NAME_RE,
 };

@@ -1,0 +1,3 @@
+marker.node("effect","sink","external-effect","external-effect");
+marker.edge("tool-effect","invokes","tool","effect","external-effect");
+marker.finding("ai-chain","validated","high","high","strong","invoke","tool-effect","external-effect","ai-instruction,tool-invoke,external-effect");

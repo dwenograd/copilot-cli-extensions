@@ -1,0 +1,3 @@
+marker.fact("activation-surface","broken-shape","activation");
+marker.node("start","activation","broken-shape","activation");
+marker.edge("broken-edge","invokes","start","missing-node","broken");

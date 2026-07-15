@@ -1,0 +1,22 @@
+{
+  "schema": "zerotrust-evaluation-expectation/v1",
+  "schema_version": 1,
+  "slug": "broken-reference",
+  "kind": "synthetic-broken",
+  "source": {"type": "local", "path": "fixtures/broken-reference"},
+  "expected": {
+    "stage": {"required": ["acquired"], "final": "acquired"},
+    "activation_facts": {"required": [], "minimum": 0},
+    "plugin_facts": {"required": [], "minimum": 0},
+    "counts": {"candidate": 0, "validated": 0, "refuted": 0, "unresolved": 0},
+    "chains": {"required": [], "complete_required": [], "forbidden": []},
+    "scores": {
+      "severity": {"min": "none", "max": "info"},
+      "confidence": {"min": "none", "max": "low"},
+      "project_fit": {"min": "none", "max": "unlikely"}
+    },
+    "tags": {"required": [], "forbidden": []},
+    "acceptable_blockers": ["plugin-failed"],
+    "failure_stage": "prepare"
+  }
+}

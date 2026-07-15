@@ -1,9 +1,8 @@
 # zerotrust-sourcecheck — agent design notes
 
 This file documents non-obvious constraints around sub-agent
-orchestration and prompt-template design. Read it before modifying
-`packet.mjs` Section 5 preambles, `council/promptTemplate.mjs`, or any
-of the role manifests.
+orchestration and prompt-template design. Read it before modifying the
+`packet/` stage renderers, `council/promptTemplate.mjs`, or any role manifest.
 
 ## Sub-agents MUST NOT write files
 
@@ -14,8 +13,8 @@ and never cleaning up.
 
 **The rule:** every sub-agent prompt this extension emits (council role
 prompts, recursive `task`-tool launches, helper agent prompts) MUST
-include an explicit "no file writes" preamble. Both `packet.mjs` Section
-5 sub-agent preambles already do — if you add a new sub-agent launch
+include an explicit "no file writes" preamble. The `packet/scan.mjs` and
+`packet/validate.mjs` sub-agent preambles already do — if you add a launch
 site, mirror the wording.
 
 **Specifically forbidden patterns** (already called out in `packet.mjs`):
@@ -42,16 +41,16 @@ site, mirror the wording.
   (~590KB) at the workspace root because their cwd was the workspace
   root, not the audit sandbox.
 - The fix is layered:
-  1. **Prompt-level ban** in `packet.mjs` Section 5 preambles
+  1. **Prompt-level ban** in the scan/validation packet preambles
      (the "Do NOT write files to disk for any reason" block).
   2. **`Set-Location $build_root`** required as the first line of
      every `powershell` call the sub-agent makes — so any accidental
      cwd-relative write lands inside the swept sandbox, not at the
      workspace root.
   3. **Post-hoc sweep** via `zerotrust_sweep_audit_scratch` — the
-     orchestrator calls a non-dry-run sweep last to close audit state.
-     Parent sweeping defaults on, so use dry-run and normally disable it
-     unless the parent is dedicated scratch.
+    orchestrator calls a non-dry-run build-root sweep before lifecycle
+    closure. Parent sweeping defaults off; if explicitly enabled, dry-run
+    first and use it only when the parent is dedicated scratch.
 
 ## `Set-Location $build_root` must be the first line of every `powershell` call
 
@@ -92,11 +91,67 @@ Keep `council/promptTemplate.mjs` and user documentation aligned:
 
 | Mode | Source-inspection | Provenance |
 |---|---|---|
-| API-direct | safe fetch/list wrappers + `web_fetch` for external context | same + `gh api` metadata |
-| Build clone | `view`/`grep`/`glob`/`web_fetch` | same + git verification/GitHub CLI |
-| Local source | `view`/`grep`/`glob` under `localPath` only | same + `web_fetch` for external advisories only |
+| API-direct | `zerotrust_safe_list_analysis_facts` + safe fetch wrapper + `web_fetch` for external context; parent supplies the pinned SHA, coverage snapshot, and bounded candidate paths | same + `gh api` metadata (never re-resolve the source tree) |
+| Build clone | `zerotrust_safe_list_analysis_facts` / `zerotrust_safe_index_source_file` + `view`/`grep`/`glob`/`web_fetch` | same + git verification/GitHub CLI |
+| Local source | `zerotrust_safe_list_analysis_facts` / `zerotrust_safe_index_source_file` + `view`/`grep`/`glob` under `localPath` only | same + `web_fetch` for external advisories only |
 
 These are prompt rules. No registered hook enforces built-in tool use.
+
+Deterministic local/build preparation is stronger than those role rules:
+`zerotrust_safe_list_source` and `zerotrust_safe_index_source_file` derive the
+root from active audit state, refuse traversal/reparse following, execute
+nothing, and retain only bounded normalized facts/hashes. Direct role reads
+remain prompt-confined, but no role evidence becomes trusted unless it matches
+the exact wrapper index identity, line range, and excerpt hash.
+
+## Version-5 malicious-source contract
+
+The objective is source-level malicious-behavior discovery and static proof,
+not generic vulnerability/exploit scanning. Council modes keep the 32-role
+discovery backbone and run the logical phases:
+
+`Prepare → Scan → Trace → Validate → Dedupe/score → Finalize`
+
+The durable state names are `acquired → prepared → scanned → traced → validated
+→ finalized`; dedupe/scoring is part of constructing the validated decision
+snapshot rather than a separate persisted stage.
+
+Finding states are `candidate → validating → validated | refuted | unresolved`;
+chain statuses are `complete | unresolved | contested`; validation records
+independent `confirm` and `refute` decisions before terminal adjudication.
+
+- Prepare uses one contained API/local/build analysis index plus deterministic
+  activation plugins. Plugins consume normalized facts/manifests and emit graph
+  seeds/context only, never findings or verdicts.
+- Scan accepts structured candidates only with exact enumerated/indexed
+  evidence identity.
+- Trace preserves partial/contradictory chains as unresolved.
+- Validate is static-only confirm/refute/adjudication. Validators execute no
+  repository code, create no PoCs, and cannot introduce evidence/topology.
+- Dedupe/score separates impact severity, evidence confidence, and
+  malicious-project-fit likelihood.
+- Finalize deterministically writes `REPORT.md` and source-text-free
+  `FINDINGS.json` from one ledger snapshot. Model-authored report prose is
+  refused; operator input is limited to structured decisions.
+
+Any incomplete acquisition/index/plugin/council/trace/validation/release,
+identity, truncation, or output-bound gate permits only `incomplete` and must
+preserve the exact blockers. Remediation candidates are source-text-free
+edge-breaking guidance. They are never auto-applied; one finding, one displayed
+diff, and one explicit operator approval remain mandatory.
+
+## Build-mode taxonomy wording is load-bearing
+
+Safe and full build modes currently use the same install/build wrappers.
+Install lifecycle scripts remain suppressed in both. Build commands may execute
+repo-controlled npm build scripts, `build.rs`, and MSBuild targets in both.
+Full mode still requires `unsafe`, but today that changes admission/warning
+posture only and reserves a future distinction; it does not select a
+less-restricted installer.
+
+Keep this wording aligned across `modes.mjs`, `handler.mjs`, `extension.mjs`,
+the build and post-audit sections of `packet.mjs`, and `README.md`. Focused
+tests intentionally pin those surfaces against drift.
 
 ## `build_root` resolution (centralised)
 
@@ -136,6 +191,82 @@ active-audit anchor. Don't try to thread the production
 `DEFAULT_BUILD_ROOT` into those test fixtures; the decoupling is
 intentional.
 
+## Metadata cache is untrusted, source-text-free derived data
+
+The optional cache lives under the active audit's trusted `build_root`:
+
+```text
+_cache/schema-<cache-version>/tool-<sha256(tool-version)>/
+  namespace-<sha256(normalized-source-namespace)>/
+    source-<sha256(schema+tool+full-source-identity)>.json
+```
+
+Do not add a caller-supplied cache path. `safeWrappers/cacheWrapper.mjs`
+must derive every path from active audit state and the canonical helpers in
+`analysis/cache.mjs`. Every access requires the exact active `auditId`.
+Cache absence or a schema/tool/plugin-version miss is normal and must not
+make an existing v4/v5 flow fail.
+
+The cache is not trusted merely because this extension wrote it. Every load
+must re-check strict schema, canonical JSON bytes, the payload SHA-256,
+source identity, compatible plugin versions, caps, and plain-file/plain-dir
+status. Never follow a symlink, junction, or other reparse point. Corrupt
+regular cache files are discarded and treated as misses.
+
+Persist only structured normalized paths/identifiers, blob/content and
+line-identity hashes, facts, graph topology, finding metadata, structured
+validation decisions, and bounded stage/coverage metadata. Never add fields
+for source/excerpt/snippet text, prompts, credentials/secrets, raw unbounded
+repo strings, report bodies, verdicts/finalization, free-form labels,
+summaries, rationales, warnings, or model output. Free-form strings are the
+main privacy regression risk: cache contracts intentionally omit them even
+when the live analysis contracts contain them.
+
+Cross-source-SHA reuse is limited to records whose current path/blob or
+content identity is unchanged. Prior-source stage/coverage is not returned,
+and verdict/finalized state is not cacheable at all. Plugin records require
+an exact plugin ID/version supplied to `zerotrust_cache_load`.
+`zerotrust_cache_store` reads `getAnalysisPluginCacheRecords` rather than
+reaching into `analysis/plugins/` state. That getter already returns the exact
+persisted cache record shape with cache-stable IDs and stripped topology; the
+cache wrapper must revalidate and consume it directly, never re-derive it.
+Keep that API coordination boundary intact when plugin contracts change.
+
+## V5 durable report artifacts are stricter than cache
+
+`analysis/reportLedger.mjs` must construct `FINDINGS.json` through explicit
+whitelisting, not broad `structuredClone` of live analysis snapshots. In
+particular, never persist plugin fact `name`/`value`, warnings/errors, node
+labels, behavior signatures, finding titles/summaries, validation rationales,
+model output, source snippets, or source-controlled arbitrary strings.
+Permitted report fields are bounded identities/enums, source identity,
+paths/lines/hashes, counts/status/topology, structured validation/remediation
+state, and structured operator decisions.
+
+V5 `REPORT.md` prose is deterministic. Judges return structured decision data
+only; they do not author summaries, recommendations, or operator context.
+`zerotrust_finalize_report` accepts only `operator_decisions` for v5. Each
+record references a canonical finding ID and predefined action/rationale
+category. The optional short `operator_rationale` is a human-authored exception:
+label it user-supplied, never trusted evidence, and reject code/backticks, URLs,
+control characters, long opaque tokens, finding/verdict claims, and matches
+against known source-derived values. Preserve the keep-as-is audit trail through
+these records, not free-form model prose.
+
+Legacy non-council `markdown_body` behavior remains supported, but its
+FINDINGS.json verdict is `trusted:false` and the flow is explicitly outside the
+v5 durable-output privacy guarantee. Cache absence, an old cache schema, or a
+corrupt cache file is a normal miss, never a migration failure. Existing report
+directories/files are not v5 state: only the active in-memory finalization
+record authorizes an idempotent retry, and unrecorded canonical artifacts are
+refused rather than adopted.
+
+Writes must remain canonical, integrity-hashed, same-directory atomic, and
+bounded by the file/count/total-byte caps. `zerotrust_close_audit` clears the
+in-memory cache binding but preserves disk cache. Clone cleanup and stale
+clone auto-purge also preserve cache. Only `zerotrust_cache_cleanup` removes
+the active source entry/namespace; it accepts no raw path.
+
 ## The `onPreToolUse` hook is intentionally NOT registered
 
 Copilot CLI 1.0.x does not invoke `onPreToolUse` for built-in tools
@@ -163,33 +294,63 @@ When working on `enforcement.mjs`:
   half of this file — the `safeWrappers/*` tools call into it.
 - Full binding assumes an SDK-provided `sessionId`. Some no-session
   compatibility/test paths fall back to default/argument-root checks; do not
-  describe wrappers as a universal authorization boundary.
+  describe wrappers as a universal authorization boundary. Destructive
+  `cleanup_audit`, report finalization, council outcome recording, and lifecycle
+  closure are exceptions: they require a real active session identity.
 - The README's "Honest disclosure" section spells this out for users;
   preserve that wording when editing.
 
 Operationally, per-session cleanup that used to happen in the now-
-removed `onSessionEnd` hook is now performed by the canonical
-end-of-audit close in `safeWrappers/sweepWrapper.mjs`. The packet's
-Section 9 instructs the agent to call `zerotrust_sweep_audit_scratch`
-(REQUIRED) for **every** mode (build, audit-only, API-direct,
-metadata_only, local-source). Sweep runs strictly after cleanup, so on
-a successful (non-dry-run) sweep the wrapper calls
-`clearRecordedOutcome + deactivateAudit` to close the audit-state Map
-entries cleanly. (Note: deactivate intentionally lives in sweep, not
-cleanup — calling it in cleanup would null out `getTrustedAuditContext`
-for the subsequent sweep call and silently retarget sweep at
-`DEFAULT_BUILD_ROOT`. See `cleanupWrapper.mjs:144-152` for the same
-note.) Per-mode TTL inside `getActiveAudit` is the secondary safety
-net for sessions that never reach sweep — expired entries are deleted
-on next access and that path also dispatches `clearRecordedOutcome`.
-Worst case: a session that ends without reaching sweep AND without
+removed `onSessionEnd` hook is performed by
+`safeWrappers/lifecycleWrapper.mjs::closeAuditHandler`. Cleanup and sweep
+wrappers never deactivate state: deletion failures return failure and keep
+the trusted audit anchor available for a safe retry. The packet routes every
+terminal path (including metadata-only, private-repo refusal, local-source,
+API-direct, and incomplete council outcomes) through
+`zerotrust_close_audit`, after any destructive cleanup. Per-mode TTL inside
+`getActiveAudit` is the secondary safety net for sessions that never close;
+expired entries are deleted on next access and that path also dispatches
+`clearRecordedOutcome`, `clearCouncilLedgerState`, and `clearCacheBinding`.
+Worst case: a session that ends without reaching close AND without
 further audit access leaves a few hundred bytes of stale Map state
 until the extension process exits — bounded and trivial.
 
+Every activation also creates a cryptographically random immutable `auditId`.
+Council outcomes must echo that ID and are stored with owner/repo/full SHA;
+`safe_build` requires an exact match to the current active generation. A late
+outcome from an earlier audit in the same session is never reusable. Recording
+is first-write-wins within a generation; only an identical normalized retry is
+idempotent, and activating a new audit clears the prior outcome.
+
 `zerotrust_cleanup_audit` is build-clone cleanup and runs **before** sweep.
 API-direct `verify_release` has no clone path, so its quarantine directory
-must be removed manually. A successful non-dry-run sweep is the final
-deactivation point.
+is removed by the active-audit-bound `zerotrust_cleanup_quarantine` wrapper.
+`zerotrust_close_audit` is the final, cleanup-aware deactivation point. It
+refuses to close while a recorded build clone or canonical `verify_release`
+quarantine still exists. `abandon_artifacts:true` explicitly acknowledges that
+those artifacts will be left on disk and cleanup authority relinquished.
+
+Report finalization is exactly once per active audit. The first call uses
+exclusive pair creation and records both canonical identities/hashes in active
+state. Retries verify and return the pair without rewriting. A pre-existing
+unrecorded `REPORT.md` or `FINDINGS.json` is never overwritten or adopted.
+
+Every council mode records one immutable outcome before finalization. An
+identical recorder retry is idempotent; replacement verdict/count/completion
+data is refused. The report finalizer cross-checks the active audit identity,
+requires exactly the recorded overall verdict and council completion boolean,
+and permits an incomplete council to finalize only `incomplete`. Deterministic
+modes remain outside this gate.
+
+`verify_release` owns a second active-audit ledger for release assets. Asset
+enumeration must use the already-bound numeric release ID/tag/source SHA; never
+re-resolve `latest` or a tag. Fetch accepts only a discovered numeric asset ID,
+uses `buildQuarantinePath` rather than spelling artifact directories, writes
+only `<asset-id>.bin`, enforces the documented 100 MB maximum, verifies byte
+counts, hashes bytes, and records duplicate/failure/oversize coverage. A
+successful zero-asset list completes the asset gate. Any other unresolved asset
+forces final verdict `incomplete`, and the finalizer appends the bounded trusted
+release-asset coverage snapshot.
 
 ## Test seam: `__internals` exports
 
@@ -216,16 +377,18 @@ The glob must be explicit — `node --test __tests__/` errors with
 live GitHub API behavior, Copilot hook delivery, host AV behavior, or OS-level
 build containment.
 
-## Grains, owner-repo-sha basenames, and other invariants
+## Grains, hashed artifact basenames, and other invariants
 
 If you touch wrapper code, preserve these invariants — they have tests
 guarding them but the rationale is non-obvious:
 
-- **Clone basename construction:** literal
-  `<owner>-<repo>-<sha.slice(0,7)>`. Because owner/repo may contain hyphens,
-  the basename is not reversibly parsed into components. Cleanup validates
-  immediate-child placement, the broad canonical regex, and (during an active
-  audit) exact equality with the recorded resolved clone path.
+- **URL artifact basename construction:** `zt-v1-` plus the SHA-256 digest of
+  an unambiguous, case-normalized `(owner, repo, full resolved SHA)` tuple for
+  clone, report, and quarantine directories. Cleanup validates immediate-child
+  placement, the canonical hashed regex, and exact equality with active state.
+  Legacy flattened full-SHA and 7-character names are recognized only by
+  age-gated clone-only auto-purge; active cleanup and all new creation use the
+  hashed identity. Auto-purge never deletes reports or quarantine.
 - **`_reports/` and `_quarantine/` are immediate children of
   `build_root`.** Anything starting with `_` is refused as a clone
   basename (defends meta-dirs from being mistaken for clones).

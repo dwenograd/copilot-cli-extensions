@@ -1,0 +1,2 @@
+marker.node("tool","capability","tool-invoke","tool-invoke");
+marker.edge("instruction-tool","invokes","instruction","tool","tool-invoke");

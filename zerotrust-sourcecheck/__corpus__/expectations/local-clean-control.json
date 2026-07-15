@@ -1,0 +1,22 @@
+{
+  "schema": "zerotrust-evaluation-expectation/v1",
+  "schema_version": 1,
+  "slug": "local-clean-control",
+  "kind": "clean-control",
+  "source": {"type": "local", "path": "fixtures/local-clean-control"},
+  "expected": {
+    "stage": {"required": ["acquired", "prepared", "scanned", "traced", "validated", "finalized"], "final": "finalized"},
+    "activation_facts": {"required": [], "minimum": 0},
+    "plugin_facts": {"required": ["control", "no-behavior"], "minimum": 2},
+    "counts": {"candidate": 0, "validated": 0, "refuted": 0, "unresolved": 0},
+    "chains": {"required": [], "complete_required": [], "forbidden": []},
+    "scores": {
+      "severity": {"min": "none", "max": "info"},
+      "confidence": {"min": "none", "max": "low"},
+      "project_fit": {"min": "none", "max": "unlikely"}
+    },
+    "tags": {"required": [], "forbidden": ["remote-fetch", "external-send"]},
+    "acceptable_blockers": [],
+    "failure_stage": null
+  }
+}

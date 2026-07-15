@@ -33,7 +33,7 @@ import {
 
 import { parseGithubUrl, buildClonePath, buildReportPath, buildQuarantinePath, validateRef } from "./urlParser.mjs";
 import { validateLocalPath } from "./localPathValidator.mjs";
-import { activateAudit } from "./enforcement.mjs";
+import { activateAudit, getAnalysisStageState } from "./enforcement.mjs";
 import { clearRecordedOutcome } from "./safeWrappers/state.mjs";
 import { buildInstructionPacket } from "./packet.mjs";
 import { DEFAULT_BUILD_ROOT, ensureDefaultBuildRoot } from "./safeWrappers/defaults.mjs";
@@ -43,10 +43,10 @@ import {
     DEFAULT_SUB_JUDGE_MODEL,
     ALLOWED_MODEL_IDS,
     resolveRoles,
-    renderRolePrompt,
     validateExtraRoles,
 } from "./council/index.mjs";
 import {
+    BUILD_MODE_TAXONOMY_NOTE,
     VALID_MODES_SET,
     COUNCIL_MODES_SET,
     isValidMode,
@@ -185,12 +185,12 @@ export function runHandler(args, { sessionId, log } = {}) {
 
     if (modeIsBuild(mode) && !buildExecAck) {
         return fail(
-            `mode '${mode}' requires \`i_understand_build_executes_code: true\`. Even with safe-mode flags, build steps execute repo-controlled code.`,
+            `mode '${mode}' requires \`i_understand_build_executes_code: true\`. Install lifecycle scripts remain suppressed, but build commands may execute repo-controlled npm build scripts, build.rs, and MSBuild targets.`,
         );
     }
     if (modeIsFullBuild(mode) && !unsafeAck) {
         return fail(
-            `mode '${mode}' requires \`unsafe: true\` in addition to \`i_understand_build_executes_code: true\`. This mode runs lifecycle scripts on your host with no sandbox.`,
+            `mode '${mode}' requires \`unsafe: true\` in addition to \`i_understand_build_executes_code: true\`. ${BUILD_MODE_TAXONOMY_NOTE}`,
         );
     }
 
@@ -212,6 +212,14 @@ export function runHandler(args, { sessionId, log } = {}) {
         if (refError) {
             return fail(`ref override rejected: ${refError}`);
         }
+        if (target.parsed.kind === "release") {
+            if (target.parsed.releaseSelector === "latest") {
+                return fail("ref override is not valid for a bare /releases URL; the latest release's actual tag is resolved by the API.");
+            }
+            if (args.ref !== target.parsed.ref) {
+                return fail("ref override cannot change a tagged release URL's release identity.");
+            }
+        }
     }
     const refOverride = args.ref ? String(args.ref) : null;
 
@@ -231,7 +239,7 @@ export function runHandler(args, { sessionId, log } = {}) {
     const resolvedBuildRoot = rootCheck.resolved;
 
     // --- 6. Compute canonical paths (placeholder SHA until agent resolves it) ---
-    // For URL-driven audits, we use a deterministic placeholder ("0000000")
+    // For URL-driven audits, we use a deterministic full-length placeholder
     // so the path string is stable in the packet for hook-side enforcement
     // and report references. The packet instructs the agent to recompute
     // paths after Section 3 (pin-the-ref) using the real SHA.
@@ -249,7 +257,7 @@ export function runHandler(args, { sessionId, log } = {}) {
             return fail(`local report path construction failed: ${err.message}`);
         }
     } else {
-        const placeholderSha = "0000000";
+        const placeholderSha = "0".repeat(40);
         try {
             expectedClonePath = buildClonePath(resolvedBuildRoot, target.parsed.owner, target.parsed.repo, placeholderSha);
             expectedReportPath = buildReportPath(resolvedBuildRoot, target.parsed.owner, target.parsed.repo, placeholderSha);
@@ -288,6 +296,7 @@ export function runHandler(args, { sessionId, log } = {}) {
     let councilJudgeModel = null;
     let councilSubJudgeModel = null;
     let maxPremiumCalls = null;
+    let validationMinSeverity = "high";
 
     if (modeUsesCouncil(mode)) {
         // Validate per-role model overrides
@@ -329,33 +338,37 @@ export function runHandler(args, { sessionId, log } = {}) {
         } else {
             maxPremiumCalls = DEFAULT_MAX_PREMIUM_CALLS;
         }
+        if (args.validation_min_severity !== undefined
+            && args.validation_min_severity !== null) {
+            if (!["high", "medium", "low", "info"].includes(args.validation_min_severity)) {
+                return fail(
+                    "validation_min_severity must be one of: high, medium, low, info",
+                );
+            }
+            validationMinSeverity = args.validation_min_severity;
+        }
 
-        // Render each role's prompt for the manifest. The packet inlines these
-        // so the calling agent has the full prompt available when launching
-        // each task() call.
+        // Keep the handler manifest static. URL-driven role prompts are
+        // materialized only after safe_list_tree/safe_clone returns the
+        // concrete pinned SHA and wrapper-owned paths.
         councilManifest = resolved.roles.map((role) => ({
             id: role.id,
             category: role.category,
             model: role.model,
             tier: role.tier,
             mandatory: !!role.mandatory,
-            renderedPrompt: renderRolePrompt(role, {
-                clonePath: expectedClonePath,
-                nonce,
-                focusOverride: focusWrapped,
-                // Tool-access flavor: local-source (view/grep/glob on
-                // localPath), api-direct (safe_fetch_file), or on-disk
-                // clone (grep against expectedClonePath).
-                apiDirect: !modeIsBuild(mode) && !modeUsesLocalSource(mode),
-                localSource: modeUsesLocalSource(mode),
-                localPath: target.kind === "local" ? target.localPath : null,
-                owner: target.kind === "url" ? target.parsed.owner : null,
-                repo: target.kind === "url" ? target.parsed.repo : null,
-            }),
+            angle: role.angle,
+            ignore_clauses: [...(role.ignore_clauses || [])],
         }));
     } else {
         // Reject council-only params when not in council mode (clearer than silently ignoring)
-        for (const k of ["roles", "extra_roles", "judge", "max_premium_calls"]) {
+        for (const k of [
+            "roles",
+            "extra_roles",
+            "judge",
+            "max_premium_calls",
+            "validation_min_severity",
+        ]) {
             if (args[k] !== undefined && args[k] !== null) {
                 return fail(`parameter '${k}' is only valid in council modes`);
             }
@@ -363,6 +376,8 @@ export function runHandler(args, { sessionId, log } = {}) {
     }
 
     // --- 8. Activate the enforcement audit-in-progress state ---
+    let auditId = null;
+    let analysisStageState = null;
     if (sessionId) {
         try {
             // Clear any stale council outcome from a prior audit in the same
@@ -375,7 +390,7 @@ export function runHandler(args, { sessionId, log } = {}) {
             } catch {
                 // best-effort; clearRecordedOutcome is idempotent
             }
-            activateAudit({
+            auditId = activateAudit({
                 sessionId,
                 buildPath: resolvedBuildRoot,
                 mode,
@@ -384,9 +399,15 @@ export function runHandler(args, { sessionId, log } = {}) {
                 repo: target.kind === "url" ? target.parsed.repo : undefined,
                 ref: target.kind === "url" ? (refOverride || target.parsed.ref) : undefined,
                 refType: target.kind === "url" ? target.parsed.refType : undefined,
+                urlKind: target.kind === "url" ? target.parsed.kind : undefined,
+                releaseSelector: target.kind === "url" ? target.parsed.releaseSelector : undefined,
                 localPath: target.kind === "local" ? target.localPath : undefined,
-                expectedReportPath: target.kind === "local" ? expectedReportPath : undefined,
+                expectedReportPath,
+                expectedQuarantinePath,
+                councilRoleManifest: councilManifest,
+                validationMinSeverity,
             });
+            analysisStageState = getAnalysisStageState(sessionId, { auditId });
             if (typeof log === "function") {
                 const targetLabel = target.kind === "url"
                     ? `${target.parsed.owner}/${target.parsed.repo}`
@@ -419,11 +440,14 @@ export function runHandler(args, { sessionId, log } = {}) {
         expectedReportPath,
         expectedQuarantinePath,
         placeholderSha: true,
+        auditId,
+        analysisStageState,
         // Council-mode additions (null when mode is not in COUNCIL_MODES)
         councilManifest,
         councilJudgeModel,
         councilSubJudgeModel,
         maxPremiumCalls,
+        validationMinSeverity,
     });
 
     return {

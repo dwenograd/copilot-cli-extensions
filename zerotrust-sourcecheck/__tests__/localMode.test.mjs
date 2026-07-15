@@ -188,6 +188,25 @@ describe("local_path handler — success paths", () => {
         assert.match(r.textResultForLlm, /\.zerotrust-backup-/);
     });
 
+    test("packet finalizes the local report once through the active local identity", () => {
+        const r = runHandler({
+            local_path: validDir,
+            i_understand_local_path_reads_my_disk: true,
+            mode: "audit_local_source",
+        });
+        assert.equal(r.resultType, "success");
+        assert.equal(
+            (r.textResultForLlm.match(/zerotrust_finalize_report\(\{/g) || []).length,
+            1,
+        );
+        assert.match(r.textResultForLlm, /Local reports accept no\s+owner\/repo\/SHA\/path fields/);
+        assert.match(r.textResultForLlm, /finalizeResult\.reportPath/);
+        assert.doesNotMatch(
+            r.textResultForLlm,
+            /New-Item\s+-ItemType\s+Directory[^\n]*(?:_reports|REPORT\.md)/i,
+        );
+    });
+
     test("packet pins the remediation path to the localPath, not arbitrary", () => {
         const r = runHandler({
             local_path: validDir,

@@ -132,9 +132,19 @@ const ALLOWED_FILES = [
     ["__tests__", "v4r2r9Hardening.test.mjs"],
     ["__tests__", "v4r2r10Hardening.test.mjs"],
     ["__tests__", "v4r2r11Hardening.test.mjs"],
+    ["analysis", "plugins", "runner.mjs"],
+    ["analysis", "reportLedger.mjs"],
+    ["__corpus__", "README.md"],
+    ["__corpus__", "promotion-gate.v1.json"],
 ];
-const ALLOWED_DIRS = [["safeWrappers"], ["tagDictionary"], ["__corpus__", "runner"]];
-const SCAN_EXTENSIONS = [".mjs", ".md"];
+const ALLOWED_DIRS = [
+    ["safeWrappers"],
+    ["tagDictionary"],
+    ["__corpus__", "runner"],
+    ["__corpus__", "fixtures"],
+    ["__corpus__", "expectations"],
+];
+const SCAN_EXTENSIONS = [".mjs", ".md", ".json", ".ztfixture"];
 
 function hasScanExtension(name) {
     return SCAN_EXTENSIONS.some((ext) => name.endsWith(ext));
@@ -284,5 +294,4 @@ test("AV-safety scan covers v3.1 hardening files (cleanup wrapper + auto-purge)"
         "expected safeWrappers/safeFetchHandler.mjs (v4) to be in scan targets",
     );
 });
-
 

@@ -25,14 +25,24 @@ test("apiClient.ensureValidSha rejects bad sha", () => {
     assert.doesNotThrow(() => apiInternals.ensureValidSha("abcdef0123456789abcdef0123456789abcdef01"));
 });
 
-test("apiClient.ensureValidPath rejects traversal / leading slash / double slash", () => {
+test("apiClient.ensureValidPath matches Git tree path safety rules", () => {
     assert.throws(() => apiInternals.ensureValidPath("../escape"), /traversal/);
+    assert.throws(() => apiInternals.ensureValidPath("src/./index.js"), /traversal/);
+    assert.throws(() => apiInternals.ensureValidPath("src/../escape"), /traversal/);
     assert.throws(() => apiInternals.ensureValidPath("/etc/evil"), /leading-trailing slash/);
     assert.throws(() => apiInternals.ensureValidPath("a//b"), /double slash/);
     assert.throws(() => apiInternals.ensureValidPath("trailing/"), /leading-trailing slash/);
-    assert.throws(() => apiInternals.ensureValidPath("foo bar"), /invalid repo path/);
+    assert.throws(() => apiInternals.ensureValidPath("bad\\path"), /invalid repo path/);
+    assert.throws(() => apiInternals.ensureValidPath(`bad${String.fromCharCode(0)}path`), /invalid repo path/);
+    assert.throws(() => apiInternals.ensureValidPath("x".repeat(1025)), /invalid repo path/);
+    assert.doesNotThrow(() => apiInternals.ensureValidPath("x".repeat(1024)));
+    assert.doesNotThrow(() => apiInternals.ensureValidPath("docs/café menu/notes..draft.md"));
     assert.doesNotThrow(() => apiInternals.ensureValidPath("src/index.js"));
     assert.doesNotThrow(() => apiInternals.ensureValidPath("README.md"));
+    assert.equal(
+        apiInternals.encodeRepoPath("docs/café #?..md"),
+        "docs/caf%C3%A9%20%23%3F..md",
+    );
 });
 
 test("safeListTreeHandler refuses missing url and missing owner/repo", async () => {

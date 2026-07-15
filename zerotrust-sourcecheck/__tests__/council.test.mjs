@@ -13,8 +13,33 @@ import {
     DEFAULT_META_JUDGE_MODEL,
     resolveRoles,
     renderRolePrompt,
+    materializeCouncilManifest,
     validateExtraRoles,
 } from "../council/index.mjs";
+import { runHandler } from "../handler.mjs";
+import { deactivateAudit } from "../enforcement.mjs";
+
+const PINNED_SHA = "1".repeat(40);
+const BUILD_ROOT = "C:\\test\\zerotrust-sourcecheck";
+const AUDIT_ID = "11111111-1111-4111-8111-111111111111";
+
+function buildPromptOptions(extra = {}) {
+    return {
+        clonePath: `${BUILD_ROOT}\\octocat-Hello-1111111`,
+        buildRoot: BUILD_ROOT,
+        auditId: AUDIT_ID,
+        owner: "octocat",
+        repo: "Hello",
+        sourceCommitSha: PINNED_SHA,
+        nonce: "abc123",
+        coverageSnapshot: {
+            coverageComplete: true,
+            aggregateEntryCount: 3,
+        },
+        candidatePaths: ["package.json", "src/index.js"],
+        ...extra,
+    };
+}
 
 // ---------- Roster shape ----------
 
@@ -168,41 +193,46 @@ test("resolveRoles does not mutate ROLES", () => {
 
 test("renderRolePrompt returns a string with required substitutions", () => {
     const role = ROLES.find((r) => r.id === "install-build-hook");
-    const out = renderRolePrompt(role, { clonePath: "C:\\test\\repo", nonce: "abc123" });
+    const out = renderRolePrompt(role, buildPromptOptions());
     assert.equal(typeof out, "string");
     assert.ok(out.includes("install-build-hook"));
-    assert.ok(out.includes("C:\\test\\repo"));
+    assert.ok(out.includes("octocat-Hello-1111111"));
+    assert.ok(out.includes(PINNED_SHA));
     assert.ok(out.includes("abc123"));
     assert.ok(out.includes("MANDATORY")); // mandatory marker present
     assert.ok(out.includes("OUTPUT CONTRACT"));
-    assert.ok(out.includes("findings:"));
-    assert.ok(out.includes("coverage_performed:"));
+    assert.ok(out.includes('"candidates"'));
+    assert.ok(out.includes('"coverage_performed"'));
+    assert.ok(out.includes("strongestBenignHypothesis"));
+    assert.ok(out.includes("zerotrust_record_council_candidates"));
+    assert.doesNotMatch(out, /quoted_evidence|"sourceText"\s*:/i);
 });
 
 test("source-inspection tier prompt mentions only the read-only tools", () => {
     const role = ROLES.find((r) => r.tier === "source-inspection");
-    const out = renderRolePrompt(role, { clonePath: "x", nonce: "y" });
+    const out = renderRolePrompt(role, buildPromptOptions({ nonce: "y" }));
+    assert.ok(out.includes("zerotrust_safe_list_analysis_facts"));
     assert.ok(out.includes("view, grep, glob, web_fetch"));
     assert.ok(!out.includes("git verify"));
 });
 
 test("provenance tier prompt extends to git verification + GitHub CLI", () => {
     const role = ROLES.find((r) => r.tier === "provenance");
-    const out = renderRolePrompt(role, { clonePath: "x", nonce: "y" });
+    const out = renderRolePrompt(role, buildPromptOptions({ nonce: "y" }));
     assert.ok(out.includes("git verification"));
     assert.ok(out.includes("GitHub CLI"));
 });
 
 test("renderRolePrompt with focusOverride includes the override block", () => {
     const role = ROLES[0];
-    const out = renderRolePrompt(role, { clonePath: "x", nonce: "y", focusOverride: "ZZZ_FOCUS" });
+    const out = renderRolePrompt(role, buildPromptOptions({ nonce: "y", focusOverride: "ZZZ_FOCUS" }));
     assert.ok(out.includes("ZZZ_FOCUS"));
     assert.ok(out.includes("untrusted hint"));
 });
 
 test("renderRolePrompt without focusOverride omits the override block", () => {
     const role = ROLES[0];
-    const out = renderRolePrompt(role, { clonePath: "x", nonce: "y" });
+    const out = renderRolePrompt(role, buildPromptOptions({ nonce: "y" }));
     assert.ok(!out.includes("focus override"));
 });
 
@@ -212,6 +242,83 @@ test("renderRolePrompt throws on null role", () => {
 
 test("renderRolePrompt throws on unknown tier", () => {
     assert.throws(() => renderRolePrompt({ id: "x", tier: "nonsense", angle: "a", category: "A", ignore_clauses: [] }, {}));
+});
+
+test("API-direct runtime materialization uses pinned wrapper identity without placeholders", () => {
+    const role = ROLES.find((r) => r.id === "install-build-hook");
+    const materialized = materializeCouncilManifest([role], {
+        sourceKind: "api-direct",
+        auditId: AUDIT_ID,
+        sourceCommitSha: PINNED_SHA,
+        owner: "octocat",
+        repo: "Hello",
+        buildRoot: BUILD_ROOT,
+        nonce: "runtime-api",
+        aggregateEntries: [
+            { path: "src/index.js", type: "blob" },
+            { path: "package.json", type: "blob" },
+            { path: ".github/workflows/ci.yml", type: "blob" },
+            ...Array.from({ length: 40 }, (_, index) => ({
+                path: `src/module-${index}.js`,
+                type: "blob",
+            })),
+        ],
+        coverageSnapshot: {
+            coverageComplete: true,
+            rootTreeSha: "2".repeat(40),
+            aggregateEntryCount: 43,
+            aggregateEntriesTruncated: false,
+            unresolvedSubtreeCount: 0,
+            coverageBlockers: [],
+        },
+    })[0];
+
+    assert.match(materialized.renderedPrompt, new RegExp(PINNED_SHA));
+    assert.match(materialized.renderedPrompt, /"package\.json"/);
+    assert.match(materialized.renderedPrompt, /"coverageComplete":true/);
+    assert.doesNotMatch(materialized.renderedPrompt, /<RESOLVED_SHA>|not yet substituted/i);
+    assert.doesNotMatch(materialized.renderedPrompt, /zerotrust_safe_list_tree\(\{/);
+    assert.match(materialized.renderedPrompt, /DO NOT write any files for any reason/);
+    assert.equal(materialized.candidatePaths.length, 24);
+});
+
+test("handler council definitions are static and carry no pre-acquisition identity", () => {
+    const result = runHandler({
+        url: "https://github.com/octocat/Hello",
+        mode: "audit_source_council",
+        build_root: BUILD_ROOT,
+    });
+    assert.equal(result.resultType, "success");
+    const start = result.textResultForLlm.indexOf("## Section 5b");
+    const end = result.textResultForLlm.indexOf("## Section 7", start);
+    const councilSection = result.textResultForLlm.slice(start, end);
+    assert.match(councilSection, /Static council definitions/);
+    assert.doesNotMatch(councilSection, /0000000|RESOLVED_SHA|not yet substituted/i);
+    assert.doesNotMatch(councilSection, /"renderedPrompt"/);
+});
+
+test("council packet finalizes scan, traces the graph, then records outcome", () => {
+    const sessionId = "council-candidate-sequencing";
+    const result = runHandler({
+        url: "https://github.com/octocat/Hello",
+        mode: "audit_source_council",
+        build_root: BUILD_ROOT,
+    }, { sessionId });
+    try {
+        assert.equal(result.resultType, "success");
+        const packet = result.textResultForLlm;
+        const submit = packet.indexOf("zerotrust_record_council_candidates(<the role's exact JSON object>)");
+        const finalize = packet.indexOf('action: "finalize"', submit);
+        const trace = packet.indexOf("zerotrust_trace_behavior_graph", finalize);
+        const outcome = packet.indexOf("zerotrust_record_council_outcome({", finalize);
+        assert.ok(submit >= 0);
+        assert.ok(finalize > submit);
+        assert.ok(trace > finalize);
+        assert.ok(outcome > trace);
+        assert.match(packet, /Candidate submission is advisory and \*\*does not\*\* count toward mandatory\s+acquisition/i);
+    } finally {
+        deactivateAudit(sessionId);
+    }
 });
 
 // ---------- validateExtraRoles ----------

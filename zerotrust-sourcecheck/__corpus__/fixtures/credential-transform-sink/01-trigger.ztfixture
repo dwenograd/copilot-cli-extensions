@@ -1,0 +1,2 @@
+marker.fact("activation-surface","manual-trigger","activation");
+marker.node("trigger","trigger","manual-trigger","activation");

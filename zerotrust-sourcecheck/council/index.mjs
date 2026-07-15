@@ -19,8 +19,18 @@ export {
     DEFAULT_SUB_JUDGE_MODEL,
     DEFAULT_META_JUDGE_MODEL,
 };
-export { renderRolePrompt } from "./promptTemplate.mjs";
+export {
+    renderRolePrompt,
+    materializeCouncilManifest,
+    normalizeCoverageSnapshot,
+    selectRoleCandidatePaths,
+} from "./promptTemplate.mjs";
 export { validateExtraRoles } from "./extraRolesValidator.mjs";
+export {
+    renderConfirmValidatorPrompt,
+    renderRefuteValidatorPrompt,
+    renderValidationAdjudicationPrompt,
+} from "./validationPromptTemplate.mjs";
 
 /**
  * Resolve the effective roster from the defaults plus user overrides.

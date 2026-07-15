@@ -7,6 +7,7 @@ import assert from "node:assert/strict";
 
 import {
     parseGithubUrl,
+    buildArtifactIdentityName,
     buildClonePath,
     buildReportPath,
     buildQuarantinePath,
@@ -193,29 +194,50 @@ test("ignores query params and fragments without leaking them", () => {
 // ---------- Path construction safety ----------
 
 test("buildClonePath produces a child of build_root", () => {
-    const p = buildClonePath(BUILD_ROOT, "octocat", "hello-world", "abc1234");
+    const sha = "a".repeat(40);
+    const p = buildClonePath(BUILD_ROOT, "octocat", "hello-world", sha);
     assert.ok(p.toLowerCase().startsWith(BUILD_ROOT.toLowerCase()));
-    assert.match(p, /octocat-hello-world-abc1234$/);
+    assert.match(p, /zt-v1-[0-9a-f]{64}$/);
 });
 
 test("buildClonePath rejects bad components", () => {
-    assert.throws(() => buildClonePath(BUILD_ROOT, "..", "hello", "abc1234"));
-    assert.throws(() => buildClonePath(BUILD_ROOT, "octocat", "..", "abc1234"));
+    const sha = "a".repeat(40);
+    assert.throws(() => buildClonePath(BUILD_ROOT, "..", "hello", sha));
+    assert.throws(() => buildClonePath(BUILD_ROOT, "octocat", "..", sha));
     assert.throws(() => buildClonePath(BUILD_ROOT, "octocat", "hello", "../etc"));
-    assert.throws(() => buildClonePath("", "octocat", "hello", "abc1234"));
+    assert.throws(() => buildClonePath("", "octocat", "hello", sha));
+    assert.throws(() => buildClonePath(BUILD_ROOT, "octocat", "hello", "abc1234"));
 });
 
-test("buildClonePath uses 7-char short SHA", () => {
-    const p = buildClonePath(BUILD_ROOT, "octocat", "hello-world", "abcdef0123456789abcdef0123456789abcdef01");
-    assert.ok(p.endsWith("abcdef0"));
+test("artifact path builders hash the full identity and avoid SHA-prefix collisions", () => {
+    const shaA = "abcdef0123456789abcdef0123456789abcdef01";
+    const shaB = "abcdef0123456789abcdef0123456789abcdef02";
+    const a = buildClonePath(BUILD_ROOT, "octocat", "hello-world", shaA);
+    const b = buildClonePath(BUILD_ROOT, "octocat", "hello-world", shaB);
+    assert.match(a, /zt-v1-[0-9a-f]{64}$/);
+    assert.match(b, /zt-v1-[0-9a-f]{64}$/);
+    assert.notEqual(a, b);
 });
 
 test("buildReportPath places report under _reports", () => {
-    const p = buildReportPath(BUILD_ROOT, "octocat", "hello-world", "abc1234");
-    assert.match(p, /_reports[/\\]octocat-hello-world-abc1234$/);
+    const sha = "b".repeat(40);
+    const p = buildReportPath(BUILD_ROOT, "octocat", "hello-world", sha);
+    assert.match(p, /_reports[/\\]zt-v1-[0-9a-f]{64}$/);
 });
 
 test("buildQuarantinePath places quarantine under _quarantine", () => {
-    const p = buildQuarantinePath(BUILD_ROOT, "octocat", "hello-world", "abc1234");
-    assert.match(p, /_quarantine[/\\]octocat-hello-world-abc1234$/);
+    const sha = "c".repeat(40);
+    const p = buildQuarantinePath(BUILD_ROOT, "octocat", "hello-world", sha);
+    assert.match(p, /_quarantine[/\\]zt-v1-[0-9a-f]{64}$/);
+});
+
+test("artifact identity encoding is unambiguous and case-normalized", () => {
+    const sha = "d".repeat(40);
+    const left = buildArtifactIdentityName("a-b", "c", sha);
+    const right = buildArtifactIdentityName("a", "b-c", sha);
+    assert.notEqual(left, right, "delimiter-ambiguous tuples must not collide");
+    assert.equal(
+        buildArtifactIdentityName("OctoCat", "Hello-World", sha.toUpperCase()),
+        buildArtifactIdentityName("octocat", "hello-world", sha),
+    );
 });

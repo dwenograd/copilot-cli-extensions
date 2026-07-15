@@ -15,17 +15,10 @@
 // This wrapper runs INSIDE the extension process where we control
 // execution unconditionally — so cleanup works regardless of hook status.
 //
-// Lifecycle role (v4-r3): this wrapper is also the canonical end-of-audit
-// deactivation point for the active-audit state machine in enforcement.mjs.
-// The packet instructs the agent to call sweep AFTER cleanup (section 9,
-// "REQUIRED — call this after cleanup"), and sweep is called for every
-// mode (build, audit-only, API-direct, metadata_only). So sweep is the
-// last wrapper in the audit lifecycle, which makes it the right place to
-// call deactivateAudit + clearRecordedOutcome. Doing so closes the audit
-// state Map entry cleanly without depending on the removed onSessionEnd
-// hook or on TTL eviction. Dry-run sweeps do NOT deactivate (the agent
-// is just inspecting; the real sweep+deactivate happens on the follow-up
-// non-dry-run call).
+// Lifecycle role: sweep is destructive cleanup only. It deliberately does
+// NOT deactivate audit state. The packet calls zerotrust_close_audit only
+// after every retryable cleanup step succeeds, preserving the trusted audit
+// anchor when a deletion fails.
 //
 // Substitutional safety:
 // - Only deletes top-level FILES (never directories — protects _reports/,
@@ -38,8 +31,7 @@
 import { existsSync, readdirSync, rmSync } from "node:fs";
 import nodePath from "node:path";
 
-import { clearRecordedOutcome } from "./state.mjs";
-import { deactivateAudit, getTrustedAuditContext } from "../enforcement.mjs";
+import { getTrustedAuditContext } from "../enforcement.mjs";
 
 import { DEFAULT_BUILD_ROOT } from "./defaults.mjs";
 
@@ -103,7 +95,10 @@ function safeRemoveFile(p) {
     if (!existsSync(p)) return { existed: false, removed: false };
     try {
         rmSync(p, { force: true, maxRetries: 3, retryDelay: 100 });
-        return { existed: true, removed: !existsSync(p) };
+        if (existsSync(p)) {
+            return { existed: true, removed: false, error: "path still exists after removal" };
+        }
+        return { existed: true, removed: true };
     } catch (err) {
         return { existed: true, removed: false, error: err.message };
     }
@@ -130,11 +125,11 @@ function listScratchFiles(dir) {
  * Tool signature:
  *   zerotrust_sweep_audit_scratch({
  *     build_root?: string,           // default DEFAULT_BUILD_ROOT (or active audit's build_root)
- *     also_sweep_parent?: boolean,   // default true — also sweep dirname(build_root)
+ *     also_sweep_parent?: boolean,   // default false — opt in to dirname(build_root)
  *     dry_run?: boolean,             // default false — when true, list only, don't delete
  *   })
  */
-export async function sweepAuditScratchHandler(args, invocation) {
+export async function sweepAuditScratchHandler(args, invocation, dependencies = {}) {
     args = args || {};
     const sessionId = invocation?.sessionId || null;
 
@@ -171,7 +166,7 @@ export async function sweepAuditScratchHandler(args, invocation) {
         return failure(`build_root must be absolute, got ${JSON.stringify(buildRoot)}`);
     }
 
-    const alsoSweepParent = args.also_sweep_parent !== false; // default true
+    const alsoSweepParent = args.also_sweep_parent === true; // default false
     const dryRun = args.dry_run === true;
 
     const sweepDirs = [buildRoot];
@@ -188,34 +183,38 @@ export async function sweepAuditScratchHandler(args, invocation) {
     const found = [];
     const removed = [];
     const errors = [];
+    const removeFile = dependencies.removeFile || safeRemoveFile;
 
     for (const dir of sweepDirs) {
         const files = listScratchFiles(dir);
         for (const f of files) {
             found.push(f);
             if (!dryRun) {
-                const r = safeRemoveFile(f);
+                const r = removeFile(f);
                 if (r.removed) {
                     removed.push(f);
-                } else if (r.error) {
-                    errors.push({ path: f, error: r.error });
+                } else if (r.error || r.existed) {
+                    errors.push({ path: f, error: r.error || "path was not removed" });
                 }
             }
         }
     }
 
-    // v4-r3: end-of-audit lifecycle close. See top-of-file "Lifecycle role".
-    // We've reached the success return path without hitting any earlier
-    // failure, so close out the audit-state Map entries. Both operations
-    // are idempotent Map.delete calls — safe to invoke even if the audit
-    // was already evicted by TTL or by a previous sweep call in the same
-    // session. Dry-run sweeps do NOT deactivate (the agent is just
-    // inspecting; the real sweep+deactivate happens on the follow-up
-    // non-dry-run call).
-    const auditDeactivated = !!(sessionId && !dryRun);
-    if (auditDeactivated) {
-        clearRecordedOutcome(sessionId);
-        deactivateAudit(sessionId);
+    if (errors.length > 0) {
+        return failure(
+            "sweep did not remove every candidate; the active audit remains open so cleanup can be retried",
+            {
+                buildRoot,
+                sweptDirs: sweepDirs,
+                dryRun,
+                foundCount: found.length,
+                found,
+                removedCount: removed.length,
+                removed,
+                errors,
+                auditStillActive: ctx.hasActiveAudit,
+            },
+        );
     }
 
     return success({
@@ -227,7 +226,7 @@ export async function sweepAuditScratchHandler(args, invocation) {
         removedCount: dryRun ? 0 : removed.length,
         removed: dryRun ? null : removed,
         errors,
-        auditDeactivated,
+        auditStillActive: ctx.hasActiveAudit,
     });
 }
 
@@ -238,9 +237,9 @@ function success(data) {
     };
 }
 
-function failure(message) {
+function failure(message, data = {}) {
     return {
-        textResultForLlm: JSON.stringify({ ok: false, error: message }, null, 2),
+        textResultForLlm: JSON.stringify({ ok: false, error: message, ...data }, null, 2),
         resultType: "failure",
     };
 }

@@ -99,6 +99,20 @@ function resolveDefault() {
 }
 
 export const DEFAULT_BUILD_ROOT = resolveDefault();
+export const DEFAULT_CACHE_DIRECTORY_NAME = "_cache";
+
+export function resolveCacheRoot(buildRoot = DEFAULT_BUILD_ROOT) {
+    if (typeof buildRoot !== "string" || !nodePath.isAbsolute(buildRoot)) {
+        throw new Error("cache build_root must be an absolute path");
+    }
+    const root = nodePath.resolve(buildRoot);
+    const cacheRoot = nodePath.resolve(nodePath.join(root, DEFAULT_CACHE_DIRECTORY_NAME));
+    const relative = nodePath.relative(root, cacheRoot);
+    if (!relative || relative.startsWith("..") || nodePath.isAbsolute(relative)) {
+        throw new Error("computed cache root escaped or collapsed to build_root");
+    }
+    return cacheRoot;
+}
 
 // First-use mkdir. Idempotent — `recursive: true` + try/catch swallow
 // any "already exists" / permission errors. Wrappers can call this
@@ -120,6 +134,7 @@ export function ensureDefaultBuildRoot() {
 // env-var precedence without polluting other tests' DEFAULT_BUILD_ROOT.
 export const __internals = {
     resolveDefault,
+    resolveCacheRoot,
     isDangerousRoot,
     DANGEROUS_ROOTS,
 };

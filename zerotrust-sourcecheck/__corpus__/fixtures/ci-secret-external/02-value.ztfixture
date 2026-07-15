@@ -1,0 +1,2 @@
+marker.node("secret-value","sensitive-source","secret-like-value","secret-like");
+marker.edge("ci-value","flows-to","ci-trigger","secret-value","secret-like");

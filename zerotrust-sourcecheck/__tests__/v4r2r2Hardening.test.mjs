@@ -213,11 +213,10 @@ test("v4-r2-r2: UTF-16BE-encoded .bat with BOM is classified as TEXT", () => {
         "UTF-16BE .bat with BOM must be text despite nulls");
 });
 
-test("v4-r2-r2: UTF-16 BOM on a non-script extension stays binary if has nulls", () => {
-    // PNG path with UTF-16 BOM doesn't trigger the text-script path.
+test("coverage hardening: UTF-16 text under a binary-looking suffix stays text", () => {
     const buf = Buffer.from([0xFF, 0xFE, 0x41, 0x00]);
-    assert.equal(classifyAsBinary(buf, "image.png"), true,
-        ".png stays binary (extension allowlist takes precedence)");
+    assert.equal(classifyAsBinary(buf, "image.png"), false,
+        "actual UTF-16 bytes take precedence over the .png suffix");
 });
 
 test("v4-r2-r2: detectUtf16Bom returns correct encoding label", () => {
@@ -324,7 +323,7 @@ test("v4-r2-r2: new code (apiClient + v4r2 test file) free of contiguous offensi
 //       of every powershell call (so any accidental cwd-relative write
 //       lands in the swept sandbox, not the workspace root)
 //
-// This test pins layer (2) — if the packet's preamble loses either the
+// This test pins layer (2) ï¿½ if the packet's preamble loses either the
 // no-file-write line OR the Set-Location requirement, the test fails.
 
 function makeBasePacketArgs(mode) {

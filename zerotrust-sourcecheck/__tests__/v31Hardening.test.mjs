@@ -25,9 +25,11 @@ import {
     deactivateAudit,
     getActiveAudit,
     getTrustedAuditContext,
+    recordResolvedArtifactPaths,
     recordResolvedClonePath,
+    recordResolvedSha,
 } from "../enforcement.mjs";
-import { parseGithubUrl } from "../urlParser.mjs";
+import { buildClonePath, buildReportPath, parseGithubUrl } from "../urlParser.mjs";
 import { recordCouncilOutcome, getRecordedOutcome, clearRecordedOutcome } from "../safeWrappers/state.mjs";
 
 const BR = join(tmpdir(), "zt-v31-test-" + Date.now() + "-" + Math.random().toString(36).slice(2, 8));
@@ -60,7 +62,7 @@ function activeAuditFor(owner, repo) {
         // v4: switched to a build mode so safe_clone is reachable in these
         // tests. Audit modes are now API-direct and don't allow safe_clone.
         mode: "audit_and_safe_build",
-        expectedClonePath: join(BR, `${owner}-${repo}-aaaaaaa`),
+        expectedClonePath: buildClonePath(BR, owner, repo, "0".repeat(40)),
         owner,
         repo,
     });
@@ -252,7 +254,7 @@ test("D: cleanupAuditHandler refuses _reports as the clone_path", async () => {
     writeFileSync(join(BR, "_reports", "octocat-X-1234567", "REPORT.md"), "# important");
     const r = await cleanupAuditHandler({ clone_path: join(BR, "_reports"), build_root: BR }, {});
     assert.equal(r.resultType, "failure");
-    assert.match(r.textResultForLlm, /starts with '_'/);
+    assert.match(r.textResultForLlm, /requires an invocation sessionId/);
     // Verify the _reports dir still exists
     assert.equal(existsSync(join(BR, "_reports", "octocat-X-1234567", "REPORT.md")), true);
 });
@@ -261,30 +263,31 @@ test("D: cleanupAuditHandler refuses _quarantine as the clone_path", async () =>
     mkdirSync(join(BR, "_quarantine"), { recursive: true });
     const r = await cleanupAuditHandler({ clone_path: join(BR, "_quarantine"), build_root: BR }, {});
     assert.equal(r.resultType, "failure");
-    assert.match(r.textResultForLlm, /starts with '_'/);
+    assert.match(r.textResultForLlm, /requires an invocation sessionId/);
 });
 
 test("D: cleanupAuditHandler refuses non-canonical clone basename", async () => {
     mkdirSync(join(BR, "random-dir"), { recursive: true });
     const r = await cleanupAuditHandler({ clone_path: join(BR, "random-dir"), build_root: BR }, {});
     assert.equal(r.resultType, "failure");
-    assert.match(r.textResultForLlm, /canonical clone-naming pattern/);
+    assert.match(r.textResultForLlm, /requires an invocation sessionId/);
 });
 
 test("D: cleanupAuditHandler refuses non-immediate child of build_root", async () => {
     mkdirSync(join(BR, "sub", "sub2", "octocat-Hello-aaaaaaa"), { recursive: true });
     const r = await cleanupAuditHandler({ clone_path: join(BR, "sub", "sub2", "octocat-Hello-aaaaaaa"), build_root: BR }, {});
     assert.equal(r.resultType, "failure");
-    assert.match(r.textResultForLlm, /not an immediate child/);
+    assert.match(r.textResultForLlm, /requires an invocation sessionId/);
 });
 
-test("D: cleanupAuditHandler accepts canonical immediate-child clone", async () => {
+test("D: cleanupAuditHandler no longer accepts no-session canonical-looking clones", async () => {
     const cp = join(BR, "octocat-Hello-aaaaaaa");
     mkdirSync(cp, { recursive: true });
     writeFileSync(join(cp, "marker.txt"), "x");
     const r = await cleanupAuditHandler({ clone_path: cp, build_root: BR }, {});
-    assert.equal(r.resultType, "success");
-    assert.equal(existsSync(cp), false);
+    assert.equal(r.resultType, "failure");
+    assert.match(r.textResultForLlm, /requires an invocation sessionId/);
+    assert.equal(existsSync(cp), true);
 });
 
 // =====================================================================
@@ -301,12 +304,32 @@ test("E: recordOutcomeHandler refuses missing sessionId (no shared-bucket fallba
 });
 
 test("E: recordOutcomeHandler accepts when sessionId is provided", async () => {
-    const r = await recordOutcomeHandler(
-        { verdict: "low", critical_count: 0, high_count: 0, complete: true },
-        { sessionId: "real-session-id" },
-    );
-    assert.equal(r.resultType, "success");
-    clearRecordedOutcome("real-session-id");
+    const sessionId = "real-session-id";
+    activateAudit({
+        sessionId,
+        buildPath: BR,
+        mode: "audit_and_safe_build_council",
+        expectedClonePath: buildClonePath(BR, "octocat", "Hello", "0".repeat(40)),
+        owner: "octocat",
+        repo: "Hello",
+    });
+    recordResolvedSha(sessionId, "a".repeat(40));
+    try {
+        const r = await recordOutcomeHandler(
+            {
+                audit_id: getActiveAudit(sessionId).auditId,
+                verdict: "low",
+                critical_count: 0,
+                high_count: 0,
+                complete: true,
+            },
+            { sessionId },
+        );
+        assert.equal(r.resultType, "success");
+    } finally {
+        clearRecordedOutcome(sessionId);
+        deactivateAudit(sessionId);
+    }
 });
 
 // =====================================================================
@@ -358,7 +381,13 @@ test("K: parseGithubUrl sets PR URL ref to refs/pull/N/head (not null)", () => {
 
 test("L: starting a new audit in same session clears prior recorded outcome", async () => {
     // Simulate: session ran audit-A → recorded outcome → starts audit-B
-    recordCouncilOutcome(SESSION, { verdict: "low", criticalCount: 0, highCount: 0, complete: true });
+    recordCouncilOutcome(SESSION, {
+        auditId: "prior-audit-generation",
+        verdict: "low",
+        criticalCount: 0,
+        highCount: 0,
+        complete: true,
+    });
     assert.ok(getRecordedOutcome(SESSION), "outcome was recorded");
 
     // Import handler dynamically so the mocked sessionId path is exercised
@@ -432,10 +461,22 @@ test("J: cleanupAuditHandler refuses agent build_root that differs from active a
 // =====================================================================
 
 test("R2/J: finalizeReportHandler uses active-audit build_root when agent omits build_root", async () => {
-    activate(SESSION, "audit_source");
+    const sha = "a".repeat(40);
+    activateAudit({
+        sessionId: SESSION,
+        buildPath: BR,
+        mode: "audit_source",
+        expectedClonePath: buildClonePath(BR, "octocat", "Hello", "0".repeat(40)),
+        owner: "octocat",
+        repo: "Hello",
+    });
+    recordResolvedSha(SESSION, sha);
+    recordResolvedArtifactPaths(SESSION, {
+        reportPath: buildReportPath(BR, "octocat", "Hello", sha),
+    });
     const { finalizeReportHandler } = await import("../safeWrappers/reportWrapper.mjs");
     const r = await finalizeReportHandler(
-        { owner: "octocat", repo: "Hello", short_sha: "aaaaaaa", markdown_body: "# ok" },
+        { owner: "octocat", repo: "Hello", resolved_sha: sha, markdown_body: "# ok\n\nVerdict: incomplete" },
         { sessionId: SESSION },
     );
     assert.equal(r.resultType, "success");
@@ -744,11 +785,18 @@ test("R4/clone-binding: safeInstallHandler refuses sibling clone_path", async ()
 
 test("R4/clone-binding: cleanupAuditHandler refuses sibling clone_path", async () => {
     const { recordResolvedClonePath } = await import("../enforcement.mjs");
-    const realClone = join(BR, "real-clone-aaaaaaa");
-    const evilClone = join(BR, "evil-sibling-bbbbbbb");
+    const realClone = buildClonePath(BR, "octocat", "real", "a".repeat(40));
+    const evilClone = buildClonePath(BR, "octocat", "evil", "b".repeat(40));
     mkdirSync(realClone, { recursive: true });
     mkdirSync(evilClone, { recursive: true });
-    activate(SESSION, "audit_source");
+    activateAudit({
+        sessionId: SESSION,
+        buildPath: BR,
+        mode: "audit_and_safe_build",
+        expectedClonePath: realClone,
+        owner: "octocat",
+        repo: "real",
+    });
     recordResolvedClonePath(SESSION, realClone);
 
     const r = await cleanupAuditHandler(
@@ -948,12 +996,12 @@ test("R7/metadata_only: safe_clone refuses when active audit is metadata_only", 
 });
 
 test("R7/cleanup-binding: cleanupAuditHandler refuses when audit active but no resolved clone yet", async () => {
-    const cp = join(BR, "octocat-Hello-World-aaaaaaa");
+    const cp = join(BR, `octocat-Hello-World-${"a".repeat(40)}`);
     mkdirSync(cp, { recursive: true });
     activateAudit({
         sessionId: SESSION,
         buildPath: BR,
-        mode: "audit_source",
+        mode: "audit_and_safe_build",
         expectedClonePath: cp,
     });
     // Don't recordResolvedClonePath
@@ -1062,11 +1110,32 @@ test("R10/F1-incomplete-verdict: recordOutcomeHandler refuses verdict='incomplet
 });
 
 test("R10/F1-incomplete-verdict: recordOutcomeHandler accepts verdict='incomplete' with complete=false", async () => {
-    const r = await recordOutcomeHandler(
-        { verdict: "incomplete", critical_count: 0, high_count: 0, complete: false },
-        { sessionId: "r10-incomplete-test-2" },
-    );
-    assert.equal(r.resultType, "success");
+    const sessionId = "r10-incomplete-test-2";
+    activateAudit({
+        sessionId,
+        buildPath: BR,
+        mode: "audit_source_council",
+        expectedClonePath: buildClonePath(BR, "octocat", "Hello", "0".repeat(40)),
+        owner: "octocat",
+        repo: "Hello",
+    });
+    recordResolvedSha(sessionId, "a".repeat(40));
+    try {
+        const r = await recordOutcomeHandler(
+            {
+                audit_id: getActiveAudit(sessionId).auditId,
+                verdict: "incomplete",
+                critical_count: 0,
+                high_count: 0,
+                complete: false,
+            },
+            { sessionId },
+        );
+        assert.equal(r.resultType, "success");
+    } finally {
+        clearRecordedOutcome(sessionId);
+        deactivateAudit(sessionId);
+    }
 });
 
 test("R10/F2-refspec: cloneInternals.resolveRefViaLsRemote uses refType-aware refspec for release_tag", async () => {

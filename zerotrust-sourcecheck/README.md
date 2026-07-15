@@ -5,13 +5,16 @@ directory) for source-level malware indicators. API-direct wrappers do
 not intentionally create source files, but returned tool text can still
 be retained in Copilot CLI session logs or oversized-tool-output storage.
 Build modes clone a pinned commit under a contained directory and run
-wrapper-controlled install/build commands.
+wrapper-controlled install/build commands. Safe/full modes currently use the
+same wrappers: install lifecycle scripts stay suppressed, while repo-controlled
+npm build scripts, `build.rs`, and MSBuild targets may execute in both.
 
 This is the "would you trust this dependency / installer / random new
-repo from someone on the internet" tool. It surfaces the patterns that
-matter (install hooks, invisible-Unicode obfuscation, unconventional
-C2 channels, credential-store reads, persistence, supply-chain) and
-gives the orchestrator a tight playbook for triaging them.
+repo from someone on the internet" tool. Its objective is to find and
+statically prove source-level malicious behavior chains: how attacker-controlled
+content activates, what capability it reaches, and what effect or target follows.
+It is not a generic vulnerability, exploit-development, lint, license, or broad
+dependency-CVE scanner.
 
 ## Tools registered
 
@@ -20,13 +23,27 @@ gives the orchestrator a tight playbook for triaging them.
 | `zerotrust_sourcecheck` | Main entry point. Returns an instruction packet the orchestrator follows. |
 | `zerotrust_safe_list_tree` | GitHub-API tree listing at a pinned SHA (API-direct mode). |
 | `zerotrust_safe_fetch_file` | GitHub-API source fetch returned through the tool result; no source file is intentionally created by the wrapper. |
+| `zerotrust_safe_list_source` | Enumerates only the active local root or recorded build clone without following symlinks/reparse points; returns metadata, not source text. |
+| `zerotrust_safe_index_source_file` | Indexes one enumerated local/build file with exact containment, classification, hashes, and bounded normalized facts; never returns source text. |
+| `zerotrust_safe_list_analysis_facts` | Pages exact audit-bound indexed fact references (path, line range, identity, excerpt hash) without source text or excerpts. |
+| `zerotrust_record_council_candidates` | Validates and records one structured role batch with exact indexed evidence, then gates `prepared → scanned`. |
+| `zerotrust_trace_behavior_graph` | Audit-bound merge and bounded trace of deterministic plugin seeds plus finalized council graph fragments; returns source-text-free chains and validation conflicts. |
+| `zerotrust_record_validation` | Paged audit-bound static validation: prepares required candidates, records independent confirm/refute decisions, records a separate adjudication, and advances `traced → validated` only when complete and untruncated. |
+| `zerotrust_safe_list_release_assets` | Lists assets only for the active audit's already-bound numeric release ID/tag/source SHA and records bounded coverage. |
+| `zerotrust_safe_fetch_release_asset` | Downloads one previously discovered numeric asset ID to the canonical quarantine, verifies byte counts, hashes it, and records coverage (100 MB hard maximum). |
+| `zerotrust_cache_list` | Lists strictly revalidated metadata-cache entries for the exact active source namespace; absence is normal. |
+| `zerotrust_cache_load` | Loads exact-source metadata or unchanged blob/content records from a prior source SHA, with exact plugin-version compatibility. |
+| `zerotrust_cache_store` | Atomically stores only normalized, bounded derived index/plugin metadata in the canonical versioned cache. |
+| `zerotrust_cache_cleanup` | Removes only the active source entry or active source namespace; accepts no raw path. |
 | `zerotrust_safe_clone` | Hardened git clone (no submodules / hooks / LFS smudge / symlinks). Build modes only. |
 | `zerotrust_safe_install` | `npm`, `npm-install`, `yarn`, `pnpm`, `pip`, `cargo`, or `dotnet` dependency operation with hardcoded flags. Build modes only. |
 | `zerotrust_safe_build` | Build step gated on prior council outcome (council-build modes). |
-| `zerotrust_record_council_outcome` | In-memory pass/fail recording the build-gate consults. |
-| `zerotrust_finalize_report` | Canonical-path `REPORT.md` write under `<build_root>/_reports/`. |
-| `zerotrust_cleanup_audit` | Removes a canonical build-mode clone and matching quarantine directory; preserves the report unless explicitly asked to delete it. |
-| `zerotrust_sweep_audit_scratch` | Deletes unrecognized top-level files in `build_root` and, by default, its parent. Dry-run first; parent sweeping can affect unrelated files. |
+| `zerotrust_record_council_outcome` | Immutably records a verdict bound to the current audit ID + owner/repo/full SHA; required before finalization in every council mode. |
+| `zerotrust_finalize_report` | Exactly-once canonical `REPORT.md` + source-text-free `FINDINGS.json` finalization. Council artifacts render from one trusted ledger snapshot. |
+| `zerotrust_cleanup_audit` | Removes only the active build audit's exact recorded hashed-identity clone; preserves the report/findings pair unless explicitly deleted. |
+| `zerotrust_cleanup_quarantine` | Removes the canonical `verify_release` quarantine derived from active audit state; accepts no raw deletion path. |
+| `zerotrust_sweep_audit_scratch` | Deletes unrecognized top-level files in `build_root`; parent sweeping is available but defaults off and must be dry-run first. |
+| `zerotrust_close_audit` | Cleanup-aware close; refuses to strand a live clone/quarantine unless `abandon_artifacts:true` explicitly acknowledges that choice. |
 
 ## Quick start
 
@@ -53,6 +70,50 @@ or set `ZEROTRUST_DETERMINISTIC_ONLY=1` in your environment to make the
 deterministic mode the workspace default. All other modes are opt-in
 — see [Modes](#modes) below.
 
+## Version 5 malicious-source pipeline
+
+Council modes retain the fixed **32-role discovery backbone**. Optional extra
+roles are additive; they do not replace the required roster or its
+mandatory/category/90% completion gates.
+
+The logical pipeline is:
+
+1. **Prepare** — API-direct, local-source, and build-clone inputs enter one
+   audit-bound analysis index. Local/build enumeration and reads are
+   exact-active-root wrapper operations that refuse traversal and reparse
+   following. Deterministic activation plugins consume only normalized indexed
+   facts/manifests and seed graph nodes/edges; they do not emit findings or
+   verdicts.
+2. **Scan** — the deterministic baseline and all successful discovery roles
+   submit bounded candidate findings and graph fragments. Every evidence
+   reference must match an enumerated file, exact indexed line range, current
+   blob/content identity, and excerpt SHA-256.
+3. **Trace** — deterministic plugin seeds and council fragments are merged into
+   bounded activation/trigger-to-effect behavior chains. Missing, contradictory,
+   or truncated topology remains unresolved and blocks a trusted verdict.
+4. **Validate** — independent confirm and refute passes, then a separate
+   adjudication, use only existing source-text-free evidence/graph IDs. This is
+   **static-only proof**: validators execute no repository code, run no builds or
+   fuzzers, create no PoCs, and cannot introduce evidence or graph edges.
+5. **Dedupe / score** — validated, refuted, and unresolved candidates are
+   grouped by semantic behavior identity. Impact severity, evidence confidence,
+   and malicious-project-fit likelihood remain separate axes.
+6. **Finalize** — the wrapper deterministically renders the canonical
+   `REPORT.md` + source-text-free `FINDINGS.json` pair from one trusted snapshot.
+   Only structured operator decisions may be added. Remediation is never
+   auto-applied.
+
+The durable stage state is `acquired → prepared → scanned → traced → validated
+→ finalized`; dedupe/scoring occurs deterministically while constructing the
+validated decision snapshot. Any incomplete acquisition, index, plugin,
+council, trace, validation, release, identity, or output-bound gate preserves
+the exact blockers and permits only verdict `incomplete`.
+
+Finding state is `candidate → validating → validated | refuted | unresolved`.
+Behavior-chain status is `complete | unresolved | contested`. Validation records
+one independent `confirm` and one `refute` decision before the separate
+`validated | refuted | unresolved` adjudication.
+
 ## API-direct by default
 
 `audit_source`, `audit_source_council`, and `verify_release` obtain source
@@ -60,22 +121,44 @@ context through the GitHub API. `metadata_only` stops at metadata and does not
 read source. The API-direct audit pipeline:
 
 1. `zerotrust_safe_list_tree` enumerates the repo's file tree at a pinned
-   SHA via `gh api`. It returns `coverageComplete`; this is false when GitHub
-   truncates the tree or the wrapper's 5,000-entry anti-spill cap fires. A
-   no-red-flags verdict is not valid until the gap is drilled into or reported.
-2. `zerotrust_safe_fetch_file` fetches each interesting file (manifests,
-   lockfiles, install/build hooks, recently-changed files) from the
-   GitHub API. Text is returned through the tool result; binaries return
-   metadata plus a 256-byte magic-byte preview. Files above the fetch
-   ceiling return metadata-only or a bounded preview, depending on which
-   GitHub API response path supplied the size/content. Text above the inline
-   cap is truncated; there is currently no ranged follow-up API, so unresolved
-   truncation must be reported as a coverage limitation.
-3. The deterministic checklist + 32-role council overlay reason about
-   the returned content.
-4. The extension intentionally writes only `REPORT.md` for ordinary source
-   audits. `verify_release` additionally downloads release artifacts into
-   `_quarantine/` for hash and magic-byte verification.
+   SHA via `gh api`. Truncated/capped listings return identity-bound
+   `unresolvedSubtrees`; call the wrapper again with a returned `subtree_path`
+   or unambiguous `tree_sha`. Results merge and deduplicate until aggregate
+   `coverageComplete` is true or exact blockers force an incomplete verdict.
+2. Every enumerated blob is marked `classificationRequired`. The parent calls
+   `zerotrust_safe_fetch_file` with `coverage_scope:"mandatory"` for every blob;
+   filename extensions are ordering hints only, never exclusions. Valid UTF-8
+   and supported BOM-marked UTF-16 are text and must be fully scanned.
+   Structurally verified binaries return metadata plus a 256-byte magic-byte
+   preview. Invalid UTF-8 without trusted magic or strong binary byte evidence
+   remains unknown and incomplete; it is never lossy-decoded or accepted as
+   binary. Oversized/metadata-only, truncated-text, failed, identity-mismatched,
+   unfetched, and council-sample-only blobs keep quantitative
+   `requiredAcquisitionComplete:false`.
+3. The deterministic checklist + all 32 discovery roles reason about the
+   returned content. Council-role samples are advisory and never satisfy the
+   parent's mandatory acquisition ledger.
+4. Candidate graphs are traced without execution. Every critical/high candidate
+   (plus lower severities selected by `validation_min_severity`) receives
+   independent static confirm and refute decisions followed by a separate
+   adjudication. Validators receive bounded source-text-free graph/fact context
+   and cannot add evidence or graph edges.
+5. Finalization writes the canonical `REPORT.md` + `FINDINGS.json` pair.
+   Version-5 council flows render both deterministically from trusted ledger
+   state. Non-council compatibility flows still accept caller-authored Markdown,
+   but their paired findings ledger is explicitly `legacy-v4` and
+   `trusted:false`. The optional metadata-cache tools can persist normalized
+   derived metadata when explicitly called, but current flows do not require or
+   automatically populate the cache. `verify_release` additionally calls
+   `zerotrust_safe_list_release_assets`, then
+   `zerotrust_safe_fetch_release_asset` once per discovered numeric ID. The
+   fetch wrapper ignores attacker-controlled names for path construction and
+   writes only `<asset-id>.bin` under the canonical quarantine.
+6. Release listing is bounded to 512 tracked unique assets. Downloads default
+   to, and can never exceed, 100 MB per asset. A zero-asset release completes
+   the release gate after a successful identity-bound list. Any truncated,
+   skipped, oversized, failed, or byte-mismatched asset keeps
+   `requiredReleaseAssetAcquisitionComplete:false`.
 
 The wrapper itself does not create source files in these modes. This is
 not a guarantee that source bytes never reach disk: Copilot CLI may retain
@@ -109,12 +192,14 @@ clone, no GitHub API calls, no SHA pinning.
 
 ### Safety boundary for local mode
 
-- Each role's prompt enforces a **CONTAINMENT** rule: every path
-  passed to `view`/`grep`/`glob` MUST start with `local_path`. Symlinks
-  whose target resolves outside `local_path` are noted as artifacts
-  but NOT followed. This is **prompt-time discipline**, not
-  wrapper-enforced; if a role agent misbehaves it could in principle
-  read outside the path.
+- Deterministic enumeration and indexing are wrapper-enforced against the exact
+  active `local_path`. Callers cannot redirect the root; traversal, symlinks,
+  junctions, and other reparse points are refused or skipped, repository code is
+  never executed, and only bounded normalized facts/hashes are retained.
+- Council roles may use `view`/`grep`/`glob` for deeper review under a separate
+  prompt-level path rule. Built-in tools are not intercepted by a runtime hook,
+  but role output cannot enter the trusted ledger unless its evidence exactly
+  matches the wrapper-owned index identity, line range, and excerpt hash.
 - `local_path` itself is validated: must be absolute, must exist, must
   be a directory, no `..` segments, no UNC / `\\?\` prefix, no
   credential-store paths (`.ssh`, `.aws`, `.docker`, `.kube`,
@@ -128,8 +213,11 @@ clone, no GitHub API calls, no SHA pinning.
 
 Build modes and local-source modes include a Section 9b remediation flow in
 their packet. API-direct `verify_release` can create quarantine files but does
-not apply this source-edit flow. Per HIGH/CRITICAL source finding, the agent
-walks you through three choices:
+not apply this source-edit flow. In a v5 council flow, remediation starts only
+from a validated, source-text-free candidate that identifies graph edges,
+evidence locations/hashes, risk codes, and static verification criteria. No
+stored diff or source text enters the ledger. Per HIGH/CRITICAL source finding,
+the agent walks you through three choices:
 
 - **defang** — surgical edit (specific files + lines, in diff form).
   Agent calls `view` first to show you the proposed change, waits for
@@ -140,12 +228,14 @@ walks you through three choices:
 - **delete project** — `Remove-Item -Recurse -Force` against the
   audit's pinned path (either `local_path` for local audits or the
   sandbox clone for build audits). Confirmed twice; refuses any
-  other path even one character off. `REPORT.md` (outside the pinned
-  path) survives.
-- **keep as-is** — append `## Operator decision` block to `REPORT.md`
-  with the finding title + your one-line rationale. **Refuses
-  "keep" without a written rationale** — the audit trail is the
-  point. This is "I knew about this and chose to keep it anyway."
+  other path even one character off. The canonical report/findings pair
+  (outside the pinned path) survives.
+- **keep as-is** — in v5, add one structured `operator_decisions` record
+  referencing the canonical finding ID and a predefined rationale category.
+  An optional one-line rationale must be the operator's own words and is labeled
+  user-supplied, not evidence. Legacy v4 compatibility appends the equivalent
+  block only to the in-memory Markdown draft before finalization. **Refuses
+  "keep" without a written rationale.**
 
 After all defangs, the agent suggests re-running the same audit on
 the defanged tree to verify findings no longer trigger (mitigates
@@ -183,9 +273,10 @@ threats this extension targets. Common patterns it actively looks for:
 
 ## What it explicitly does NOT do
 
-- **Sandboxed dynamic analysis.** Build modes execute repo-controlled build
-  code on the real host. The wrapper constrains argv/path selection; it is not
-  an OS sandbox or network monitor.
+- **Sandboxed dynamic analysis.** Build modes execute repo-controlled npm build
+  scripts, `build.rs`, MSBuild targets, and other build-time code on the real
+  host in both safe and full modes. The wrapper constrains argv/path selection;
+  it is not an OS sandbox or network monitor.
 - **Decompiling release binaries.**
 - **Network behavior monitoring.**
 - **Proving "this repo is safe."** Static analysis catches patterns,
@@ -196,11 +287,12 @@ threats this extension targets. Common patterns it actively looks for:
 
 ## ⚠️ Real malware samples + Windows Defender = noise (or dead audit)
 
-The hardened-clone wrapper protects against **execution** of
-repo-controlled code (no symlinks, no submodules, no LFS smudge filters,
-no git hooks, no lifecycle scripts). It does **not** — and cannot —
-protect against your host antivirus signature-scanning the cloned source
-files.
+The hardened-clone and install wrappers suppress checkout/install-time
+execution surfaces (no symlinks, submodules, LFS smudge filters, git hooks, or
+install lifecycle scripts). A later build command may still execute
+repo-controlled build-time code in either safe or full mode. The wrappers do
+**not** — and cannot — protect against your host antivirus signature-scanning
+the cloned source files.
 
 If you point this tool at a known-distributed malware sample (e.g., a
 keylogger, RAT, or stealer source repo) on a Windows host with Defender
@@ -230,17 +322,17 @@ samples, and any of the deterministic / council audits against repos
 you don't have prior reason to suspect contain *known-distributed*
 malware.
 
-For known-distributed malware: clone in a VM, audit there, copy the
-`REPORT.md` back. Don't use your host machine.
+For known-distributed malware: clone in a VM, audit there, copy the canonical
+`REPORT.md` + `FINDINGS.json` pair back. Don't use your host machine.
 
 ## How it works
 
 The extension follows the same instruction-packet pattern as the rest
-of this workspace: the registered tool returns a long natural-language
-playbook, which the calling agent executes using its existing tools
-(clone, grep, view, web_fetch, sub-agents, powershell). All of the
-heavy lifting happens in the agent loop, not inside the extension
-process.
+of this workspace: the registered tool returns a natural-language playbook,
+which the calling agent orchestrates. Safety-sensitive identity, acquisition,
+indexing, plugin execution, candidate ingestion, tracing, validation state,
+cache handling, and finalization are owned by registered wrappers rather than
+free-form report assembly.
 
 ### Defense-in-depth
 
@@ -283,13 +375,43 @@ boundary outside the registered tool flow.
   - `cargo` → `cargo build --locked --offline`
   - `dotnet` → `dotnet build --no-restore`
   - `dotnet-publish` → `dotnet publish --no-restore`
-- `zerotrust_finalize_report` writes `REPORT.md` only to the canonical
-  `<build_root>/_reports/<owner>-<repo>-<short-sha>/REPORT.md` path. Refuses
-  oversized writes (>1MB) and any agent-supplied `build_root` that
-  doesn't match either the active audit's `buildPath` or the default
-  (defence against destructive arbitrary-write via missing sessionId).
+- `zerotrust_safe_list_release_assets` accepts the owner/repo/numeric release
+  ID/tag/full source SHA returned by the bound tree operation and rejects any
+  mismatch. It never re-resolves `latest` or a tag, tracks zero assets and
+  duplicates, and does not expose an attacker-controlled download path.
+- `zerotrust_safe_fetch_release_asset` accepts only a previously enumerated
+  numeric asset ID plus an optional lower `max_bytes`. It downloads through
+  the GitHub asset-ID endpoint, verifies listed/downloaded/written byte counts,
+  computes SHA-256, returns bounded magic/preview metadata, and writes only the
+  numeric `.bin` filename produced under the canonical quarantine path builder.
+- `zerotrust_finalize_report` writes the canonical pair
+  `<build_root>/_reports/zt-v1-<sha256-identity>/{REPORT.md,FINDINGS.json}`.
+  Council flows serialize only whitelisted source-text-free identity,
+  path/line/hash, enum, count, status, topology, validation, remediation, and
+  structured operator-decision fields from one trusted version-5 ledger
+  snapshot. Plugin fact `name`/`value`, warning/error prose, source-controlled
+  free strings, model output, and source snippets are not report-artifact
+  fields. REPORT.md's executive summary, recommendation, finding rows,
+  states/severities, operator-decision audit trail, and verdict are all rendered
+  deterministically from the same FINDINGS.json snapshot. V5 rejects
+  model-authored report prose. Callers may supply only `operator_decisions`
+  referencing canonical finding IDs with predefined action/rationale categories.
+  An optional short `operator_rationale` is explicitly labeled user-supplied,
+  is not trusted evidence, and is rejected if it resembles code, a URL, an
+  encoded token, a finding/verdict claim, or known source-derived text. Legacy
+  non-council flows retain `markdown_body` compatibility, are marked
+  `trusted:false`, and are outside this v5 durable-output privacy guarantee.
+  Same-directory durable temp files are published exclusively; partial creation
+  is rolled back where possible. Both paths, byte counts, and hashes are
+  recorded together. Same-audit retries verify and return the existing pair
+  without rewriting; missing/tampered recorded files and unrecorded pre-existing
+  files fail closed. Trusted council verdicts require stage `validated` plus all
+  source/release/council/trace/validation gates. Incomplete artifacts remain
+  available with exact blockers. Only after both files are durable and recorded
+  does the stage advance `validated → finalized`.
 - `zerotrust_sweep_audit_scratch` deletes top-level unrecognized files
-  left in `build_root` and, by default, its immediate parent directory.
+  left in `build_root`. Its immediate parent is included only when
+  `also_sweep_parent:true` is passed.
   Sub-agents have been observed writing source bytes / path
   enumerations to disk via PowerShell `Out-File` / `Set-Content` /
   `iwr -OutFile` in violation of the API-direct contract; this wrapper
@@ -297,9 +419,17 @@ boundary outside the registered tool flow.
   directories, with a finite whitelist of known-good filenames
   (README, package.json, .gitignore, Makefile, Cargo.toml, backup files
   matching `<orig>.zerotrust-backup-<utc-ts>`, etc.). The packet's
-  epilogue instructs the agent to call this at end-of-audit. Because the
-  parent may contain unrelated files, run `dry_run:true` first and normally
-  pass `also_sweep_parent:false` unless the parent is a dedicated audit area.
+  epilogue instructs the agent to call this before lifecycle closure.
+  Parent sweeping defaults off because the parent may contain unrelated
+  files; dry-run before explicitly enabling it.
+- `zerotrust_cleanup_quarantine` derives the canonical `verify_release`
+  quarantine path from the active audit's trusted build root and resolved
+  SHA. It accepts no raw path, and deletion failures keep the audit active
+  for retry.
+- `zerotrust_close_audit` performs no filesystem deletion, but checks whether
+  the active build clone or `verify_release` quarantine still exists. It
+  refuses closure until cleanup succeeds. `abandon_artifacts:true` explicitly
+  leaves those paths on disk and relinquishes active cleanup authority.
 
 If the agent tries to call `git clone` / `npm install` / `cargo build`
 directly via the shell instead of through these wrappers, **nothing
@@ -343,25 +473,20 @@ be wired back into `extension.mjs`:
 
 ```js
 // near the top, with the other imports
-import { preToolUseHook, deactivateAudit } from "./enforcement.mjs";
-import { clearRecordedOutcome } from "./safeWrappers/state.mjs";
+import { preToolUseHook } from "./enforcement.mjs";
 
 // inside joinSession({ ... }), after the `tools: [ ... ],` array
 hooks: {
     onPreToolUse: (input, invocation) => preToolUseHook(input, invocation),
-    onSessionEnd: async (_input, invocation) => {
-        if (invocation?.sessionId) {
-            deactivateAudit(invocation.sessionId);
-            clearRecordedOutcome(invocation.sessionId);
-        }
-    },
 },
 ```
 
-Those are the current integration points. `preToolUseHook`,
-`deactivateAudit`, `clearRecordedOutcome`, `inspectToolCall`, and the
-deny-policy patterns remain present and unit-tested, but any future wiring
-must be revalidated against that SDK/runtime version.
+Only the deny hook should be reconsidered here. Lifecycle state must continue
+through `zerotrust_close_audit`; do not restore unconditional `onSessionEnd`
+deactivation, which would discard retry authority after cleanup failures.
+`preToolUseHook`, `inspectToolCall`, and the deny-policy patterns remain
+present and unit-tested, but any future wiring must be revalidated against
+that SDK/runtime version.
 
 For the specific case of sub-agents leaving scratch files in
 `build_root` after an audit, the active mitigation is
@@ -374,14 +499,14 @@ call it in the audit epilogue.
 |---|---|---|
 | `metadata_only` | GH API recon only, no clone. NOT a security audit. | (explicit) |
 | `audit_source` | Recon + static audit via GH API (no clone) + verdict. | repo / commit / tree / pull URLs when `ZEROTRUST_DETERMINISTIC_ONLY=1` is set |
-| `audit_source_council` | `audit_source` plus the 32-role council and meta-judge synthesis. | **Default** for repo / commit / tree / pull URLs |
+| `audit_source_council` | `audit_source` plus all 32 discovery roles, bounded graph tracing, independent confirm/refute/adjudication, and meta-judge synthesis. | **Default** for repo / commit / tree / pull URLs |
 | `audit_local_source` | Same as `audit_source` but against an already-on-disk path. | (explicit; `local_path=...`) |
 | `audit_local_source_council` | Council audit against an on-disk path. | **Default when `local_path` is supplied** |
 | `verify_release` | Release-artifact provenance: signed tag, attestations, Authenticode, `workflow_run` cross-check. | `/releases/...` URLs |
-| `audit_and_safe_build` | `audit_source` + safe build (mandates `--ignore-scripts` etc.). Requires `i_understand_build_executes_code`. | (explicit) |
-| `audit_and_full_build` | Build mode requiring both acknowledgements. It currently uses the same install/build wrappers as safe mode; see below. | (explicit) |
-| `audit_and_safe_build_council` | Council audit + safe build. The build wrapper refuses to proceed until a passing council outcome is recorded, unless the explicit wrapper override is supplied. | (explicit) |
-| `audit_and_full_build_council` | Council build requiring both acknowledgements and the recorded-outcome gate; wrapper commands remain the same as safe mode. | (explicit) |
+| `audit_and_safe_build` | `audit_source` + shared install/build wrappers. Install lifecycle scripts stay suppressed; build-time repo code may execute. Requires `i_understand_build_executes_code`. | (explicit) |
+| `audit_and_full_build` | Same wrappers as safe-build; additionally requires `unsafe` for admission/warning posture and reserves a future distinction. | (explicit) |
+| `audit_and_safe_build_council` | Council audit + shared install/build wrappers. The build wrapper refuses to proceed until a passing council outcome is recorded, unless the explicit wrapper override is supplied. | (explicit) |
+| `audit_and_full_build_council` | Same wrappers and recorded-outcome gate as the safe council build; additionally requires `unsafe`. | (explicit) |
 
 ### Safe vs full build: current behavior
 
@@ -390,7 +515,8 @@ not select a different installer implementation. Both safe and full modes call
 the same `zerotrust_safe_install` and `zerotrust_safe_build` wrappers. Install
 lifecycle scripts remain suppressed by the hardcoded install flags. Build
 scripts/`build.rs`/MSBuild targets may execute in **both** modes because the
-build command itself is arbitrary repo-controlled code.
+build command itself is arbitrary repo-controlled code. Full mode currently
+reserves a future distinction only; it is not a less-restricted installer.
 
 ### Council-build overrides are orthogonal
 
@@ -398,23 +524,36 @@ build command itself is arbitrary repo-controlled code.
 - `council_build_override:true` bypasses only the severity gate.
 - Both are required to bypass both conditions.
 - Neither flag bypasses the requirement to record an outcome first.
+- Every recording must include the exact immutable `audit_id` printed in the
+  current sourcecheck packet. The recorder stores it with owner/repo/full SHA,
+  and the build gate rejects stale or cross-audit outcomes.
+- Outcome recording is first-write-wins for that audit generation. Exact
+  normalized retries are idempotent; changed verdicts, counts, completion, or
+  identity are refused. Starting a new audit generation clears the old outcome.
 
 The recorder accepts only `critical`, `high`, `medium`, `low`,
 `no red flags found`, or `incomplete`. `info` is a finding severity, not an
-overall recorded verdict. The local-source report template also contains older
-`clean / suspicious / malicious` prose; translate it to the canonical
-vocabulary before calling `zerotrust_record_council_outcome`. Likewise,
-`reconnaissance only` is a report label, not a recordable council verdict.
+overall recorded verdict, and `reconnaissance only` is a metadata-report label,
+not a recordable council verdict.
 The recorder also rejects inconsistent severity counts and requires
 `verdict:"incomplete"` to use `complete:false`.
+
+The first successful outcome write is immutable. An identical retry is
+idempotent; a different verdict/count/completion payload is refused. Every
+council mode records before final report finalization, not only council-build
+modes. The finalizer requires the stored verdict, critical/high counts, and
+completion state to exactly match the deterministic trusted ledger decision.
+Incomplete council artifacts use verdict `incomplete`, `complete:false`, and
+retain the ledger's partial severity counts. Deterministic legacy modes do not
+use this gate.
 
 ### Council role tool whitelists
 
 | Source mode | Source-inspection roles | Provenance roles |
 |---|---|---|
-| API-direct URL | `zerotrust_safe_fetch_file`, `zerotrust_safe_list_tree`, `web_fetch` for external context | Same, plus `gh api` metadata verification |
-| Build-mode clone | `view`, `grep`, `glob`, `web_fetch` | Same, plus git verification commands and GitHub CLI |
-| Local source | `view`, `grep`, `glob` under `local_path` only | Same, plus `web_fetch` only for external advisory/CVE lookup |
+| API-direct URL | `zerotrust_safe_list_analysis_facts`, `zerotrust_safe_fetch_file`, `web_fetch`; the parent supplies the pinned SHA, bounded paths, and coverage snapshot, and roles must not call `zerotrust_safe_list_tree` | Same, plus `gh api` metadata verification without re-resolving the source tree |
+| Build-mode clone | `zerotrust_safe_list_analysis_facts`, `zerotrust_safe_index_source_file`, `view`, `grep`, `glob`, `web_fetch` | Same, plus git verification commands and GitHub CLI |
+| Local source | `zerotrust_safe_list_analysis_facts`, `zerotrust_safe_index_source_file`, `view`, `grep`, `glob` under `local_path` only | Same, plus `web_fetch` only for external advisory/CVE lookup |
 
 These are prompt-enforced whitelists, not runtime interception of built-in
 tools.
@@ -461,7 +600,7 @@ zerotrust_sourcecheck({
   focus?: string,                                 // free-text emphasis
   build_root?: string,                            // see Storage layout
   i_understand_build_executes_code?: boolean,     // required for build modes
-  unsafe?: boolean,                               // required for full-build mode
+  unsafe?: boolean,                               // required for full-build modes
   i_understand_private_repo_risk?: boolean,       // required for private repos
   roles?: object,                                 // council modes only
   extra_roles?: object[],                         // council modes only
@@ -470,30 +609,114 @@ zerotrust_sourcecheck({
 })
 ```
 
+## Version-5 migration and compatibility
+
+- The existing 10 mode names remain accepted; version 5 adds staged analysis
+  contracts and tools without renaming the public mode taxonomy.
+- Non-council finalization remains an explicit legacy-v4 compatibility path.
+  It accepts `markdown_body`, writes the dual artifact pair, and marks the
+  findings verdict `trusted:false`.
+- Missing, old-version, incompatible, or corrupt metadata cache entries are
+  normal misses. They never block an otherwise valid audit.
+- Existing `_reports` directories or files are not imported as version-5 state.
+  Only the active audit's in-memory finalization record authorizes an idempotent
+  retry; unrecorded canonical `REPORT.md` or `FINDINGS.json` files fail closed.
+
 ## Storage layout
 
-For an audit of `owner/repo` at SHA `abc1234`, all artefacts live
-under `build_root`:
+For an audit of `owner/repo` at SHA
+`abcdef0123456789abcdef0123456789abcdef01`, all artefacts live under
+`build_root`:
 
 ```text
 <build_root>/
-  owner-repo-abc1234/           ← cloned source (untrusted; do not execute)
+  zt-v1-<64-hex-sha256-identity>/ ← cloned source
   _reports/
-    owner-repo-abc1234/
+    zt-v1-<64-hex-sha256-identity>/
       REPORT.md                 ← audit report
+      FINDINGS.json             ← canonical source-text-free findings ledger
   _quarantine/
-    owner-repo-abc1234/
-      <asset>.bin               ← downloaded release binaries (Windows MOTW removed when present)
+    zt-v1-<64-hex-sha256-identity>/
+      <asset-id>.bin            ← downloaded release binaries (Windows MOTW removed when present)
+  _cache/
+    schema-1/
+      tool-<64-hex-tool-version-hash>/
+        namespace-<64-hex-source-namespace-hash>/
+          source-<64-hex-versioned-source-identity-hash>.json
 ```
 
 Reports are written **outside** the cloned tree so they are not repo-controlled
 files and the clone can be deleted independently. Their conclusions still
 depend on audit coverage and model/tool behavior.
 
-The basename is constructed literally as
-`<owner>-<repo>-<sha.slice(0,7)>`. Because owner/repo names may contain
-hyphens, wrappers do not reverse-parse that string into owner and repo; active
-audit state binds the exact resolved path.
+The basename is `zt-v1-` plus the SHA-256 digest of an unambiguous,
+case-normalized tuple `(owner, repo, full resolved SHA)`. This prevents the
+delimiter collisions possible with flattened owner/repo names while keeping
+clone/report/quarantine paths as immediate children of their required roots.
+Age-gated auto-purge recognizes legacy full-SHA and 7-character clone
+directories only as non-active orphans. It deletes stale clone directories
+only; reports and quarantine are preserved for explicit active-bound cleanup.
+
+### Metadata cache privacy and trust boundary
+
+The metadata cache is **optional, untrusted derived data**, not an audit
+result. No current v4/v5 packet path requires a cache hit. Every list/load
+revalidates strict schema, schema/tool/plugin versions, canonical JSON, the
+SHA-256 integrity digest, source namespace, and active source identity.
+Corrupt regular files are discarded and treated as a miss. Cache directories
+and files must be plain filesystem objects; symlinks and reparse points are
+never followed.
+
+Cache payloads may contain only:
+
+- normalized relative paths and bounded identifiers;
+- Git blob and content SHA hashes (plus line-identity hashes, never excerpts);
+- normalized deterministic/plugin facts;
+- graph node/edge topology without free-form labels;
+- finding state/severity/confidence/source-reference metadata, without
+  titles or summaries;
+- structured validation decisions without free-form rationale;
+- bounded stage and quantitative coverage metadata.
+
+They must never contain source text, excerpt text, snippets, prompts,
+credentials/secrets, raw unbounded repository strings, verdicts, report
+bodies/finalization, or free-form model output. Unknown fields and
+snippet-capable free-text fields fail validation. Cache writes use canonical
+JSON, an integrity SHA-256, same-directory atomic replacement, a 4 MB
+per-file cap, 64 MB/512-file total cap, and a 64-file per-source-namespace
+cap. Cache-load payload selection is additionally bounded to 2 MB and reports
+`truncated:true` rather than emitting an unbounded metadata result.
+
+`zerotrust_cache_store` consumes the active analysis-plugin cache-record API
+directly. That API already returns audit-ID/label-free topology and
+cache-stable plugin-fact IDs in the exact persisted shape; the cache wrapper
+revalidates those records without re-deriving them. Optional caller-supplied
+records use the same strict persisted schema and cannot override an active
+plugin ID/version record. A non-cacheable active plugin record is reported in
+`skippedActivePluginRecords` and omitted rather than weakening the cache
+privacy contract.
+
+The cache privacy contract is separate from the stricter version-5 report
+artifact contract. Cache records may retain validated normalized plugin
+metadata values needed for exact reuse. `REPORT.md` and `FINDINGS.json` never
+copy those values; they retain only plugin fact IDs/kinds, plugin
+ID/version/producer, source identity, path/line/endLine, excerpt hash, bounded
+enum tags when applicable, and quantitative/topology state.
+
+GitHub cache identity includes normalized owner/repo plus the full resolved
+source SHA. A later source SHA may reuse only records whose current
+path/blob (or content) identity is unchanged; prior-source stage/coverage,
+verdict, and finalized status are never carried forward. Plugin records
+require an exact plugin ID/version requested by the caller. Local-source
+identity additionally requires a complete set of current content hashes, so
+cache absence before local indexing is expected.
+
+Disk cache entries persist across `zerotrust_close_audit` and build-clone
+cleanup. Closure clears only the in-memory active-audit cache binding and
+does not treat a cache entry as a blocking artifact. Use
+`zerotrust_cache_cleanup` explicitly to remove the current source entry or
+the current source namespace; neither `zerotrust_cleanup_audit` nor stale
+clone auto-purge deletes metadata cache entries.
 
 ### `build_root` default
 
@@ -515,22 +738,30 @@ extension's handler runs.
 
 ### Cleanup sequence
 
-1. Write/finalize `REPORT.md`.
-2. For council builds, ensure the council outcome was recorded before the
-   build; recording is not an end-of-audit cleanup step.
+1. In every council mode, record the immutable outcome before any report
+   finalization (and before the build in council-build modes).
+2. Write/finalize the canonical `REPORT.md` + `FINDINGS.json` pair.
 3. For build modes, call `zerotrust_cleanup_audit` to remove the canonical
    clone. It deletes the matching quarantine directory by default and keeps
-   the report by default.
+   the report/findings pair by default.
 4. For API-direct `verify_release`, there is no clone path, so
-   `zerotrust_cleanup_audit` cannot be used. Delete the canonical
-   `_quarantine/<owner>-<repo>-<short-sha>/` directory manually when finished.
-5. Call a **non-dry-run** `zerotrust_sweep_audit_scratch` last; that call closes
-   the in-memory audit state.
+   call `zerotrust_cleanup_quarantine`; it computes the canonical target from
+   active audit state and does not accept an agent-supplied deletion path.
+5. Call `zerotrust_sweep_audit_scratch` with
+   `also_sweep_parent:false`.
+6. Optionally call `zerotrust_cache_cleanup` if derived metadata should not
+   persist. Cache retention is otherwise independent of clone/quarantine
+   cleanup.
+7. After every requested cleanup succeeds, call `zerotrust_close_audit`.
+   Cleanup failures return failure and retain trusted state for retry. Closure
+   itself refuses a still-existing clone/quarantine. Use
+   `abandon_artifacts:true` only when intentionally leaving those artifacts.
 
-The sweep's runtime default is `also_sweep_parent:true`. That parent can hold
-unrelated files, and the filename whitelist is not exhaustive. Prefer
-`dry_run:true` first and `also_sweep_parent:false` unless the parent directory
-is dedicated to audit scratch.
+The sweep's runtime default is `also_sweep_parent:false`. The parent sweep
+remains available for dedicated audit scratch areas, but the filename
+whitelist is not exhaustive: first call with `also_sweep_parent:true` and
+`dry_run:true`, inspect the candidates, then explicitly run the destructive
+parent sweep.
 
 ## Hardened clone
 
@@ -603,11 +834,10 @@ characters and allow only `[A-Za-z0-9._=:@/\\-]+`.
   ships npm-only lockfile heuristics. Other ecosystems (PyPI, Cargo,
   Go, NuGet, Gradle/Maven) are flagged in the report as
   "dependency-audit not yet implemented for this ecosystem."
-- **Synthetic malicious-fixture corpus** for regression testing of
-  the audit logic. Currently ships unit tests for the deterministic
-  pieces (URL parser, `preToolUseHook` / `inspectToolCall` deny-policy
-  spec, safe wrappers) plus a clean-control corpus harness — but no
-  adversarial fixtures.
+- **Broader ecosystem-specific evaluation fixtures.** Version 5 now ships an
+  AV-safe deterministic corpus for clean controls, benign lookalikes, generic
+  cross-file behavior-chain shapes, incomplete graphs, and broken references.
+  It intentionally does not ship live malware or executable payload samples.
 - **`_shared/resolveModels()` integration** for automatic model
   fallback in the council. Currently zerotrust hard-fails at runtime
   if a default model is unavailable; the orchestrator extensions
@@ -650,10 +880,14 @@ zerotrust-sourcecheck/
   urlParser.mjs           ← pure URL/owner/repo/ref/path validation
   localPathValidator.mjs  ← local-path validation for local-mode audits
   enforcement.mjs         ← audit-in-progress state machine (used by wrappers) + unregistered preToolUseHook policy
-  packet.mjs              ← long instruction-packet template
+  packet.mjs              ← stable packet assembly surface
+  packet/                 ← prepare / acquisition / scan / trace / validate / finalize renderers
   modes.mjs               ← mode enum + per-mode policy helpers
-  council/                ← role manifest + per-role prompt templates
-  safeWrappers/           ← clone / install / build / report / cleanup / sweep / fetch / list-tree
+  analysis/validation.mjs ← static validator/adjudication contracts + bounded validation state
+  analysis/cache.mjs      ← strict metadata-cache schema, canonical JSON, identity/path derivation
+  analysis/reportLedger.mjs ← source-text-free FINDINGS.json serialization + shared Markdown rendering
+  council/                ← discovery-role and validation/adjudication prompt templates
+  safeWrappers/           ← clone / install / build / report / cache / validation / cleanup / sweep / fetch / list-tree
   __corpus__/             ← regression corpus harness (see its own README)
   __tests__/              ← node:test in-process suite
   AGENTS.md               ← agent design notes (read before modifying sub-agent prompts)
@@ -687,8 +921,8 @@ contributions right now are:
 
 - New ecosystem dependency-audit parsers (PyPI, Cargo, Go, NuGet, Maven)
 - Additional council roles for under-covered threat classes
-- New deterministic-corpus fixtures (clean-control URLs only — see
-  `__corpus__/README.md` for the AV-safety contract)
+- New AV-safe deterministic corpus shapes and expectation refinements (see
+  `__corpus__/README.md` for the inert-marker and live-run safety contract)
 - Wiring `_shared/resolveModels()` into the council role assignment
   (currently zerotrust hard-fails on unavailable models rather than
   silently falling back — see [Model availability](#model-availability))

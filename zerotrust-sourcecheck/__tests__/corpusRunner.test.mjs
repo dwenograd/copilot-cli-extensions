@@ -4,13 +4,43 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
+import nodePath from "node:path";
 
 import { deriveTags, tagsForCategory } from "../__corpus__/runner/tagDictionary.mjs";
-import { parseFindings } from "../__corpus__/runner/parseFindings.mjs";
-import { compareFindings, findingMatches, maxSeverity } from "../__corpus__/runner/compareFindings.mjs";
-import { classifyFailure, FAILURE_CLASSES } from "../__corpus__/runner/failureClassifier.mjs";
+import {
+    parseAuditArtifacts,
+    parseFindings,
+    parseFindingsJson,
+} from "../__corpus__/runner/parseFindings.mjs";
+import {
+    compareEvaluation,
+    compareFindings,
+    findingMatches,
+    maxSeverity,
+} from "../__corpus__/runner/compareFindings.mjs";
+import {
+    classifyFailure,
+    classifyStageFailure,
+    FAILURE_CLASSES,
+} from "../__corpus__/runner/failureClassifier.mjs";
 import { dispatchAudit, __internals as dispatchInternals } from "../__corpus__/runner/dispatchAudit.mjs";
-import { __internals as runnerInternals } from "../__corpus__/runner/runCorpus.mjs";
+import {
+    EXPECTATION_SCHEMA,
+    validateExpectation,
+} from "../__corpus__/runner/expectationSchema.mjs";
+import {
+    executeLocalFixture,
+    __internals as localExecutorInternals,
+} from "../__corpus__/runner/localFixtureExecutor.mjs";
+import {
+    calculateMetrics,
+    evaluatePromotionGate,
+} from "../__corpus__/runner/metrics.mjs";
+import {
+    main as runCorpus,
+    __internals as runnerInternals,
+} from "../__corpus__/runner/runCorpus.mjs";
 
 function finding(overrides = {}) {
     return {
@@ -227,8 +257,38 @@ test("dispatchAudit dry-run plans without subprocess", async () => {
 });
 
 test("dispatchAudit finds Windows report paths in text", () => {
-    const p = dispatchInternals.findReportPath("report written: C:\\work\\_reports\\owner-repo\\REPORT.md");
-    assert.equal(p, "C:\\work\\_reports\\owner-repo\\REPORT.md");
+    const canonical = `zt-v1-${"a".repeat(64)}`;
+    const p = dispatchInternals.findReportPath(`report written: C:\\work\\_reports\\${canonical}\\REPORT.md`);
+    assert.equal(p, `C:\\work\\_reports\\${canonical}\\REPORT.md`);
+});
+
+test("dispatchAudit finds POSIX and JSON artifact paths", () => {
+    assert.equal(
+        dispatchInternals.findReportPath("report written: /work/_reports/sample/REPORT.md"),
+        "/work/_reports/sample/REPORT.md",
+    );
+    assert.equal(
+        dispatchInternals.findFindingsPath('{"findingsPath":"/work/_reports/sample/FINDINGS.json"}'),
+        "/work/_reports/sample/FINDINGS.json",
+    );
+    assert.equal(
+        dispatchInternals.siblingArtifactPath("C:\\work\\sample\\REPORT.md", "FINDINGS.json"),
+        "C:\\work\\sample\\FINDINGS.json",
+    );
+    assert.equal(
+        dispatchInternals.siblingArtifactPath("/work/sample/REPORT.md", "FINDINGS.json"),
+        "/work/sample/FINDINGS.json",
+    );
+});
+
+test("dispatchAudit refuses live work without the explicit environment gate", async () => {
+    const result = await dispatchAudit({
+        url: "https://github.com/octocat/Hello-World",
+        mode: "audit_source",
+        env: {},
+    });
+    assert.equal(result.ok, false);
+    assert.match(result.stderr, /ZEROTRUST_CORPUS_LIVE=1/u);
 });
 
 test("runCorpus registry reads committed clean controls", () => {
@@ -240,4 +300,194 @@ test("runCorpus registry reads committed clean controls", () => {
 test("runCorpus parses list columns", () => {
     assert.deepEqual(runnerInternals.parseList("remote-fetch, obfuscation"), ["remote-fetch", "obfuscation"]);
     assert.deepEqual(runnerInternals.parseList(""), []);
+});
+
+test("expectation schema is versioned and rejects traversal or unknown fields", () => {
+    const expectation = runnerInternals.loadExpectation("local-clean-control");
+    assert.equal(expectation.schema, EXPECTATION_SCHEMA);
+    assert.throws(
+        () => validateExpectation({
+            ...expectation,
+            source: { type: "local", path: "../outside" },
+        }),
+        /inside the corpus root/u,
+    );
+    assert.throws(
+        () => validateExpectation({ ...expectation, extra: true }),
+        /not allowed/u,
+    );
+});
+
+test("registry includes local clean, benign, risky, incomplete, and broken fixtures", () => {
+    const expectations = runnerInternals.loadExpectations();
+    assert.equal(expectations.length, 11);
+    assert.ok(expectations.some((entry) => entry.kind === "clean-control"));
+    assert.ok(expectations.some((entry) => entry.kind === "benign-lookalike"));
+    assert.ok(expectations.some((entry) => entry.kind === "synthetic-risk"));
+    assert.ok(expectations.some((entry) => entry.kind === "synthetic-incomplete"));
+    assert.ok(expectations.some((entry) => entry.kind === "synthetic-broken"));
+});
+
+test("all local fixtures are printable inert marker declarations", () => {
+    for (const expectation of runnerInternals.loadExpectations()
+        .filter((entry) => entry.source.type === "local")) {
+        const root = nodePath.resolve(
+            runnerInternals.CORPUS_ROOT,
+            expectation.source.path,
+        );
+        for (const file of localExecutorInternals.walkFiles(root)) {
+            const text = readFileSync(file, "utf8");
+            const relative = nodePath.relative(root, file).replace(/\\/gu, "/");
+            const markers = localExecutorInternals.validateFixtureText(text, relative);
+            assert.ok(markers.length >= 1);
+            assert.doesNotMatch(text, /https?:|data:|file:/iu);
+        }
+    }
+});
+
+test("local deterministic executor covers index, plugin, graph, scoring, and expectations", () => {
+    const results = [];
+    const chainTypes = new Set();
+    for (const expectation of runnerInternals.loadExpectations()
+        .filter((entry) => entry.source.type === "local")) {
+        const document = executeLocalFixture({
+            fixtureRoot: nodePath.resolve(
+                runnerInternals.CORPUS_ROOT,
+                expectation.source.path,
+            ),
+            slug: expectation.slug,
+        });
+        const actual = parseFindingsJson(document);
+        const comparison = compareEvaluation(actual, expectation);
+        assert.equal(
+            comparison.status,
+            "PASS",
+            `${expectation.slug}: ${comparison.failures.join("; ")}`,
+        );
+        for (const chain of actual.chains.types) chainTypes.add(chain);
+        results.push({ expectation, comparison });
+    }
+    assert.deepEqual(
+        [...chainTypes].sort(),
+        [
+            "ai-instruction-tool-effect",
+            "behavior-chain",
+            "ci-trigger-secret-external-sink",
+            "credential-read-transform-send",
+            "install-fetch-decode-execute",
+            "startup-persistence",
+        ],
+    );
+    const metrics = calculateMetrics(results);
+    assert.equal(metrics.activationRecall, 1);
+    assert.equal(metrics.candidateRecall, 1);
+    assert.equal(metrics.completeChainRecall, 1);
+    assert.equal(metrics.validationRefutationAccuracy, 1);
+    assert.equal(metrics.falsePositiveRate, 0);
+    assert.ok(metrics.unresolvedRate > 0 && metrics.unresolvedRate < 0.2);
+    assert.equal(
+        evaluatePromotionGate(
+            metrics,
+            runnerInternals.loadPromotionThresholds(),
+        ).passed,
+        true,
+    );
+});
+
+test("synthetic complete chain shapes are cross-file", () => {
+    for (const slug of [
+        "activation-fetch-transform-effect",
+        "credential-transform-sink",
+        "startup-persistence",
+        "ci-secret-external",
+        "ai-instruction-tool-effect",
+    ]) {
+        const expectation = runnerInternals.loadExpectation(slug);
+        const document = executeLocalFixture({
+            fixtureRoot: nodePath.resolve(
+                runnerInternals.CORPUS_ROOT,
+                expectation.source.path,
+            ),
+            slug,
+        });
+        assert.ok(document.graph.chains.some((chain) =>
+            chain.status === "complete" && chain.crossFile));
+    }
+});
+
+test("broken fixture reports a prepare failure and acceptable blocker", () => {
+    const expectation = runnerInternals.loadExpectation("broken-reference");
+    const document = executeLocalFixture({
+        fixtureRoot: nodePath.resolve(
+            runnerInternals.CORPUS_ROOT,
+            expectation.source.path,
+        ),
+        slug: expectation.slug,
+    });
+    const actual = parseFindingsJson(document);
+    assert.equal(actual.failureStage, "prepare");
+    assert.deepEqual(actual.blockers, ["plugin-failed"]);
+    assert.equal(compareEvaluation(actual, expectation).status, "PASS");
+});
+
+test("FINDINGS.json is primary and REPORT.md remains a legacy fallback", () => {
+    const expectation = runnerInternals.loadExpectation("local-clean-control");
+    const document = executeLocalFixture({
+        fixtureRoot: nodePath.resolve(
+            runnerInternals.CORPUS_ROOT,
+            expectation.source.path,
+        ),
+        slug: expectation.slug,
+    });
+    const primary = parseAuditArtifacts({
+        findingsJson: document,
+        reportMarkdown: genericReport,
+    });
+    assert.equal(primary.sourceFormat, "findings-json");
+    assert.equal(primary.findings.length, 0);
+    const fallback = parseAuditArtifacts({ reportMarkdown: genericReport });
+    assert.equal(fallback.sourceFormat, "report-markdown");
+    assert.equal(fallback.findings.length, 1);
+});
+
+test("decision snapshots are accepted as evaluation inputs", () => {
+    const expectation = runnerInternals.loadExpectation("startup-persistence");
+    const document = executeLocalFixture({
+        fixtureRoot: nodePath.resolve(
+            runnerInternals.CORPUS_ROOT,
+            expectation.source.path,
+        ),
+        slug: expectation.slug,
+    });
+    const parsed = parseAuditArtifacts({ decisionSnapshot: document.decision });
+    assert.equal(parsed.sourceFormat, "decision-snapshot");
+    assert.equal(parsed.counts.validated, 1);
+    assert.equal(parsed.scores.severity, "high");
+});
+
+test("stage failure classification covers prepare through finalize", () => {
+    const cases = [
+        ["acquired", "prepare", FAILURE_CLASSES.PREPARE_FAILED],
+        ["prepared", "scan", FAILURE_CLASSES.SCAN_FAILED],
+        ["scanned", "trace", FAILURE_CLASSES.TRACE_FAILED],
+        ["traced", "validate", FAILURE_CLASSES.VALIDATE_FAILED],
+        ["validated", "finalize", FAILURE_CLASSES.FINALIZE_FAILED],
+    ];
+    for (const [finalStage, stage, classification] of cases) {
+        const result = classifyStageFailure({
+            finalStage,
+            blockers: [{ code: `${stage}-blocker` }],
+        });
+        assert.equal(result.stage, stage);
+        assert.equal(result.classification, classification);
+        assert.match(result.reason, new RegExp(stage, "u"));
+    }
+});
+
+test("dry-run validates local fixtures without writing corpus results", async () => {
+    const resultsDir = runnerInternals.RESULTS_DIR;
+    const before = existsSync(resultsDir) ? readdirSync(resultsDir).sort() : [];
+    assert.equal(await runCorpus(["--dry-run", "--promote-gate"]), 0);
+    const after = existsSync(resultsDir) ? readdirSync(resultsDir).sort() : [];
+    assert.deepEqual(after, before);
 });

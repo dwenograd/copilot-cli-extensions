@@ -1,0 +1,3 @@
+marker.node("registration","persistence","persistence-registration","persistence");
+marker.edge("startup-registration","triggers","startup","registration","persistence");
+marker.finding("startup-chain","validated","high","high","strong","register","persistence","startup-registration","startup,persistence");

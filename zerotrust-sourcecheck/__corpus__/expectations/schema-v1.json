@@ -1,0 +1,34 @@
+{
+  "$id": "zerotrust-evaluation-expectation/v1",
+  "title": "Zero Trust source-check evaluation expectation",
+  "type": "object",
+  "required": [
+    "schema",
+    "schema_version",
+    "slug",
+    "kind",
+    "source",
+    "expected"
+  ],
+  "properties": {
+    "schema": {
+      "const": "zerotrust-evaluation-expectation/v1"
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "slug": {
+      "type": "string"
+    },
+    "kind": {
+      "type": "string"
+    },
+    "source": {
+      "type": "object"
+    },
+    "expected": {
+      "type": "object"
+    }
+  },
+  "additionalProperties": false
+}

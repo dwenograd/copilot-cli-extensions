@@ -1,0 +1,3 @@
+marker.node("external-sink","sink","external-send","external-send");
+marker.edge("value-sink","flows-to","secret-value","external-sink","external-send");
+marker.finding("ci-chain","validated","high","high","strong","send","secret-read","external-sink","ci-workflow,secret-like,external-send");

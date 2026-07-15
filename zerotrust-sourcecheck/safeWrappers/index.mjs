@@ -6,13 +6,36 @@ export { safeBuildHandler } from "./buildWrapper.mjs";
 export { recordOutcomeHandler } from "./outcomeWrapper.mjs";
 export { finalizeReportHandler } from "./reportWrapper.mjs";
 export { cleanupAuditHandler } from "./cleanupWrapper.mjs";
+export { cleanupQuarantineHandler } from "./quarantineWrapper.mjs";
 export { sweepAuditScratchHandler } from "./sweepWrapper.mjs";
+export { closeAuditHandler } from "./lifecycleWrapper.mjs";
 export { safeListTreeHandler } from "./safeListTreeHandler.mjs";
 export { safeFetchFileHandler } from "./safeFetchHandler.mjs";
+export { safeListReleaseAssetsHandler } from "./releaseAssetListWrapper.mjs";
+export { safeFetchReleaseAssetHandler } from "./releaseAssetFetchWrapper.mjs";
+export {
+    safeIndexSourceFileHandler,
+    safeListSourceHandler,
+} from "./sourceIngestion.mjs";
+export { safeListAnalysisFactsHandler } from "./analysisFactsWrapper.mjs";
+export { recordCouncilCandidatesHandler } from "./findingLedgerWrapper.mjs";
+export { traceBehaviorGraphHandler } from "./traceWrapper.mjs";
+export { recordValidationHandler } from "./validationWrapper.mjs";
+export {
+    cacheCleanupHandler,
+    cacheListHandler,
+    cacheLoadHandler,
+    cacheStoreHandler,
+} from "./cacheWrapper.mjs";
 
 export {
     recordCouncilOutcome,
     getRecordedOutcome,
     clearRecordedOutcome,
     evaluateCouncilGate,
+    getCouncilLedgerSnapshot,
+    clearCouncilLedgerState,
+    recordCacheBinding,
+    getCacheBinding,
+    clearCacheBinding,
 } from "./state.mjs";

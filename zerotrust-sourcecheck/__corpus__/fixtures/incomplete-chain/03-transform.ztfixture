@@ -1,0 +1,3 @@
+marker.node("transform","transform","decode-transform","decode-transform");
+marker.edge("fetch-transform","transforms","fetch","transform","decode-transform");
+marker.finding("incomplete-chain","unresolved","high","high","likely","transform","remote-fetch","pending-effect","remote-fetch,decode-transform");

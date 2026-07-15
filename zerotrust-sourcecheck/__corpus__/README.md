@@ -1,77 +1,128 @@
-# Regression corpus harness
+# Version 5 evaluation corpus
 
-Experimental local harness for comparing `audit_source` with
-`audit_source_council`. The committed registry currently contains only two
-clean-control public repositories; it is not a malicious-sample corpus and is
-not a release gate by itself.
+The corpus evaluates stage behavior without committing live malware, executable
+payloads, credentials, command inventories, or weaponizable examples.
+It evaluates the malicious-source pipeline, not generic vulnerability/exploit
+coverage.
 
-## Dry run
+It contains:
 
-From `zerotrust-sourcecheck/`:
+- two public clean-control GitHub URLs;
+- local clean and benign-lookalike controls;
+- inert cross-file marker fixtures for:
+  - activation to fetch, transform, and effect;
+  - credential-like source to transform and external-like sink;
+  - startup to persistence-like registration;
+  - CI trigger to secret-like value and external-like sink;
+  - AI instruction to tool-like effect;
+- incomplete and deliberately broken graph variants.
+
+Local fixtures are plain `.ztfixture` text. The runner parses their restricted
+`marker.*(...)` declarations as data and never imports or executes them.
+
+## Safe default
 
 ```powershell
-node __corpus__\runner\runCorpus.mjs --dry-run
+node __corpus__\runner\runCorpus.mjs --dry-run --promote-gate
 ```
 
-Dry-run validates `urls.txt` and matching expectation files, prints the two
-planned modes, and performs no network/audit dispatch.
+No execution flag also defaults to dry-run. Dry-run:
 
-Options:
+1. validates every versioned expectation;
+2. enforces printable-ASCII and restricted inert-marker fixture syntax;
+3. runs local deterministic indexing, fixture-plugin seeding, graph merge,
+   static validation, tracing, deduplication, and scoring in memory;
+4. compares the resulting FINDINGS-shaped snapshot with expectations;
+5. calculates promotion metrics;
+6. performs no network calls, model calls, subprocess audit dispatch, or result
+   writes.
 
-- `--fixture <slug>` selects one expectation filename stem.
-- `--promote-gate` returns nonzero for failed or inconclusive fixtures.
+Use `--fixture <slug>` to select one fixture.
 
-## Live mode is experimental
+## Local deterministic run
 
-Without `--dry-run`, `dispatchAudit.mjs` currently shells out to:
+```powershell
+node __corpus__\runner\runCorpus.mjs --local --promote-gate
+```
+
+Local mode writes ignored results under:
 
 ```text
-gh copilot exec -- <prompt>
+__corpus__\results\<ISO timestamp>\
 ```
 
-That command path is marked TODO in source and has not been validated as a
-reliable promotion gate. It requires the relevant `gh`/Copilot command,
-authentication, network access, model availability, and parseable report-path
-output. The path extractor recognizes Windows drive-letter paths only.
+Each local fixture gets a source-text-free `FINDINGS.json`-shaped snapshot and
+`comparison.json`. A run-level `summary.json` contains metrics and gate output.
+These are evaluation outputs, not adopted audit state and not substitutes for
+the exactly-once production `REPORT.md` + `FINDINGS.json` finalizer.
 
-The runner does not copy reports into the corpus results directory. It reads
-the absolute `REPORT.md` path printed by the child. If no path is parsed, the
-fallback `<fixture>/<mode>-REPORT.md` name is only a guessed path and is not
-created by `dispatchAudit`, so the comparison will fail when it tries to read
-it. Live fixtures run sequentially with a 30-second delay.
+## Live multi-model run
 
-## Results paths
+Live URL audits require both an explicit flag and environment gate:
 
-Successful live comparisons create:
+```powershell
+$env:ZEROTRUST_CORPUS_LIVE = "1"
+node __corpus__\runner\runCorpus.mjs --live
+```
+
+Live mode remains experimental. It runs API-direct `audit_source` and
+`audit_source_council` flows only and tells the child not to install, build, or
+execute repository code. It may use network and models, runs sequentially with
+a delay, and is never selected implicitly.
+
+The artifact parser consumes `FINDINGS.json` first. If the JSON artifact is not
+available, it falls back to legacy `REPORT.md` category parsing. Report and
+findings path extraction supports Windows, UNC, POSIX, and JSON-encoded paths.
+
+## Expectations
+
+Expectations use schema:
 
 ```text
-__corpus__\results\<ISO-timestamp>\<fixture>\comparison.json
+zerotrust-evaluation-expectation/v1
 ```
 
-The actual audit reports remain in the Zero Trust canonical `_reports`
-location returned by each child audit. `results/` is git-ignored.
+Each expectation defines:
 
-## TSV format
+- required and final stage completion;
+- required/minimum activation and plugin facts;
+- candidate, validated, refuted, and unresolved count ranges;
+- required, complete-required, and forbidden chain types;
+- minimum/maximum severity, confidence, and malicious-project-fit;
+- required and forbidden generic tags;
+- acceptable generic blocker codes;
+- expected prepare, scan, trace, validate, or finalize failure stage.
 
-`urls.txt` is tab-separated:
+`expectations/schema-v1.json` documents the top-level serialized contract.
+`runner/expectationSchema.mjs` performs the strict runtime validation.
 
-```text
-URL<TAB>kind<TAB>expected_min_verdict<TAB>required_tags<TAB>forbidden_tags
-```
+## Metrics and promotion gate
 
-Tags are comma-separated generic labels such as `remote-fetch`,
-`obfuscation`, `credential-store-read`, `persistence`, `supply-chain`, or
-`ci-workflow`.
+The runner reports:
+
+- activation recall;
+- candidate recall;
+- complete-chain recall;
+- validation/refutation accuracy;
+- false-positive rate on clean/benign controls;
+- unresolved rate;
+- prepare/scan/trace/validate/finalize failure reasons.
+
+Thresholds live in `promotion-gate.v1.json`. `--promote-gate` returns nonzero
+when a fixture comparison or metric threshold fails. Planned URL fixtures do
+not count as evaluated dry-run fixtures.
 
 ## AV-safety contract
 
-1. Do not store literal attack patterns, command inventories, encoded payload
-   fragments, or invisible-character bytes in committed corpus files.
-2. Expectations use category letters (`A` through `G`) and generic tags only.
-3. Synthetic reports use category-letter prose and generic paths.
-4. Risky URLs/expectations remain local under ignored paths or outside the
-   repository.
-5. Stop immediately if host AV alerts during corpus work.
+1. Do not add live malware, executable payloads, credentials, encoded payload
+   fragments, invisible characters, or attack-command inventories.
+2. Use inert marker declarations and generic tokens only.
+3. Keep local fixtures printable ASCII; the parser rejects URLs, payload
+   schemes, malformed calls, unknown marker APIs, and unrestricted prose.
+4. Do not make local fixture execution import or execute fixture contents.
+5. Keep live runs explicit and API-direct; never silently enable network/model
+   use or repository execution.
+6. Stop immediately if host protection alerts during corpus work.
 
-These constraints reduce alert-prone byte shapes; they do not make live corpus
-runs a sandbox or an AV test.
+These constraints reduce alert-prone byte shapes. They do not make live audit
+runs an operating-system sandbox or an AV test.

@@ -6,7 +6,20 @@ export const FAILURE_CLASSES = Object.freeze({
     VANISHED: "SKIPPED-VANISHED",
     AV_TRIPPED: "AV-TRIPPED",
     INCONCLUSIVE: "INCONCLUSIVE",
+    PREPARE_FAILED: "FAILED-PREPARE",
+    SCAN_FAILED: "FAILED-SCAN",
+    TRACE_FAILED: "FAILED-TRACE",
+    VALIDATE_FAILED: "FAILED-VALIDATE",
+    FINALIZE_FAILED: "FAILED-FINALIZE",
     FAILED_EXECUTION: "FAILED-EXECUTION",
+});
+
+const STAGE_CLASS = Object.freeze({
+    prepare: FAILURE_CLASSES.PREPARE_FAILED,
+    scan: FAILURE_CLASSES.SCAN_FAILED,
+    trace: FAILURE_CLASSES.TRACE_FAILED,
+    validate: FAILURE_CLASSES.VALIDATE_FAILED,
+    finalize: FAILURE_CLASSES.FINALIZE_FAILED,
 });
 
 function joinText(input) {
@@ -51,6 +64,14 @@ export function classifyFailure(input = {}) {
         return result(FAILURE_CLASSES.FAILED_EXECUTION, "report parse failed");
     }
 
+    if (input.failureStage && STAGE_CLASS[input.failureStage]) {
+        return result(
+            STAGE_CLASS[input.failureStage],
+            input.failureReason || `${input.failureStage} stage did not complete`,
+            { stage: input.failureStage },
+        );
+    }
+
     if (Number.isFinite(Number(input.exitCode)) && Number(input.exitCode) !== 0) {
         return result(FAILURE_CLASSES.FAILED_EXECUTION, `process exited ${Number(input.exitCode)}`);
     }
@@ -62,6 +83,31 @@ export function classifyFailure(input = {}) {
     return result(null, "no failure detected");
 }
 
+export function classifyStageFailure({
+    finalStage = null,
+    failureStage = null,
+    failureReason = null,
+    blockers = [],
+} = {}) {
+    const inferred = failureStage
+        || (finalStage === "acquired" ? "prepare"
+            : finalStage === "prepared" ? "scan"
+                : finalStage === "scanned" ? "trace"
+                    : finalStage === "traced" ? "validate"
+                        : finalStage === "validated" ? "finalize"
+                            : null);
+    if (!inferred) return result(null, "no stage failure detected");
+    const blockerReason = blockers.map((blocker) =>
+        typeof blocker === "string"
+            ? blocker
+            : blocker?.code || blocker?.kind).filter(Boolean).join(",");
+    return result(
+        STAGE_CLASS[inferred],
+        failureReason || blockerReason || `${inferred} stage did not complete`,
+        { stage: inferred },
+    );
+}
+
 function result(classification, reason, extra = {}) {
     return {
         classification,
@@ -69,10 +115,12 @@ function result(classification, reason, extra = {}) {
         skipped: Boolean(extra.skipped),
         retryable: Boolean(extra.retryable),
         abort: Boolean(extra.abort),
+        stage: extra.stage || null,
     };
 }
 
 export const __internals = {
     joinText,
     councilFailureRatio,
+    STAGE_CLASS,
 };

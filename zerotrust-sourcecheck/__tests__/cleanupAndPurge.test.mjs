@@ -19,8 +19,45 @@ import {
     __internals as purgeInternals,
 } from "../safeWrappers/autoPurge.mjs";
 import { __internals as cleanupInternals } from "../safeWrappers/cleanupWrapper.mjs";
+import {
+    activateAudit,
+    deactivateAudit,
+    getActiveAudit,
+    recordResolvedClonePath,
+} from "../enforcement.mjs";
+import {
+    clearRecordedOutcome,
+    getRecordedOutcome,
+    recordCouncilOutcome,
+} from "../safeWrappers/state.mjs";
+import { buildArtifactIdentityName } from "../urlParser.mjs";
 
 const BR = join(tmpdir(), "zerotrust-test-" + Date.now() + "-" + Math.random().toString(36).slice(2, 8));
+let cleanupSequence = 0;
+
+function fullBasename(repo, hex) {
+    return buildArtifactIdentityName("octocat", repo, hex.repeat(40));
+}
+
+async function withCleanupAudit(clonePath, fn, mode = "audit_and_safe_build") {
+    cleanupSequence += 1;
+    const sessionId = `cleanup-active-${cleanupSequence}`;
+    activateAudit({
+        sessionId,
+        buildPath: BR,
+        mode,
+        expectedClonePath: clonePath,
+        owner: "octocat",
+        repo: "Hello",
+    });
+    recordResolvedClonePath(sessionId, clonePath);
+    try {
+        return await fn(sessionId);
+    } finally {
+        deactivateAudit(sessionId);
+        clearRecordedOutcome(sessionId);
+    }
+}
 
 function mkClone(basename, contents = "test") {
     const p = join(BR, basename);
@@ -72,65 +109,78 @@ test("cleanupAuditHandler rejects relative clone_path", async () => {
 test("cleanupAuditHandler rejects clone_path equal to build_root (would delete sandbox)", async () => {
     const r = await cleanupAuditHandler({ clone_path: BR, build_root: BR }, {});
     assert.equal(r.resultType, "failure");
-    assert.match(r.textResultForLlm, /not under build_root/);
+    assert.match(r.textResultForLlm, /requires an invocation sessionId/);
 });
 
 test("cleanupAuditHandler rejects clone_path outside build_root", async () => {
     const outside = process.platform === "win32" ? "C:\\Windows\\Temp\\evil" : "/etc/evil";
     const r = await cleanupAuditHandler({ clone_path: outside, build_root: BR }, {});
     assert.equal(r.resultType, "failure");
-    assert.match(r.textResultForLlm, /not under build_root/);
+    assert.match(r.textResultForLlm, /requires an invocation sessionId/);
 });
 
 test("cleanupAuditHandler deletes existing clone (idempotent on missing)", async () => {
-    const cp = mkClone("octocat-Hello-aaaaaaa");
+    const cp = mkClone(fullBasename("Hello", "a"));
     assert.ok(existsSync(cp));
-    const r = await cleanupAuditHandler({ clone_path: cp, build_root: BR }, {});
-    assert.equal(r.resultType, "success");
-    assert.equal(existsSync(cp), false);
+    await withCleanupAudit(cp, async (sessionId) => {
+        const r = await cleanupAuditHandler({ clone_path: cp, build_root: BR }, { sessionId });
+        assert.equal(r.resultType, "success");
+        assert.equal(existsSync(cp), false);
 
-    // Second call is a no-op success
-    const r2 = await cleanupAuditHandler({ clone_path: cp, build_root: BR }, {});
-    assert.equal(r2.resultType, "success");
+        const r2 = await cleanupAuditHandler({ clone_path: cp, build_root: BR }, { sessionId });
+        assert.equal(r2.resultType, "success");
+    });
 });
 
 test("cleanupAuditHandler keeps REPORT.md by default", async () => {
-    const cp = mkClone("octocat-Hello-bbbbbbb");
-    const rp = mkReportFor("octocat-Hello-bbbbbbb");
-    const r = await cleanupAuditHandler({ clone_path: cp, build_root: BR }, {});
-    assert.equal(r.resultType, "success");
-    assert.equal(existsSync(cp), false);
-    assert.equal(existsSync(rp), true, "report dir preserved");
+    const basename = fullBasename("Hello", "b");
+    const cp = mkClone(basename);
+    const rp = mkReportFor(basename);
+    await withCleanupAudit(cp, async (sessionId) => {
+        const r = await cleanupAuditHandler({ clone_path: cp, build_root: BR }, { sessionId });
+        assert.equal(r.resultType, "success");
+        assert.equal(existsSync(cp), false);
+        assert.equal(existsSync(rp), true, "report dir preserved");
+    });
 });
 
 test("cleanupAuditHandler deletes REPORT.md when also_delete_report=true", async () => {
-    const cp = mkClone("octocat-Hello-ccccccc");
-    const rp = mkReportFor("octocat-Hello-ccccccc");
-    const r = await cleanupAuditHandler(
-        { clone_path: cp, build_root: BR, also_delete_report: true },
-        {},
-    );
-    assert.equal(r.resultType, "success");
-    assert.equal(existsSync(rp), false);
+    const basename = fullBasename("Hello", "c");
+    const cp = mkClone(basename);
+    const rp = mkReportFor(basename);
+    await withCleanupAudit(cp, async (sessionId) => {
+        const r = await cleanupAuditHandler(
+            { clone_path: cp, build_root: BR, also_delete_report: true },
+            { sessionId },
+        );
+        assert.equal(r.resultType, "success");
+        assert.equal(existsSync(rp), false);
+    });
 });
 
 test("cleanupAuditHandler deletes _quarantine by default", async () => {
-    const cp = mkClone("octocat-Hello-ddddddd");
-    const qp = mkQuarantineFor("octocat-Hello-ddddddd");
-    const r = await cleanupAuditHandler({ clone_path: cp, build_root: BR }, {});
-    assert.equal(r.resultType, "success");
-    assert.equal(existsSync(qp), false);
+    const basename = fullBasename("Hello", "d");
+    const cp = mkClone(basename);
+    const qp = mkQuarantineFor(basename);
+    await withCleanupAudit(cp, async (sessionId) => {
+        const r = await cleanupAuditHandler({ clone_path: cp, build_root: BR }, { sessionId });
+        assert.equal(r.resultType, "success");
+        assert.equal(existsSync(qp), false);
+    });
 });
 
 test("cleanupAuditHandler keeps _quarantine when also_delete_quarantine=false", async () => {
-    const cp = mkClone("octocat-Hello-eeeeeee");
-    const qp = mkQuarantineFor("octocat-Hello-eeeeeee");
-    const r = await cleanupAuditHandler(
-        { clone_path: cp, build_root: BR, also_delete_quarantine: false },
-        {},
-    );
-    assert.equal(r.resultType, "success");
-    assert.equal(existsSync(qp), true, "quarantine preserved");
+    const basename = fullBasename("Hello", "e");
+    const cp = mkClone(basename);
+    const qp = mkQuarantineFor(basename);
+    await withCleanupAudit(cp, async (sessionId) => {
+        const r = await cleanupAuditHandler(
+            { clone_path: cp, build_root: BR, also_delete_quarantine: false },
+            { sessionId },
+        );
+        assert.equal(r.resultType, "success");
+        assert.equal(existsSync(qp), true, "quarantine preserved");
+    });
 });
 
 test("cleanupAuditHandler is robust against attempted ../ escape via clone_path", async () => {
@@ -139,6 +189,138 @@ test("cleanupAuditHandler is robust against attempted ../ escape via clone_path"
     const escape = join(BR, "..", "outside-target");
     const r = await cleanupAuditHandler({ clone_path: escape, build_root: BR }, {});
     assert.equal(r.resultType, "failure");
+});
+
+test("cleanupAuditHandler refuses a real session with no active audit or custom-root fallback", async () => {
+    const cp = mkClone(fullBasename("Hello", "2"));
+    const r = await cleanupAuditHandler(
+        { clone_path: cp, build_root: BR },
+        { sessionId: "cleanup-no-active" },
+    );
+    assert.equal(r.resultType, "failure");
+    assert.match(r.textResultForLlm, /requires an active audit|no active audit/i);
+    assert.equal(existsSync(cp), true);
+});
+
+test("cleanupAuditHandler refuses non-build audits and clone-path mismatches", async () => {
+    const cp = mkClone(fullBasename("Hello", "3"));
+    const sibling = mkClone(fullBasename("Other", "4"));
+    const nonBuild = "cleanup-non-build";
+    activateAudit({
+        sessionId: nonBuild,
+        buildPath: BR,
+        mode: "audit_source",
+        expectedClonePath: cp,
+        owner: "octocat",
+        repo: "Hello",
+    });
+    recordResolvedClonePath(nonBuild, cp);
+    try {
+        const refused = await cleanupAuditHandler({ clone_path: cp }, { sessionId: nonBuild });
+        assert.equal(refused.resultType, "failure");
+        assert.match(refused.textResultForLlm, /only valid for build-mode audits/i);
+    } finally {
+        deactivateAudit(nonBuild);
+    }
+
+    await withCleanupAudit(cp, async (sessionId) => {
+        const mismatch = await cleanupAuditHandler(
+            { clone_path: sibling },
+            { sessionId },
+        );
+        assert.equal(mismatch.resultType, "failure");
+        assert.match(mismatch.textResultForLlm, /does not match the active audit's resolved clone path/i);
+        assert.equal(existsSync(sibling), true);
+    });
+});
+
+test("cleanupAuditHandler refuses legacy 7-character clone names for active cleanup", async () => {
+    const cp = mkClone("octocat-Hello-abcdef0");
+    await withCleanupAudit(cp, async (sessionId) => {
+        const r = await cleanupAuditHandler({ clone_path: cp }, { sessionId });
+        assert.equal(r.resultType, "failure");
+        assert.match(r.textResultForLlm, /zt-v1-<sha256>/);
+        assert.equal(existsSync(cp), true);
+    });
+});
+
+test("cleanupAuditHandler refuses legacy flattened full-SHA names for active cleanup", async () => {
+    const cp = mkClone(`octocat-Hello-${"a".repeat(40)}`);
+    await withCleanupAudit(cp, async (sessionId) => {
+        const r = await cleanupAuditHandler({ clone_path: cp }, { sessionId });
+        assert.equal(r.resultType, "failure");
+        assert.match(r.textResultForLlm, /zt-v1-<sha256>/);
+        assert.equal(existsSync(cp), true);
+    });
+});
+
+test("cleanupAuditHandler preserves trusted state after successful cleanup until close", async () => {
+    const sessionId = "cleanup-state-" + Math.random().toString(36).slice(2);
+    const cp = mkClone(fullBasename("Hello", "f"));
+    activateAudit({
+        sessionId,
+        buildPath: BR,
+        mode: "audit_and_safe_build_council",
+        expectedClonePath: cp,
+        owner: "octocat",
+        repo: "Hello",
+    });
+    recordResolvedClonePath(sessionId, cp);
+    recordCouncilOutcome(sessionId, {
+        auditId: getActiveAudit(sessionId).auditId,
+        owner: "octocat",
+        repo: "hello",
+        resolvedSha: null,
+        verdict: "low",
+        criticalCount: 0,
+        highCount: 0,
+        complete: true,
+    });
+    try {
+        const r = await cleanupAuditHandler(
+            { clone_path: cp, build_root: BR },
+            { sessionId },
+        );
+        assert.equal(r.resultType, "success");
+        assert.ok(getActiveAudit(sessionId), "cleanup must leave active audit context intact");
+        assert.ok(getRecordedOutcome(sessionId), "cleanup must not clear council outcome");
+    } finally {
+        deactivateAudit(sessionId);
+        clearRecordedOutcome(sessionId);
+    }
+});
+
+test("cleanupAuditHandler deletion errors fail and preserve trusted state", async () => {
+    const sessionId = "cleanup-failure-" + Math.random().toString(36).slice(2);
+    const cp = mkClone(fullBasename("Hello", "1"));
+    activateAudit({
+        sessionId,
+        buildPath: BR,
+        mode: "audit_and_safe_build",
+        expectedClonePath: cp,
+        owner: "octocat",
+        repo: "Hello",
+    });
+    recordResolvedClonePath(sessionId, cp);
+    try {
+        const r = await cleanupAuditHandler(
+            { clone_path: cp, build_root: BR },
+            { sessionId },
+            {
+                remove: () => ({
+                    existed: true,
+                    removed: false,
+                    error: "simulated access denied",
+                }),
+            },
+        );
+        assert.equal(r.resultType, "failure");
+        assert.match(r.textResultForLlm, /simulated access denied/);
+        assert.ok(getActiveAudit(sessionId), "failed cleanup must not deactivate the audit");
+        assert.ok(existsSync(cp), "failed target must remain available for retry");
+    } finally {
+        deactivateAudit(sessionId);
+    }
 });
 
 // ---------- autoPurge: getPurgeHours ----------
@@ -184,6 +366,24 @@ test("findStaleClones: returns clones older than threshold", () => {
     assert.deepEqual(stale, ["octocat-Hello-1234567"]);
 });
 
+test("findStaleClones recognizes canonical hashes and legacy orphan names", () => {
+    const currentName = fullBasename("Hello", "a");
+    const current = mkClone(currentName);
+    const legacyFullName = `octocat-Hello-${"b".repeat(40)}`;
+    const legacyFull = mkClone(legacyFullName);
+    const legacy = mkClone("octocat-Hello-abcdef0");
+    setMtimeAgo(current, 48);
+    setMtimeAgo(legacyFull, 48);
+    setMtimeAgo(legacy, 48);
+    const stale = findStaleClones({ buildRoot: BR, hoursThreshold: 24 }).sort();
+    assert.deepEqual(stale, ["octocat-Hello-abcdef0", legacyFullName, currentName].sort());
+    assert.equal(purgeInternals.CLONE_NAME_RE.test(currentName), true);
+    assert.equal(purgeInternals.CLONE_NAME_RE.test(legacyFullName), false);
+    assert.equal(purgeInternals.CLONE_NAME_RE.test("octocat-Hello-abcdef0"), false);
+    assert.equal(purgeInternals.LEGACY_FULL_SHA_CLONE_NAME_RE.test(legacyFullName), true);
+    assert.equal(purgeInternals.LEGACY_CLONE_NAME_RE.test("octocat-Hello-abcdef0"), true);
+});
+
 test("findStaleClones: ignores _reports/ and _quarantine/ dirs (don't match clone-name regex)", () => {
     mkReportFor("octocat-Hello-1234567");
     mkQuarantineFor("octocat-Hello-1234567");
@@ -221,18 +421,19 @@ test("findStaleClones: returns empty when threshold=0 (disabled)", () => {
 
 // ---------- autoPurge: purgeStaleClones ----------
 
-test("purgeStaleClones: deletes stale clones AND matching _reports/_quarantine subdirs", () => {
-    const cp = mkClone("octocat-X-aaaaaaa");
-    const rp = mkReportFor("octocat-X-aaaaaaa");
-    const qp = mkQuarantineFor("octocat-X-aaaaaaa");
+test("purgeStaleClones: deletes only stale clones and preserves reports/quarantine", () => {
+    const basename = fullBasename("X", "a");
+    const cp = mkClone(basename);
+    const rp = mkReportFor(basename);
+    const qp = mkQuarantineFor(basename);
     setMtimeAgo(cp, 48);
 
     const result = purgeStaleClones({ buildRoot: BR, hoursThreshold: 24 });
     assert.equal(result.purged.length, 1);
-    assert.equal(result.purged[0].basename, "octocat-X-aaaaaaa");
+    assert.deepEqual(result.purged[0], { basename, clone: true });
     assert.equal(existsSync(cp), false);
-    assert.equal(existsSync(rp), false);
-    assert.equal(existsSync(qp), false);
+    assert.equal(existsSync(rp), true);
+    assert.equal(existsSync(qp), true);
 });
 
 test("purgeStaleClones: leaves fresh clones alone", () => {

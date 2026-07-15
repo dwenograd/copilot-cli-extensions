@@ -195,12 +195,50 @@ describe("Section 9b — load-bearing safety invariants present verbatim", () =>
             assert.match(out, /re-run.*sourcecheck.*invocation/i);
         });
 
+        test(`(${label}) keeps operator decisions in memory until the single finalizer`, () => {
+            const out = findRemediationBlock(invocation);
+            assert.match(out, /structured `operatorDecisions`/);
+            assert.match(out, /Do NOT call `zerotrust_finalize_report` inside this block/);
+            assert.match(out, /write\s+REPORT\.md\/FINDINGS\.json directly/);
+            assert.equal((out.match(/zerotrust_finalize_report\(\{/g) || []).length, 1);
+            assert.ok(
+                out.indexOf("Section 9b — Remediation")
+                    < out.indexOf("const finalizeResult = zerotrust_finalize_report({"),
+                "remediation must complete before the only artifact finalization",
+            );
+        });
+
         test(`(${label}) contains path-pinning instruction`, () => {
             const out = findRemediationBlock(invocation);
             // The block says "the pinned path for this audit is **exactly** ..."
             assert.match(out, /pinned path for this audit is \*\*exactly\*\*/);
         });
+
+        test(`(${label}) requires one-finding exact-diff approval wording`, () => {
+            const out = findRemediationBlock(invocation);
+            assert.match(
+                out,
+                /Approve this one finding's proposed diff exactly as shown\? \(yes\/no\)/,
+            );
+            assert.match(out, /one-finding approval/);
+            assert.match(out, /Never execute project code/i);
+            assert.match(out, /build output as proof/i);
+        });
     }
+});
+
+test("council remediation packet consumes validated ledger metadata", () => {
+    const r = runHandler({
+        local_path: validDir,
+        i_understand_local_path_reads_my_disk: true,
+        mode: "audit_local_source_council",
+    });
+    assert.equal(r.resultType, "success");
+    assert.match(r.textResultForLlm, /validationFinal\.remediation/);
+    assert.match(r.textResultForLlm, /alternate-path-remains/);
+    assert.match(r.textResultForLlm, /graph-incomplete/);
+    assert.match(r.textResultForLlm, /Refuted findings have no entry/);
+    assert.match(r.textResultForLlm, /confidentPatchAllowed: false/);
 });
 
 // ---- Pinned-path identity ----
@@ -228,8 +266,8 @@ describe("Section 9b pinned-path identity", () => {
         });
         assert.equal(r.resultType, "success");
         // The pinned path for build modes is the expectedClonePath under build_root.
-        // We don't know the exact placeholder-SHA path string without parsing,
-        // but it must contain the build_root and the owner-repo prefix.
-        assert.match(r.textResultForLlm, /pinned path for this audit is \*\*exactly\*\* `[^`]*foo-bar[^`]*`/);
+        // The placeholder identity is hashed, so assert the canonical shape
+        // rather than expecting owner/repo text in the basename.
+        assert.match(r.textResultForLlm, /pinned path for this audit is \*\*exactly\*\* `[^`]*zt-v1-[0-9a-f]{64}`/);
     });
 });

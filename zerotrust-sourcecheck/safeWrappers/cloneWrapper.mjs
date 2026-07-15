@@ -8,9 +8,20 @@ import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync } from "node:fs";
 import nodePath from "node:path";
 
-import { parseGithubUrl, buildClonePath, validateRef } from "../urlParser.mjs";
+import {
+    parseGithubUrl,
+    buildClonePath,
+    buildReportPath,
+    buildQuarantinePath,
+    validateRef,
+} from "../urlParser.mjs";
 import { purgeStaleClones, getPurgeHours } from "./autoPurge.mjs";
-import { getTrustedAuditContext, recordResolvedClonePath, recordResolvedSha } from "../enforcement.mjs";
+import {
+    getTrustedAuditContext,
+    recordResolvedArtifactPaths,
+    recordResolvedClonePath,
+    recordResolvedSha,
+} from "../enforcement.mjs";
 import { modeNeedsClone } from "../modes.mjs";
 import { resolveTrustedProgram } from "./programResolver.mjs";
 
@@ -123,6 +134,15 @@ function resolveRefViaLsRemote(canonicalUrl, ref, refType, gitPath) {
 
 function ensureDirExists(p) {
     if (!existsSync(p)) mkdirSync(p, { recursive: true });
+}
+
+function buildCloneBoundContext({ buildRoot, owner, repo, resolvedSha, clonePath }) {
+    return {
+        sourceCommitSha: resolvedSha,
+        clonePath,
+        reportPath: buildReportPath(buildRoot, owner, repo, resolvedSha),
+        quarantinePath: buildQuarantinePath(buildRoot, owner, repo, resolvedSha),
+    };
 }
 
 function doHardenedClone({ canonicalUrl, sha, clonePath, gitPath }) {
@@ -276,9 +296,16 @@ export async function safeCloneHandler(args, invocation) {
         return failure(`build_root must be absolute, got ${JSON.stringify(buildRoot)}`);
     }
 
-    let clonePath;
+    let clonePath, boundContext;
     try {
-        clonePath = buildClonePath(buildRoot, owner, repo, resolvedSha.slice(0, 7));
+        clonePath = buildClonePath(buildRoot, owner, repo, resolvedSha);
+        boundContext = buildCloneBoundContext({
+            buildRoot,
+            owner,
+            repo,
+            resolvedSha,
+            clonePath,
+        });
     } catch (err) {
         return failure(`path construction failed: ${err.message}`);
     }
@@ -316,31 +343,28 @@ export async function safeCloneHandler(args, invocation) {
         return failure(`hardened clone failed: ${err.message}${stderr ? `\nstderr: ${stderr}` : ""}`);
     }
 
-    // Round-4 hardening (gpt-5.5 F2): bind the resolved clone path to the
-    // active audit so subsequent install/build/cleanup/finalize_report calls
-    // can cross-check that they're operating on THIS audit's clone, not a
-    // sibling repo dropped in the same sandbox by a different session.
     if (sessionId) {
-        try {
-            recordResolvedClonePath(sessionId, clonePath);
-        } catch {
-            // best-effort — wrapper still succeeds even if recording fails
-        }
-        // v4-r2 round-6 (A-R6-2 high): also pin the audit's SHA so any
-        // subsequent safe_fetch_file in build mode is constrained to
-        // the same commit we just cloned. Mirrors what safe_list_tree
-        // does for API-direct modes.
-        // v4-r2 round-12 (C-R12-1): check the boolean return of
-        // recordResolvedSha — first-write-wins should only return false
-        // on a SHA conflict, which we already gated above; this is a
-        // belt-and-suspenders re-check.
         try {
             const pinOk = recordResolvedSha(sessionId, resolvedSha);
             if (pinOk === false && ctx.hasActiveAudit) {
                 return failure(`safe_clone refused: resolved SHA conflicts with the audit's previously-pinned commit (race or repeated clone with different ref).`);
             }
-        } catch {
-            // best-effort
+            const cloneBound = recordResolvedClonePath(sessionId, clonePath);
+            const artifactsBound = recordResolvedArtifactPaths(sessionId, {
+                reportPath: boundContext.reportPath,
+                quarantinePath: boundContext.quarantinePath,
+            });
+            if (ctx.hasActiveAudit && (!cloneBound || !artifactsBound)) {
+                return failure(
+                    "safe_clone created the clone but failed to bind its hashed owner/repo/full-SHA clone/report/quarantine identity to the active audit; audit state remains open for operator cleanup",
+                );
+            }
+        } catch (err) {
+            if (ctx.hasActiveAudit) {
+                return failure(
+                    `safe_clone created the clone but failed to record active-audit identity: ${err.message}`,
+                );
+            }
         }
     }
 
@@ -348,6 +372,7 @@ export async function safeCloneHandler(args, invocation) {
         clonePath,
         sha: resolvedSha,
         canonicalUrl,
+        boundContext,
         ...(purgeSummary ? { autoPurge: purgeSummary } : {}),
     });
 }
@@ -371,4 +396,5 @@ export const __internals = {
     HARDENED_CLONE_FLAGS,
     looksLikeSha,
     resolveRefViaLsRemote,
+    buildCloneBoundContext,
 };

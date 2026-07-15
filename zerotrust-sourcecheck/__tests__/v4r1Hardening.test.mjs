@@ -2,10 +2,9 @@
 //
 // Anchor tests for v4-r1 hardening (the round-1 triple-review fixes
 // shipped after v4 + v4.1):
-//   1. classifyAsBinary catches polyglot files (clean ASCII first 8KB
-//      then null byte deeper). The original 8KB-only sniff bypassed.
-//   2. classifyAsBinary uses extension allowlist for null-byte-free
-//      binary formats (JSE, PFX, etc.).
+//   1. Classification inspects the full byte buffer without treating
+//      valid UTF-8 control bytes as structural binary evidence.
+//   2. Binary classification inspects the full byte buffer.
 //   3. renderRolePrompt branches on apiDirect (sub-agents must call
 //      zerotrust_safe_fetch_file in API-direct, not look for a clone).
 //   4. safeCloneHandler refuses when sessionId given but no active
@@ -23,7 +22,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { classifyAsBinary } from "../safeWrappers/apiClient.mjs";
+import {
+    classifyAsBinary,
+    isKnownBinaryPath,
+} from "../safeWrappers/apiClient.mjs";
 import { renderRolePrompt, __internals as ptInternals } from "../council/promptTemplate.mjs";
 import { safeCloneHandler } from "../safeWrappers/cloneWrapper.mjs";
 import { inspectToolCall, activateAudit, deactivateAudit } from "../enforcement.mjs";
@@ -37,28 +39,30 @@ const CLONE_PATH = process.platform === "win32"
 
 // ---------- 1. polyglot binary detection ----------
 
-test("v4-r1: classifyAsBinary catches polyglot (clean ASCII first 8KB + null deep in buffer)", () => {
+test("v4-r1: valid UTF-8 remains text even with a null byte past the old preview window", () => {
     const ascii = Buffer.alloc(8192, 0x41); // 8KB of 'A'
     const polyglotPayload = Buffer.from([0x42, 0x43, 0x00, 0x44, 0x45]); // null inside
     const buf = Buffer.concat([ascii, polyglotPayload]);
-    assert.equal(classifyAsBinary(buf, "innocent.txt"), true,
-        "polyglot file with null past 8KB must classify as binary");
+    assert.equal(classifyAsBinary(buf, "innocent.txt"), false,
+        "valid UTF-8 must remain text; null alone is not structural binary proof");
 });
 
-// ---------- 2. extension-based binary detection ----------
+// ---------- 2. suffixes are prioritization hints, not classification ----------
 
-test("v4-r1: classifyAsBinary uses extension allowlist for null-byte-free binaries", () => {
+test("coverage hardening: valid text bytes override known binary suffixes", () => {
     const cleanText = Buffer.from(
         "just some all-ASCII text with no null bytes anywhere here",
         "utf-8",
     );
     assert.equal(cleanText.includes(0), false, "test setup: control buffer has no nulls");
-    assert.equal(classifyAsBinary(cleanText, "setup.exe"), true, "setup.exe path forces binary");
-    assert.equal(classifyAsBinary(cleanText, "evil.jse"), true, "JSE encoded scripts → binary");
-    assert.equal(classifyAsBinary(cleanText, "cert.pfx"), true, "PFX certs → binary");
-    assert.equal(classifyAsBinary(cleanText, "image.png"), true, "PNG → binary");
+    assert.equal(classifyAsBinary(cleanText, "setup.exe"), false);
+    assert.equal(classifyAsBinary(cleanText, "evil.jse"), false);
+    assert.equal(classifyAsBinary(cleanText, "cert.pfx"), false);
+    assert.equal(classifyAsBinary(cleanText, "image.png"), false);
     assert.equal(classifyAsBinary(cleanText, "src/index.js"), false, "regular .js stays text");
     assert.equal(classifyAsBinary(cleanText, "README.md"), false, "regular .md stays text");
+    assert.equal(isKnownBinaryPath("setup.exe"), true, "suffix remains a fetch-order hint");
+    assert.equal(isKnownBinaryPath("image.png"), true, "suffix remains a fetch-order hint");
 });
 
 test("v4-r1: classifyAsBinary requires a Buffer", () => {
@@ -77,13 +81,19 @@ const FAKE_ROLE = {
     ignore_clauses: ["adjacent role's territory"],
     priors: ["prior 1", "prior 2"],
 };
+const RUNTIME_SHA = "a".repeat(40);
 
 test("v4-r1: renderRolePrompt apiDirect=true uses safe_fetch_file ground rule", () => {
     const prompt = renderRolePrompt(FAKE_ROLE, {
+        auditId: "11111111-1111-4111-8111-111111111111",
         nonce: "abcd1234",
         apiDirect: true,
         owner: "octocat",
         repo: "Hello-World",
+        sourceCommitSha: RUNTIME_SHA,
+        buildRoot: BUILD_ROOT,
+        coverageSnapshot: { coverageComplete: true, aggregateEntryCount: 1 },
+        candidatePaths: ["package.json"],
     });
     assert.match(prompt, /zerotrust_safe_fetch_file/, "API-direct prompt mentions safe_fetch_file");
     assert.match(prompt, /octocat/, "owner is interpolated");
@@ -93,9 +103,16 @@ test("v4-r1: renderRolePrompt apiDirect=true uses safe_fetch_file ground rule", 
 
 test("v4-r1: renderRolePrompt apiDirect=false uses on-disk clone ground rule", () => {
     const prompt = renderRolePrompt(FAKE_ROLE, {
+        auditId: "11111111-1111-4111-8111-111111111111",
         clonePath: CLONE_PATH,
+        owner: "octocat",
+        repo: "Hello-World",
         nonce: "abcd1234",
         apiDirect: false,
+        sourceCommitSha: RUNTIME_SHA,
+        buildRoot: BUILD_ROOT,
+        coverageSnapshot: { coverageComplete: true, aggregateEntryCount: 1 },
+        candidatePaths: ["package.json"],
     });
     assert.match(prompt, /ALREADY CLONED/i, "on-disk prompt mentions clone");
     assert.doesNotMatch(prompt, /zerotrust_safe_fetch_file/, "on-disk prompt does not direct to safe_fetch_file");

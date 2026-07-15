@@ -1,0 +1,26 @@
+{
+  "schema": "zerotrust-evaluation-expectation/v1",
+  "schema_version": 1,
+  "slug": "incomplete-chain",
+  "kind": "synthetic-incomplete",
+  "source": {"type": "local", "path": "fixtures/incomplete-chain"},
+  "expected": {
+    "stage": {"required": ["acquired", "prepared", "scanned", "traced", "validated", "finalized"], "final": "finalized"},
+    "activation_facts": {"required": ["package-lifecycle"], "minimum": 1},
+    "plugin_facts": {"required": ["remote-fetch", "decode-transform"], "minimum": 2},
+    "counts": {"candidate": 1, "validated": 0, "refuted": 0, "unresolved": 1},
+    "chains": {
+      "required": ["behavior-chain"],
+      "complete_required": [],
+      "forbidden": ["install-fetch-decode-execute"]
+    },
+    "scores": {
+      "severity": {"min": "high", "max": "high"},
+      "confidence": {"min": "medium", "max": "medium"},
+      "project_fit": {"min": "likely", "max": "likely"}
+    },
+    "tags": {"required": ["remote-fetch", "decode-transform"], "forbidden": ["execute-effect"]},
+    "acceptable_blockers": ["unresolved-severe-finding"],
+    "failure_stage": null
+  }
+}

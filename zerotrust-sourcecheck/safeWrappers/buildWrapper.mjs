@@ -19,7 +19,11 @@
 import { execFileSync } from "node:child_process";
 import nodePath from "node:path";
 
-import { getRecordedOutcome, evaluateCouncilGate } from "./state.mjs";
+import {
+    councilOutcomeMatchesAudit,
+    evaluateCouncilGate,
+    getRecordedOutcome,
+} from "./state.mjs";
 import { modeIsBuild, modeUsesCouncil } from "../modes.mjs";
 import { getTrustedAuditContext } from "../enforcement.mjs";
 import { resolveTrustedProgram } from "./programResolver.mjs";
@@ -125,6 +129,12 @@ function pathIsUnder(parent, child) {
     return !!rel && !rel.startsWith("..") && !nodePath.isAbsolute(rel);
 }
 
+function pathsEqual(left, right) {
+    const a = nodePath.resolve(left);
+    const b = nodePath.resolve(right);
+    return process.platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b;
+}
+
 /**
  * Tool signature:
  *   zerotrust_safe_build({
@@ -187,9 +197,7 @@ export async function safeBuildHandler(args, invocation) {
         if (!ctx.resolvedClonePath) {
             return failure(`safe_build refused: no resolved clone path recorded for the active audit. Call zerotrust_safe_clone before zerotrust_safe_build.`);
         }
-        const argResolved = nodePath.resolve(args.clone_path).toLowerCase();
-        const auditResolved = ctx.resolvedClonePath.toLowerCase();
-        if (argResolved !== auditResolved) {
+        if (!pathsEqual(args.clone_path, ctx.resolvedClonePath)) {
             return failure(`safe_build refused: clone_path ${args.clone_path} does not match the active audit's resolved clone path ${ctx.resolvedClonePath}`);
         }
     }
@@ -217,6 +225,11 @@ export async function safeBuildHandler(args, invocation) {
     let gateOpenReason;
     if (isCouncilBuildMode) {
         const outcome = getRecordedOutcome(sessionId);
+        if (outcome && !councilOutcomeMatchesAudit(outcome, ctx)) {
+            return failure(
+                "council-build gate CLOSED: recorded council outcome belongs to a different audit identity (auditId/owner/repo/resolvedSha mismatch)",
+            );
+        }
         const gate = evaluateCouncilGate(outcome, {
             override: !!args.council_build_override,
             overrideOnFailure: !!args.proceed_on_council_failure,
@@ -305,4 +318,5 @@ export const __internals = {
     ARG_DENYLIST,
     validateExtraArgs,
     pathIsUnder,
+    pathsEqual,
 };
