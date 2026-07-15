@@ -16,6 +16,7 @@ import {
     createDomainRepositoryAdapter,
     loadSupervisorConfig,
     normalizeSupervisorConfig,
+    openResourceBroker,
     supervisorConfigDocument,
 } from "../runtime/index.mjs";
 import {
@@ -325,6 +326,28 @@ function makeDeps(workspace, overrides = {}) {
                     config.paths.configPath,
                     JSON.stringify(supervisorConfigDocument(config)),
                 );
+                const broker = openResourceBroker({
+                    stateRoot: workspace.stateRoot,
+                    config: config.runner.resourceBroker.config,
+                });
+                try {
+                    if (broker.getInvestigation(
+                        config.runner.investigationId,
+                    ) === null) {
+                        broker.registerInvestigation({
+                            investigationId:
+                                config.runner.investigationId,
+                            supervisorGeneration: 1,
+                            supervisorNonce: "fixture-supervisor-nonce",
+                            runnerIncarnation:
+                                "fixture-runner-incarnation",
+                            limits: config.runner.resourceBroker
+                                .investigationLimits,
+                        });
+                    }
+                } finally {
+                    broker.close();
+                }
                 return {
                     action: "started",
                     pid: 4242,

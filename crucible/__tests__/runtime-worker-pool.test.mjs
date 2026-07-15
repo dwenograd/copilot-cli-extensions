@@ -204,6 +204,42 @@ function mutableClock(start = 10_000) {
     };
 }
 
+function controlledTimers(clock) {
+    let nextId = 0;
+    const scheduled = new Map();
+    return {
+        setTimeout(callback, milliseconds) {
+            const handle = {
+                id: ++nextId,
+                at: clock.now() + milliseconds,
+                unref() {},
+            };
+            scheduled.set(handle.id, { callback, handle });
+            return handle;
+        },
+        clearTimeout(handle) {
+            scheduled.delete(handle?.id);
+        },
+        advance(milliseconds) {
+            clock.advance(milliseconds);
+            for (;;) {
+                const due = [...scheduled.values()]
+                    .filter(({ handle }) => handle.at <= clock.now())
+                    .sort((left, right) =>
+                        left.handle.at - right.handle.at
+                        || left.handle.id - right.handle.id);
+                if (due.length === 0) break;
+                const next = due[0];
+                scheduled.delete(next.handle.id);
+                next.callback();
+            }
+        },
+        get pendingCount() {
+            return scheduled.size;
+        },
+    };
+}
+
 // In-memory parent snapshot reader that exposes ONLY the two read callbacks the
 // worker is allowed to use. There is no write/execute surface at all.
 const SNAPSHOT_A = `sha256:${"a".repeat(64)}`;
@@ -404,17 +440,24 @@ describe("Crucible SDK worker pool", () => {
 
     it("bounds a never-resolving createSession by the absolute deadline and reports it on close", async () => {
         const root = makeRoot("create-session-deadline");
+        const clock = mutableClock();
+        const timers = controlledTimers(clock);
         let stopCalls = 0;
+        let markCreateEntered;
+        const createEntered = new Promise((resolve) => {
+            markCreateEntered = resolve;
+        });
         const client = {
             async start() {},
             async stop() {
                 stopCalls += 1;
             },
             createSession() {
+                markCreateEntered();
                 return new Promise(() => {});
             },
         };
-        const deadlineMs = Date.now() + 50;
+        const deadlineMs = clock.now() + 600;
         const pool = createSdkWorkerPool({
             client,
             baseDirectory: path.join(root, "sdk"),
@@ -422,20 +465,26 @@ describe("Crucible SDK worker pool", () => {
             sessionTimeoutMs: 5_000,
             shutdownTimeoutMs: 25,
             deadlineMs,
+            clock,
+            timers,
         });
 
-        const proposalStartedAt = Date.now();
-        await expect(pool.propose(request())).rejects.toMatchObject({
+        const proposal = pool.propose(request());
+        await createEntered;
+        timers.advance(600);
+        await expect(proposal).rejects.toMatchObject({
             code: RUNTIME_ERROR_CODES.DEADLINE_EXCEEDED,
             details: {
                 deadlineMs,
                 stage: "proposal session creation",
             },
         });
-        expect(Date.now() - proposalStartedAt).toBeLessThan(1_000);
 
-        const closeStartedAt = Date.now();
-        await expect(pool.close()).rejects.toMatchObject({
+        const closing = pool.close();
+        await new Promise((resolve) => setImmediate(resolve));
+        expect(timers.pendingCount).toBeGreaterThan(0);
+        timers.advance(25);
+        await expect(closing).rejects.toMatchObject({
             code: RUNTIME_ERROR_CODES.RUNTIME_FAILURE,
             details: {
                 failures: [
@@ -448,7 +497,6 @@ describe("Crucible SDK worker pool", () => {
                 ],
             },
         });
-        expect(Date.now() - closeStartedAt).toBeLessThan(1_000);
         expect(stopCalls).toBe(1);
     });
 

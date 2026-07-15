@@ -142,7 +142,11 @@ export {
 } from "./sdk-availability.mjs";
 
 export {
+    captureProcessIdentity,
     createProcessIdentityAdapter,
+    normalizeProcessIdentity,
+    parseWindowsCommandLine,
+    readProcessIdentity,
     readProcessStartId,
 } from "./process-identity.mjs";
 

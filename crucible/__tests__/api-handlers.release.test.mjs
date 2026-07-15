@@ -9,7 +9,14 @@
 // terminal results (verified + target-unreachable), and strict non-result
 // redaction.
 
-import { afterEach, beforeAll, describe, expect, it } from "vitest";
+import {
+    afterAll,
+    afterEach,
+    beforeAll,
+    describe,
+    expect,
+    it,
+} from "vitest";
 import fs from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
@@ -56,12 +63,20 @@ import {
 import { DatabaseSync } from "../persistence/sqlite.mjs";
 import {
     PROMPT_CONTEXT_HASH_ALGORITHM,
+    RESOURCE_BROKER_CONFIG_VERSION,
+    buildQuiescenceSnapshot,
     createDomainRepositoryAdapter,
     loadSupervisorConfig,
+    normalizeInvestigationResourceLimits,
+    normalizeResourceBrokerConfig,
     normalizeSupervisorConfig,
+    openResourceBroker,
+    persistPausedQuiescent,
+    persistQuiescentStopBarrier,
     readSupervisorLock,
     readStatus,
     requestStop,
+    supervisorConfigDocument,
     supervisorPaths,
 } from "../runtime/index.mjs";
 import {
@@ -110,6 +125,11 @@ import { loadExperimentRegistry } from "../api/experiment-registry.mjs";
 import { fakeHarnessIdentity } from "./harness-identity-fixture.mjs";
 import { appendLegacyV3Investigation } from "./legacy-v3-fixture.mjs";
 import {
+    cleanupImpossibilityRunnerFixture,
+    runImpossibilityRunnerFixture,
+    setupImpossibilityRunnerFixture,
+} from "./impossibility-runner-fixture.mjs";
+import {
     buildHarnessSuiteForAllowlist,
     fakeHypothesisPolicy,
     fakeObservableRegistry,
@@ -130,15 +150,96 @@ import {
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const roots = [];
 const authorityFixturesByStateRoot = new Map();
+let unreachableTemplate = null;
+let inconclusiveTemplate = null;
 const VERIFIER_SANDBOX = fakeHarnessIdentity({
     harnessId: "verifier-harness",
     executesCandidateCode: true,
 }).sandbox;
+const SANDBOX_HELPER_SOURCE = "public class Fixture {}\n";
+const SANDBOX_HELPER_BINARY = "fixture sandbox helper";
+const SANDBOX_LAUNCHER_BINARY = "fixture sandbox launcher";
+const SANDBOX_LAUNCHER_SCRIPT_HASH =
+    `sha256:crucible-test-sandbox-launcher-v1:${"b".repeat(64)}`;
+
+function sandboxFileHash(bytes) {
+    return `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
+}
+
+function workspaceSandboxIdentity() {
+    const policyIdentity = {
+        ...VERIFIER_SANDBOX.policyIdentity,
+        helperSourceHash: sandboxFileHash(SANDBOX_HELPER_SOURCE),
+        helperBinaryHash: sandboxFileHash(SANDBOX_HELPER_BINARY),
+        launcherBinaryHash: sandboxFileHash(SANDBOX_LAUNCHER_BINARY),
+        launcherScriptHash: SANDBOX_LAUNCHER_SCRIPT_HASH,
+    };
+    return Object.freeze({
+        policyIdentity: Object.freeze(policyIdentity),
+        policyDigest: hashCanonical(
+            policyIdentity,
+            "sha256:crucible-measurement-sandbox-policy-identity-v1",
+        ),
+    });
+}
+
+function fixtureBrokerConfig() {
+    return {
+        version: RESOURCE_BROKER_CONFIG_VERSION,
+        lease: {
+            defaultTtlMs: 1_000,
+            maxTtlMs: 10_000,
+        },
+        capacities: {
+            sdkSessions: 2,
+            sandboxProcesses: 2,
+            cpuSlots: { general: 2 },
+            gpuSlots: {},
+            outputBytes: 10_000_000,
+            receiptBytes: 10_000_000,
+            casBytes: 10_000_000,
+            storageBytes: 20_000_000,
+            modelCostUnits: 100_000,
+        },
+    };
+}
 
 beforeAll(async () => {
     await removeStaleTestRoots(HERE, ".api-handlers-", {
         label: "stale api-handlers test root",
     });
+    unreachableTemplate = setupImpossibilityRunnerFixture(
+        "api-unreachable-template",
+    );
+    const unreachable = await runImpossibilityRunnerFixture(
+        unreachableTemplate,
+    );
+    expect(unreachable.result).toMatchObject({
+        kind: "TERMINAL",
+        decision: "TARGET_UNREACHABLE",
+    });
+    inconclusiveTemplate = setupImpossibilityRunnerFixture(
+        "api-inconclusive-template",
+        { verifierStatus: "REJECTED" },
+    );
+    const inconclusive = await runImpossibilityRunnerFixture(
+        inconclusiveTemplate,
+    );
+    expect(inconclusive.result).toMatchObject({
+        kind: "NON_RESULT",
+        code: "IMPOSSIBILITY_CERTIFICATE_INCONCLUSIVE",
+    });
+});
+
+afterAll(async () => {
+    for (const template of [
+        unreachableTemplate,
+        inconclusiveTemplate,
+    ]) {
+        if (template !== null) {
+            await cleanupImpossibilityRunnerFixture(template);
+        }
+    }
 });
 
 afterEach(async () => {
@@ -188,6 +289,7 @@ function makeWorkspace(label) {
     const verifierExecutableSha256 = createHash("sha256")
         .update(fs.readFileSync(verifierExecutable))
         .digest("hex");
+    const sandbox = workspaceSandboxIdentity();
 
     const allowlistPath = path.join(root, "harnesses.json");
     const allowlistJson = {
@@ -241,7 +343,7 @@ function makeWorkspace(label) {
         "primary-suite": buildHarnessSuiteForAllowlist(initialAllowlist, {
             includeVerifier: true,
             verifierHarnessId: "verifier-harness",
-            sandboxPolicyDigest: VERIFIER_SANDBOX.policyDigest,
+            sandboxPolicyDigest: sandbox.policyDigest,
             roleCaseIds: {
                 calibration: ["good", "bad"],
                 search: ["search"],
@@ -259,17 +361,57 @@ function makeWorkspace(label) {
         CRUCIBLE_CASE_STORE_PATH: snapshotStoreRoot,
         CRUCIBLE_EXPERIMENT_REGISTRY_PATH: path.join(root, "experiments.json"),
         CRUCIBLE_STATE_ROOT: stateRoot,
-        COPILOT_SDK_PATH: path.join(root, "sdk"),
-        COPILOT_CLI_PATH: path.join(root, "cli.exe"),
+        CRUCIBLE_CLI_PACKAGE_PATH: path.join(root, "copilot-package"),
+        CRUCIBLE_NODE_PATH: path.join(root, "node.exe"),
+        COPILOT_SDK_PATH: path.join(root, "copilot-package", "sdk"),
+        COPILOT_CLI_PATH: path.join(root, "copilot.exe"),
+        CRUCIBLE_SANDBOX_HELPER_SOURCE_PATH:
+            path.join(root, "sandbox-runtime", "helper.cs"),
+        CRUCIBLE_SANDBOX_HELPER_BINARY_PATH:
+            path.join(root, "sandbox-runtime", "helper.exe"),
+        CRUCIBLE_SANDBOX_LAUNCHER_PATH:
+            path.join(root, "sandbox-runtime", "launcher.exe"),
+        CRUCIBLE_SANDBOX_LAUNCHER_SCRIPT_HASH:
+            SANDBOX_LAUNCHER_SCRIPT_HASH,
         ...experimentAuthority.env,
     };
-    const sdkPath = env.COPILOT_SDK_PATH;
-    fs.mkdirSync(sdkPath, { recursive: true });
-    fs.writeFileSync(path.join(sdkPath, "index.js"), "export {};\n");
+    fs.mkdirSync(env.CRUCIBLE_CLI_PACKAGE_PATH, { recursive: true });
+    fs.mkdirSync(env.COPILOT_SDK_PATH, { recursive: true });
+    fs.mkdirSync(
+        path.dirname(env.CRUCIBLE_SANDBOX_HELPER_SOURCE_PATH),
+        { recursive: true },
+    );
+    fs.writeFileSync(
+        path.join(env.CRUCIBLE_CLI_PACKAGE_PATH, "package.json"),
+        JSON.stringify({ name: "fixture-copilot" }),
+    );
+    fs.writeFileSync(
+        path.join(env.CRUCIBLE_CLI_PACKAGE_PATH, "app.js"),
+        "export {};\n",
+    );
+    fs.writeFileSync(
+        path.join(env.COPILOT_SDK_PATH, "index.js"),
+        "export {};\n",
+    );
     fs.writeFileSync(env.COPILOT_CLI_PATH, "fixture copilot cli");
+    fs.writeFileSync(env.CRUCIBLE_NODE_PATH, "fixture node runtime");
+    fs.writeFileSync(
+        env.CRUCIBLE_SANDBOX_HELPER_SOURCE_PATH,
+        SANDBOX_HELPER_SOURCE,
+    );
+    fs.writeFileSync(
+        env.CRUCIBLE_SANDBOX_HELPER_BINARY_PATH,
+        SANDBOX_HELPER_BINARY,
+    );
+    fs.writeFileSync(
+        env.CRUCIBLE_SANDBOX_LAUNCHER_PATH,
+        SANDBOX_LAUNCHER_BINARY,
+    );
     authorityFixturesByStateRoot.set(stateRoot, {
         fixture: experimentAuthority,
         projectDir,
+        sandbox,
+        env,
     });
     return {
         root,
@@ -284,31 +426,16 @@ function makeWorkspace(label) {
 
 function persistSupervisorConfig(config) {
     fs.mkdirSync(config.paths.directory, { recursive: true });
-    fs.writeFileSync(config.paths.configPath, JSON.stringify({
-        runner: {
-            investigationId: config.runner.investigationId,
-            stateDir: config.runner.stateDir,
-            artifactRoot: config.runner.artifactRoot,
-            allowlistPath: config.runner.allowlistPath,
-            copilotSdkPath: config.runner.sdkPath,
-            copilotCliPath: config.runner.cliPath,
-            runnerEpochId: config.runner.runnerEpochId,
-            deadline: config.runner.deadlineMs,
-            options: config.runner.options,
-        },
-        runnerCliPath: config.runnerCliPath,
-        supervisorEpochId: config.supervisorEpochId,
-        maxRestarts: config.maxRestarts,
-        baseBackoffMs: config.baseBackoffMs,
-        maxBackoffMs: config.maxBackoffMs,
-        heartbeatIntervalMs: config.heartbeatIntervalMs,
-        staleLockMs: config.staleLockMs,
-        circuitWindowMs: config.circuitWindowMs,
-    }));
+    fs.writeFileSync(
+        config.paths.configPath,
+        JSON.stringify(supervisorConfigDocument(config)),
+    );
 }
 
 function makeDeps(env, overrides = {}) {
     const calls = { ensure: [] };
+    const sandbox = authorityFixturesByStateRoot
+        .get(env.CRUCIBLE_STATE_ROOT)?.sandbox ?? workspaceSandboxIdentity();
     const deps = {
         env,
         log: () => {},
@@ -318,8 +445,8 @@ function makeDeps(env, overrides = {}) {
         probeSandboxAvailability: () => ({
             available: true,
             policyIdentity: {
-                ...VERIFIER_SANDBOX.policyIdentity,
-                policyDigest: VERIFIER_SANDBOX.policyDigest,
+                ...sandbox.policyIdentity,
+                policyDigest: sandbox.policyDigest,
             },
         }),
         openRepository,
@@ -330,6 +457,14 @@ function makeDeps(env, overrides = {}) {
         ensureSupervisor: (input, opts) => {
             calls.ensure.push({ input, opts });
             persistSupervisorConfig(input);
+            const catalogAuthority = registerCatalogInvestigation(
+                env.CRUCIBLE_STATE_ROOT,
+                input.runner.investigationId,
+                {
+                    config: input.runner.resourceBroker.config,
+                    limits: input.runner.resourceBroker.investigationLimits,
+                },
+            );
             return {
                 action: "started",
                 pid: 4242,
@@ -337,7 +472,8 @@ function makeDeps(env, overrides = {}) {
                 acknowledged: true,
                 acknowledgement: {
                     supervisorGeneration: 1,
-                    runnerIncarnation: "fixture-runner-incarnation",
+                    runnerIncarnation:
+                        catalogAuthority.runnerIncarnation,
                     configFingerprint: "sha256:fixture-supervisor-config",
                     deadlineMs: input.runner.deadlineMs,
                 },
@@ -351,6 +487,46 @@ function makeDeps(env, overrides = {}) {
         ...overrides,
     };
     return { deps, calls };
+}
+
+function registerCatalogInvestigation(
+    stateRoot,
+    investigationId,
+    {
+        config = null,
+        limits = null,
+    } = {},
+) {
+    const normalizedConfig = normalizeResourceBrokerConfig(
+        config ?? fixtureBrokerConfig(),
+    );
+    const normalizedLimits = normalizeInvestigationResourceLimits(
+        limits ?? normalizedConfig.capacities,
+        normalizedConfig,
+    );
+    const broker = openResourceBroker({
+        stateRoot,
+        config: normalizedConfig,
+    });
+    try {
+        const existing = broker.getInvestigation(investigationId);
+        if (existing === null) {
+            const suffix = createHash("sha256")
+                .update(investigationId)
+                .digest("hex")
+                .slice(0, 24);
+            return broker.registerInvestigation({
+                investigationId,
+                supervisorGeneration: 1,
+                supervisorNonce: `fixture-supervisor-${suffix}`,
+                runnerIncarnation: `fixture-runner-${suffix}`,
+                limits: normalizedLimits,
+            }).investigation;
+        }
+        return existing;
+    } finally {
+        broker.close();
+    }
 }
 
 function startArgs(workspace, overrides = {}) {
@@ -1813,6 +1989,10 @@ function seedInvestigation(stateRoot, investigationId, contractInput, seedFn) {
             signed.capability,
             createRuntimeConfigAuthorityFixture(signed.investigationId),
         );
+        registerCatalogInvestigation(
+            stateRoot,
+            signed.investigationId,
+        );
         return {
             aggregate: seedFn(adapter, store),
             investigationId: signed.investigationId,
@@ -1907,6 +2087,7 @@ function seedUnsignedForgedTerminal(stateRoot, investigationId) {
     } finally {
         repository.close();
     }
+    registerCatalogInvestigation(stateRoot, investigationId);
     return paths;
 }
 
@@ -2065,89 +2246,53 @@ function seedTargetUnreachable(stateRoot, investigationId) {
 }
 
 function seedCertifiedTargetUnreachable(stateRoot, investigationId) {
-    return seedInvestigation(
+    return cloneImpossibilityTemplate(
+        unreachableTemplate,
         stateRoot,
         investigationId,
-        (store) => {
-            const validationCases = seedValidationCases(store);
-            const candidate = createSeedSnapshot(store, [{
-                path: "candidate.txt",
-                content: "certified-candidate",
-            }]).snapshotId;
-            return baseSeedContract({
-                hypothesisTopology: "certified_impossibility",
-                workerModels: ["model-a"],
-                candidatesPerRound: 1,
-                maxRounds: 1,
-                acceptancePredicate: { kind: "harness_pass" },
-                validationCases,
-                enumerandManifest: {
-                    topology: "finite_enumerable",
-                    entries: [{
-                        id: "certified-candidate",
-                        ordinal: 0,
-                        artifactSnapshotHash: candidate,
-                    }],
-                    control: {
-                        kind: "reference",
-                        referenceHash: validationCases[0].artifactHash,
-                    },
-                },
-            });
-        },
-        (adapter, store) => driveToTerminal(adapter, store, [
-            { data: { pass: false, metrics: { score: 20 } } },
-            {
-                certificateFacts: {
-                    pass: true,
-                    searchSpaceExhausted: true,
-                },
-            },
-        ]),
     );
 }
 
 function seedCertifiedNonResult(stateRoot, investigationId) {
-    return seedInvestigation(
+    return cloneImpossibilityTemplate(
+        inconclusiveTemplate,
         stateRoot,
         investigationId,
-        (store) => {
-            const validationCases = seedValidationCases(store);
-            const candidate = createSeedSnapshot(store, [{
-                path: "candidate.txt",
-                content: "certified-non-result-candidate",
-            }]).snapshotId;
-            return baseSeedContract({
-                hypothesisTopology: "certified_impossibility",
-                workerModels: ["model-a"],
-                candidatesPerRound: 1,
-                maxRounds: 1,
-                acceptancePredicate: { kind: "harness_pass" },
-                validationCases,
-                enumerandManifest: {
-                    topology: "finite_enumerable",
-                    entries: [{
-                        id: "certified-candidate",
-                        ordinal: 0,
-                        artifactSnapshotHash: candidate,
-                    }],
-                    control: {
-                        kind: "reference",
-                        referenceHash: validationCases[0].artifactHash,
-                    },
-                },
-            });
-        },
-        (adapter, store) => driveToTerminal(adapter, store, [
-            { data: { pass: false, metrics: { score: 20 } } },
-            {
-                certificateFacts: {
-                    pass: false,
-                    searchSpaceExhausted: true,
-                },
-            },
-        ]),
     );
+}
+
+function cloneImpossibilityTemplate(template, stateRoot, investigationId) {
+    if (template === null) {
+        throw new Error("impossibility runner template is unavailable");
+    }
+    const workspace = authorityFixturesByStateRoot.get(stateRoot);
+    if (workspace === undefined) {
+        throw new Error("impossibility clone requires a workspace");
+    }
+    Object.assign(workspace.env, template.authorityEnv);
+    workspace.fixture = template.authorityFixture;
+    const targetId = template.config.investigationId;
+    const paths = resolveInvestigationPaths(stateRoot, targetId);
+    if (fs.existsSync(paths.investigationDir)) {
+        throw new Error("impossibility clone target already exists");
+    }
+    fs.mkdirSync(stateRoot, { recursive: true });
+    fs.cpSync(template.artifactRoot, paths.artifactRoot, {
+        recursive: true,
+        errorOnExist: true,
+    });
+    fs.mkdirSync(paths.stateDir, { recursive: true });
+    fs.cpSync(template.stateDir, paths.stateDir, {
+        recursive: true,
+        force: true,
+    });
+    registerCatalogInvestigation(stateRoot, targetId);
+    return {
+        aggregate: replayAggregate(stateRoot, targetId),
+        investigationId: targetId,
+        paths,
+        requestedInvestigationId: investigationId,
+    };
 }
 
 function seedPaused(stateRoot, investigationId) {
@@ -2197,7 +2342,14 @@ function replayAggregate(stateRoot, investigationId) {
     const paths = resolveInvestigationPaths(stateRoot, investigationId);
     const repository = openRepository({ file: paths.eventsDbPath });
     try {
-        const adapter = createDomainRepositoryAdapter({ repository, investigationId, ensure: false });
+        const adapter = createDomainRepositoryAdapter({
+            repository,
+            artifactStore: openArtifactStoreReadOnly({
+                root: paths.artifactRoot,
+            }),
+            investigationId,
+            ensure: false,
+        });
         return adapter.replay().aggregate;
     } finally {
         repository.close();
@@ -2416,7 +2568,74 @@ function persistPauseForStarted(workspace, started) {
             evidenceId: "pause-validation-evidence",
             observationId: "pause-validation-observation",
         }).aggregate;
-        adapter.appendKernelDecision();
+        const suffix = createHash("sha256")
+            .update(started.investigation_id)
+            .digest("hex")
+            .slice(0, 24);
+        const supervisorGeneration = 1;
+        const supervisorNonce = `fixture-supervisor-${suffix}`;
+        const runnerIncarnation = `fixture-runner-${suffix}`;
+        repository.claimSupervisorGeneration({
+            investigationId: started.investigation_id,
+            supervisorGeneration,
+            supervisorNonce,
+        });
+        repository.issueRunnerIncarnation({
+            investigationId: started.investigation_id,
+            supervisorGeneration,
+            supervisorNonce,
+            runnerIncarnation,
+        });
+        const stop = persistQuiescentStopBarrier({
+            repository,
+            investigationId: started.investigation_id,
+            requestId: "fixture-persisted-pause",
+            reason: "fixture quiescent pause",
+            pauseRequested: true,
+            owner: {
+                pid: 4242,
+                supervisorGeneration,
+                nonce: supervisorNonce,
+            },
+            runnerPid: null,
+        });
+        const proof = buildQuiescenceSnapshot({
+            repository,
+            investigationId: started.investigation_id,
+            supervisorStatus: {
+                verified: true,
+                pid: 4242,
+                supervisorGeneration,
+                supervisorNonce,
+                runnerIncarnation,
+            },
+            processes: {
+                verified: true,
+                activePids: [],
+            },
+            sdkSessions: {
+                verified: true,
+                activeCount: 0,
+            },
+            runnerChild: {
+                verified: true,
+                runnerIncarnation,
+                pid: null,
+                active: false,
+            },
+            resourceBroker: {
+                verified: true,
+                configured: false,
+                authorityRetired: true,
+                activeLeases: [],
+            },
+        });
+        persistPausedQuiescent({
+            repository,
+            adapter,
+            stop,
+            proof,
+        });
     } finally {
         repository.close();
     }
@@ -2789,9 +3008,10 @@ describe("crucible_start", () => {
         expect(stopped.resumable).toBe(true);
 
         fs.rmSync(workspace.projectDir, { recursive: true, force: true });
-        delete deps.env.CRUCIBLE_ALLOWLIST_PATH;
-        delete deps.env.COPILOT_SDK_PATH;
-        delete deps.env.COPILOT_CLI_PATH;
+        fs.rmSync(workspace.caseStorePath, {
+            recursive: true,
+            force: true,
+        });
         const resumed = startInvestigation({
             investigation_id: started.investigation_id,
         }, deps);
@@ -2993,8 +3213,8 @@ describe("crucible_start", () => {
             is_result: false,
             tool: "crucible_start",
             code: "CRUCIBLE_API_INVESTIGATION_NOT_RESUMABLE",
-            terminal_available: true,
         });
+        expect(payload).not.toHaveProperty("terminal_available");
         expect(JSON.stringify(payload)).not.toContain("VERIFIED_RESULT");
         expect(JSON.stringify(payload)).not.toContain(FIRST_GENERATED_CANDIDATE_ID);
     });
@@ -3169,7 +3389,8 @@ describe("crucible_status", () => {
                             : {}),
                     investigation_id: investigationId,
                 });
-            expect(response.resultType).toBe("success");
+            expect(response.resultType, response.textResultForLlm)
+                .toBe("success");
             return JSON.parse(response.textResultForLlm);
         };
         const status = invoke("crucible_status");
@@ -3188,7 +3409,7 @@ describe("crucible_status", () => {
                 actual_domain_version: 3,
                 event_count: 1,
                 read_only: true,
-                archiveable: true,
+                archiveable: false,
                 non_result_code: "LEGACY_INCOMPATIBLE",
             });
             expect(payload).not.toHaveProperty("decision");
@@ -3400,11 +3621,16 @@ describe("crucible_stop", () => {
         const stop = stopInvestigation({ investigation_id: started.investigation_id, reason: "operator pause" }, deps);
         expect(stop.is_result).toBe(false);
         expect(stop.pause_requested).toBe(true);
-        expect(stop.stop_state).toBe("pause_requested");
+        expect(stop.stop_state).toBe("pause_pending");
         expect(stop.pause_in_flight).toBe(true);
         expect(stop.resumable).toBe(false);
         expect(stop.appended).toBe(true);
         expect(stop.pause_persisted).toBe(false);
+        expect(stop.quiescent).toBe(false);
+        expect(stop.intervention_required).toBe(true);
+        expect(stop.non_result_code).toBe(
+            "CRUCIBLE_RUNTIME_NON_QUIESCENT",
+        );
 
         const aggregate = replayAggregate(resolveStateRoot(workspace.env), started.investigation_id);
         expect(aggregate.stopRequests).toHaveLength(1);
@@ -3424,7 +3650,7 @@ describe("crucible_stop", () => {
         }, deps);
         expect(stop).toMatchObject({
             stop_state: "pause_persisted",
-            pause_requested: true,
+            pause_requested: false,
             pause_in_flight: false,
             pause_persisted: true,
             resumable: true,
@@ -3759,6 +3985,7 @@ describe("crucible_result", () => {
         );
         fs.mkdirSync(paths.stateDir, { recursive: true });
         fs.writeFileSync(paths.eventsDbPath, "forged id alias");
+        registerCatalogInvestigation(workspace.stateRoot, mismatchedId);
 
         const result = resultInvestigation({
             investigation_id: mismatchedId,

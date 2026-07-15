@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 
 import {
     DEFAULT_SEARCH_POLICY,
+    LEGACY_SEARCH_STRATEGY_POLICY_VERSION,
+    SEARCH_STRATEGY_POLICY_VERSION,
     contractHash,
     createInvestigationContract,
 } from "../domain/index.mjs";
@@ -21,6 +23,34 @@ function clone(value) {
 }
 
 describe("v4 frozen statistical contract", () => {
+    it("versions new search authority while preserving unversioned v1 contracts", () => {
+        const current = createInvestigationContract(makeV4ContractInput());
+        expect(current.searchPolicy.version)
+            .toBe(SEARCH_STRATEGY_POLICY_VERSION);
+
+        const legacyInput = makeV4ContractInput();
+        const {
+            version: _version,
+            ...legacySearchPolicy
+        } = legacyInput.searchPolicy;
+        legacyInput.searchPolicy = legacySearchPolicy;
+        const legacy = createInvestigationContract(legacyInput);
+        expect(legacy.searchPolicy).not.toHaveProperty("version");
+
+        const explicitLegacyInput = makeV4ContractInput();
+        explicitLegacyInput.searchPolicy.version =
+            LEGACY_SEARCH_STRATEGY_POLICY_VERSION;
+        expect(createInvestigationContract(explicitLegacyInput).searchPolicy)
+            .toMatchObject({
+                version: LEGACY_SEARCH_STRATEGY_POLICY_VERSION,
+            });
+
+        const unknown = makeV4ContractInput();
+        unknown.searchPolicy.version = "crucible-search-strategy-v999";
+        expect(() => createInvestigationContract(unknown))
+            .toThrow(/searchPolicy\.version is unsupported/u);
+    });
+
     it("canonicalizes unordered registries, metrics, alpha families, and tolerances", () => {
         const base = makeV4ContractInput({
             observableRegistry: [

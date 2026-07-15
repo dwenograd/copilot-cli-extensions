@@ -25,7 +25,8 @@ export function parseRecoveryTaskArgv(argv) {
         stateRoot: null,
         nodePath: process.execPath,
         daemonPath: undefined,
-        intervalMs: 30_000,
+        launcherPath: undefined,
+        intervalMs: undefined,
         expectedNodeSha256: undefined,
         expectedDaemonSha256: undefined,
     };
@@ -42,6 +43,8 @@ export function parseRecoveryTaskArgv(argv) {
             options.nodePath = value;
         } else if (flag === "--daemon-path") {
             options.daemonPath = value;
+        } else if (flag === "--launcher-path") {
+            options.launcherPath = value;
         } else if (flag === "--interval-ms") {
             options.intervalMs = parseInteger(value, flag);
         } else if (flag === "--expected-node-sha256") {
@@ -51,6 +54,9 @@ export function parseRecoveryTaskArgv(argv) {
         } else {
             throw new TypeError(`unknown recovery task flag ${flag}`);
         }
+    }
+    if (command !== "uninstall" && options.intervalMs === undefined) {
+        options.intervalMs = 30_000;
     }
     if (typeof options.stateRoot !== "string"
         || !path.isAbsolute(options.stateRoot)) {
@@ -72,6 +78,10 @@ function publicTaskResult(command, result) {
         node_sha256: spec.runtime.nodeSha256,
         daemon_path: spec.runtime.daemonPath,
         daemon_sha256: spec.runtime.daemonSha256,
+        launcher_path: spec.runtime.launcherPath ?? null,
+        launcher_sha256: spec.runtime.launcherSha256 ?? null,
+        launch_manifest_sha256:
+            spec.runtime.launchManifestSha256 ?? null,
         state_root: spec.stateRoot,
         trigger: "user_logon",
         interactive_token: true,

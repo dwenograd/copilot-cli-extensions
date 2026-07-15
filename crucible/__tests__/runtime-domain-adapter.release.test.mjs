@@ -10,6 +10,7 @@ import {
     EVENT_TYPES,
     artifactRefsFromProvenance,
     computeEventHash as computeDomainEventHash,
+    contractHash,
     constructEvidenceCommittedEvent,
     constructHarnessObservedEvent,
     constructKernelDecisionEvent,
@@ -19,6 +20,7 @@ import {
     createInvestigationContract,
     createMeasurementProvenance,
     createSnapshotProvenance,
+    deriveReplicationControlBinding,
     hashCanonical,
     replicationBlockPlan,
 } from "../domain/index.mjs";
@@ -475,10 +477,31 @@ function harnessReceipt(
                 left.blockIndex - right.blockIndex
                 || left.armIndex - right.armIndex)
             .map((arm) => ({ subjectId: arm.subjectId, arm, series: null }));
-    const measurements = descriptors.map(({ subjectId, series }) => {
+    const candidateSnapshotId = purpose === "candidate"
+        ? `sha256:crucible-measurement-snapshot-v1:${
+            digestOf(hashCanonical({ attemptId, artifact: true }))
+        }`
+        : null;
+    const controlSnapshotId = purpose === "candidate"
+        ? deriveReplicationControlBinding({
+            contractHash: contractHash(contract),
+            statisticalPolicy: contract.statisticalPolicy,
+            schedule: command.replicationSchedule,
+            enumerandManifest: contract.enumerandManifest ?? null,
+            manifestOptions: {
+                topology: contract.enumerandManifest?.topology
+                    ?? contract.hypothesisTopology,
+                observableRegistry: contract.observableRegistry,
+                hypothesisPolicy: contract.hypothesisPolicy,
+            },
+        }).expectedArtifactHash
+        : null;
+    const measurements = descriptors.map(({ subjectId, arm, series }) => {
         const snapshotId = purpose === "validation"
             ? series.artifactHash
-            : `sha256:${digestOf(hashCanonical({ attemptId, artifact: true }))}`;
+            : arm.armId === "candidate"
+                ? candidateSnapshotId
+                : controlSnapshotId;
         const stdoutHash = hashCanonical(
             { attemptId, subjectId, stream: "stdout" },
             "sha256:crucible-measurement-stream-v1",
@@ -593,7 +616,7 @@ function harnessReceipt(
             )
             : provenance.measurements[0].rawStderrHash,
         candidateArtifactHash: purpose === "candidate"
-            ? provenance.measurements[0].snapshot.snapshotHash
+            ? candidateSnapshotId
             : null,
         provenance,
     };
@@ -841,7 +864,7 @@ describe("Crucible domain/persistence adapter", () => {
             expect(Object.keys(row.payload)).toEqual(["domainEvent"]);
         }
         expect(rows.at(-1)).toMatchObject({
-            kind: "domain:v4:non_result_recorded",
+            kind: "domain:v4:scientific_confirmation_frozen",
             isTerminal: false,
             terminalKind: null,
         });
@@ -1512,7 +1535,7 @@ describe("Crucible domain/persistence adapter", () => {
         expect(repositoryB.getCommandAttempt("attempt-b").state).toBe("committed");
     });
 
-    it("fences scientific non-result takeover and lets only the current owner persist it once", () => {
+    it("fences scientific confirmation takeover and lets only the current owner persist it once", () => {
         const {
             repositoryA,
             repositoryB,
@@ -1525,7 +1548,9 @@ describe("Crucible domain/persistence adapter", () => {
         );
         const aggregate = appendFullVerifiedHistory(adapterA, { includeTerminal: false });
         const decisionEvent = constructKernelDecisionEvent(aggregate);
-        expect(decisionEvent.type).toBe(EVENT_TYPES.NON_RESULT_RECORDED);
+        expect(decisionEvent.type).toBe(
+            EVENT_TYPES.SCIENTIFIC_CONFIRMATION_FROZEN,
+        );
         const factHash = adapterA.domainFactIdentity(decisionEvent);
         const decisionCommand = formatAttemptCommand("domain-event", {
             scope: "kernel-decision",
@@ -1581,7 +1606,8 @@ describe("Crucible domain/persistence adapter", () => {
         });
         expect(repositoryB.listEvents(investigationId)
             .filter((event) =>
-                event.kind === "domain:v4:non_result_recorded")).toHaveLength(1);
+                event.kind === "domain:v4:scientific_confirmation_frozen"))
+            .toHaveLength(1);
         expect(repositoryB.getTerminalEvent(investigationId)).toBeNull();
         expect(repositoryB.getCommandAttempt("terminal-b").state).toBe("committed");
         expect(() => adapterB.appendKernelDecisionFenced({
@@ -1594,6 +1620,7 @@ describe("Crucible domain/persistence adapter", () => {
         }));
         expect(repositoryB.listEvents(investigationId)
             .filter((event) =>
-                event.kind === "domain:v4:non_result_recorded")).toHaveLength(1);
+                event.kind === "domain:v4:scientific_confirmation_frozen"))
+            .toHaveLength(1);
     });
 });

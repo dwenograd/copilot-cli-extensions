@@ -85,6 +85,10 @@ import {
     sdkUsageToModelCostUnits,
 } from "./resource-broker.mjs";
 import {
+    normalizeSdkOperationIdentity,
+    reconcileSdkCost,
+} from "./retry-policy.mjs";
+import {
     DEFAULT_PARENT_READ_LIMITS,
     buildProposalPrompt,
     createBoundedParentReadAuthority,
@@ -126,6 +130,31 @@ const LOGICAL_EFFECT_KEY_ALGORITHM = "sha256:crucible-runtime-logical-effect-v1"
 const EFFECT_RECOVERY_CAPSULE_HASH_ALGORITHM =
     "sha256:crucible-runtime-effect-recovery-capsule-v1";
 const EFFECT_RECOVERY_CAPSULE_VERSION = 1;
+const SDK_ACCOUNTING_STATE_HASH_ALGORITHM =
+    "sha256:crucible-runtime-sdk-accounting-state-v1";
+const SDK_ACCOUNTING_STATE_VERSION = 1;
+const SDK_ACCOUNTING_RECONCILIATION_LIMIT = 3;
+const SDK_ACCOUNTING_STATUSES = new Set([
+    "reserved",
+    "pending",
+    "reconciled",
+    "failed",
+]);
+const PERMANENT_SDK_ACCOUNTING_ERROR_CODES = new Set([
+    PERSISTENCE_ERROR_CODES.INVALID_ARGUMENT,
+    PERSISTENCE_ERROR_CODES.SCHEMA_VERSION_MISMATCH,
+    PERSISTENCE_ERROR_CODES.NOT_FOUND,
+    PERSISTENCE_ERROR_CODES.INVESTIGATION_NOT_FOUND,
+    PERSISTENCE_ERROR_CODES.LEASE_NOT_FOUND,
+    PERSISTENCE_ERROR_CODES.CAS_CONFLICT,
+    PERSISTENCE_ERROR_CODES.FENCE_REJECTED,
+    PERSISTENCE_ERROR_CODES.INTEGRITY_VIOLATION,
+    PERSISTENCE_ERROR_CODES.SCHEMA_INTEGRITY_VIOLATION,
+    PERSISTENCE_ERROR_CODES.DATABASE_INTEGRITY_VIOLATION,
+    RUNTIME_ERROR_CODES.INVALID_CONFIG,
+    RUNTIME_ERROR_CODES.INTEGRITY_FAILURE,
+    RUNTIME_ERROR_CODES.RUNTIME_DRIFT,
+]);
 const RUNTIME_TEMP_OWNER_VERSION = 1;
 const IMPOSSIBILITY_CERTIFICATE_ARTIFACT_HASH_ALGORITHM =
     "sha256:crucible-impossibility-certificate-artifact-v2";
@@ -148,6 +177,23 @@ export const DEFAULT_RUNTIME_BYTE_BUDGETS = Object.freeze({
 
 function objectIdForBytes(bytes) {
     return `sha256:${sha256Hex(bytes)}`;
+}
+
+function sdkAccountingErrorSummary(error) {
+    return immutableCanonical({
+        name: typeof error?.name === "string" ? error.name : "Error",
+        code: typeof error?.code === "string" ? error.code : null,
+        message: typeof error?.message === "string"
+            ? error.message
+            : String(error),
+        recoverable: error?.recoverable === true,
+    });
+}
+
+function sdkAccountingFailureIsPermanent(error) {
+    if (error?.recoverable === false || error?.permanent === true) return true;
+    if (error?.recoverable === true) return false;
+    return PERMANENT_SDK_ACCOUNTING_ERROR_CODES.has(error?.code);
 }
 
 function taggedHashMatchesObjectId(tagged, objectId) {
@@ -1933,6 +1979,265 @@ export class AutonomousRunner {
         });
     }
 
+    #sdkAccountingIdentity(command) {
+        if (command?.kind !== "sdk-proposal"
+            || typeof command.commandId !== "string"
+            || typeof command.proposalSlotId !== "string"
+            || typeof command.sdkLogicalEffectId !== "string") {
+            return null;
+        }
+        return normalizeSdkOperationIdentity({
+            proposalSlotId: command.proposalSlotId,
+            commandId: command.commandId,
+            logicalEffectId: command.sdkLogicalEffectId,
+        });
+    }
+
+    #projectSdkAccountingLease(lease) {
+        if (lease === null
+            || typeof lease !== "object"
+            || typeof lease.leaseId !== "string"
+            || !Number.isSafeInteger(lease.fencingToken)
+            || lease.fencingToken < 1
+            || typeof lease.leaseNonce !== "string") {
+            throw new RuntimeIntegrityError(
+                "SDK accounting state requires a durable resource lease handle",
+            );
+        }
+        return immutableCanonical({
+            leaseId: lease.leaseId,
+            fencingToken: lease.fencingToken,
+            leaseNonce: lease.leaseNonce,
+            ownerId: typeof lease.ownerId === "string" ? lease.ownerId : null,
+            supervisorGeneration:
+                Number.isSafeInteger(lease.supervisorGeneration)
+                    ? lease.supervisorGeneration
+                    : null,
+            runnerIncarnation:
+                typeof lease.runnerIncarnation === "string"
+                    ? lease.runnerIncarnation
+                    : null,
+        });
+    }
+
+    #projectSdkAccountingReport(report, operationIdentity) {
+        if (report === null
+            || typeof report !== "object"
+            || !Number.isSafeInteger(report.attempts)
+            || report.attempts < 0
+            || report.accounting === null
+            || typeof report.accounting !== "object"
+            || !Number.isSafeInteger(report.accounting.chargedCostUnits)
+            || report.accounting.chargedCostUnits < 0) {
+            throw new RuntimeIntegrityError(
+                "SDK accounting report is malformed",
+                { operationHash: operationIdentity.operationHash },
+            );
+        }
+        const reportIdentity = normalizeSdkOperationIdentity(
+            report.operationIdentity,
+        );
+        if (reportIdentity.operationHash !== operationIdentity.operationHash) {
+            throw new RuntimeIntegrityError(
+                "SDK accounting report is bound to another operation",
+                {
+                    expectedOperationHash: operationIdentity.operationHash,
+                    actualOperationHash: reportIdentity.operationHash,
+                },
+            );
+        }
+        return immutableCanonical({
+            operationIdentity: reportIdentity,
+            attempts: report.attempts,
+            recovered: report.recovered === true,
+            accounting: report.accounting,
+        });
+    }
+
+    #latestSdkAccountingState(operationIdentity) {
+        let latest = null;
+        for (const event of this.#adapter.listOperationalEvidence()) {
+            if (event.kind !== "runtime:sdk_accounting_state") continue;
+            const record = event.payload?.record;
+            if (record?.operationHash !== operationIdentity.operationHash) {
+                continue;
+            }
+            if (record.type !== "crucible.sdk_accounting_state"
+                || record.version !== SDK_ACCOUNTING_STATE_VERSION
+                || record.logicalEffectId !== operationIdentity.logicalEffectId
+                || !SDK_ACCOUNTING_STATUSES.has(record.status)
+                || record.lease === null
+                || typeof record.lease !== "object"
+                || !Number.isSafeInteger(record.reconciliationAttempt)
+                || record.reconciliationAttempt < 0
+                || typeof record.evidenceHash !== "string") {
+                throw new RuntimeIntegrityError(
+                    "Persisted SDK accounting state is malformed",
+                    { operationHash: operationIdentity.operationHash },
+                );
+            }
+            const { evidenceHash, ...body } = record;
+            if (evidenceHash !== hashCanonical(
+                body,
+                SDK_ACCOUNTING_STATE_HASH_ALGORITHM,
+            )) {
+                throw new RuntimeIntegrityError(
+                    "Persisted SDK accounting state hash is invalid",
+                    { operationHash: operationIdentity.operationHash },
+                );
+            }
+            latest = record;
+        }
+        return latest;
+    }
+
+    async #persistSdkAccountingState({
+        operationIdentity,
+        status,
+        lease,
+        report = null,
+        reconciliationAttempt = 0,
+        reconciliationId = null,
+        source,
+        error = null,
+    }) {
+        if (!SDK_ACCOUNTING_STATUSES.has(status)
+            || !Number.isSafeInteger(reconciliationAttempt)
+            || reconciliationAttempt < 0
+            || reconciliationAttempt > SDK_ACCOUNTING_RECONCILIATION_LIMIT
+            || typeof source !== "string"
+            || source.length === 0) {
+            throw new RuntimeIntegrityError(
+                "SDK accounting state transition is invalid",
+                {
+                    operationHash: operationIdentity.operationHash,
+                    status,
+                    reconciliationAttempt,
+                    source,
+                },
+            );
+        }
+        const body = immutableCanonical({
+            type: "crucible.sdk_accounting_state",
+            version: SDK_ACCOUNTING_STATE_VERSION,
+            operationHash: operationIdentity.operationHash,
+            proposalSlotId: operationIdentity.proposalSlotId,
+            commandId: operationIdentity.commandId,
+            logicalEffectId: operationIdentity.logicalEffectId,
+            status,
+            lease: this.#projectSdkAccountingLease(lease),
+            report: report === null
+                ? null
+                : this.#projectSdkAccountingReport(
+                    report,
+                    operationIdentity,
+                ),
+            reconciliationAttempt,
+            reconciliationId,
+            source,
+            error,
+            observedAtMs: Math.max(0, Math.floor(this.#clock.now())),
+        });
+        const record = immutableCanonical({
+            ...body,
+            evidenceHash: hashCanonical(
+                body,
+                SDK_ACCOUNTING_STATE_HASH_ALGORITHM,
+            ),
+        });
+        await this.#verifyRuntimeClosure("sdk_accounting_state");
+        await this.#persistSdkJournalRecord("accounting_state", record);
+        return record;
+    }
+
+    async #bindSdkAccountingLease(command, context) {
+        const operationIdentity = this.#sdkAccountingIdentity(command);
+        if (operationIdentity === null || context === null) return null;
+        const state = await this.#persistSdkAccountingState({
+            operationIdentity,
+            status: "reserved",
+            lease: context.lease,
+            reconciliationAttempt: 0,
+            source: "resource_admission",
+        });
+        context.sdkAccountingState = state;
+        context.sdkAccountingReport = null;
+        return state;
+    }
+
+    #sdkAccountingReportForState(operationIdentity, state) {
+        if (state.report !== null) {
+            return state.report;
+        }
+        const commit = this.#findSdkSubmissionCommit(operationIdentity);
+        if (commit === null) return null;
+        return immutableCanonical({
+            operationIdentity,
+            attempts: commit.attempt,
+            recovered: true,
+            accounting: reconcileSdkCost({
+                reservedCostUnitsPerAttempt:
+                    this.#config.options.sdkRetryPolicy
+                        .reservedCostUnitsPerAttempt,
+                attemptedCount: commit.attempt,
+                sdkReportedCostUnits: [],
+                priorChargedCostUnits: 0,
+                maxCostUnits:
+                    this.#config.options.sdkRetryPolicy.maxCostUnits,
+            }),
+        });
+    }
+
+    #sdkAccountingUnavailable(command, state) {
+        const outcome = {
+            status: state.status,
+            logicalEffectId: state.logicalEffectId,
+            operationHash: state.operationHash,
+            reconciliationAttempt: state.reconciliationAttempt,
+            reconciliationId: state.reconciliationId,
+            error: state.error,
+            sealedSubmissionPreserved: true,
+            sdkSideEffectReplayAllowed: false,
+            scientificConclusion: false,
+        };
+        if (state.status === "failed") {
+            return this.#pauseForResourceUnavailable(command, {
+                status: "sdk_accounting_failed",
+                ...outcome,
+            });
+        }
+        const error = new CrucibleRuntimeError(
+            RUNTIME_ERROR_CODES.RESOURCE_UNAVAILABLE,
+            "SDK submission is durably sealed, but usage accounting remains pending",
+            outcome,
+        );
+        error.recoverable = true;
+        error.sealedSdkSubmission = true;
+        throw error;
+    }
+
+    async #reconcileSdkAccountingForCommand(command) {
+        if (this.#resourceBroker === null) return null;
+        const operationIdentity = this.#sdkAccountingIdentity(command);
+        if (operationIdentity === null) return null;
+        let state = this.#latestSdkAccountingState(operationIdentity);
+        if (state === null || state.status === "reconciled") return state;
+        if (state.status === "failed") {
+            return this.#sdkAccountingUnavailable(command, state);
+        }
+        const report = this.#sdkAccountingReportForState(
+            operationIdentity,
+            state,
+        );
+        if (report === null) return state;
+        const outcome = await this.#reportSdkUsage(report);
+        if (outcome?.status === "reconciled") {
+            return this.#latestSdkAccountingState(operationIdentity);
+        }
+        state = this.#latestSdkAccountingState(operationIdentity) ?? state;
+        return this.#sdkAccountingUnavailable(command, state);
+    }
+
     #unresolvedExternalEffects() {
         const uncertain = Array.isArray(this.#recovery?.uncertain)
             ? this.#recovery.uncertain
@@ -2467,6 +2772,17 @@ export class AutonomousRunner {
             .slice(0, 40)}`;
     }
 
+    #withArtifactGenerationLock(work) {
+        try {
+            return this.#artifactStore.withGenerationLock(work);
+        } catch (error) {
+            if (error?.cause instanceof CrucibleRuntimeError) {
+                throw error.cause;
+            }
+            throw error;
+        }
+    }
+
     #persistEffectRecoveryCapsule({
         attemptId,
         command,
@@ -2535,7 +2851,7 @@ export class AutonomousRunner {
             expectedObjectId,
             "effect-recovery-capsule",
         );
-        const persisted = this.#artifactStore.withGenerationLock(() => {
+        const persisted = this.#withArtifactGenerationLock(() => {
             const stored = this.#artifactStore.putBytes(bytes, {
                 contentType: "application/vnd.crucible.effect-recovery+json",
             });
@@ -2593,7 +2909,7 @@ export class AutonomousRunner {
             command,
         );
         if (this.#repository.getArtifact(artifactId) === null) return null;
-        return this.#artifactStore.withGenerationLock(() => {
+        return this.#withArtifactGenerationLock(() => {
             const metadata = this.#repository.getArtifact(artifactId);
             if (metadata === null
                 || metadata.investigationId !== this.#config.investigationId
@@ -2769,7 +3085,7 @@ export class AutonomousRunner {
             resolutionAttemptId: recoveryAttemptId,
         });
         return {
-            attemptId: capsuleRecord.capsule.effectAttemptId,
+            attemptId: recoveryAttemptId,
             result: recovered.result,
             persisted: recovered.persisted,
             logicalEffectKey,
@@ -3079,6 +3395,7 @@ export class AutonomousRunner {
                     context.lease.leaseId,
                     context,
                 );
+                await this.#bindSdkAccountingLease(command, context);
                 return context;
             }
             if (outcome.status === "already_finalized"
@@ -3140,47 +3457,172 @@ export class AutonomousRunner {
                 ? {}
                 : { modelCostUnits: context.modelCostUnits }),
         };
-        try {
-            return this.#resourceBroker.release({
-                lease: context.lease,
-                usage,
-                releaseId: `release-${context.logicalEffectId}`,
-            });
-        } finally {
-            this.#activeResourceLeases.delete(
-                context.lease.leaseId,
-            );
-        }
+        const released = this.#resourceBroker.release({
+            lease: context.lease,
+            usage,
+            releaseId: `release-${context.logicalEffectId}`,
+        });
+        this.#activeResourceLeases.delete(
+            context.lease.leaseId,
+        );
+        return released;
     }
 
-    #reportSdkUsage(report) {
-        if (this.#resourceBroker === null) return;
+    async #recordReleasedSdkAccounting(context) {
+        if (context?.sdkAccountingReport === null
+            || context?.sdkAccountingReport === undefined
+            || context?.sdkAccountingState === null
+            || context?.sdkAccountingState === undefined) {
+            return null;
+        }
+        const operationIdentity = normalizeSdkOperationIdentity(
+            context.sdkAccountingReport.operationIdentity,
+        );
+        const state = await this.#persistSdkAccountingState({
+            operationIdentity,
+            status: "reconciled",
+            lease: context.lease,
+            report: context.sdkAccountingReport,
+            reconciliationAttempt:
+                context.sdkAccountingState.reconciliationAttempt,
+            reconciliationId:
+                context.sdkAccountingState.reconciliationId,
+            source: "resource_lease_release",
+        });
+        context.sdkAccountingState = state;
+        return state;
+    }
+
+    async #reportSdkUsage(report) {
+        if (this.#resourceBroker === null) {
+            return Object.freeze({ status: "not_configured" });
+        }
+        const operationIdentity = normalizeSdkOperationIdentity(
+            report.operationIdentity,
+        );
         const context = [...this.#activeResourceLeases.values()]
             .find((candidate) =>
                 candidate.logicalEffectId
-                    === report.operationIdentity.logicalEffectId);
-        if (context === undefined) {
-            if (report.recovered === true) return;
-            throw new RuntimeIntegrityError(
-                "SDK usage arrived without its active resource lease",
-                {
-                    logicalEffectId:
-                        report.operationIdentity.logicalEffectId,
-                },
-            );
+                    === operationIdentity.logicalEffectId);
+        const latest = this.#latestSdkAccountingState(operationIdentity);
+        if (latest?.status === "reconciled"
+            || latest?.status === "failed") {
+            return Object.freeze({
+                status: latest.status,
+                reconciliationId: latest.reconciliationId,
+                error: latest.error,
+            });
         }
-        context.modelCostUnits = report.accounting.chargedCostUnits;
-        this.#resourceBroker.reconcileUsage({
-            lease: context.lease,
-            usage: {
-                modelCostUnits: report.accounting.chargedCostUnits,
-            },
-            reconciliationId: `sdk-usage-${stableHex({
-                operationHash:
-                    report.operationIdentity.operationHash,
-                accounting: report.accounting,
-            }).slice(0, 40)}`,
-            source: "copilot_sdk_usage",
+        let lease = context?.lease ?? latest?.lease ?? null;
+        if (lease === null) {
+            lease = this.#resourceBroker.listActiveLeases({
+                investigationId: this.#config.investigationId,
+            }).find((candidate) =>
+                candidate.logicalEffectId
+                    === operationIdentity.logicalEffectId) ?? null;
+        }
+        if (lease === null) {
+            const error = new RuntimeIntegrityError(
+                "SDK accounting recovery has no durable resource lease binding",
+                { logicalEffectId: operationIdentity.logicalEffectId },
+            );
+            return Object.freeze({
+                status: "failed",
+                error: sdkAccountingErrorSummary(error),
+            });
+        }
+        const incomingReport = this.#projectSdkAccountingReport(
+            report,
+            operationIdentity,
+        );
+        const priorReport = latest?.report === null
+            || latest?.report === undefined
+            ? null
+            : this.#projectSdkAccountingReport(
+                latest.report,
+                operationIdentity,
+            );
+        const projectedReport = priorReport !== null
+            && priorReport.accounting.chargedCostUnits
+                >= incomingReport.accounting.chargedCostUnits
+            ? priorReport
+            : incomingReport;
+        const reconciliationId = `sdk-usage-${stableHex({
+            operationHash: operationIdentity.operationHash,
+            accounting: projectedReport.accounting,
+        }).slice(0, 40)}`;
+        const reconciliationAttempt = Math.min(
+            SDK_ACCOUNTING_RECONCILIATION_LIMIT,
+            (latest?.reconciliationAttempt ?? 0) + 1,
+        );
+        let state = await this.#persistSdkAccountingState({
+            operationIdentity,
+            status: "pending",
+            lease,
+            report: projectedReport,
+            reconciliationAttempt,
+            reconciliationId,
+            source: report.recovered === true
+                ? "sealed_submission_recovery"
+                : "sdk_usage_reporter",
+        });
+        if (context !== undefined) {
+            context.modelCostUnits =
+                projectedReport.accounting.chargedCostUnits;
+            context.sdkAccountingReport = projectedReport;
+            context.sdkAccountingState = state;
+        }
+        try {
+            this.#resourceBroker.reconcileUsage({
+                lease,
+                usage: {
+                    modelCostUnits:
+                        projectedReport.accounting.chargedCostUnits,
+                },
+                reconciliationId,
+                source: "copilot_sdk_usage",
+            });
+        } catch (error) {
+            const permanent = sdkAccountingFailureIsPermanent(error)
+                || reconciliationAttempt
+                    >= SDK_ACCOUNTING_RECONCILIATION_LIMIT;
+            state = await this.#persistSdkAccountingState({
+                operationIdentity,
+                status: permanent ? "failed" : "pending",
+                lease,
+                report: projectedReport,
+                reconciliationAttempt,
+                reconciliationId,
+                source: permanent
+                    ? "sdk_usage_reconciliation_failed"
+                    : "sdk_usage_reconciliation_retry",
+                error: sdkAccountingErrorSummary(error),
+            });
+            if (context !== undefined) {
+                context.sdkAccountingState = state;
+            }
+            return Object.freeze({
+                status: state.status,
+                reconciliationId,
+                error: state.error,
+            });
+        }
+        state = await this.#persistSdkAccountingState({
+            operationIdentity,
+            status: "reconciled",
+            lease,
+            report: projectedReport,
+            reconciliationAttempt,
+            reconciliationId,
+            source: "sdk_usage_reconciliation",
+        });
+        if (context !== undefined) {
+            context.sdkAccountingState = state;
+        }
+        return Object.freeze({
+            status: "reconciled",
+            reconciliationId,
+            error: null,
         });
     }
 
@@ -3223,6 +3665,7 @@ export class AutonomousRunner {
                 sourceAttemptId: committed.effectAttemptId,
                 resolutionAttemptId: committed.attempt.attemptId,
             });
+            await this.#reconcileSdkAccountingForCommand(command);
             return {
                 attemptId: committed.effectAttemptId,
                 result: recovered.result,
@@ -3242,12 +3685,14 @@ export class AutonomousRunner {
                     { logicalEffectKey, command },
                 );
             }
-            return this.#recoverPersistedEffectCapsule({
+            const recovered = await this.#recoverPersistedEffectCapsule({
                 capsuleRecord,
                 command,
                 logicalEffectKey,
                 recover,
             });
+            await this.#reconcileSdkAccountingForCommand(command);
+            return recovered;
         }
         this.#assertEffectLaunchAllowed(command);
         const attemptId = this.#stableAttemptId("external-effect", command);
@@ -3355,6 +3800,7 @@ export class AutonomousRunner {
         this.#adapter.observeAttempt(attemptId, this.#lease);
         this.#effectEvidenceBuffers.set(attemptId, []);
         let persisted;
+        let releaseOutcome = null;
         try {
             persisted = persist === null
                 ? null
@@ -3400,7 +3846,10 @@ export class AutonomousRunner {
             }
         } finally {
             this.#effectEvidenceBuffers.delete(attemptId);
-            this.#releaseResourceLease(resourceContext);
+            releaseOutcome = this.#releaseResourceLease(resourceContext);
+        }
+        if (releaseOutcome !== null) {
+            await this.#recordReleasedSdkAccounting(resourceContext);
         }
         this.#quarantinedEffectAttempts.delete(attemptId);
         this.#attemptCommands.delete(attemptId);
@@ -3415,6 +3864,7 @@ export class AutonomousRunner {
             sourceAttemptId: attemptId,
             resolutionAttemptId: attemptId,
         });
+        await this.#reconcileSdkAccountingForCommand(command);
         return {
             attemptId,
             result,
@@ -7517,25 +7967,29 @@ export class AutonomousRunner {
             expectedObjectId,
             kind,
         );
-        const stored = this.#artifactStore.putBytes(bytes, { contentType });
-        if (stored.id !== expectedObjectId || stored.size !== bytes.length) {
-            throw new RuntimeIntegrityError(
-                "ArtifactStore returned an unexpected CAS identity",
-                {
-                    kind,
-                    expectedObjectId,
-                    actualObjectId: stored.id,
-                    expectedSize: bytes.length,
-                    actualSize: stored.size,
-                },
-            );
-        }
-        const registered = this.#registerCasObject({
-            attemptId,
-            kind,
-            objectId: stored.id,
-            size: stored.size,
-            contentType,
+        const registered = this.#withArtifactGenerationLock(() => {
+            const stored = this.#artifactStore.putBytes(bytes, {
+                contentType,
+            });
+            if (stored.id !== expectedObjectId || stored.size !== bytes.length) {
+                throw new RuntimeIntegrityError(
+                    "ArtifactStore returned an unexpected CAS identity",
+                    {
+                        kind,
+                        expectedObjectId,
+                        actualObjectId: stored.id,
+                        expectedSize: bytes.length,
+                        actualSize: stored.size,
+                    },
+                );
+            }
+            return this.#registerCasObject({
+                attemptId,
+                kind,
+                objectId: stored.id,
+                size: stored.size,
+                contentType,
+            });
         });
         this.#assertDeadlineOpen("artifact persistence");
         return registered;

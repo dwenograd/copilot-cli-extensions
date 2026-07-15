@@ -1794,6 +1794,17 @@ function localAbsolutePath(value, field) {
     }
 }
 
+function sdkAccountingErrorSummary(error) {
+    return immutableCanonical({
+        name: typeof error?.name === "string" ? error.name : "Error",
+        code: typeof error?.code === "string" ? error.code : null,
+        message: typeof error?.message === "string"
+            ? error.message
+            : String(error),
+        recoverable: error?.recoverable === true,
+    });
+}
+
 export class SdkWorkerPool {
     #options;
     #client = null;
@@ -1980,6 +1991,74 @@ export class SdkWorkerPool {
         if (this.#options.sdkOperationalEvidenceSink !== null) {
             await this.#options.sdkOperationalEvidenceSink(event);
         }
+    }
+
+    async #reportSdkUsage(report) {
+        if (this.#options.sdkUsageReporter === null) return null;
+        let outcome;
+        try {
+            outcome = await this.#options.sdkUsageReporter(report);
+        } catch (error) {
+            const event = createSdkOperationalEvidence({
+                eventType: "cost_reconciled",
+                operationIdentity: report.operationIdentity,
+                attempt: report.attempts,
+                observedAtMs: Math.max(
+                    0,
+                    Math.floor(this.#options.clock.now()),
+                ),
+                reason: "usage_reconciliation_pending",
+                details: {
+                    accounting: report.accounting,
+                    recovered: report.recovered,
+                    sealedSubmissionPreserved: true,
+                    reporterError: sdkAccountingErrorSummary(error),
+                },
+            });
+            try {
+                await this.#recordSdkEvidence(event);
+            } catch {
+                // The sealed SDK result remains authoritative even when the
+                // secondary operational-evidence sink is also unavailable.
+            }
+            return Object.freeze({
+                status: "pending",
+                error: sdkAccountingErrorSummary(error),
+            });
+        }
+        if (outcome !== null
+            && typeof outcome === "object"
+            && ["pending", "failed"].includes(outcome.status)) {
+            const event = createSdkOperationalEvidence({
+                eventType: "cost_reconciled",
+                operationIdentity: report.operationIdentity,
+                attempt: report.attempts,
+                observedAtMs: Math.max(
+                    0,
+                    Math.floor(this.#options.clock.now()),
+                ),
+                reason: outcome.status === "failed"
+                    ? "usage_reconciliation_failed"
+                    : "usage_reconciliation_pending",
+                details: {
+                    accounting: report.accounting,
+                    recovered: report.recovered,
+                    sealedSubmissionPreserved: true,
+                    reconciliationId: outcome.reconciliationId ?? null,
+                    reporterError: outcome.error === null
+                        || outcome.error === undefined
+                        ? null
+                        : sdkAccountingErrorSummary(outcome.error),
+                },
+            });
+            try {
+                await this.#recordSdkEvidence(event);
+            } catch {
+                // The reporter owns the durable accounting state. Failure to
+                // mirror it here must not replay the sealed SDK side effect.
+            }
+        }
+        return outcome ?? null;
     }
 
     #beginSessionCreation(sessionConfig, { sessionId, model }) {
@@ -2565,6 +2644,11 @@ export class SdkWorkerPool {
                         };
                     }
                     submission = sealed.submission;
+                    this.#claimedCandidateIds.set(
+                        candidate.candidateId,
+                        claimOwner,
+                    );
+                    claimedByThisSession = candidate.candidateId;
                     await this.#recordSdkEvidence(createSdkOperationalEvidence({
                         eventType: "submission_sealed",
                         operationIdentity: retryContext.operationIdentity,
@@ -2580,8 +2664,13 @@ export class SdkWorkerPool {
                 } else {
                     submission = proposedSubmission;
                 }
-                this.#claimedCandidateIds.set(candidate.candidateId, claimOwner);
-                claimedByThisSession = candidate.candidateId;
+                if (claimedByThisSession === null) {
+                    this.#claimedCandidateIds.set(
+                        candidate.candidateId,
+                        claimOwner,
+                    );
+                    claimedByThisSession = candidate.candidateId;
+                }
                 return {
                     resultType: "success",
                     textResultForLlm: "Candidate accepted for trusted measurement. No verdict was produced.",
@@ -3069,16 +3158,14 @@ export class SdkWorkerPool {
                 priorChargedCostUnits:
                     stableInput.sdkPriorChargedCostUnits ?? 0,
             });
-            if (this.#options.sdkUsageReporter !== null) {
-                await this.#options.sdkUsageReporter(Object.freeze({
-                    operationIdentity,
-                    retryBudget,
-                    attempts: result.attempts,
-                    recovered: result.recovered,
-                    usage: usageAccumulator.snapshot(),
-                    accounting: result.accounting,
-                }));
-            }
+            await this.#reportSdkUsage(Object.freeze({
+                operationIdentity,
+                retryBudget,
+                attempts: result.attempts,
+                recovered: result.recovered,
+                usage: usageAccumulator.snapshot(),
+                accounting: result.accounting,
+            }));
             return result.value;
         } finally {
             gate.close();

@@ -14,9 +14,11 @@ import {
     ESCAPE_SEARCH_OPERATORS,
     GOAL_MODES,
     HYPOTHESIS_TOPOLOGIES,
+    LEGACY_SEARCH_STRATEGY_POLICY_VERSION,
     MISSINGNESS_MODES,
     SEARCH_POLICY_LIMITS,
     SEARCH_OPERATORS,
+    SEARCH_STRATEGY_POLICY_VERSIONS,
     STATISTICAL_POLICY_HASH_ALGORITHM,
     STATISTICAL_METRIC_DIRECTIONS,
     STATISTICAL_POLICY_VERSION,
@@ -132,7 +134,7 @@ const HARNESS_SANDBOX_JOB_KEYS = Object.freeze([
 ]);
 const SANDBOX_POLICY_IDENTITY_HASH_ALGORITHM =
     "sha256:crucible-measurement-sandbox-policy-identity-v1";
-const SEARCH_POLICY_KEYS = Object.freeze([
+const LEGACY_SEARCH_POLICY_KEYS = Object.freeze([
     "archiveCaps",
     "dedupPolicy",
     "mandatoryEscapeRounds",
@@ -141,6 +143,10 @@ const SEARCH_POLICY_KEYS = Object.freeze([
     "plateauMinImprovement",
     "plateauWindow",
     "promptCaps",
+]);
+const VERSIONED_SEARCH_POLICY_KEYS = Object.freeze([
+    ...LEGACY_SEARCH_POLICY_KEYS,
+    "version",
 ]);
 const ARCHIVE_CAP_KEYS = Object.freeze([
     "accepted",
@@ -1325,7 +1331,26 @@ function normalizeImpossibilityPolicy(input, topology) {
 }
 
 export function createSearchPolicy(input) {
-    requireExactObjectKeys(input, "searchPolicy", SEARCH_POLICY_KEYS);
+    const versioned = input !== null
+        && typeof input === "object"
+        && !Array.isArray(input)
+        && Object.hasOwn(input, "version");
+    requireExactObjectKeys(
+        input,
+        "searchPolicy",
+        versioned
+            ? VERSIONED_SEARCH_POLICY_KEYS
+            : LEGACY_SEARCH_POLICY_KEYS,
+    );
+    const version = versioned
+        ? input.version
+        : LEGACY_SEARCH_STRATEGY_POLICY_VERSION;
+    if (!SEARCH_STRATEGY_POLICY_VERSIONS.includes(version)) {
+        throw new ContractError("searchPolicy.version is unsupported", {
+            expected: SEARCH_STRATEGY_POLICY_VERSIONS,
+            actual: typeof version === "string" ? version : null,
+        });
+    }
 
     const plateauWindow = requireSafeIntegerInRange(
         input.plateauWindow,
@@ -1433,6 +1458,7 @@ export function createSearchPolicy(input) {
     }
 
     return immutableCanonical({
+        ...(versioned ? { version } : {}),
         plateauWindow,
         minRoundsBeforePlateau,
         plateauMinImprovement,

@@ -1,9 +1,9 @@
-import {
-    openRepository,
-} from "../../persistence/index.mjs";
+import fs from "node:fs";
 
-const [databaseFile, faultStage] = process.argv.slice(2);
-if (!databaseFile || !faultStage) {
+import { openRepository } from "../../persistence/index.mjs";
+
+const [databaseFile, faultStage, markerFile] = process.argv.slice(2);
+if (!databaseFile || !faultStage || !markerFile) {
     process.exit(64);
 }
 
@@ -17,7 +17,19 @@ repository.rotateEventSegment({
     quiescent: true,
     faultInjector: (stage) => {
         if (stage === faultStage) {
-            process.kill(process.pid, "SIGKILL");
+            const fd = fs.openSync(markerFile, "wx");
+            try {
+                fs.writeFileSync(fd, JSON.stringify({
+                    version: 1,
+                    pid: process.pid,
+                    stage,
+                }));
+                fs.fsyncSync(fd);
+            } finally {
+                fs.closeSync(fd);
+            }
+            const latch = new Int32Array(new SharedArrayBuffer(4));
+            for (;;) Atomics.wait(latch, 0, 0, 60_000);
         }
     },
 });

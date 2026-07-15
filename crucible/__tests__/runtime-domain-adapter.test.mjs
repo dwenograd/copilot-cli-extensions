@@ -419,7 +419,7 @@ describe("Crucible domain repository adapter fast component coverage", () => {
                 contractDomainVersion: null,
                 eventCount: 1,
                 readOnly: true,
-                archiveable: true,
+                archiveable: false,
             });
 
             const readOnlyAdapter = createDomainRepositoryAdapter({

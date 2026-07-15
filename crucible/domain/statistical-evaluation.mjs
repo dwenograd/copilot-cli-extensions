@@ -125,7 +125,9 @@ function parentEvidenceReferences(parentEvidence = {}) {
             invalidated: source.invalidated === true,
         }))
         .sort((left, right) =>
-            left.evidenceId.localeCompare(right.evidenceId));
+            left.evidenceId < right.evidenceId
+                ? -1
+                : left.evidenceId > right.evidenceId ? 1 : 0);
 }
 
 export function createCandidateStatisticalClaimPlan({

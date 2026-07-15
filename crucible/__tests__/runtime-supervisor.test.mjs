@@ -2,6 +2,7 @@ import { EventEmitter } from "node:events";
 import { afterEach, describe, expect, it } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
+import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 
 import {
@@ -32,6 +33,18 @@ function makeRoot(label) {
     const root = fs.mkdtempSync(path.join(HERE, `.runtime-supervisor-${label}-`));
     roots.push(root);
     return root;
+}
+
+function ownerScopedTestPath(file, generation, nonce) {
+    const token = createHash("sha256")
+        .update(nonce, "utf8")
+        .digest("hex")
+        .slice(0, 24);
+    const extension = path.extname(file);
+    const stem = extension.length === 0
+        ? file
+        : file.slice(0, -extension.length);
+    return `${stem}.g${generation}-${token}${extension}`;
 }
 
 afterEach(() => {
@@ -196,7 +209,13 @@ function childResultSpawner(sequence) {
 
             child.emit("close", spec.code ?? 0, spec.signal ?? null);
         }, 0);
-        return { child, resultPath: config.paths.childResultPath };
+        return {
+            child,
+            resultPath: config.paths.childResultPath,
+            ...(spec.processIdentity === undefined
+                ? {}
+                : { processIdentity: spec.processIdentity }),
+        };
     };
 }
 
@@ -432,6 +451,50 @@ describe("Crucible supervisor", () => {
             supervisorGeneration: 1,
         });
         expect(fs.existsSync(config.paths.lockPath)).toBe(false);
+    });
+
+    it("persists the launched runner OS identity in running status", async () => {
+        const root = makeRoot("runner-process-identity");
+        const config = normalizeSupervisorConfig(rawConfig(root));
+        const identity = {
+            version: 1,
+            processId: 5001,
+            processStartId: "windows-start-ticks:123",
+            executablePath: process.execPath,
+            commandIdentity:
+                `sha256:crucible-process-command-v1:${
+                    "b".repeat(64)
+                }`,
+        };
+        let runningStatus = null;
+        const result = await runSupervisor(config, {
+            pid: 3031,
+            idFactory: () => "process-identity-owner",
+            isPidAlive: () => false,
+            statusFaultInjector(point, details) {
+                if (point === "after_status_write"
+                    && details.state === "running"
+                    && runningStatus === null) {
+                    runningStatus = JSON.parse(
+                        fs.readFileSync(details.path, "utf8"),
+                    );
+                }
+            },
+            spawnRunner: childResultSpawner([{
+                envelope: successfulOutcome(
+                    "non_result",
+                    "IDENTITY_RECORDED",
+                ),
+                processIdentity: identity,
+            }]),
+        });
+
+        expect(result.kind).toBe("NON_RESULT");
+        expect(runningStatus).toMatchObject({
+            childPid: identity.processId,
+            childProcessIdentity: identity,
+        });
+        expect(result.status.childProcessIdentity).toBeNull();
     });
 
     it("reaps the crashed runner incarnation before launching its replacement", async () => {
@@ -1600,6 +1663,151 @@ describe("Crucible supervisor", () => {
             stop: { state: QUIESCENT_STOP_STATES.PAUSED_QUIESCENT },
         });
         expect(fs.existsSync(config.paths.lockPath)).toBe(false);
+    });
+
+    it("refuses recovered termination after PID reuse despite matching generation and incarnation", async () => {
+        const root = makeRoot("stop-pid-reuse");
+        const config = normalizeSupervisorConfig(rawConfig(root));
+        fs.mkdirSync(config.runner.stateDir, { recursive: true });
+        fs.mkdirSync(config.paths.directory, { recursive: true });
+        const oldOwner = {
+            pid: 5052,
+            nonce: "old-stop-owner",
+            supervisorGeneration: 1,
+        };
+        const oldRunnerPid = 7656;
+        const oldRunnerIncarnation = "old-stop-runner";
+        const oldProcessIdentity = {
+            version: 1,
+            processId: oldRunnerPid,
+            processStartId: "windows-start-ticks:100",
+            executablePath: process.execPath,
+            commandIdentity:
+                `sha256:crucible-process-command-v1:${
+                    "a".repeat(64)
+                }`,
+        };
+        const repository = openRepository({
+            file: path.join(config.runner.stateDir, "events.sqlite"),
+        });
+        repository.ensureInvestigation({
+            investigationId: config.runner.investigationId,
+            metadata: {
+                role: "crucible-domain",
+                domainVersion: 4,
+            },
+        });
+        repository.claimSupervisorGeneration({
+            investigationId: config.runner.investigationId,
+            supervisorGeneration: oldOwner.supervisorGeneration,
+            supervisorNonce: oldOwner.nonce,
+        });
+        repository.issueRunnerIncarnation({
+            investigationId: config.runner.investigationId,
+            supervisorGeneration: oldOwner.supervisorGeneration,
+            supervisorNonce: oldOwner.nonce,
+            runnerIncarnation: oldRunnerIncarnation,
+        });
+        const stop = persistQuiescentStopBarrier({
+            repository,
+            investigationId: config.runner.investigationId,
+            requestId: "pid-reuse-stop",
+            reason: "recover an interrupted stop",
+            owner: oldOwner,
+            runnerPid: oldRunnerPid,
+        });
+        repository.close();
+        expect(stop).toMatchObject({
+            targetSupervisorGeneration: 1,
+            targetSupervisorNonce: oldOwner.nonce,
+            targetRunnerIncarnation: oldRunnerIncarnation,
+            targetRunnerPid: oldRunnerPid,
+        });
+
+        const allocatedAt = new Date().toISOString();
+        fs.writeFileSync(config.paths.generationPath, JSON.stringify({
+            version: 1,
+            investigationId: config.runner.investigationId,
+            supervisorGeneration: oldOwner.supervisorGeneration,
+            pid: oldOwner.pid,
+            nonce: oldOwner.nonce,
+            allocatedAt,
+        }));
+        const oldStatusPath = ownerScopedTestPath(
+            config.paths.statusPath,
+            oldOwner.supervisorGeneration,
+            oldOwner.nonce,
+        );
+        fs.writeFileSync(oldStatusPath, JSON.stringify({
+            version: 4,
+            investigationId: config.runner.investigationId,
+            supervisorEpochId: config.supervisorEpochId,
+            configFingerprint: supervisorConfigFingerprint(config),
+            deadlineMs: config.runner.deadlineMs,
+            pid: oldOwner.pid,
+            nonce: oldOwner.nonce,
+            supervisorGeneration: oldOwner.supervisorGeneration,
+            startedAt: allocatedAt,
+            heartbeatAt: allocatedAt,
+            state: "stopping",
+            restartCount: 0,
+            childPid: oldRunnerPid,
+            childProcessIdentity: oldProcessIdentity,
+            runnerIncarnation: oldRunnerIncarnation,
+            statusRevision: 3,
+            terminal_available: false,
+            non_result_code: null,
+        }));
+        fs.copyFileSync(oldStatusPath, config.paths.statusPath);
+
+        const terminated = [];
+        const result = await runSupervisor(config, {
+            pid: 5053,
+            idFactory: () => "pid-reuse-reconciler",
+            isPidAlive: (pid) => pid === oldRunnerPid,
+            ensureStopDomainIntent() {},
+            runnerProcessIdentityAdapter: {
+                matches(identity) {
+                    expect(identity).toEqual(oldProcessIdentity);
+                    return {
+                        matched: false,
+                        active: true,
+                        reason: "identity_mismatch",
+                        current: {
+                            ...identity,
+                            processStartId:
+                                "windows-start-ticks:200",
+                        },
+                    };
+                },
+            },
+            processTreeAdapter: {
+                terminateTree(pid, options) {
+                    terminated.push({ pid, options });
+                    return true;
+                },
+                activeOwnedPids: () => [],
+                close: async () => true,
+            },
+        });
+
+        expect(terminated).toEqual([]);
+        expect(result).toMatchObject({
+            kind: "PAUSE_PENDING",
+            quiescent: false,
+            interventionRequired: true,
+            stop: {
+                targetSupervisorGeneration: 1,
+                targetSupervisorNonce: oldOwner.nonce,
+                targetRunnerIncarnation: oldRunnerIncarnation,
+                targetRunnerPid: oldRunnerPid,
+            },
+        });
+        expect(result.proof.missingVerifications)
+            .toEqual(expect.arrayContaining([
+                "runner_child",
+                "owned_processes",
+            ]));
     });
 
     it("retains authority when the exact runner PID refuses quiescent stop", async () => {

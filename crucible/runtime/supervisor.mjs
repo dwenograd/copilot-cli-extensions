@@ -35,6 +35,10 @@ import {
 } from "./domain-adapter.mjs";
 import { normalizeRunnerOutcomeEnvelope } from "./outcome.mjs";
 import {
+    createProcessIdentityAdapter,
+    normalizeProcessIdentity,
+} from "./process-identity.mjs";
+import {
     CrucibleRuntimeError,
     RUNTIME_ERROR_CODES,
     RuntimeConfigError,
@@ -1104,9 +1108,15 @@ async function defaultSpawnRunner(config, context) {
     const processAdapter = context.processAdapter
         ?? createDefaultProcessAdapter();
     const remaining = remainingDeadlineMs(config.runner.deadlineMs);
+    const executable = process.execPath;
+    const argv = [
+        config.runnerCliPath,
+        "--config",
+        config.paths.childConfigPath,
+    ];
     const child = processAdapter.spawn(
-        process.execPath,
-        [config.runnerCliPath, "--config", config.paths.childConfigPath],
+        executable,
+        argv,
         {
             cwd: config.runner.stateDir,
             stdio: ["ignore", "ignore", "ignore"],
@@ -1122,7 +1132,60 @@ async function defaultSpawnRunner(config, context) {
             ),
         },
     );
-    return { child, resultPath: config.paths.childResultPath };
+    let processIdentity;
+    try {
+        const identityExecutable =
+            typeof child?.spawnfile === "string"
+            && path.isAbsolute(child.spawnfile)
+                ? path.resolve(child.spawnfile)
+                : executable;
+        const identityArgv =
+            Array.isArray(child?.spawnargs)
+            && child.spawnargs.length > 0
+            && child.spawnargs.every((value) =>
+                typeof value === "string")
+                ? child.spawnargs.slice(1)
+                : argv;
+        processIdentity = context.processIdentityAdapter.capture({
+            processId: child.pid,
+            executablePath: identityExecutable,
+            argv: identityArgv,
+        });
+    } catch (error) {
+        if (Number.isSafeInteger(child?.pid) && child.pid > 0) {
+            let terminated = false;
+            try {
+                terminated = await processAdapter.terminateTree(child.pid, {
+                    force: true,
+                    phase: "identity_capture_failed",
+                    timeoutMs: 5_000,
+                });
+            } catch {
+                terminated = false;
+            }
+            if (terminated !== true) {
+                try {
+                    await processAdapter.closeJobObject?.(child.pid, {
+                        timeoutMs: 5_000,
+                    });
+                } catch {
+                    // The supervisor reports the identity failure below.
+                }
+            }
+        }
+        throw new RuntimeConfigError(
+            "Runner process identity could not be captured before launch acknowledgement",
+            {
+                pid: child?.pid ?? null,
+                cause: error?.message ?? String(error),
+            },
+        );
+    }
+    return {
+        child,
+        processIdentity,
+        resultPath: config.paths.childResultPath,
+    };
 }
 
 function consumeChildEnvelope(resultPath) {
@@ -1286,10 +1349,16 @@ export async function runSupervisor(input, dependencies = {}) {
     const timers = dependencies.timers ?? globalThis;
     const sleep = dependencies.sleep ?? ((milliseconds) => delay(milliseconds, timers));
     const processTreeAdapter = dependencies.processTreeAdapter ?? createDefaultProcessAdapter();
+    const runnerProcessIdentityAdapter =
+        dependencies.runnerProcessIdentityAdapter
+        ?? createProcessIdentityAdapter(
+            dependencies.processIdentityDependencies,
+        );
     const spawnRunner = dependencies.spawnRunner
         ?? ((runnerConfig, context) => defaultSpawnRunner(runnerConfig, {
             ...context,
             processAdapter: processTreeAdapter,
+            processIdentityAdapter: runnerProcessIdentityAdapter,
         }));
     const shutdownPolicy = normalizeShutdownPolicy(dependencies.shutdownPolicy);
     const shutdownTimers = dependencies.shutdownTimers ?? globalThis;
@@ -1386,6 +1455,7 @@ export async function runSupervisor(input, dependencies = {}) {
     let currentChild = null;
     let currentChildWait = null;
     let currentChildPid = null;
+    let currentChildProcessIdentity = null;
     let currentRunnerIncarnation = null;
     let restartCount = 0;
     let shutdownRequest = null;
@@ -1653,6 +1723,7 @@ export async function runSupervisor(input, dependencies = {}) {
             state,
             restartCount,
             childPid: currentChildPid,
+            childProcessIdentity: currentChildProcessIdentity,
             runnerIncarnation: currentRunnerIncarnation,
             statusRevision: statusRevision + 1,
             terminal_available: terminalAvailable,
@@ -1938,30 +2009,23 @@ export async function runSupervisor(input, dependencies = {}) {
             currentChild = null;
             currentChildWait = null;
             currentChildPid = null;
+            currentChildProcessIdentity = null;
         }
         return exit;
     };
 
-    const terminateRecordedRunner = async (pid, identityVerified) => {
+    const terminateRecordedRunner = async (pid, expectedIdentity) => {
         if (!Number.isSafeInteger(pid) || pid < 1) {
             return Object.freeze({
                 pid: null,
                 attempted: false,
                 active: false,
+                identityVerified: false,
                 diagnostics: Object.freeze([]),
             });
         }
-        const isPidAlive = dependencies.isPidAlive ?? isExactPidAlive;
         const diagnostics = [];
-        if (!isPidAlive(pid)) {
-            return Object.freeze({
-                pid,
-                attempted: false,
-                active: false,
-                diagnostics: Object.freeze(diagnostics),
-            });
-        }
-        if (identityVerified !== true) {
+        if (expectedIdentity === null) {
             return Object.freeze({
                 pid,
                 attempted: false,
@@ -1971,14 +2035,75 @@ export async function runSupervisor(input, dependencies = {}) {
                     phase: "identity_verification",
                     status: "refused",
                     reason:
-                        "recorded runner PID no longer matches its generation/incarnation status",
+                        "recorded runner status lacks exact OS process identity",
                 }]),
             });
         }
+
+        const verifyCurrentIdentity = (phase) => {
+            let verification;
+            try {
+                verification =
+                    runnerProcessIdentityAdapter.matches(expectedIdentity);
+            } catch (error) {
+                verification = {
+                    matched: false,
+                    active: null,
+                    reason: "identity_probe_failed",
+                    error,
+                };
+            }
+            if (verification === null
+                || typeof verification !== "object"
+                || typeof verification.matched !== "boolean"
+                || ![true, false, null].includes(
+                    verification.active,
+                )) {
+                verification = {
+                    matched: false,
+                    active: null,
+                    reason: "identity_probe_invalid",
+                };
+            }
+            diagnostics.push({
+                phase,
+                status: verification.matched ? "matched" : "refused",
+                reason: verification.reason ?? null,
+                active: verification.active,
+            });
+            return verification;
+        };
+
+        let verification = verifyCurrentIdentity(
+            "identity_verification_initial",
+        );
+        if (!verification.matched) {
+            return Object.freeze({
+                pid,
+                attempted: false,
+                active: verification.active !== false,
+                identityVerified: false,
+                diagnostics: Object.freeze(diagnostics),
+            });
+        }
+        let attempted = false;
         for (const [phase, force, timeoutMs] of [
             ["drain", false, shutdownPolicy.drainMs],
             ["escalation", true, shutdownPolicy.escalationMs],
         ]) {
+            verification = verifyCurrentIdentity(
+                `${phase}_identity_verification`,
+            );
+            if (!verification.matched) {
+                return Object.freeze({
+                    pid,
+                    attempted,
+                    active: verification.active !== false,
+                    identityVerified: false,
+                    diagnostics: Object.freeze(diagnostics),
+                });
+            }
+            attempted = true;
             const outcome = await settleWithin(
                 () => processTreeAdapter.terminateTree(pid, {
                     phase,
@@ -1995,9 +2120,32 @@ export async function runSupervisor(input, dependencies = {}) {
                 result: outcome.value ?? null,
                 error: outcome.error?.message ?? null,
             });
-            if (!isPidAlive(pid)) break;
+            verification = verifyCurrentIdentity(
+                `${phase}_post_termination_identity`,
+            );
+            if (verification.active === false) {
+                return Object.freeze({
+                    pid,
+                    attempted,
+                    active: false,
+                    identityVerified: true,
+                    diagnostics: Object.freeze(diagnostics),
+                });
+            }
+            if (!verification.matched) {
+                return Object.freeze({
+                    pid,
+                    attempted,
+                    active: true,
+                    identityVerified: false,
+                    diagnostics: Object.freeze(diagnostics),
+                });
+            }
         }
-        if (isPidAlive(pid)
+        verification = verifyCurrentIdentity(
+            "job_object_identity_verification",
+        );
+        if (verification.matched
             && typeof processTreeAdapter.closeJobObject === "function") {
             const outcome = await settleWithin(
                 () => processTreeAdapter.closeJobObject(pid, {
@@ -2012,23 +2160,28 @@ export async function runSupervisor(input, dependencies = {}) {
                 result: outcome.value ?? null,
                 error: outcome.error?.message ?? null,
             });
+            verification = verifyCurrentIdentity(
+                "job_object_post_termination_identity",
+            );
         }
         return Object.freeze({
             pid,
-            attempted: true,
-            active: isPidAlive(pid),
-            identityVerified: true,
+            attempted,
+            active: verification.active !== false,
+            identityVerified:
+                verification.active === false
+                || verification.matched === true,
             diagnostics: Object.freeze(diagnostics),
         });
     };
 
-    const recordedRunnerIdentityIsExact = (stop) => {
+    const recordedRunnerIdentityForStop = (stop) => {
         if (stop.targetSupervisorGeneration === null
             || stop.targetSupervisorNonce === null
             || stop.targetSupervisorPid === null
             || stop.targetRunnerIncarnation === null
             || stop.targetRunnerPid === null) {
-            return false;
+            return null;
         }
         const targetStatus = readStatusForOwnership(
             config.paths.statusPath,
@@ -2039,7 +2192,7 @@ export async function runSupervisor(input, dependencies = {}) {
                     stop.targetSupervisorGeneration,
             },
         );
-        return targetStatus !== null
+        const fenced = targetStatus !== null
             && targetStatus.pid === stop.targetSupervisorPid
             && targetStatus.nonce === stop.targetSupervisorNonce
             && targetStatus.supervisorGeneration
@@ -2047,6 +2200,17 @@ export async function runSupervisor(input, dependencies = {}) {
             && targetStatus.childPid === stop.targetRunnerPid
             && targetStatus.runnerIncarnation
                 === stop.targetRunnerIncarnation;
+        if (!fenced) return null;
+        try {
+            const identity = normalizeProcessIdentity(
+                targetStatus.childProcessIdentity,
+            );
+            return identity.processId === stop.targetRunnerPid
+                ? identity
+                : null;
+        } catch {
+            return null;
+        }
     };
 
     const reconcileQuiescentStop = async (initialStop) => {
@@ -2081,6 +2245,9 @@ export async function runSupervisor(input, dependencies = {}) {
                 reconcilerPid: lock.pid,
             },
         });
+        const recoveredRunnerIdentity = currentChild === null
+            ? recordedRunnerIdentityForStop(stop)
+            : null;
         writeStatus("stopping", {
             quiescent: false,
             interventionRequired: false,
@@ -2128,7 +2295,7 @@ export async function runSupervisor(input, dependencies = {}) {
             })
             : await terminateRecordedRunner(
                 stop.targetRunnerPid,
-                recordedRunnerIdentityIsExact(stop),
+                recoveredRunnerIdentity,
             );
         let adapterClose = {
             status: "fulfilled",
@@ -2243,10 +2410,14 @@ export async function runSupervisor(input, dependencies = {}) {
                         );
                     }
                     const activePids = new Set(ownedPids);
-                    for (const pid of [
-                        currentChildPid,
-                        stop.targetRunnerPid,
-                    ]) {
+                    if (!hadCurrentChild
+                        && stop.targetRunnerPid !== null
+                        && recordedTarget.identityVerified !== true) {
+                        throw new RuntimeConfigError(
+                            "recovered runner process identity is unverified",
+                        );
+                    }
+                    for (const pid of [currentChildPid]) {
                         if (Number.isSafeInteger(pid) && pid > 0) {
                             const active = isPidAlive(pid);
                             if (typeof active !== "boolean") {
@@ -2256,6 +2427,12 @@ export async function runSupervisor(input, dependencies = {}) {
                             }
                             if (active) activePids.add(pid);
                         }
+                    }
+                    if (recordedTarget.identityVerified === true
+                        && recordedTarget.active === true
+                        && Number.isSafeInteger(recordedTarget.pid)
+                        && recordedTarget.pid > 0) {
+                        activePids.add(recordedTarget.pid);
                     }
                     processes = {
                         verified: true,
@@ -2272,13 +2449,9 @@ export async function runSupervisor(input, dependencies = {}) {
             let targetActive = false;
             let targetLivenessVerified = targetPid === null;
             if (Number.isSafeInteger(targetPid) && targetPid > 0) {
-                try {
-                    targetActive = isPidAlive(targetPid);
-                    targetLivenessVerified =
-                        typeof targetActive === "boolean";
-                } catch {
-                    targetLivenessVerified = false;
-                }
+                targetActive = recordedTarget.active === true;
+                targetLivenessVerified =
+                    recordedTarget.identityVerified === true;
             }
             const runnerIdentityVerified = hadCurrentChild
                 ? recordedTarget.identityVerified === true
@@ -2286,7 +2459,7 @@ export async function runSupervisor(input, dependencies = {}) {
                     ? exactStatus
                         && stop.targetRunnerIncarnation === null
                         && ownerStatus.childPid === null
-                    : recordedRunnerIdentityIsExact(stop);
+                    : recordedTarget.identityVerified === true;
             const runnerChild = runnerIdentityVerified
                 && targetLivenessVerified
                 ? {
@@ -2691,6 +2864,8 @@ export async function runSupervisor(input, dependencies = {}) {
                     runnerIncarnation,
                     assertOwnership,
                     runtimeGuard: verifyRuntimeClosure,
+                    processIdentityAdapter:
+                        runnerProcessIdentityAdapter,
                 });
             } catch (error) {
                 if (isOwnershipLostError(error)) {
@@ -2734,8 +2909,60 @@ export async function runSupervisor(input, dependencies = {}) {
             }
 
             if (launched?.child !== null && launched?.child !== undefined) {
+                const launchedPid = launched.child.pid ?? null;
+                let launchedIdentity = null;
+                try {
+                    launchedIdentity =
+                        launched.processIdentity === undefined
+                            || launched.processIdentity === null
+                            ? null
+                            : normalizeProcessIdentity(
+                                launched.processIdentity,
+                            );
+                    if (launchedIdentity !== null
+                        && launchedIdentity.processId !== launchedPid) {
+                        throw new RuntimeConfigError(
+                            "Runner process identity PID differs from the launched child",
+                            {
+                                childPid: launchedPid,
+                                identityPid:
+                                    launchedIdentity.processId,
+                            },
+                        );
+                    }
+                } catch (error) {
+                    if (Number.isSafeInteger(launchedPid)
+                        && launchedPid > 0) {
+                        try {
+                            await processTreeAdapter.terminateTree(
+                                launchedPid,
+                                {
+                                    force: true,
+                                    phase:
+                                        "invalid_process_identity",
+                                    timeoutMs:
+                                        shutdownPolicy.escalationMs,
+                                },
+                            );
+                        } catch {
+                            try {
+                                await processTreeAdapter.closeJobObject?.(
+                                    launchedPid,
+                                    {
+                                        timeoutMs:
+                                            shutdownPolicy.escalationMs,
+                                    },
+                                );
+                            } catch {
+                                // The launch is rejected below.
+                            }
+                        }
+                    }
+                    throw error;
+                }
                 currentChild = launched.child;
-                currentChildPid = launched.child.pid ?? null;
+                currentChildPid = launchedPid;
+                currentChildProcessIdentity = launchedIdentity;
                 currentChildWait = waitForChild(launched.child);
             }
             assertOwnership("runner launch completion");
@@ -2813,6 +3040,7 @@ export async function runSupervisor(input, dependencies = {}) {
                 currentChild = null;
                 currentChildWait = null;
                 currentChildPid = null;
+                currentChildProcessIdentity = null;
                 stopHeartbeat();
                 assertOwnership("runner result processing");
                 const stopAfterChildExit = readPersistedStop();

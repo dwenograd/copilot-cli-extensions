@@ -116,6 +116,7 @@ function makeContract({
     enumerandManifest,
     maxBlocks = 8,
     alpha = 0.5,
+    acceptanceThreshold = 100,
 }) {
     const input = upgradeLegacyContractInput({
         objective: "Prove the finite target is unreachable",
@@ -123,7 +124,7 @@ function makeContract({
             kind: "metric_compare",
             metric: "score",
             operator: ">=",
-            value: 100,
+            value: acceptanceThreshold,
         },
         validationCases: [
             { id: "known-good", expectation: "accept", artifactHash: goodSnapshot },
@@ -165,7 +166,7 @@ function makeContract({
         estimand: "mean score versus frozen control",
         unit: "score",
         direction: "max",
-        acceptanceThreshold: 100,
+        acceptanceThreshold,
         practicalEquivalenceDelta: 1,
         family: "primary",
     }];
@@ -227,7 +228,26 @@ function scoreProcessAdapter() {
     };
 }
 
-function writeVerifierScript(root, checkerEvidenceRoot) {
+function writeVerifierScript(
+    root,
+    checkerEvidenceRoot,
+    verifierStatus = "VERIFIED",
+) {
+    const verifierVerdict = verifierStatus === "VERIFIED"
+        ? "target_unreachable"
+        : verifierStatus === "REJECTED"
+            ? "not_proven"
+            : verifierStatus === "INCONCLUSIVE"
+                ? "inconclusive"
+                : "invalid";
+    const claimState = verifierStatus === "VERIFIED"
+        ? "REFUTED"
+        : verifierStatus === "REJECTED"
+            ? "SUPPORTED"
+            : verifierStatus === "INCONCLUSIVE"
+                ? "UNRESOLVED"
+                : "INVALID";
+    const complete = ["VERIFIED", "REJECTED"].includes(verifierStatus);
     return writeHarnessScript(root, "impossibility-verifier", `
 const { createHash } = await import("node:crypto");
 const candidatePath = process.argv[2];
@@ -260,7 +280,10 @@ const enumerandResults = mode === "enumerand_reexecution"
     ? request.evidence.coverageClosure.enumerands.map((entry) => {
         const input = request.reevaluation.enumerands[entry.ordinal];
         const claimStates = entry.claims
-            .map((claim) => ({ claimId: claim.claimId, state: "REFUTED" }))
+            .map((claim) => ({
+                claimId: claim.claimId,
+                state: ${JSON.stringify(claimState)},
+            }))
             .sort((left, right) => left.claimId.localeCompare(right.claimId));
         const evidenceRoot = hash({
             requestHash,
@@ -294,13 +317,16 @@ const enumerandResultsRoot = hash(
     enumerandResults,
     "sha256:crucible-impossibility-verifier-enumerand-results-v1",
 );
+const disagreementCount = enumerandResults.filter((result) =>
+    result.claimStates.some((claim) => claim.state !== "REFUTED")
+).length;
 const proofValidationReceiptHash = mode === "certificate_validation"
     ? hash({
         requestHash,
         proofArtifactHash,
         proofCheckerIdentity,
         certificateFormat,
-        status: "VERIFIED",
+        status: ${JSON.stringify(verifierStatus)},
         checkerEvidenceRoot: ${JSON.stringify(checkerEvidenceRoot)},
     }, "sha256:crucible-impossibility-proof-validation-receipt-v1")
     : null;
@@ -329,8 +355,8 @@ const independentFactsRoot = mode === "enumerand_reexecution"
     }, "sha256:crucible-impossibility-verifier-facts-v1");
 const certificate = {
     version: "crucible-impossibility-certificate-v2",
-    status: "VERIFIED",
-    verdict: "target_unreachable",
+    status: ${JSON.stringify(verifierStatus)},
+    verdict: ${JSON.stringify(verifierVerdict)},
     mode,
     requestHash,
     proposedCertificateArtifactHash:
@@ -354,7 +380,7 @@ const certificate = {
 };
 process.stdout.write(JSON.stringify({
     version: "crucible-impossibility-verifier-output-v1",
-    status: "VERIFIED",
+    status: ${JSON.stringify(verifierStatus)},
     mode,
     requestHash,
     proposedCertificateArtifactHash:
@@ -371,8 +397,8 @@ process.stdout.write(JSON.stringify({
     alphaLedgerRoot: request.statistics.alphaLedgerRoot,
     checkerEvidenceRoot: ${JSON.stringify(checkerEvidenceRoot)},
     independentFactsRoot,
-    disagreementCount: 0,
-    complete: true,
+    disagreementCount,
+    complete: ${JSON.stringify(complete)},
     certificateFormat,
     proofCheckerIdentity,
     proofValidationReceiptHash,
@@ -494,6 +520,9 @@ export function setupImpossibilityRunnerFixture(
         mode = "enumerand_reexecution",
         maxBlocks = 3,
         alpha = 0.5,
+        acceptanceThreshold = 100,
+        verifierStatus = "VERIFIED",
+        authorityFixture = undefined,
     } = {},
 ) {
     const root = makeTempRoot(`impossibility-${label}`);
@@ -532,8 +561,11 @@ export function setupImpossibilityRunnerFixture(
         { label, checker: "actual-process" },
         "sha256:crucible-runtime-checker-evidence-v1",
     );
-    const verifierScript =
-        writeVerifierScript(root, checkerEvidenceRoot);
+    const verifierScript = writeVerifierScript(
+        root,
+        checkerEvidenceRoot,
+        verifierStatus,
+    );
     const proofChecker = path.join(root, "proof-checker.bin");
     fs.writeFileSync(proofChecker, "operator-attested proof checker bytes\n");
     const verifierDependencies = [{
@@ -667,6 +699,7 @@ export function setupImpossibilityRunnerFixture(
         enumerandManifest,
         maxBlocks,
         alpha,
+        acceptanceThreshold,
     });
     const repository = openRepository({
         file: path.join(stateDir, "events.sqlite"),
@@ -675,6 +708,9 @@ export function setupImpossibilityRunnerFixture(
         contract,
         experimentId: `runner-${label}`,
         projectDir: root,
+        ...(authorityFixture === undefined
+            ? {}
+            : { fixture: authorityFixture }),
     });
     const adapter = createDomainRepositoryAdapter({
         repository,
@@ -701,6 +737,8 @@ export function setupImpossibilityRunnerFixture(
         proofChecker,
         sandboxPolicyDigest: verifierIdentity.sandbox.policyDigest,
         contract,
+        authorityEnv: signed.env,
+        authorityFixture: signed.fixture,
         config: {
             investigationId: signed.investigationId,
             stateDir,

@@ -376,6 +376,52 @@ describe("SDK worker retry integration", () => {
         await pool.close();
     });
 
+    it("retains the candidate claim when sealed-evidence recording fails", async () => {
+        const root = makeRoot("sealed-evidence-failure");
+        const clock = fakeClock();
+        const journal = durableJournal();
+        const originalRecordEvidence = journal.recordEvidence;
+        let injected = false;
+        journal.recordEvidence = async (record) => {
+            if (!injected && record.eventType === "submission_sealed") {
+                injected = true;
+                throw new Error("injected sealed evidence failure");
+            }
+            return originalRecordEvidence(record);
+        };
+        const results = [];
+        const client = {
+            async start() {},
+            async stop() {},
+            async createSession(config) {
+                return {
+                    async sendAndWait() {
+                        results.push(await submit(config));
+                    },
+                    async disconnect() {},
+                };
+            },
+        };
+        const pool = createSdkWorkerPool(poolOptions(
+            root,
+            client,
+            journal,
+            clock,
+        ));
+
+        await expect(pool.propose(request(clock.now() + 5_000)))
+            .resolves.toMatchObject({ candidateId: "candidate-a" });
+        expect(injected).toBe(true);
+        await expect(pool.propose(request(clock.now() + 5_000, {
+            sessionId: "session-b",
+            proposalSlotId: "slot-b",
+            commandId: "command-b",
+            logicalEffectId: "effect-b",
+        }))).rejects.toThrow();
+        expect(results.at(-1)).toMatchObject({ resultType: "rejected" });
+        await pool.close();
+    });
+
     it("recovers an in-flight durable callback instead of starting another model attempt", async () => {
         const root = makeRoot("in-flight-callback");
         const clock = fakeClock();
@@ -676,5 +722,164 @@ describe("SDK worker retry integration", () => {
             },
         });
         await pool.close();
+    });
+
+    it("preserves a sealed proposal across usage reporter failure and restart", async () => {
+        const root = makeRoot("usage-reporter-restart");
+        const clock = fakeClock();
+        const journal = durableJournal();
+        let createCalls = 0;
+        let reporterCalls = 0;
+        const firstClient = {
+            async start() {},
+            async stop() {},
+            async createSession(config) {
+                createCalls += 1;
+                return {
+                    async sendAndWait() {
+                        await submit(config);
+                    },
+                    async abort() {},
+                    async disconnect() {},
+                };
+            },
+        };
+        const firstPool = createSdkWorkerPool(poolOptions(
+            root,
+            firstClient,
+            journal,
+            clock,
+            {
+                sdkUsageReporter: async () => {
+                    reporterCalls += 1;
+                    throw Object.assign(
+                        new Error("resource catalog temporarily unavailable"),
+                        { recoverable: true },
+                    );
+                },
+            },
+        ));
+
+        await expect(firstPool.propose(request(clock.now() + 5_000)))
+            .resolves.toMatchObject({ candidateId: "candidate-a" });
+        expect(createCalls).toBe(1);
+        expect(journal.commitCalls).toBe(1);
+        expect(journal.evidence.some((record) =>
+            record.eventType === "cost_reconciled"
+            && record.reason === "usage_reconciliation_pending"
+            && record.details.sealedSubmissionPreserved === true)).toBe(true);
+        await firstPool.close();
+
+        const secondClient = {
+            async start() {},
+            async stop() {},
+            async createSession() {
+                throw new Error("sealed proposal recovery must not call the model");
+            },
+        };
+        const secondPool = createSdkWorkerPool(poolOptions(
+            root,
+            secondClient,
+            journal,
+            clock,
+            {
+                sdkUsageReporter: async () => {
+                    reporterCalls += 1;
+                    return {
+                        status: "reconciled",
+                        reconciliationId: "sdk-usage-recovered",
+                    };
+                },
+            },
+        ));
+
+        await expect(secondPool.propose(request(clock.now() + 5_000)))
+            .resolves.toMatchObject({ candidateId: "candidate-a" });
+        expect(reporterCalls).toBe(2);
+        expect(createCalls).toBe(1);
+        expect(journal.commitCalls).toBe(1);
+        await secondPool.close();
+    });
+
+    it("surfaces permanent post-seal accounting failure as operational evidence", async () => {
+        const root = makeRoot("usage-reporter-permanent");
+        const clock = fakeClock();
+        const journal = durableJournal();
+        let createCalls = 0;
+        const client = {
+            async start() {},
+            async stop() {},
+            async createSession(config) {
+                createCalls += 1;
+                return {
+                    async sendAndWait() {
+                        await submit(config);
+                    },
+                    async abort() {},
+                    async disconnect() {},
+                };
+            },
+        };
+        const pool = createSdkWorkerPool(poolOptions(
+            root,
+            client,
+            journal,
+            clock,
+            {
+                sdkUsageReporter: async () => ({
+                    status: "failed",
+                    reconciliationId: "sdk-usage-permanent",
+                    error: {
+                        code: "ACCOUNTING_POLICY_REJECTED",
+                        message: "accounting policy rejected the charge",
+                        recoverable: false,
+                    },
+                }),
+            },
+        ));
+
+        await expect(pool.propose(request(clock.now() + 5_000)))
+            .resolves.toMatchObject({ candidateId: "candidate-a" });
+        expect(journal.commitCalls).toBe(1);
+        expect(pool.sdkOperationalEvidence.some((record) =>
+            record.eventType === "cost_reconciled"
+            && record.reason === "usage_reconciliation_failed"
+                && record.details.reconciliationId
+                === "sdk-usage-permanent")).toBe(true);
+        await pool.close();
+
+        const recoveryPool = createSdkWorkerPool(poolOptions(
+            root,
+            {
+                async start() {},
+                async stop() {},
+                async createSession() {
+                    throw new Error(
+                        "permanent accounting recovery must not replay the SDK effect",
+                    );
+                },
+            },
+            journal,
+            clock,
+            {
+                sdkUsageReporter: async () => ({
+                    status: "failed",
+                    reconciliationId: "sdk-usage-permanent",
+                    error: {
+                        code: "ACCOUNTING_POLICY_REJECTED",
+                        message: "accounting policy rejected the charge",
+                        recoverable: false,
+                    },
+                }),
+            },
+        ));
+        await expect(recoveryPool.propose(request(clock.now() + 5_000)))
+            .resolves.toMatchObject({ candidateId: "candidate-a" });
+        expect(createCalls).toBe(1);
+        expect(journal.commitCalls).toBe(1);
+        expect(recoveryPool.sdkOperationalEvidence.some((record) =>
+            record.reason === "usage_reconciliation_failed"
+            && record.details.sealedSubmissionPreserved === true)).toBe(true);
+        await recoveryPool.close();
     });
 });

@@ -128,7 +128,7 @@ describe("same-user recovery daemon", () => {
         expect(broker.released).toBe(true);
     });
 
-    it("never launches paused, archived, tombstoned, or auth-blocked runs", async () => {
+    it("launches only eligible runs after unattended restart", async () => {
         const investigations = [
             {
                 investigationId: "paused",
@@ -146,12 +146,37 @@ describe("same-user recovery daemon", () => {
                 investigationId: "auth-blocked",
                 lifecycleState: "active",
             },
+            {
+                investigationId: "terminal",
+                lifecycleState: "active",
+            },
+            {
+                investigationId: "non-result",
+                lifecycleState: "active",
+            },
+            {
+                investigationId: "integrity-blocked",
+                lifecycleState: "active",
+            },
+            {
+                investigationId: "runtime-drift",
+                lifecycleState: "active",
+            },
         ];
         const codes = new Map([
             ["paused", RECOVERY_DISCOVERY_CODES.PAUSED],
             ["archived", RECOVERY_DISCOVERY_CODES.LIFECYCLE_ARCHIVED],
             ["tombstoned", RECOVERY_DISCOVERY_CODES.LIFECYCLE_TOMBSTONED],
             ["auth-blocked", RECOVERY_DISCOVERY_CODES.SDK_AUTH_UNAVAILABLE],
+            ["terminal", RECOVERY_DISCOVERY_CODES.TERMINAL],
+            ["non-result", RECOVERY_DISCOVERY_CODES.NON_RESULT],
+            ["integrity-blocked", RECOVERY_DISCOVERY_CODES.INTEGRITY_BLOCKED],
+            ["runtime-drift", RECOVERY_DISCOVERY_CODES.RUNTIME_DRIFT],
+        ]);
+        const blocked = new Set([
+            "auth-blocked",
+            "integrity-blocked",
+            "runtime-drift",
         ]);
         const broker = fakeBroker({ investigations });
         const result = await runRecoveryDaemon(
@@ -162,8 +187,9 @@ describe("same-user recovery daemon", () => {
                     catalogInvestigation,
                 }) => ({
                     eligible: false,
-                    state: catalogInvestigation.investigationId
-                        === "auth-blocked"
+                    state: blocked.has(
+                        catalogInvestigation.investigationId,
+                    )
                         ? "blocked"
                         : "skipped",
                     code: codes.get(catalogInvestigation.investigationId),
@@ -173,7 +199,7 @@ describe("same-user recovery daemon", () => {
                 },
             },
         );
-        expect(result.operations).toHaveLength(4);
+        expect(result.operations).toHaveLength(investigations.length);
         expect(result.operations.map((operation) => operation.code).sort())
             .toEqual([...codes.values()].sort());
     });

@@ -8,6 +8,11 @@ import {
     summarizeCandidateCohortComparison,
 } from "./cohort.mjs";
 import { deriveScientificConfirmationState } from "./confirmation.mjs";
+import {
+    LEGACY_SEARCH_STRATEGY_POLICY_VERSION,
+} from "./constants.mjs";
+import { statisticalSubjectIndex } from "./replication.mjs";
+import { searchAlphaSubjectOrdinal } from "./statistics.mjs";
 
 export const SCIENTIFIC_REPLAY_VERSION =
     "crucible-scientific-replay-v1";
@@ -46,6 +51,146 @@ function evidenceItems(aggregate, purpose) {
             evidence !== null
             && evidence.sourceKind === "harness"
             && evidence.purpose === purpose);
+}
+
+function searchSubjectCapacity(contract) {
+    return contract.enumerandManifest?.entries?.length
+        ?? contract.candidatesPerRound * contract.maxRounds;
+}
+
+function failSearchAlphaReplay(message, details) {
+    const error = new TypeError(`Scientific replay alpha-lane error: ${message}`);
+    error.code = "CRUCIBLE_SCIENTIFIC_ALPHA_LANE_REPLAY";
+    error.details = details;
+    throw error;
+}
+
+export function assertScientificSearchAlphaLanes(aggregate) {
+    const contract = aggregate?.contract;
+    if (contract === null || contract === undefined) {
+        return immutableCanonical({ laneCount: 0, lanes: [] });
+    }
+    const searchSlots = searchSubjectCapacity(contract);
+    const strategyPolicyVersion = contract.searchPolicy.version
+        ?? LEGACY_SEARCH_STRATEGY_POLICY_VERSION;
+    const legacyStrategy = strategyPolicyVersion
+        === LEGACY_SEARCH_STRATEGY_POLICY_VERSION;
+    const seenLanes = new Map();
+    const attemptsBySlot = new Map();
+    const lanes = [];
+
+    for (const evidenceId of aggregate.evidenceOrder ?? []) {
+        const evidence = ownEntry(aggregate.evidence, evidenceId);
+        if (evidence?.sourceKind !== "harness"
+            || evidence?.purpose !== "candidate") {
+            continue;
+        }
+        const observation = ownEntry(
+            aggregate.observations,
+            evidence.observationId,
+        );
+        const commandRecord = observation === null
+            ? null
+            : ownEntry(aggregate.commands, observation.commandId);
+        const command = commandRecord?.command ?? null;
+        if (observation === null
+            || command?.kind !== "search_candidate"
+            || command.replicationSchedule?.subject === undefined) {
+            failSearchAlphaReplay(
+                "candidate evidence is missing its authoritative search schedule",
+                { evidenceId },
+            );
+        }
+        if (command.round !== evidence.round
+            || command.slotIndex !== evidence.slotIndex
+            || command.candidateId !== evidence.candidateId) {
+            failSearchAlphaReplay(
+                "candidate evidence substituted search-slot authority",
+                { evidenceId },
+            );
+        }
+
+        const slotKey = `${command.round}:${command.slotIndex}`;
+        const expectedReplacementOrdinal =
+            attemptsBySlot.get(slotKey) ?? 0;
+        const replacementOrdinal = command.replacementOrdinal ?? 0;
+        if (replacementOrdinal !== expectedReplacementOrdinal) {
+            failSearchAlphaReplay(
+                "candidate evidence substituted its deterministic replacement ordinal",
+                {
+                    evidenceId,
+                    expectedReplacementOrdinal,
+                    replacementOrdinal,
+                },
+            );
+        }
+
+        const globalSlot = (command.round - 1)
+            * contract.candidatesPerRound
+            + command.slotIndex;
+        const expectedKind = contract.enumerandManifest?.entries?.[globalSlot]
+            === undefined
+            ? "candidate"
+            : "enumerand";
+        const expectedIndex = statisticalSubjectIndex(
+            expectedKind,
+            legacyStrategy
+                ? globalSlot
+                : searchAlphaSubjectOrdinal({
+                    searchSlots,
+                    maxConfirmations:
+                        contract.statisticalPolicy.maxConfirmations,
+                    globalSlot,
+                    replacementOrdinal,
+                }),
+        );
+        const subject = command.replicationSchedule.subject;
+        const priorEvidenceId = seenLanes.get(subject.index);
+        // V1 histories retain their original shared-lane authority verbatim.
+        if (!legacyStrategy && priorEvidenceId !== undefined) {
+            failSearchAlphaReplay(
+                "multiple candidate observations reused one preregistered alpha lane",
+                {
+                    evidenceId,
+                    priorEvidenceId,
+                    subjectIndex: subject.index,
+                },
+            );
+        }
+        if (subject.kind !== expectedKind
+            || subject.index !== expectedIndex
+            || subject.id !== command.candidateId) {
+            failSearchAlphaReplay(
+                "candidate observation substituted its preregistered alpha lane",
+                {
+                    evidenceId,
+                    expectedKind,
+                    expectedIndex,
+                    actualKind: subject.kind,
+                    actualIndex: subject.index,
+                },
+            );
+        }
+
+        if (priorEvidenceId === undefined) {
+            seenLanes.set(subject.index, evidenceId);
+        }
+        attemptsBySlot.set(slotKey, expectedReplacementOrdinal + 1);
+        lanes.push({
+            evidenceId,
+            round: command.round,
+            slotIndex: command.slotIndex,
+            replacementOrdinal,
+            subjectKind: subject.kind,
+            subjectIndex: subject.index,
+        });
+    }
+
+    return immutableCanonical({
+        strategyPolicyVersion,
+        laneCount: lanes.length,
+        lanes,
+    });
 }
 
 function candidateProjection(evidence) {
@@ -477,6 +622,7 @@ function deriveScientificReplayMaterial(
     if (aggregate?.contract === null || aggregate?.contract === undefined) {
         return null;
     }
+    assertScientificSearchAlphaLanes(aggregate);
     const candidates = evidenceItems(aggregate, "candidate")
         .map(candidateProjection);
     const confirmations = evidenceItems(aggregate, "confirmation")

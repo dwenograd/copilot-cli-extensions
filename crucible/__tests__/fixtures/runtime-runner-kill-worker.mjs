@@ -62,6 +62,7 @@ const pool = {
 await runAutonomousInvestigation(config, {
     workerPool: pool,
     idFactory: () => `kill-worker-id-${++nextId}`,
+    runtimeIdentityVerifier: async () => ({}),
     async faultInjector(point, details) {
         if (reached
             || point !== faultPoint

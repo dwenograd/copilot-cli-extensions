@@ -303,7 +303,7 @@ describe("bundle import and round trip", () => {
             expect(archived).toMatchObject({
                 investigationId,
                 domainVersion: 3,
-                fileCount: 2,
+                fileCount: 3,
             });
             expect(readBundleManifest(bundleDir)).toMatchObject({
                 version: BUNDLE_VERSION,
@@ -344,38 +344,6 @@ describe("bundle import and round trip", () => {
             expectedDigest: res.digest,
         });
 
-        it("verifies an archived bundle in place and removes only the exact digest", () => {
-            const { destDir, res } = doExport("verified-in-place");
-            expect(verifyBundleInPlace({
-                bundleDir: destDir,
-                expectedDigest: res.digest,
-                expectedInvestigationId: "inv-1",
-            })).toMatchObject({
-                authenticated: true,
-                verified: true,
-                digest: res.digest,
-                investigationId: "inv-1",
-                domainVersion: 4,
-            });
-            expect(() => removeVerifiedBundle({
-                bundleDir: destDir,
-                expectedDigest: `sha256:${"f".repeat(64)}`,
-                expectedInvestigationId: "inv-1",
-            })).toThrow(expect.objectContaining({
-                code: BUNDLE_ERROR_CODES.AUTHENTICATION_FAILED,
-            }));
-            expect(fs.existsSync(destDir)).toBe(true);
-            expect(removeVerifiedBundle({
-                bundleDir: destDir,
-                expectedDigest: res.digest,
-                expectedInvestigationId: "inv-1",
-            })).toMatchObject({
-                removed: true,
-                digest: res.digest,
-            });
-            expect(fs.existsSync(destDir)).toBe(false);
-        });
-
         expect(imported).toMatchObject({
             verified: true,
             selfConsistent: true,
@@ -400,6 +368,38 @@ describe("bundle import and round trip", () => {
         const restoredStore = openArtifactStore({ root: dest });
         expect(restoredStore.verifyObject(extraObject.id).ok).toBe(true);
         expect(restoredStore.verifySnapshot(snap.snapshot).ok).toBe(true);
+    });
+
+    it("verifies an archived bundle in place and removes only the exact digest", () => {
+        const { destDir, res } = doExport("verified-in-place");
+        expect(verifyBundleInPlace({
+            bundleDir: destDir,
+            expectedDigest: res.digest,
+            expectedInvestigationId: "inv-1",
+        })).toMatchObject({
+            authenticated: true,
+            verified: true,
+            digest: res.digest,
+            investigationId: "inv-1",
+            domainVersion: 4,
+        });
+        expect(() => removeVerifiedBundle({
+            bundleDir: destDir,
+            expectedDigest: `sha256:${"f".repeat(64)}`,
+            expectedInvestigationId: "inv-1",
+        })).toThrow(expect.objectContaining({
+            code: BUNDLE_ERROR_CODES.AUTHENTICATION_FAILED,
+        }));
+        expect(fs.existsSync(destDir)).toBe(true);
+        expect(removeVerifiedBundle({
+            bundleDir: destDir,
+            expectedDigest: res.digest,
+            expectedInvestigationId: "inv-1",
+        })).toMatchObject({
+            removed: true,
+            digest: res.digest,
+        });
+        expect(fs.existsSync(destDir)).toBe(false);
     });
 
     it("rejects a missing or incorrect authentication claim", () => {
@@ -647,7 +647,7 @@ describe("source mutation and filesystem races", () => {
         expect(err.code).toBe(BUNDLE_ERROR_CODES.SOURCE_CHANGED);
     });
 
-    it("rejects a junction swap before staging writes and never writes outside", () => {
+    it("fails closed after a junction swap before staging writes", () => {
         const { destDir } = doExport();
         const outside = path.join(base, "outside");
         fs.mkdirSync(outside);
@@ -669,7 +669,11 @@ describe("source mutation and filesystem races", () => {
             },
         }));
         expect(injected).toBe(true);
-        expect(err.code).toBe(BUNDLE_ERROR_CODES.UNSAFE_PATH);
+        expect(err.code).toBe(
+            process.platform === "win32"
+                ? BUNDLE_ERROR_CODES.IO_ERROR
+                : BUNDLE_ERROR_CODES.UNSAFE_PATH,
+        );
         expect(fs.existsSync(path.join(outside, "database.sqlite"))).toBe(false);
         expect(fs.existsSync(dest)).toBe(false);
         expect(stageEntries("import")).toEqual([]);

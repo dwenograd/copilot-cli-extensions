@@ -12,6 +12,7 @@ import { DatabaseSync } from "../persistence/sqlite.mjs";
 
 import {
     openRepository,
+    openRepositoryReadOnly,
     computeEventHash,
     ERROR_CODES,
 } from "../persistence/index.mjs";
@@ -61,6 +62,33 @@ describe("append-only hash-chained event log", () => {
         expect(result.events[1].prevHash).toBe(result.events[0].eventHash);
         expect(repo.getHead("inv-1")).toEqual({ seq: 2, eventHash: result.events[1].eventHash });
         expect(repo.verifyInvestigation("inv-1").ok).toBe(true);
+    });
+
+    it("opens immutable read views without creating SQLite sidecars", () => {
+        const file = repo.databaseFile;
+        repo.appendEvents({
+            investigationId: "inv-1",
+            expectedHead: null,
+            events: [{ kind: "immutable-read", payload: {} }],
+        });
+        repo.checkpointWal({ force: true, mode: "TRUNCATE" });
+        repo.close();
+        repo = null;
+        fs.rmSync(`${file}-wal`, { force: true });
+        fs.rmSync(`${file}-shm`, { force: true });
+
+        const readOnly = openRepositoryReadOnly({
+            file,
+            immutable: true,
+        });
+        try {
+            expect(readOnly.countEvents("inv-1")).toBe(1);
+            expect(readOnly.verifyInvestigation("inv-1").ok).toBe(true);
+        } finally {
+            readOnly.close();
+        }
+        expect(fs.existsSync(`${file}-wal`)).toBe(false);
+        expect(fs.existsSync(`${file}-shm`)).toBe(false);
     });
 
     it("rejects a compare-and-swap append when the head moved (concurrent writers)", () => {

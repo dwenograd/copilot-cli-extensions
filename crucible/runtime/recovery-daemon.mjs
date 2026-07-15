@@ -386,18 +386,34 @@ export async function runRecoveryDaemon({
         primaryError = error;
         throw error;
     } finally {
-        leaseController.stop();
+        const teardownErrors = [];
         try {
+            leaseController.stop();
+        } catch (error) {
+            teardownErrors.push(error);
+        }
+        try {
+            broker.releaseRecoveryDaemonLease({
+                lease: leaseController.lease,
+                reason: releaseReason,
+            });
+        } catch (error) {
+            teardownErrors.push(error);
+        }
+        if (brokerOwned) {
             try {
-                broker.releaseRecoveryDaemonLease({
-                    lease: leaseController.lease,
-                    reason: releaseReason,
-                });
+                broker.close();
             } catch (error) {
-                if (primaryError === null) throw error;
+                teardownErrors.push(error);
             }
-        } finally {
-            if (brokerOwned) broker.close();
+        }
+        if (primaryError === null && teardownErrors.length > 0) {
+            throw teardownErrors.length === 1
+                ? teardownErrors[0]
+                : new AggregateError(
+                    teardownErrors,
+                    "Crucible recovery daemon teardown failed",
+                );
         }
     }
 }

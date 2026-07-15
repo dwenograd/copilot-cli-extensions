@@ -7,7 +7,9 @@ import {
 } from "./archive.mjs";
 import {
     ESCAPE_SEARCH_OPERATORS,
+    LEGACY_SEARCH_STRATEGY_POLICY_VERSION,
     SEARCH_OPERATORS,
+    SEARCH_STRATEGY_POLICY_VERSION,
 } from "./constants.mjs";
 import {
     enumerandBinding,
@@ -19,6 +21,7 @@ import {
     statisticalSubjectIndex,
 } from "./replication.mjs";
 import { replayDerivedCandidateEvidence } from "./scientific-replay.mjs";
+import { searchAlphaSubjectOrdinal } from "./statistics.mjs";
 import {
     behavioralRoleIdentity,
     replayDerivedCandidateNovelty,
@@ -30,6 +33,13 @@ export const SEARCH_OPERATOR_POLICY_IDENTITY_ALGORITHM =
     "sha256:crucible-search-operator-policy-v1";
 export const SEARCH_OPERATOR_ARCHIVE_FINGERPRINT_ALGORITHM =
     "sha256:crucible-search-operator-archive-v1";
+export const SEARCH_STRATEGY_V2_ADAPTATION = Object.freeze({
+    version: SEARCH_STRATEGY_POLICY_VERSION,
+    historyAuthority: "committed_search_command_operators",
+    configuredZeroWeightsRemainZero: true,
+    untriedAdversarialOddsMultiplier: 64,
+    postAdversarialRefinementOddsMultiplier: 64,
+});
 
 function candidateEvidence(aggregate, { includeInvalidated = false } = {}) {
     return aggregate.evidenceOrder
@@ -337,6 +347,46 @@ function configuredOperatorWeight(searchPolicy, operator) {
     return Number.isSafeInteger(weight) && weight > 0 ? weight : 0;
 }
 
+function searchStrategyPolicyVersion(searchPolicy) {
+    return searchPolicy.version ?? LEGACY_SEARCH_STRATEGY_POLICY_VERSION;
+}
+
+function normalizeOperatorHistory(operatorHistory) {
+    if (operatorHistory === null || operatorHistory === undefined) {
+        return [];
+    }
+    if (!Array.isArray(operatorHistory)
+        || operatorHistory.some((operator) =>
+            !SEARCH_OPERATORS.includes(operator))) {
+        throw deterministicStrategyError(
+            "operator history must contain only supported search operators",
+        );
+    }
+    return [...operatorHistory];
+}
+
+function multiplyAdaptiveWeight(weight, multiplier) {
+    if (weight === 0) return 0;
+    const result = weight * multiplier;
+    if (!Number.isSafeInteger(result)) {
+        throw deterministicStrategyError(
+            "adaptive operator weight exceeds the safe integer range",
+        );
+    }
+    return result;
+}
+
+function versionedOperatorEntropy(searchPolicy, history, entropy) {
+    const version = searchStrategyPolicyVersion(searchPolicy);
+    return version === LEGACY_SEARCH_STRATEGY_POLICY_VERSION
+        ? entropy
+        : {
+            ...entropy,
+            strategyPolicyVersion: version,
+            operatorHistory: history,
+        };
+}
+
 function selectWeightedOperator(weights, entropy, emptyReason) {
     const total = SEARCH_OPERATORS.reduce(
         (sum, operator) => sum + (weights[operator] > 0 ? weights[operator] : 0),
@@ -356,7 +406,13 @@ function selectWeightedOperator(weights, entropy, emptyReason) {
     throw deterministicStrategyError("weighted operator selection exhausted unexpectedly");
 }
 
-export function adaptiveOperatorWeights(searchPolicy, archive, phase = "normal") {
+export function adaptiveOperatorWeights(
+    searchPolicy,
+    archive,
+    phase = "normal",
+    operatorHistory = null,
+) {
+    const history = normalizeOperatorHistory(operatorHistory);
     const weights = Object.fromEntries(
         SEARCH_OPERATORS.map((operator) => [
             operator,
@@ -430,6 +486,27 @@ export function adaptiveOperatorWeights(searchPolicy, archive, phase = "normal")
             weights.diversification += 1;
         }
     }
+    const versionedAdaptation = searchStrategyPolicyVersion(searchPolicy)
+        === SEARCH_STRATEGY_POLICY_VERSION;
+    if (versionedAdaptation
+        && phase === "normal"
+        && history.length > 0
+        && eligibleIncumbent(archive) !== null) {
+        if (!history.includes("adversarial") && weights.adversarial > 0) {
+            weights.adversarial = multiplyAdaptiveWeight(
+                weights.adversarial,
+                SEARCH_STRATEGY_V2_ADAPTATION
+                    .untriedAdversarialOddsMultiplier,
+            );
+        } else if (history.includes("adversarial")
+            && weights.refinement > 0) {
+            weights.refinement = multiplyAdaptiveWeight(
+                weights.refinement,
+                SEARCH_STRATEGY_V2_ADAPTATION
+                    .postAdversarialRefinementOddsMultiplier,
+            );
+        }
+    }
     return immutableCanonical(weights);
 }
 
@@ -441,7 +518,9 @@ export function selectAdaptiveOperator({
     round,
     slotIndex,
     phase = "normal",
+    operatorHistory = null,
 }) {
+    const history = normalizeOperatorHistory(operatorHistory);
     if (phase === "normal"
         && archive.incumbent === null
         && archive.nearMisses.length === 0
@@ -451,15 +530,24 @@ export function selectAdaptiveOperator({
         && configuredOperatorWeight(searchPolicy, "fresh") > 0) {
         return "fresh";
     }
-    const weights = adaptiveOperatorWeights(searchPolicy, archive, phase);
-    return selectWeightedOperator(weights, {
-        policyIdentity,
-        archiveFingerprint: archivePolicyFingerprint(archive),
-        round,
-        slotIndex,
+    const weights = adaptiveOperatorWeights(
+        searchPolicy,
+        archive,
         phase,
-        weights,
-    }, `no positive-weight eligible operators for phase "${phase}"`);
+        history,
+    );
+    return selectWeightedOperator(weights, versionedOperatorEntropy(
+        searchPolicy,
+        history,
+        {
+            policyIdentity,
+            archiveFingerprint: archivePolicyFingerprint(archive),
+            round,
+            slotIndex,
+            phase,
+            weights,
+        },
+    ), `no positive-weight eligible operators for phase "${phase}"`);
 }
 
 export const selectOperator = selectAdaptiveOperator;
@@ -606,8 +694,17 @@ function fallbackOperator({
     slotIndex,
     phase,
     failedOperator,
+    operatorHistory = null,
 }) {
-    const weights = { ...adaptiveOperatorWeights(searchPolicy, archive, phase) };
+    const history = normalizeOperatorHistory(operatorHistory);
+    const weights = {
+        ...adaptiveOperatorWeights(
+            searchPolicy,
+            archive,
+            phase,
+            history,
+        ),
+    };
     weights[failedOperator] = 0;
     for (const operator of SEARCH_OPERATORS) {
         const parents = parentEvidenceIds(
@@ -629,15 +726,19 @@ function fallbackOperator({
             return operator;
         }
     }
-    return selectWeightedOperator(weights, {
-        policyIdentity,
-        archiveFingerprint: archivePolicyFingerprint(archive),
-        round,
-        slotIndex,
-        phase,
-        failedOperator,
-        weights,
-    }, `no positive-weight eligible fallback after "${failedOperator}" for phase "${phase}"`);
+    return selectWeightedOperator(weights, versionedOperatorEntropy(
+        searchPolicy,
+        history,
+        {
+            policyIdentity,
+            archiveFingerprint: archivePolicyFingerprint(archive),
+            round,
+            slotIndex,
+            phase,
+            failedOperator,
+            weights,
+        },
+    ), `no positive-weight eligible fallback after "${failedOperator}" for phase "${phase}"`);
 }
 
 function generatedCandidateId(round, slotIndex, replacementOrdinal = 0) {
@@ -654,6 +755,29 @@ function replacementOrdinal(aggregate, round, slotIndex) {
             && evidence.round === round
             && evidence.slotIndex === slotIndex)
         .length;
+}
+
+function searchSubjectCapacity(contract) {
+    return contract.enumerandManifest?.entries?.length
+        ?? contract.candidatesPerRound * contract.maxRounds;
+}
+
+function completedSearchOperatorHistory(aggregate) {
+    return (aggregate.evidenceOrder ?? [])
+        .map((evidenceId) => aggregate.evidence?.[evidenceId] ?? null)
+        .filter((evidence) =>
+            evidence?.sourceKind === "harness"
+            && evidence?.purpose === "candidate")
+        .map((evidence) => {
+            const observation =
+                aggregate.observations?.[evidence.observationId] ?? null;
+            const command =
+                aggregate.commands?.[observation?.commandId]?.command ?? null;
+            return SEARCH_OPERATORS.includes(command?.operator)
+                ? command.operator
+                : null;
+        })
+        .filter((operator) => operator !== null);
 }
 
 export function buildSearchCandidateCommand(aggregate, progress) {
@@ -692,6 +816,7 @@ export function buildSearchCandidateCommand(aggregate, progress) {
     const candidateId = boundedCandidateId
         ?? generatedCandidateId(round, slotIndex, replacement);
     const model = contract.workerModels[globalSlot % contract.workerModels.length];
+    const operatorHistory = completedSearchOperatorHistory(aggregate);
     let operator = selectAdaptiveOperator({
         searchPolicy: policy,
         archive,
@@ -699,6 +824,7 @@ export function buildSearchCandidateCommand(aggregate, progress) {
         round,
         slotIndex,
         phase: plateau.phase,
+        operatorHistory,
     });
     const promptContextRefs = selectPromptEvidence(archive, policy);
     let parents = parentEvidenceIds(
@@ -717,6 +843,7 @@ export function buildSearchCandidateCommand(aggregate, progress) {
             slotIndex,
             phase: plateau.phase,
             failedOperator: operator,
+            operatorHistory,
         });
         parents = parentEvidenceIds(
             archive,
@@ -754,7 +881,16 @@ export function buildSearchCandidateCommand(aggregate, progress) {
             kind: assignedEnumerand === null ? "candidate" : "enumerand",
             index: statisticalSubjectIndex(
                 assignedEnumerand === null ? "candidate" : "enumerand",
-                globalSlot,
+                searchStrategyPolicyVersion(policy)
+                        === LEGACY_SEARCH_STRATEGY_POLICY_VERSION
+                    ? globalSlot
+                    : searchAlphaSubjectOrdinal({
+                        searchSlots: searchSubjectCapacity(contract),
+                        maxConfirmations:
+                            contract.statisticalPolicy.maxConfirmations,
+                        globalSlot,
+                        replacementOrdinal: replacement,
+                    }),
             ),
             id: candidateId,
             identity: deriveReplicationSubjectIdentity({

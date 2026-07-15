@@ -7,6 +7,13 @@ import { fileURLToPath } from "node:url";
 import { canonicalize } from "../persistence/canonical.mjs";
 import { assertLocalDatabasePath } from "../persistence/paths.mjs";
 import { verifyLocalRegularFile } from "../measurement/fs-verify.mjs";
+import {
+    buildRecoveryLaunchManifest,
+    buildRecoveryLauncherAction,
+    captureRecoveryLaunchEnvironment,
+    hashRecoveryLaunchFile,
+    parseRecoveryLauncherAction,
+} from "./recovery-launcher.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULT_DAEMON_PATH = path.resolve(
@@ -18,24 +25,19 @@ const DEFAULT_DAEMON_PATH = path.resolve(
 const TASK_PATH = "\\Crucible\\";
 const HASH_RE = /^sha256:[a-f0-9]{64}$/u;
 
-function sha256(value) {
-    return createHash("sha256").update(value).digest("hex");
+function defaultLauncherPath(env) {
+    const systemRoot = env.SystemRoot ?? env.SYSTEMROOT ?? "C:\\Windows";
+    return path.join(
+        systemRoot,
+        "System32",
+        "WindowsPowerShell",
+        "v1.0",
+        "powershell.exe",
+    );
 }
 
-function fileHash(file) {
-    const hash = createHash("sha256");
-    const buffer = Buffer.allocUnsafe(1024 * 1024);
-    const fd = fs.openSync(file, "r");
-    try {
-        for (;;) {
-            const bytes = fs.readSync(fd, buffer, 0, buffer.length, null);
-            if (bytes === 0) break;
-            hash.update(buffer.subarray(0, bytes));
-        }
-    } finally {
-        fs.closeSync(fd);
-    }
-    return `sha256:${hash.digest("hex")}`;
+function sha256(value) {
+    return createHash("sha256").update(value).digest("hex");
 }
 
 function normalizeExpectedHash(value, field) {
@@ -116,6 +118,7 @@ function validateStateRootIdentity(stateRoot, env) {
 function validateRuntimeFiles({
     nodePath,
     daemonPath,
+    launcherPath = null,
     expectedNodeSha256 = null,
     expectedDaemonSha256 = null,
     env,
@@ -133,8 +136,23 @@ function validateRuntimeFiles({
             "daemonPath must name recovery-daemon-cli.mjs",
         );
     }
-    const nodeSha256 = fileHash(node);
-    const daemonSha256 = fileHash(daemon);
+    const launcher = verifyLocalRegularFile(
+        assertLocalDatabasePath(path.resolve(
+            launcherPath ?? defaultLauncherPath(env),
+        ), { env }),
+        { label: "Crucible recovery launcher host" },
+    );
+    const nodeIdentity = hashRecoveryLaunchFile(node, "Node executable");
+    const daemonIdentity = hashRecoveryLaunchFile(
+        daemon,
+        "Crucible recovery daemon",
+    );
+    const launcherIdentity = hashRecoveryLaunchFile(
+        launcher,
+        "Crucible recovery launcher host",
+    );
+    const nodeSha256 = nodeIdentity.sha256;
+    const daemonSha256 = daemonIdentity.sha256;
     if (expectedNodeSha256 !== null
         && nodeSha256 !== normalizeExpectedHash(
             expectedNodeSha256,
@@ -164,8 +182,15 @@ function validateRuntimeFiles({
     return Object.freeze({
         nodePath: node,
         daemonPath: daemon,
+        runtimeRoot: path.resolve(path.dirname(daemon), ".."),
+        launcherPath: launcher,
         nodeSha256,
         daemonSha256,
+        nodeSize: nodeIdentity.size,
+        daemonSize: daemonIdentity.size,
+        launcherSha256: launcherIdentity.sha256,
+        launcherSize: launcherIdentity.size,
+        launchEnvironment: captureRecoveryLaunchEnvironment(env),
         nodeVersion,
     });
 }
@@ -175,6 +200,7 @@ function expectedRuntimeIdentity({
     daemonPath,
     expectedNodeSha256,
     expectedDaemonSha256,
+    launcherPath = null,
     env,
 }) {
     if (typeof nodePath !== "string" || !path.isAbsolute(nodePath)
@@ -191,6 +217,10 @@ function expectedRuntimeIdentity({
     return Object.freeze({
         nodePath: node,
         daemonPath: daemon,
+        runtimeRoot: path.resolve(path.dirname(daemon), ".."),
+        launcherPath: path.resolve(
+            launcherPath ?? defaultLauncherPath(env),
+        ),
         nodeSha256: normalizeExpectedHash(
             expectedNodeSha256,
             "expectedNodeSha256",
@@ -199,22 +229,20 @@ function expectedRuntimeIdentity({
             expectedDaemonSha256,
             "expectedDaemonSha256",
         ),
+        nodeSize: null,
+        daemonSize: null,
+        launcherSha256: null,
+        launcherSize: null,
+        launchEnvironment: null,
         nodeVersion: null,
     });
 }
 
-export function buildRecoveryTaskSpec({
+function recoveryTaskIdentity({
     stateRoot,
-    runtime,
     user,
-    intervalMs = 30_000,
     platform = process.platform,
-} = {}) {
-    if (!Number.isSafeInteger(intervalMs)
-        || intervalMs < 1_000
-        || intervalMs > 24 * 60 * 60_000) {
-        throw new TypeError("intervalMs is outside the supported range");
-    }
+}) {
     const identityDocument = {
         version: 1,
         userSid: user.userSid,
@@ -225,13 +253,142 @@ export function buildRecoveryTaskSpec({
     }`;
     const identityHex =
         taskIdentity.slice(taskIdentity.lastIndexOf(":") + 1);
-    const taskName = `Recovery-${identityHex.slice(0, 24)}`;
+    return Object.freeze({
+        taskIdentity,
+        taskName: `Recovery-${identityHex.slice(0, 24)}`,
+    });
+}
+
+function requireInterval(intervalMs) {
+    if (!Number.isSafeInteger(intervalMs)
+        || intervalMs < 1_000
+        || intervalMs > 24 * 60 * 60_000) {
+        throw new TypeError("intervalMs is outside the supported range");
+    }
+    return intervalMs;
+}
+
+export function buildRecoveryTaskSpec({
+    stateRoot,
+    runtime,
+    user,
+    intervalMs = 30_000,
+    platform = process.platform,
+} = {}) {
+    const interval = requireInterval(intervalMs);
+    const { taskIdentity, taskName } = recoveryTaskIdentity({
+        stateRoot,
+        user,
+        platform,
+    });
+    const argumentsList = [
+        "--state-root",
+        stateRoot,
+        "--interval-ms",
+        String(interval),
+        "--expected-node-sha256",
+        runtime.nodeSha256,
+        "--expected-daemon-sha256",
+        runtime.daemonSha256,
+    ];
+    const launchBinding = buildRecoveryLaunchManifest({
+        runtimeRoot: runtime.runtimeRoot,
+        entryPath: runtime.daemonPath,
+        node: {
+            path: runtime.nodePath,
+            sha256: runtime.nodeSha256,
+            size: runtime.nodeSize,
+        },
+        launcherHost: {
+            path: runtime.launcherPath,
+            sha256: runtime.launcherSha256,
+            size: runtime.launcherSize,
+        },
+        arguments: argumentsList,
+        environment: runtime.launchEnvironment,
+    });
+    const action = buildRecoveryLauncherAction(launchBinding);
+    const actionDocument = {
+        version: 2,
+        execute: normalizePathForIdentity(action.execute, platform),
+        arguments: action.arguments,
+        workingDirectory: normalizePathForIdentity(
+            action.workingDirectory,
+            platform,
+        ),
+        nodeSha256: runtime.nodeSha256,
+        daemonSha256: runtime.daemonSha256,
+        launchManifestSha256: launchBinding.sha256,
+        launcherHostSha256: runtime.launcherSha256,
+        launcherScriptSha256: action.launcherScriptSha256,
+    };
+    const actionFingerprint = `sha256:crucible-recovery-action-v2:${
+        sha256(canonicalize(actionDocument))
+    }`;
+    const boundRuntime = Object.freeze({
+        ...runtime,
+        launchManifest: launchBinding.manifest,
+        launchManifestSha256: launchBinding.sha256,
+        launcherScriptSha256: action.launcherScriptSha256,
+    });
+    return Object.freeze({
+        version: 2,
+        taskPath: TASK_PATH,
+        taskName,
+        taskIdentity,
+        actionFingerprint,
+        description:
+            `Crucible same-user recovery v2; identity=${taskIdentity}; action=${actionFingerprint}`,
+        user,
+        stateRoot,
+        runtime: boundRuntime,
+        action: Object.freeze({
+            execute: action.execute,
+            arguments: action.arguments,
+            workingDirectory: action.workingDirectory,
+        }),
+        trigger: Object.freeze({
+            type: "logon",
+            userId: user.userId,
+        }),
+        principal: Object.freeze({
+            userId: user.userId,
+            userSid: user.userSid,
+            logonType: "InteractiveToken",
+            runLevel: "LeastPrivilege",
+        }),
+        settings: Object.freeze({
+            hidden: true,
+            startWhenAvailable: true,
+            restartCount: 999,
+            restartIntervalMinutes: 1,
+            multipleInstances: "IgnoreNew",
+            executionTimeLimitSeconds: 0,
+            allowStartOnBatteries: true,
+            stopOnBatteryTransition: false,
+        }),
+    });
+}
+
+function buildLegacyRecoveryTaskSpec({
+    stateRoot,
+    runtime,
+    user,
+    intervalMs = 30_000,
+    platform = process.platform,
+} = {}) {
+    const interval = requireInterval(intervalMs);
+    const { taskIdentity, taskName } = recoveryTaskIdentity({
+        stateRoot,
+        user,
+        platform,
+    });
     const argumentsList = [
         runtime.daemonPath,
         "--state-root",
         stateRoot,
         "--interval-ms",
-        String(intervalMs),
+        String(interval),
         "--expected-node-sha256",
         runtime.nodeSha256,
         "--expected-daemon-sha256",
@@ -297,6 +454,23 @@ function samePath(left, right, platform) {
         === normalizePathForIdentity(right, platform);
 }
 
+function schedulerUserMatches(
+    observed,
+    observedSid,
+    expectedUserId,
+    expectedUserSid,
+) {
+    if (typeof observed !== "string") return false;
+    if (typeof observedSid === "string") {
+        return observedSid.toLowerCase() === expectedUserSid.toLowerCase();
+    }
+    return [
+        expectedUserId,
+        expectedUserSid,
+    ].map((value) => value.toLowerCase())
+        .includes(observed.toLowerCase());
+}
+
 export function taskActionMatches(observed, expected, {
     platform = process.platform,
 } = {}) {
@@ -315,19 +489,23 @@ export function taskActionMatches(observed, expected, {
             expected.action.workingDirectory,
             platform,
         )
-        && [
-            expected.principal.userId.toLowerCase(),
-            expected.principal.userSid.toLowerCase(),
-        ].includes(String(observed.principal?.userId ?? "").toLowerCase());
+        && schedulerUserMatches(
+            observed.principal?.userId,
+            observed.principal?.userSid,
+            expected.principal.userId,
+            expected.principal.userSid,
+        );
 }
 
 export function taskDefinitionMatches(observed, expected, options = {}) {
     return taskActionMatches(observed, expected, options)
         && observed.trigger?.type === expected.trigger.type
-        && [
-            expected.trigger.userId.toLowerCase(),
-            expected.principal.userSid.toLowerCase(),
-        ].includes(String(observed.trigger?.userId ?? "").toLowerCase())
+        && schedulerUserMatches(
+            observed.trigger?.userId,
+            observed.trigger?.userSid,
+            expected.trigger.userId,
+            expected.principal.userSid,
+        )
         && observed.principal?.logonType
             === expected.principal.logonType
         && observed.principal?.runLevel
@@ -342,7 +520,145 @@ export function taskDefinitionMatches(observed, expected, options = {}) {
         && observed.settings?.multipleInstances
             === expected.settings.multipleInstances
         && observed.settings?.executionTimeLimitSeconds
-            === expected.settings.executionTimeLimitSeconds;
+            === expected.settings.executionTimeLimitSeconds
+        && observed.settings?.allowStartOnBatteries
+            === expected.settings.allowStartOnBatteries
+        && observed.settings?.stopOnBatteryTransition
+            === expected.settings.stopOnBatteryTransition;
+}
+
+function reconstructPinnedRecoveryTaskSpec(observed, {
+    stateRoot,
+    runtime,
+    user,
+    intervalMs,
+    platform,
+}) {
+    const parsed = parseRecoveryLauncherAction(
+        observed?.action?.arguments,
+    );
+    const manifest = parsed.manifest;
+    const intervalIndex = manifest.arguments.indexOf("--interval-ms");
+    const manifestInterval = intervalIndex >= 0
+        ? Number(manifest.arguments[intervalIndex + 1])
+        : Number.NaN;
+    const resolvedInterval = intervalMs ?? manifestInterval;
+    const expectedArguments = [
+        "--state-root",
+        stateRoot,
+        "--interval-ms",
+        String(requireInterval(resolvedInterval)),
+        "--expected-node-sha256",
+        runtime.nodeSha256,
+        "--expected-daemon-sha256",
+        runtime.daemonSha256,
+    ];
+    const daemonRelative = path.relative(
+        manifest.root,
+        runtime.daemonPath,
+    ).split(path.sep).join("/");
+    const daemonRecord = manifest.files.find((record) =>
+        record.path === manifest.entry);
+    if (!samePath(manifest.root, runtime.runtimeRoot, platform)
+        || daemonRelative !== manifest.entry
+        || daemonRecord?.sha256 !== runtime.daemonSha256
+        || !samePath(manifest.node.path, runtime.nodePath, platform)
+        || manifest.node.sha256 !== runtime.nodeSha256
+        || JSON.stringify(manifest.arguments)
+            !== JSON.stringify(expectedArguments)
+        || !samePath(
+            manifest.launcherHost.path,
+            observed?.action?.execute,
+            platform,
+        )
+        || !samePath(
+            manifest.root,
+            observed?.action?.workingDirectory,
+            platform,
+        )) {
+        throw new Error(
+            "installed recovery launcher does not match the requested pinned runtime",
+        );
+    }
+    const { taskIdentity, taskName } = recoveryTaskIdentity({
+        stateRoot,
+        user,
+        platform,
+    });
+    const actionDocument = {
+        version: 2,
+        execute: normalizePathForIdentity(
+            manifest.launcherHost.path,
+            platform,
+        ),
+        arguments: observed.action.arguments,
+        workingDirectory: normalizePathForIdentity(
+            manifest.root,
+            platform,
+        ),
+        nodeSha256: manifest.node.sha256,
+        daemonSha256: daemonRecord.sha256,
+        launchManifestSha256: parsed.sha256,
+        launcherHostSha256: manifest.launcherHost.sha256,
+        launcherScriptSha256: parsed.launcherScriptSha256,
+    };
+    const actionFingerprint = `sha256:crucible-recovery-action-v2:${
+        sha256(canonicalize(actionDocument))
+    }`;
+    const spec = Object.freeze({
+        version: 2,
+        taskPath: TASK_PATH,
+        taskName,
+        taskIdentity,
+        actionFingerprint,
+        description:
+            `Crucible same-user recovery v2; identity=${taskIdentity}; action=${actionFingerprint}`,
+        user,
+        stateRoot,
+        runtime: Object.freeze({
+            ...runtime,
+            nodeSize: manifest.node.size,
+            daemonSize: daemonRecord.size,
+            launcherPath: manifest.launcherHost.path,
+            launcherSha256: manifest.launcherHost.sha256,
+            launcherSize: manifest.launcherHost.size,
+            launchEnvironment: manifest.environment,
+            launchManifest: manifest,
+            launchManifestSha256: parsed.sha256,
+            launcherScriptSha256: parsed.launcherScriptSha256,
+        }),
+        action: Object.freeze({
+            execute: manifest.launcherHost.path,
+            arguments: observed.action.arguments,
+            workingDirectory: manifest.root,
+        }),
+        trigger: Object.freeze({
+            type: "logon",
+            userId: user.userId,
+        }),
+        principal: Object.freeze({
+            userId: user.userId,
+            userSid: user.userSid,
+            logonType: "InteractiveToken",
+            runLevel: "LeastPrivilege",
+        }),
+        settings: Object.freeze({
+            hidden: true,
+            startWhenAvailable: true,
+            restartCount: 999,
+            restartIntervalMinutes: 1,
+            multipleInstances: "IgnoreNew",
+            executionTimeLimitSeconds: 0,
+            allowStartOnBatteries: true,
+            stopOnBatteryTransition: false,
+        }),
+    });
+    if (!taskActionMatches(observed, spec, { platform })) {
+        throw new Error(
+            "installed recovery launcher action is not canonical",
+        );
+    }
+    return spec;
 }
 
 async function preparedTask(
@@ -360,10 +676,13 @@ async function preparedTask(
     const stateRoot = verifyRuntimeBytes
         ? validateStateRoot(options.stateRoot, env)
         : validateStateRootIdentity(options.stateRoot, env);
+    const user = requireUserIdentity(await adapter.currentUser());
+    const platform = dependencies.platform ?? process.platform;
     const runtime = verifyRuntimeBytes
         ? validateRuntimeFiles({
             nodePath: options.nodePath,
             daemonPath: options.daemonPath ?? DEFAULT_DAEMON_PATH,
+            launcherPath: options.launcherPath ?? null,
             expectedNodeSha256: options.expectedNodeSha256 ?? null,
             expectedDaemonSha256:
                 options.expectedDaemonSha256 ?? null,
@@ -372,19 +691,71 @@ async function preparedTask(
         : expectedRuntimeIdentity({
             nodePath: options.nodePath,
             daemonPath: options.daemonPath ?? DEFAULT_DAEMON_PATH,
+            launcherPath: options.launcherPath ?? null,
             expectedNodeSha256: options.expectedNodeSha256,
             expectedDaemonSha256: options.expectedDaemonSha256,
             env,
         });
-    const user = requireUserIdentity(await adapter.currentUser());
-    const spec = buildRecoveryTaskSpec({
+    if (verifyRuntimeBytes) {
+        const spec = buildRecoveryTaskSpec({
+            stateRoot,
+            runtime,
+            user,
+            intervalMs: options.intervalMs,
+            platform,
+        });
+        const observed = await adapter.inspect(spec);
+        return { adapter, observed, spec };
+    }
+    const locatorIdentity = recoveryTaskIdentity({
         stateRoot,
-        runtime,
         user,
-        intervalMs: options.intervalMs,
-        platform: dependencies.platform ?? process.platform,
+        platform,
     });
-    const observed = await adapter.inspect(spec);
+    const locator = {
+        taskPath: TASK_PATH,
+        taskName: locatorIdentity.taskName,
+    };
+    const observed = await adapter.inspect(locator);
+    if (observed?.exists !== true) {
+        return {
+            adapter,
+            observed,
+            spec: Object.freeze({
+                ...locator,
+                taskIdentity: locatorIdentity.taskIdentity,
+                actionFingerprint: null,
+                stateRoot,
+                runtime,
+                user,
+            }),
+        };
+    }
+    let spec;
+    try {
+        spec = reconstructPinnedRecoveryTaskSpec(observed, {
+            stateRoot,
+            runtime,
+            user,
+            intervalMs: options.intervalMs,
+            platform,
+        });
+    } catch (launcherError) {
+        const legacy = buildLegacyRecoveryTaskSpec({
+            stateRoot,
+            runtime,
+            user,
+            intervalMs: options.intervalMs,
+            platform,
+        });
+        if (!taskActionMatches(observed, legacy, { platform })) {
+            throw new Error(
+                "refusing to remove a task whose action does not exactly match",
+                { cause: launcherError },
+            );
+        }
+        spec = legacy;
+    }
     return { adapter, observed, spec };
 }
 
@@ -516,6 +887,40 @@ export function createPowerShellTaskSchedulerAdapter(options = {}) {
         options.scriptsDirectory ?? HERE,
         name,
     );
+    const inspect = (spec) => invokePowerShell(
+        script("configure-recovery-task.ps1"),
+        [
+            "-Mode",
+            "Inspect",
+            "-TaskPath",
+            spec.taskPath,
+            "-TaskName",
+            spec.taskName,
+        ],
+        options,
+    );
+    const control = (spec, mode) => {
+        const observed = inspect(spec);
+        if (!taskDefinitionMatches(observed, spec, {
+            platform: options.platform ?? process.platform,
+        })) {
+            throw new Error(
+                "refusing to control a recovery task whose definition does not exactly match",
+            );
+        }
+        return invokePowerShell(
+            script("control-recovery-task.ps1"),
+            [
+                "-Mode",
+                mode,
+                "-TaskPath",
+                spec.taskPath,
+                "-TaskName",
+                spec.taskName,
+            ],
+            options,
+        );
+    };
     return Object.freeze({
         currentUser() {
             return invokePowerShell(
@@ -525,18 +930,7 @@ export function createPowerShellTaskSchedulerAdapter(options = {}) {
             );
         },
         inspect(spec) {
-            return invokePowerShell(
-                script("configure-recovery-task.ps1"),
-                [
-                    "-Mode",
-                    "Inspect",
-                    "-TaskPath",
-                    spec.taskPath,
-                    "-TaskName",
-                    spec.taskName,
-                ],
-                options,
-            );
+            return inspect(spec);
         },
         install(spec) {
             return invokePowerShell(
@@ -550,6 +944,8 @@ export function createPowerShellTaskSchedulerAdapter(options = {}) {
                     "-WorkingDirectory", spec.action.workingDirectory,
                     "-UserId", spec.user.userId,
                     "-UserSid", spec.user.userSid,
+                    "-LauncherSha256", spec.runtime.launcherSha256,
+                    "-NodePath", spec.runtime.nodePath,
                     "-NodeSha256", spec.runtime.nodeSha256,
                     "-DaemonSha256", spec.runtime.daemonSha256,
                     "-DaemonPath", spec.runtime.daemonPath,
@@ -569,6 +965,26 @@ export function createPowerShellTaskSchedulerAdapter(options = {}) {
                     "-WorkingDirectory", spec.action.workingDirectory,
                     "-UserId", spec.user.userId,
                     "-UserSid", spec.user.userSid,
+                ],
+                options,
+            );
+        },
+        start(spec) {
+            return control(spec, "Start");
+        },
+        stop(spec) {
+            return control(spec, "Stop");
+        },
+        runtime(spec) {
+            return invokePowerShell(
+                script("control-recovery-task.ps1"),
+                [
+                    "-Mode",
+                    "Runtime",
+                    "-TaskPath",
+                    spec.taskPath,
+                    "-TaskName",
+                    spec.taskName,
                 ],
                 options,
             );

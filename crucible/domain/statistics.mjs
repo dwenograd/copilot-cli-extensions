@@ -29,6 +29,8 @@ const CLAIM_STATE = Object.freeze(
 const THRESHOLD_OPERATORS = new Set(["<", "<=", ">=", ">"]);
 const DIRECTIONS = new Set(["increase", "decrease"]);
 const SAFE_IDENTIFIER = /^(?!.*\.\.)[A-Za-z0-9][A-Za-z0-9._@-]{0,127}$/u;
+// Confirmation reserves confirmation, challenge, and guard lanes per member.
+export const SEARCH_ALPHA_CONFIRMATION_LANES_PER_MEMBER = 3;
 
 export class StatisticsError extends Error {
     constructor(code, message, details = null) {
@@ -227,6 +229,58 @@ export function statisticalScheduleWeight(index) {
         CONTRACT_LIMITS.maxStatisticalEvaluations + 1,
     );
     return cleanNumber((1 / scheduleIndex) / (scheduleIndex + 1));
+}
+
+export function searchAlphaSubjectOrdinal({
+    searchSlots,
+    maxConfirmations,
+    globalSlot,
+    replacementOrdinal,
+}) {
+    const normalizedSearchSlots = requirePositiveSafeInteger(
+        searchSlots,
+        "searchSlots",
+        CONTRACT_LIMITS.maxStatisticalEvaluations,
+    );
+    const normalizedMaxConfirmations = requirePositiveSafeInteger(
+        maxConfirmations,
+        "maxConfirmations",
+        CONTRACT_LIMITS.maxConfirmations,
+    );
+    const normalizedGlobalSlot = requireNonNegativeSafeInteger(
+        globalSlot,
+        "globalSlot",
+        normalizedSearchSlots - 1,
+    );
+    const normalizedReplacementOrdinal = requireNonNegativeSafeInteger(
+        replacementOrdinal,
+        "replacementOrdinal",
+    );
+    const ordinal = normalizedReplacementOrdinal === 0
+        ? BigInt(normalizedGlobalSlot)
+        : BigInt(normalizedSearchSlots)
+            + BigInt(normalizedMaxConfirmations)
+                * BigInt(SEARCH_ALPHA_CONFIRMATION_LANES_PER_MEMBER)
+            + BigInt(normalizedReplacementOrdinal - 1)
+                * BigInt(normalizedSearchSlots)
+            + BigInt(normalizedGlobalSlot);
+    const maximumOrdinal = BigInt(Math.floor(
+        (CONTRACT_LIMITS.maxStatisticalEvaluations - 2) / 2,
+    ));
+    if (ordinal > maximumOrdinal) {
+        fail(
+            STATISTICAL_ERROR_CODES.INVALID_ARGUMENT,
+            "search allocation exhausts the preregistered statistical subject lanes",
+            {
+                searchSlots: normalizedSearchSlots,
+                maxConfirmations: normalizedMaxConfirmations,
+                globalSlot: normalizedGlobalSlot,
+                replacementOrdinal: normalizedReplacementOrdinal,
+                maximumOrdinal: Number(maximumOrdinal),
+            },
+        );
+    }
+    return Number(ordinal);
 }
 
 function inspectStatisticalPolicy(statisticalPolicy) {

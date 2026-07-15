@@ -5,11 +5,13 @@ import { fileURLToPath } from "node:url";
 
 import { afterEach, describe, expect, it } from "vitest";
 
+import { ERROR_CODES } from "../persistence/index.mjs";
 import {
     RESOURCE_BROKER_CONFIG_VERSION,
     openResourceBroker,
     runRecoveryDaemon,
 } from "../runtime/index.mjs";
+import { removeTrackedRoots } from "./test-cleanup.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const FIXTURE = path.join(
@@ -19,6 +21,7 @@ const FIXTURE = path.join(
 );
 const roots = [];
 const children = [];
+const brokers = [];
 
 function waitForLine(child) {
     return new Promise((resolve, reject) => {
@@ -38,18 +41,20 @@ function waitForLine(child) {
     });
 }
 
-afterEach(() => {
+afterEach(async () => {
     for (const child of children.splice(0)) {
         if (child.exitCode === null) child.kill("SIGKILL");
     }
-    for (const root of roots.splice(0)) {
-        fs.rmSync(root, {
-            recursive: true,
-            force: true,
-            maxRetries: 20,
-            retryDelay: 50,
-        });
+    for (const broker of brokers.splice(0)) {
+        try {
+            broker.close();
+        } catch {
+            // A successful test may already have closed the broker.
+        }
     }
+    await removeTrackedRoots(roots, {
+        label: "recovery daemon release test root",
+    });
 });
 
 describe("recovery daemon crash fencing", () => {
@@ -77,6 +82,7 @@ describe("recovery daemon crash fencing", () => {
             },
         };
         const broker = openResourceBroker({ stateRoot, config });
+        brokers.push(broker);
         broker.registerInvestigation({
             investigationId: "kill-recovery",
             limits: {
@@ -157,18 +163,17 @@ describe("recovery daemon crash fencing", () => {
         }]);
         expect(broker.getLease(inFlight.lease.leaseId).status)
             .toBe("reclaimed");
-        expect(broker.acquire({
+        expect(() => broker.acquire({
             investigationId: "kill-recovery",
             ownerId: "runner-g2",
             supervisorGeneration: 2,
             runnerIncarnation: "runner-g2",
-            attemptId: "attempt-mid-effect-retry",
+            attemptId: "attempt-mid-effect",
             logicalEffectId: "logical-effect-mid-effect",
             reservation: { sdkSessions: 1 },
-        })).toMatchObject({
-            status: "already_finalized",
-            deduplicated: true,
-        });
+        })).toThrow(expect.objectContaining({
+            code: ERROR_CODES.ATTEMPT_IDENTITY_MISMATCH,
+        }));
         broker.close();
     });
 });

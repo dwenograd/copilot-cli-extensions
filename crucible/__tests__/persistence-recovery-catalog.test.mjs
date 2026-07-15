@@ -9,6 +9,7 @@ import {
     RESOURCE_BROKER_CONFIG_VERSION,
     openResourceBroker,
     openResourceBrokerFromStateRoot,
+    openResourceBrokerReadOnlyFromStateRoot,
     readResourceBrokerConfiguration,
 } from "../runtime/index.mjs";
 import { canonicalize } from "../persistence/canonical.mjs";
@@ -17,6 +18,37 @@ import { DatabaseSync } from "../persistence/sqlite.mjs";
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const roots = [];
 const brokers = [];
+
+function cleanupRelativePath(investigationId, archiveDigest) {
+    const digest = createHash("sha256")
+        .update("crucible-delete-cleanup-v2\0")
+        .update(investigationId)
+        .update("\0")
+        .update(archiveDigest)
+        .digest("hex");
+    return `.retention/archives/cleanup-${digest}`;
+}
+
+function markerDigest({
+    investigationId,
+    archiveRelativePath,
+    cleanupRelativePath: cleanupPath,
+    archiveDigest,
+    nonce,
+}) {
+    const document = {
+        type: "crucible-delete-cleanup-marker",
+        version: 1,
+        investigationId,
+        archiveRelativePath,
+        cleanupRelativePath: cleanupPath,
+        archiveDigest,
+        nonce,
+    };
+    return `sha256:${createHash("sha256")
+        .update(`${canonicalize(document)}\n`)
+        .digest("hex")}`;
+}
 
 function makeRoot(label) {
     const root = fs.mkdtempSync(
@@ -75,6 +107,77 @@ function register(broker, investigationId = "recovery-investigation") {
         supervisorNonce: `supervisor-nonce-${investigationId}`,
         runnerIncarnation: `runner-incarnation-${investigationId}`,
     });
+}
+
+function archiveCatalogInvestigation(
+    broker,
+    investigationId,
+    {
+        digest = `sha256:${"a".repeat(64)}`,
+        archiveRelativePath =
+            `.retention/archives/${investigationId}`,
+    } = {},
+) {
+    broker.beginLifecycleOperation({
+        investigationId,
+        operationKind: "archive",
+        operationToken: `archive-${investigationId}`,
+        ownerProcessId: 100,
+        ownerProcessStartId: `archive-owner-${investigationId}`,
+        archiveRelativePath,
+    });
+    broker.commitArchive({
+        investigationId,
+        operationToken: `archive-${investigationId}`,
+        archiveRelativePath,
+        archiveDigest: digest,
+        trustLevel: "authenticated",
+        domainVersion: 4,
+        terminalAvailable: false,
+        sizeBytes: 100,
+        domainHead: {
+            seq: 1,
+            eventHash: "b".repeat(64),
+        },
+    });
+    return { digest, archiveRelativePath };
+}
+
+function deleteOptions(
+    investigationId,
+    {
+        digest,
+        archiveRelativePath,
+        operationToken = `delete-${investigationId}`,
+        deletedAtMs = Date.now(),
+    },
+) {
+    const cleanupPath = cleanupRelativePath(
+        investigationId,
+        digest,
+    );
+    const nonce = "f".repeat(64);
+    return {
+        investigationId,
+        operationToken,
+        expectedArchiveDigest: digest,
+        cleanupRelativePath: cleanupPath,
+        cleanupMarkerNonce: nonce,
+        cleanupMarkerDigest: markerDigest({
+            investigationId,
+            archiveRelativePath,
+            cleanupRelativePath: cleanupPath,
+            archiveDigest: digest,
+            nonce,
+        }),
+        tombstoneRelativePath:
+            `.retention/tombstones/${investigationId}.json`,
+        tombstoneDigest: `sha256:${"d".repeat(64)}`,
+        signingKeyFingerprint: "test-signing-key",
+        signature: "test-signature",
+        tombstoneSizeBytes: 64,
+        deletedAtMs,
+    };
 }
 
 afterEach(() => {
@@ -243,6 +346,19 @@ describe("recovery catalog authority", () => {
         });
         register(broker, "lifecycle-investigation");
         const digest = `sha256:${"a".repeat(64)}`;
+        const cleanupPath = cleanupRelativePath(
+            "lifecycle-investigation",
+            digest,
+        );
+        const markerNonce = "f".repeat(64);
+        const marker = markerDigest({
+            investigationId: "lifecycle-investigation",
+            archiveRelativePath:
+                ".retention/archives/lifecycle-investigation",
+            cleanupRelativePath: cleanupPath,
+            archiveDigest: digest,
+            nonce: markerNonce,
+        });
         const head = {
             seq: 2,
             eventHash: "b".repeat(64),
@@ -333,10 +449,13 @@ describe("recovery catalog authority", () => {
             expectedArchiveDigest: digest,
         });
         now += 1;
-        const deleted = broker.commitDelete({
+        const deleteOptions = {
             investigationId: "lifecycle-investigation",
             operationToken: "delete-token",
             expectedArchiveDigest: digest,
+            cleanupRelativePath: cleanupPath,
+            cleanupMarkerNonce: markerNonce,
+            cleanupMarkerDigest: marker,
             tombstoneRelativePath:
                 ".retention/tombstones/lifecycle-investigation.json",
             tombstoneDigest: `sha256:${"d".repeat(64)}`,
@@ -347,6 +466,27 @@ describe("recovery catalog authority", () => {
             signature: "signed-tombstone",
             tombstoneSizeBytes: 512,
             deletedAtMs: now,
+        };
+        const pending = broker.commitDelete(deleteOptions);
+        expect(pending.investigation.deleteCleanup).toMatchObject({
+            cleanupState: "reserved",
+            cleanupRelativePath: cleanupPath,
+            cleanupMarkerDigest: marker,
+        });
+        for (const nextCleanupState of [
+            "marked",
+            "moved",
+            "durability_pending",
+            "durable",
+        ]) {
+            broker.commitDelete({
+                ...deleteOptions,
+                nextCleanupState,
+            });
+        }
+        const deleted = broker.commitDelete({
+            ...deleteOptions,
+            archiveRemoved: true,
         });
         expect(deleted.investigation).toMatchObject({
             investigationId: "lifecycle-investigation",
@@ -368,6 +508,65 @@ describe("recovery catalog authority", () => {
         )).toThrow(/cannot be registered again/u);
     });
 
+    it("reserves cleanup paths exclusively across archive operations and cleanup authority", () => {
+        const broker = openBroker({
+            stateRoot: makeRoot("cross-table-paths"),
+            config: config(),
+        });
+        for (const investigationId of [
+            "cleanup-owner",
+            "archive-competitor",
+            "later-competitor",
+        ]) {
+            register(broker, investigationId);
+        }
+        const archived = archiveCatalogInvestigation(
+            broker,
+            "cleanup-owner",
+            {
+                archiveRelativePath:
+                    ".retention/archives/custom-authenticated-owner",
+            },
+        );
+        const options = deleteOptions("cleanup-owner", archived);
+        broker.beginLifecycleOperation({
+            investigationId: "archive-competitor",
+            operationKind: "archive",
+            operationToken: "competing-cleanup-reservation",
+            ownerProcessId: 200,
+            ownerProcessStartId: "competing-owner",
+            archiveRelativePath: options.cleanupRelativePath,
+        });
+        broker.beginLifecycleOperation({
+            investigationId: "cleanup-owner",
+            operationKind: "delete",
+            operationToken: options.operationToken,
+            ownerProcessId: 201,
+            ownerProcessStartId: "delete-owner",
+            expectedArchiveDigest: archived.digest,
+        });
+        expect(() => broker.commitDelete(options))
+            .toThrow(/retention path is already owned/u);
+        broker.abortLifecycleOperation({
+            investigationId: "archive-competitor",
+            operationToken: "competing-cleanup-reservation",
+        });
+        expect(broker.commitDelete(options).investigation)
+            .toMatchObject({
+                deleteCleanup: {
+                    cleanupRelativePath: options.cleanupRelativePath,
+                },
+            });
+        expect(() => broker.beginLifecycleOperation({
+            investigationId: "later-competitor",
+            operationKind: "archive",
+            operationToken: "later-competing-reservation",
+            ownerProcessId: 202,
+            ownerProcessStartId: "later-owner",
+            archiveRelativePath: options.cleanupRelativePath,
+        })).toThrow(/retention path is already owned/u);
+    });
+
     it("paginates lifecycle catalog identities in deterministic order", () => {
         const broker = openBroker({
             stateRoot: makeRoot("pagination"),
@@ -384,6 +583,46 @@ describe("recovery catalog authority", () => {
             limit: 2,
         }).map((entry) => entry.investigationId))
             .toEqual(["catalog-c"]);
+    });
+
+    it("materializes list entries from one deferred snapshot while generation advances", () => {
+        const root = makeRoot("snapshot-generation");
+        const writer = openBroker({
+            stateRoot: root,
+            config: config(),
+        });
+        register(writer, "snapshot-investigation");
+        const reader = openResourceBrokerReadOnlyFromStateRoot({
+            stateRoot: root,
+        });
+        brokers.push(reader);
+        const listed = reader.listInvestigations({
+            onSnapshotEstablished() {
+                writer.beginLifecycleOperation({
+                    investigationId: "snapshot-investigation",
+                    operationKind: "archive",
+                    operationToken: "snapshot-archive",
+                    ownerProcessId: 300,
+                    ownerProcessStartId: "snapshot-owner",
+                    archiveRelativePath:
+                        ".retention/archives/snapshot-investigation",
+                });
+            },
+        });
+        expect(listed).toEqual([
+            expect.objectContaining({
+                investigationId: "snapshot-investigation",
+                lifecycleOperation: null,
+            }),
+        ]);
+        expect(listed.catalogGeneration).toBe(1);
+        expect(writer.getInvestigation("snapshot-investigation"))
+            .toMatchObject({
+                catalogGeneration: 2,
+                lifecycleOperation: {
+                    operationKind: "archive",
+                },
+            });
     });
 
     it("reopens the broker from its verified on-disk singleton config", () => {
@@ -414,6 +653,7 @@ describe("recovery catalog authority", () => {
         try {
             db.exec(`
                 PRAGMA foreign_keys = OFF;
+                DROP TABLE investigation_delete_cleanup;
                 DROP TABLE investigation_tombstones;
                 DROP TABLE investigation_archives;
                 DROP TABLE lifecycle_operations;
@@ -460,7 +700,7 @@ describe("recovery catalog authority", () => {
 
         const migrated = openResourceBrokerFromStateRoot({ stateRoot: root });
         brokers.push(migrated);
-        expect(migrated.verifyIntegrity()).toMatchObject({ version: 4 });
+        expect(migrated.verifyIntegrity()).toMatchObject({ version: 6 });
         expect(migrated.getInvestigation("recovery-investigation"))
             .toMatchObject({ lifecycleState: "active" });
     });
@@ -476,6 +716,7 @@ describe("recovery catalog authority", () => {
         try {
             db.exec(`
                 PRAGMA foreign_keys = OFF;
+                DROP TABLE investigation_delete_cleanup;
                 DROP TABLE investigation_tombstones;
                 DROP TABLE investigation_archives;
                 DROP TABLE lifecycle_operations;
@@ -518,8 +759,258 @@ describe("recovery catalog authority", () => {
 
         const migrated = openResourceBrokerFromStateRoot({ stateRoot: root });
         brokers.push(migrated);
-        expect(migrated.verifyIntegrity()).toMatchObject({ version: 4 });
+        expect(migrated.verifyIntegrity()).toMatchObject({ version: 6 });
         expect(migrated.getInvestigation("recovery-investigation"))
             .toMatchObject({ lifecycleState: "active" });
+    });
+
+    it("migrates v4 tombstones without inventing an archive destination", () => {
+        const root = makeRoot("migrate-v4-custom");
+        const broker = openBroker({ stateRoot: root, config: config() });
+        const investigationId = "legacy-custom";
+        register(broker, investigationId);
+        const archived = archiveCatalogInvestigation(
+            broker,
+            investigationId,
+            {
+                archiveRelativePath:
+                    ".retention/archives/custom-v4-destination",
+            },
+        );
+        const options = deleteOptions(investigationId, archived);
+        broker.beginLifecycleOperation({
+            investigationId,
+            operationKind: "delete",
+            operationToken: options.operationToken,
+            ownerProcessId: 400,
+            ownerProcessStartId: "legacy-delete-owner",
+            expectedArchiveDigest: archived.digest,
+        });
+        broker.commitDelete(options);
+        for (const nextCleanupState of [
+            "marked",
+            "moved",
+            "durability_pending",
+            "durable",
+        ]) {
+            broker.commitDelete({
+                ...options,
+                nextCleanupState,
+            });
+        }
+        broker.commitDelete({
+            ...options,
+            archiveRemoved: true,
+        });
+        broker.close();
+
+        const file = path.join(root, "resource-catalog.sqlite");
+        const db = new DatabaseSync(file);
+        try {
+            db.exec(`
+                PRAGMA foreign_keys = OFF;
+                DROP TABLE investigation_delete_cleanup;
+            `);
+            const manifest = db.prepare(`
+                SELECT type, name, tbl_name, sql
+                FROM sqlite_schema
+                WHERE name NOT LIKE 'sqlite_%'
+                  AND sql IS NOT NULL
+                ORDER BY type, name
+            `).all().map((row) => ({
+                type: row.type,
+                name: row.name,
+                table: row.tbl_name,
+                sql: String(row.sql).replace(/\s+/gu, " ").trim(),
+            }));
+            const digest = createHash("sha256")
+                .update(canonicalize({ version: 4, manifest }))
+                .digest("hex");
+            db.prepare(`
+                UPDATE schema_meta
+                SET value = '4'
+                WHERE key = 'schema_version'
+            `).run();
+            db.prepare(`
+                UPDATE schema_meta
+                SET value = ?
+                WHERE key = 'schema_fingerprint'
+            `).run(
+                `sha256:crucible-resource-catalog-schema-v4:${digest}`,
+            );
+            db.exec("PRAGMA user_version = 4;");
+        } finally {
+            db.close();
+        }
+        expect(() => openResourceBrokerReadOnlyFromStateRoot({
+            stateRoot: root,
+        })).toThrow(/schema version mismatch/u);
+        const migrated = openResourceBrokerFromStateRoot({
+            stateRoot: root,
+        });
+        brokers.push(migrated);
+        expect(migrated.getInvestigation(investigationId))
+            .toMatchObject({
+                lifecycleState: "tombstoned",
+                deleteCleanup: {
+                    authorityKind: "legacy_tombstone",
+                    sourceAuthority: "legacy_discovery",
+                    archiveRelativePath: null,
+                    archiveAbsent: false,
+                    archiveDigest: archived.digest,
+                },
+            });
+    });
+
+    it("migrates v5 partial cleanup as exact preverified authority and rejects path injection", () => {
+        const root = makeRoot("migrate-v5-partial");
+        const broker = openBroker({ stateRoot: root, config: config() });
+        const investigationId = "v5-partial";
+        register(broker, investigationId);
+        const archived = archiveCatalogInvestigation(
+            broker,
+            investigationId,
+            {
+                archiveRelativePath:
+                    ".retention/archives/custom-v5-partial",
+            },
+        );
+        const options = deleteOptions(investigationId, archived);
+        broker.beginLifecycleOperation({
+            investigationId,
+            operationKind: "delete",
+            operationToken: options.operationToken,
+            ownerProcessId: 500,
+            ownerProcessStartId: "v5-delete-owner",
+            expectedArchiveDigest: archived.digest,
+        });
+        broker.commitDelete(options);
+        broker.close();
+
+        const file = path.join(root, "resource-catalog.sqlite");
+        const db = new DatabaseSync(file);
+        try {
+            const pending = db.prepare(`
+                SELECT *
+                FROM investigation_delete_cleanup
+                WHERE investigation_id = ?
+            `).get(investigationId);
+            db.exec(`
+                PRAGMA foreign_keys = OFF;
+                DROP INDEX ix_investigation_delete_cleanup_state;
+                DROP TABLE investigation_delete_cleanup;
+                CREATE TABLE investigation_delete_cleanup (
+                    investigation_id TEXT PRIMARY KEY
+                        REFERENCES investigations(investigation_id),
+                    archive_relpath TEXT NOT NULL UNIQUE,
+                    archive_digest TEXT NOT NULL UNIQUE,
+                    tombstone_relpath TEXT NOT NULL UNIQUE,
+                    tombstone_digest TEXT NOT NULL UNIQUE,
+                    signing_key_fingerprint TEXT NOT NULL,
+                    signature TEXT NOT NULL,
+                    tombstone_size_bytes INTEGER NOT NULL
+                        CHECK (tombstone_size_bytes > 0),
+                    deleted_at_ms INTEGER NOT NULL
+                        CHECK (deleted_at_ms >= 0),
+                    prepared_at_ms INTEGER NOT NULL
+                        CHECK (prepared_at_ms >= 0)
+                );
+                CREATE INDEX ix_investigation_delete_cleanup_prepared
+                    ON investigation_delete_cleanup(prepared_at_ms, investigation_id);
+            `);
+            db.prepare(`
+                INSERT INTO investigation_delete_cleanup(
+                    investigation_id, archive_relpath,
+                    archive_digest, tombstone_relpath,
+                    tombstone_digest, signing_key_fingerprint,
+                    signature, tombstone_size_bytes,
+                    deleted_at_ms, prepared_at_ms)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            `).run(
+                investigationId,
+                pending.archive_relpath,
+                pending.archive_digest,
+                pending.tombstone_relpath,
+                pending.tombstone_digest,
+                pending.signing_key_fingerprint,
+                pending.signature,
+                pending.tombstone_size_bytes,
+                pending.deleted_at_ms,
+                pending.prepared_at_ms,
+            );
+            const manifest = db.prepare(`
+                SELECT type, name, tbl_name, sql
+                FROM sqlite_schema
+                WHERE name NOT LIKE 'sqlite_%'
+                  AND sql IS NOT NULL
+                ORDER BY type, name
+            `).all().map((row) => ({
+                type: row.type,
+                name: row.name,
+                table: row.tbl_name,
+                sql: String(row.sql).replace(/\s+/gu, " ").trim(),
+            }));
+            const digest = createHash("sha256")
+                .update(canonicalize({ version: 5, manifest }))
+                .digest("hex");
+            db.prepare(`
+                UPDATE schema_meta
+                SET value = '5'
+                WHERE key = 'schema_version'
+            `).run();
+            db.prepare(`
+                UPDATE schema_meta
+                SET value = ?
+                WHERE key = 'schema_fingerprint'
+            `).run(
+                `sha256:crucible-resource-catalog-schema-v5:${digest}`,
+            );
+            db.exec("PRAGMA user_version = 5;");
+        } finally {
+            db.close();
+        }
+        expect(() => openResourceBrokerReadOnlyFromStateRoot({
+            stateRoot: root,
+        })).toThrow(/schema version mismatch/u);
+        const tampered = new DatabaseSync(file);
+        try {
+            tampered.prepare(`
+                UPDATE investigation_delete_cleanup
+                SET archive_relpath =
+                    '.retention/archives/attacker-injected'
+                WHERE investigation_id = ?
+            `).run(investigationId);
+        } finally {
+            tampered.close();
+        }
+        expect(() => openResourceBrokerFromStateRoot({
+            stateRoot: root,
+        })).toThrow(/lacks exact archived authority/u);
+        const restored = new DatabaseSync(file);
+        try {
+            expect(restored.prepare("PRAGMA user_version;").get()
+                .user_version).toBe(5);
+            restored.prepare(`
+                UPDATE investigation_delete_cleanup
+                SET archive_relpath = ?
+                WHERE investigation_id = ?
+            `).run(archived.archiveRelativePath, investigationId);
+        } finally {
+            restored.close();
+        }
+        const migrated = openResourceBrokerFromStateRoot({
+            stateRoot: root,
+        });
+        brokers.push(migrated);
+        expect(migrated.getInvestigation(investigationId))
+            .toMatchObject({
+                deleteCleanup: {
+                    sourceAuthority: "legacy_preverified",
+                    cleanupState: "reserved",
+                    archiveRelativePath:
+                        archived.archiveRelativePath,
+                    archiveDigest: archived.digest,
+                },
+            });
     });
 });

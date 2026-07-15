@@ -7,6 +7,7 @@ import {
 } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
+import { Worker } from "node:worker_threads";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -44,8 +45,10 @@ import {
     READ_PARENT_ARTIFACT_TOOL_NAME,
     RUNTIME_ERROR_CODES,
     SUBMIT_CANDIDATE_TOOL_NAME,
+    DEFAULT_RESOURCE_BROKER_CONFIG,
     createDomainRepositoryAdapter,
     deriveRunnerExecutionLimits,
+    deriveRuntimeResourceAdmission,
     requestStop,
     runAutonomousInvestigation,
     validateCandidateSubmission,
@@ -66,6 +69,13 @@ import {
     createSignedInvestigationAuthority,
 } from "./experiment-authority-fixture.mjs";
 import { removeTreeRobust } from "./test-cleanup.mjs";
+import {
+    cleanupImpossibilityRunnerFixture,
+    cloneImpossibilityRunnerFixture,
+    replayImpossibilityRunnerFixture,
+    runImpossibilityRunnerFixture,
+    setupImpossibilityRunnerFixture,
+} from "./impossibility-runner-fixture.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const roots = [];
@@ -360,6 +370,7 @@ function makeContract({
         : 0,
     minBlocks = 1,
     maxBlocks = 1,
+    alpha = 0.05,
 } = {}) {
     const resolvedTopology = hypothesisTopology
         ?? (boundedCandidateIds === undefined
@@ -412,10 +423,12 @@ function makeContract({
         manifest: enumerandManifest ?? null,
         minBlocks,
         maxBlocks,
+        alpha,
         control: enumerandManifest === undefined
             ? { kind: "snapshot", identity: badSnapshot }
             : null,
     });
+    input.statisticalPolicy.investigationAlpha = alpha;
     input.observableRegistry = [{
         key: "score",
         kind: "numeric",
@@ -695,7 +708,7 @@ function setupInvestigation(label, contractOptions = {}, {
                     store,
                     root,
                     "certified-enumerand",
-                    20,
+                    contractOptions.certifiedEnumerandScore ?? 20,
                 ),
             }],
             control: {
@@ -987,6 +1000,16 @@ $output = [ordered]@{
         maxStdoutBytes: 1024 * 1024,
         maxStderrBytes: 256 * 1024,
         executesCandidateCode: true,
+        validationCases: {
+            "known-good": {
+                snapshotHash: goodSnapshot,
+                expectation: "accept",
+            },
+            "known-bad": {
+                snapshotHash: badSnapshot,
+                expectation: "reject",
+            },
+        },
     };
     fs.writeFileSync(allowlistPath, JSON.stringify(allowlistDocument, null, 2));
     let allowlist = loadHarnessAllowlist(allowlistPath);
@@ -1017,7 +1040,21 @@ $output = [ordered]@{
     const verifierVerification = verifyHarnessPreflight(
         allowlist,
         "verifier-harness",
-        { parserVersion: VERIFIER_PARSER_VERSION },
+        {
+            validationCases: [
+                {
+                    id: "known-good",
+                    expectation: "accept",
+                    artifactHash: goodSnapshot,
+                },
+                {
+                    id: "known-bad",
+                    expectation: "reject",
+                    artifactHash: badSnapshot,
+                },
+            ],
+            parserVersion: VERIFIER_PARSER_VERSION,
+        },
     );
     const verifierIdentity = buildFrozenHarnessIdentity(
         verifierVerification,
@@ -1165,8 +1202,80 @@ function runnerDependencies(workerPool, extra = {}) {
     return {
         workerPool,
         idFactory: deterministicIds(),
+        runtimeIdentityVerifier: async () => ({}),
         ...extra,
     };
+}
+
+function enableRunnerResourceBroker(setup, label) {
+    const stateRoot = fs.mkdtempSync(path.join(
+        path.resolve(HERE, "..", ".."),
+        ".rb-",
+    ));
+    roots.push(stateRoot);
+    const investigationRoot = path.join(
+        stateRoot,
+        setup.config.investigationId,
+    );
+    const stateDir = path.join(investigationRoot, "state");
+    const artifactRoot = path.join(investigationRoot, "artifacts");
+    fs.mkdirSync(investigationRoot, { recursive: true });
+    fs.renameSync(setup.stateDir, stateDir);
+    fs.renameSync(setup.artifactRoot, artifactRoot);
+    setup.stateDir = stateDir;
+    setup.artifactRoot = artifactRoot;
+    setup.config = {
+        ...setup.config,
+        stateDir,
+        artifactRoot,
+    };
+    const brokerConfig = {
+        ...structuredClone(DEFAULT_RESOURCE_BROKER_CONFIG),
+        capacities: {
+            ...structuredClone(DEFAULT_RESOURCE_BROKER_CONFIG.capacities),
+            sdkSessions: 1,
+        },
+    };
+    const admission = deriveRuntimeResourceAdmission({
+        executionLimits: deriveRunnerExecutionLimits(setup.contract),
+        deadlineMs: setup.config.deadline,
+        brokerConfig,
+    });
+    const supervisorAuthority = {
+        supervisorGeneration: 1,
+        supervisorNonce: `resource-supervisor-${label}`,
+        runnerIncarnation: `resource-runner-${label}`,
+    };
+    const repository = openRepository({
+        file: path.join(setup.stateDir, "events.sqlite"),
+    });
+    repository.claimSupervisorGeneration({
+        investigationId: setup.config.investigationId,
+        supervisorGeneration:
+            supervisorAuthority.supervisorGeneration,
+        supervisorNonce: supervisorAuthority.supervisorNonce,
+    });
+    repository.issueRunnerIncarnation({
+        investigationId: setup.config.investigationId,
+        ...supervisorAuthority,
+    });
+    repository.close();
+    setup.config = {
+        ...setup.config,
+        ...supervisorAuthority,
+        resourceBroker: {
+            stateRoot,
+            config: admission.config,
+            configFingerprint: admission.configFingerprint,
+            investigationLimits: admission.investigationLimits,
+            limitsFingerprint: admission.limitsFingerprint,
+        },
+        options: {
+            ...setup.config.options,
+            sdkRetryPolicy: admission.sdkRetryPolicy,
+        },
+    };
+    return { stateRoot, admission };
 }
 
 function certifiedRunnerDependencies(workerPool, extra = {}) {
@@ -1237,11 +1346,79 @@ function createRunnerContainmentProvider(
     });
 }
 
-function expectScientificConfirmationRequired(result) {
-    expect(result).toMatchObject({
+function expectScientificCohortUnresolved(result) {
+    expect(result, JSON.stringify(result, null, 2)).toMatchObject({
         kind: "NON_RESULT",
-        code: "SCIENTIFIC_CONFIRMATION_REQUIRED",
+        code: "SCIENTIFIC_COHORT_UNRESOLVED",
     });
+}
+
+function expectVerifiedTerminal(result) {
+    expect(result, JSON.stringify(result, null, 2)).toMatchObject({
+        kind: "TERMINAL",
+        decision: "VERIFIED_RESULT",
+    });
+}
+
+const VERIFIED_CRASH_RECOVERY_EVENT_SEQUENCE = Object.freeze([
+    "domain:v4:investigation_opened",
+    "domain:v4:capability_epoch_recorded",
+    "domain:v4:command_reserved",
+    "domain:v4:command_dispatched",
+    "domain:v4:command_observed",
+    "domain:v4:evidence_committed",
+    "domain:v4:validation_completed",
+    "domain:v4:command_reserved",
+    "domain:v4:command_dispatched",
+    "domain:v4:command_observed",
+    "domain:v4:evidence_committed",
+    "domain:v4:scientific_confirmation_frozen",
+    "domain:v4:command_reserved",
+    "domain:v4:command_dispatched",
+    "domain:v4:command_observed",
+    "domain:v4:evidence_committed",
+    "domain:v4:command_reserved",
+    "domain:v4:command_dispatched",
+    "domain:v4:command_observed",
+    "domain:v4:evidence_committed",
+    "domain:v4:verified_result",
+]);
+
+function expectExactCrashRecoveryTerminal(
+    result,
+    { abandonedCount, uncertainDispatched, seq = 21 },
+) {
+    expect(result).toMatchObject({
+        kind: "TERMINAL",
+        decision: "VERIFIED_RESULT",
+        candidateId: "candidate-r000001-s000",
+        evidenceId: "evidence-000002",
+        seq,
+        recovery: {
+            abandonedCount,
+            uncertainDispatched,
+        },
+        tempRootCleaned: true,
+    });
+}
+
+function expectExactCrashRecoveryReplay(replayed) {
+    expect(replayed.repository.listEvents(
+        replayed.adapter.investigationId,
+    ).map((event) => event.kind)).toEqual(
+        VERIFIED_CRASH_RECOVERY_EVENT_SEQUENCE,
+    );
+    expect(harnessCandidateEvidenceItems(replayed.aggregate).map(
+        (candidate) => ({
+            evidenceId: candidate.evidenceId,
+            outcomeClass: candidate.outcomeClass,
+            acceptanceSatisfied: candidate.acceptanceSatisfied,
+        }),
+    )).toEqual([{
+        evidenceId: "evidence-000002",
+        outcomeClass: "accepted",
+        acceptanceSatisfied: true,
+    }]);
 }
 
 describe("Crucible autonomous runner", () => {
@@ -1257,7 +1434,7 @@ describe("Crucible autonomous runner", () => {
             runnerDependencies(pool),
         );
 
-        expectScientificConfirmationRequired(result);
+        expectScientificCohortUnresolved(result);
         expect(result.tempRootCleaned).toBe(true);
         expect(pool.calls).toHaveLength(4);
         expect(pool.calls.map((call) => call.model)).toEqual([
@@ -1282,12 +1459,14 @@ describe("Crucible autonomous runner", () => {
         expect(replayed.aggregate.terminal).toBeNull();
         const scientificNonResult = replayed.aggregate.nonResults.at(-1);
         expect(scientificNonResult).toMatchObject({
-            code: "SCIENTIFIC_CONFIRMATION_REQUIRED",
-            candidateId: "candidate-r000002-s000",
+            code: "SCIENTIFIC_COHORT_UNRESOLVED",
             readiness: {
-                ready: false,
-                confirmationSupported: false,
-                challengeSupported: false,
+                cohortStatus: "UNRESOLVED",
+                tieResolution: {
+                    required: true,
+                    schedulable: false,
+                    exhausted: true,
+                },
             },
         });
         expect(replayed.aggregate.capabilityEpochs["runner-epoch-1"].capabilities)
@@ -1371,12 +1550,8 @@ describe("Crucible autonomous runner", () => {
                 objectArtifacts: expect.any(Array),
             },
         });
-        expect(scientificNonResult.evidenceId).toBe(
-            replayed.aggregate.evidenceOrder
-                .map((id) => replayed.aggregate.evidence[id])
-                .find((evidence) =>
-                    evidence.candidateId === "candidate-r000002-s000")?.evidenceId,
-        );
+        expect(scientificNonResult).not.toHaveProperty("candidateId");
+        expect(scientificNonResult).not.toHaveProperty("evidenceId");
         for (const evidenceId of replayed.aggregate.evidenceOrder) {
             const evidence = replayed.aggregate.evidence[evidenceId];
             const expectedArtifactIds = artifactRefsFromProvenance(
@@ -1478,6 +1653,7 @@ describe("Crucible autonomous runner", () => {
                 left.path.localeCompare(right.path));
         };
         const before = inventory();
+        const beforePaths = new Set(before.map((entry) => entry.path));
         let outcome;
         try {
             outcome = await runAutonomousInvestigation(
@@ -1495,8 +1671,148 @@ describe("Crucible autonomous runner", () => {
         expect(outcome?.message ?? outcome?.reason).toMatch(
             /validation measurements failed/i,
         );
-        expect(inventory()).toEqual(before);
+        const after = inventory();
+        expect(after.filter((entry) =>
+            !entry.path.endsWith(".referenced.json"))).toEqual(
+            before.filter((entry) =>
+                !entry.path.endsWith(".referenced.json")),
+        );
+        expect(after.filter((entry) => !beforePaths.has(entry.path))
+            .every((entry) =>
+                entry.path.endsWith(".referenced.json"))).toBe(true);
     }, 30_000);
+
+    it("keeps receipt installation registered while orphan-zero GC races", async () => {
+        const setup = setupInvestigation(
+            "receipt-cas-gc-race",
+            { candidatesPerRound: 1, maxRounds: 1 },
+        );
+        const coordination = new Int32Array(new SharedArrayBuffer(4));
+        let raceObjectId = null;
+        let raceBlockedByGenerationLock = false;
+        let raceReportPromise = null;
+        const artifactStoreFactory = ({ root }) => {
+            const store = openArtifactStore({ root });
+            return new Proxy(store, {
+                get(target, property) {
+                    if (property === "putBytes") {
+                        return (bytes, options = {}) => {
+                            const stored = target.putBytes(bytes, options);
+                            if (raceReportPromise === null
+                                && options.contentType
+                                    === "application/vnd.crucible.measurement-receipt+json") {
+                                raceObjectId = stored.id;
+                                const worker = new Worker(`
+                                    const {
+                                        parentPort,
+                                        workerData,
+                                    } = require("node:worker_threads");
+                                    (async () => {
+                                        try {
+                                            const signal = new Int32Array(
+                                                workerData.signal,
+                                            );
+                                            Atomics.store(signal, 0, 1);
+                                            Atomics.notify(signal, 0);
+                                            const {
+                                                openArtifactStore,
+                                            } = await import(workerData.moduleUrl);
+                                            const store = openArtifactStore({
+                                                root: workerData.root,
+                                            });
+                                            const report = store.reconcile({
+                                                referenced: [],
+                                                olderThanMs: 0,
+                                                now: Date.now(),
+                                                referenceProbe: (objectId) =>
+                                                    objectId
+                                                        !== workerData.targetId,
+                                            });
+                                            Atomics.store(signal, 0, 2);
+                                            Atomics.notify(signal, 0);
+                                            parentPort.postMessage({
+                                                ok: true,
+                                                report,
+                                            });
+                                        } catch (error) {
+                                            parentPort.postMessage({
+                                                ok: false,
+                                                error: {
+                                                    code: error?.code ?? null,
+                                                    message:
+                                                        error?.message
+                                                        ?? String(error),
+                                                },
+                                            });
+                                        }
+                                    })();
+                                `, {
+                                    eval: true,
+                                    workerData: {
+                                        root,
+                                        targetId: stored.id,
+                                        signal: coordination.buffer,
+                                        moduleUrl: new URL(
+                                            "../persistence/index.mjs",
+                                            import.meta.url,
+                                        ).href,
+                                    },
+                                });
+                                raceReportPromise = new Promise(
+                                    (resolve, reject) => {
+                                        worker.once("message", resolve);
+                                        worker.once("error", reject);
+                                        worker.once("exit", (code) => {
+                                            if (code !== 0) {
+                                                reject(new Error(
+                                                    `GC racer exited ${code}`,
+                                                ));
+                                            }
+                                        });
+                                    },
+                                );
+                                while (Atomics.load(coordination, 0) === 0) {
+                                    Atomics.wait(
+                                        coordination,
+                                        0,
+                                        0,
+                                        5_000,
+                                    );
+                                }
+                                Atomics.wait(
+                                    coordination,
+                                    0,
+                                    1,
+                                    1_000,
+                                );
+                                raceBlockedByGenerationLock =
+                                    Atomics.load(coordination, 0) === 1;
+                            }
+                            return stored;
+                        };
+                    }
+                    const value = Reflect.get(target, property, target);
+                    return typeof value === "function"
+                        ? value.bind(target)
+                        : value;
+                },
+            });
+        };
+
+        const result = await runAutonomousInvestigation(
+            setup.config,
+            runnerDependencies(new ScriptedOrchestrationWorkerPool([95]), {
+                artifactStoreFactory,
+            }),
+        );
+        expect(["TERMINAL", "NON_RESULT"]).toContain(result.kind);
+        const race = await raceReportPromise;
+        expect(race).toMatchObject({ ok: true });
+        expect(raceBlockedByGenerationLock).toBe(true);
+        expect(race.report.removedObjects).not.toContain(raceObjectId);
+        expect(openArtifactStore({ root: setup.artifactRoot })
+            .verifyObject(raceObjectId).ok).toBe(true);
+    }, 120_000);
 
     it("seeds the investigation CAS budget from durable prior artifacts", async () => {
         const setup = setupInvestigation("cas-investigation-budget", {
@@ -1562,11 +1878,11 @@ describe("Crucible autonomous runner", () => {
             setup.config,
             runnerDependencies(pool),
         );
-        expectScientificConfirmationRequired(result);
+        expectScientificCohortUnresolved(result);
         const replayed = replaySetup(setup);
         expect(replayed.adapter.latestOperationalNonResult()).toBeNull();
         replayed.repository.close();
-    }, 60_000);
+    }, 120_000);
 
     it.each([
         [
@@ -1699,14 +2015,14 @@ describe("Crucible autonomous runner", () => {
             }),
         );
 
-        expectScientificConfirmationRequired(result);
+        expectVerifiedTerminal(result);
         expect(calls.hostLaunches).toBe(0);
         expect(calls.hostTerminations).toBe(0);
         expect(providerControlRoots).toHaveLength(1);
         expect(providerControlRoots[0]).toContain(
             path.join("runtime-temp", "run-g0-"),
         );
-        expect(calls.admissions.length).toBeGreaterThanOrEqual(3);
+        expect(calls.admissions).toHaveLength(8);
         expect(calls.launches).toHaveLength(calls.admissions.length);
         expect(calls.cleanups).toHaveLength(calls.admissions.length);
         expect(calls.terminations).toHaveLength(0);
@@ -1737,12 +2053,15 @@ describe("Crucible autonomous runner", () => {
                         `sha256:runner-fixture-policy-v1:${"c".repeat(64)}`,
                 });
         }
-        expect(replayed.aggregate.terminal).toBeNull();
-        expect(replayed.aggregate.nonResults.at(-1)).toMatchObject({
-            code: "SCIENTIFIC_CONFIRMATION_REQUIRED",
+        expect(replayed.aggregate.terminal).toMatchObject({
+            decision: "VERIFIED_RESULT",
+            candidateId: "candidate-r000001-s000",
+            evidenceId: "evidence-000002",
+            seq: 21,
         });
+        expect(replayed.aggregate.nonResults).toEqual([]);
         replayed.repository.close();
-    }, 60_000);
+    }, 180_000);
 
     it("persists a search-capacity non-result after successful validation", async () => {
         const setup = setupInvestigation("budget", {
@@ -1801,8 +2120,11 @@ describe("Crucible autonomous runner", () => {
     }, 90_000);
 
     it("bounds a hung worker-pool close after persisting the scientific non-result", async () => {
-        const setup = setupInvestigation("runner-shutdown-bound", { maxRounds: 1 });
-        const pool = new ScriptedOrchestrationWorkerPool([95]);
+        const setup = setupInvestigation("runner-shutdown-bound", {
+            maxRounds: 1,
+            acceptanceThreshold: 90,
+        });
+        const pool = new ScriptedOrchestrationWorkerPool([20]);
         let closeStartedAt = null;
         pool.close = () => {
             closeStartedAt = Date.now();
@@ -1831,7 +2153,7 @@ describe("Crucible autonomous runner", () => {
         const replayed = replaySetup(setup);
         expect(replayed.aggregate.terminal).toBeNull();
         expect(replayed.aggregate.nonResults.at(-1)).toMatchObject({
-            code: "SCIENTIFIC_CONFIRMATION_REQUIRED",
+            code: "BUDGET_EXHAUSTED_INCONCLUSIVE",
         });
         replayed.repository.close();
         expect(removeRetainedRuntimeRoots(setup).length).toBeGreaterThan(0);
@@ -1926,29 +2248,31 @@ describe("Crucible autonomous runner", () => {
             ...setup.config,
             deadline: clock.now() + 60_000,
         }, runnerDependencies(recoveryPool, { clock }));
-        expectScientificConfirmationRequired(recovered);
+        expectVerifiedTerminal(recovered);
         expect(recoveryPool.calls).toHaveLength(1);
         const recoveredReplay = replaySetup(setup);
         expect(recoveredReplay.adapter.latestOperationalNonResult()).toBeNull();
-        expect(recoveredReplay.aggregate.terminal).toBeNull();
-        expect(recoveredReplay.aggregate.nonResults.at(-1)).toMatchObject({
-            code: "SCIENTIFIC_CONFIRMATION_REQUIRED",
+        expect(recoveredReplay.aggregate.terminal).toMatchObject({
+            decision: "VERIFIED_RESULT",
+            evidenceId: "evidence-000002",
+            seq: 24,
         });
+        expect(recoveredReplay.aggregate.nonResults).toEqual([]);
         expect(recoveredReplay.aggregate.pause).toBeNull();
         expect(recoveredReplay.aggregate.pauseHistory).toHaveLength(1);
-        expect(harnessCallCount(setup)).toBe(4);
+        expect(harnessCallCount(setup)).toBe(8);
         const deadlineFailures = recoveredReplay.adapter.listOperationalEvidence()
             .filter((row) =>
                 row.kind === "runtime:effect_failure"
                 && row.payload?.classification === "deadline_expired");
         expect(deadlineFailures).toHaveLength(1);
         recoveredReplay.repository.close();
-    }, 60_000);
+    }, 120_000);
 
     it("rejects candidate measurement facts completed after the deadline", async () => {
         const setup = setupInvestigation(
             "deadline-measurement",
-            { maxRounds: 1 },
+            { maxRounds: 1, acceptanceThreshold: 90 },
             { countHarnessCalls: true },
         );
         const clock = mutableClock();
@@ -1957,7 +2281,7 @@ describe("Crucible autonomous runner", () => {
         const result = await runAutonomousInvestigation({
             ...setup.config,
             deadline,
-        }, runnerDependencies(new ScriptedOrchestrationWorkerPool([95]), {
+        }, runnerDependencies(new ScriptedOrchestrationWorkerPool([20]), {
             clock,
             faultInjector(point, details) {
                 if (!advanced
@@ -2102,7 +2426,7 @@ describe("Crucible autonomous runner", () => {
     it("suppresses a scientific non-result when the deadline crosses before append", async () => {
         const setup = setupInvestigation(
             "deadline-terminal",
-            { maxRounds: 1 },
+            { maxRounds: 1, acceptanceThreshold: 90 },
             { countHarnessCalls: true },
         );
         const clock = mutableClock();
@@ -2111,7 +2435,7 @@ describe("Crucible autonomous runner", () => {
         const result = await runAutonomousInvestigation({
             ...setup.config,
             deadline,
-        }, runnerDependencies(new ScriptedOrchestrationWorkerPool([95]), {
+        }, runnerDependencies(new ScriptedOrchestrationWorkerPool([20]), {
             clock,
             faultInjector(point) {
                 if (!advanced && point === "before_non_result_append") {
@@ -2158,10 +2482,22 @@ describe("Crucible autonomous runner", () => {
         expect(replayed.aggregate.terminal).toBeNull();
         const nonResult = replayed.aggregate.nonResults.at(-1);
         expect(nonResult.basis).toMatchObject({
-            enumerandCount: 2,
-            searchSpaceExhausted: true,
+            kind:
+                "bounded_search_exhausted_without_terminal_grade_coverage",
+            topology: "finite_enumerable",
+            roundsExhausted: true,
+            boundedComplete: true,
+            coverageComplete: false,
+            missing: [
+                "enumerand:0:claim:metric.score.acceptance:unresolved",
+                "enumerand:0:terminal_grade",
+                "enumerand:1:claim:metric.score.acceptance:unresolved",
+                "enumerand:1:terminal_grade",
+                "independent_impossibility_verifier_evidence",
+                "independently_derived_impossibility_verifier_facts",
+            ],
         });
-        expect(nonResult.basis.enumerandManifestRoot).toMatch(
+        expect(replayed.aggregate.contract.enumerandManifest.merkleRoot).toMatch(
             /^sha256:crucible-enumerand-manifest-root-v1:[a-f0-9]{64}$/,
         );
         expect(nonResult.readiness).toMatchObject({
@@ -2172,196 +2508,167 @@ describe("Crucible autonomous runner", () => {
     }, 60_000);
 
     it("runs the allowlisted verifier and persists a positive impossibility certificate", async () => {
-        const setup = setupInvestigation(
-            "certified-positive",
-            {
-                hypothesisTopology: "certified_impossibility",
-                candidatesPerRound: 1,
-                maxRounds: 1,
-            },
-            {
-                countHarnessCalls: true,
-                impossibilityResult: {
-                    pass: true,
-                    searchSpaceExhausted: true,
-                },
-            },
+        const setup = setupImpossibilityRunnerFixture(
+            "runner-release-positive",
         );
-        const pool = new ScriptedOrchestrationWorkerPool([20]);
-        const result = await runAutonomousInvestigation(
-            setup.config,
-            certifiedRunnerDependencies(pool),
-        );
-        expect(result).toMatchObject({
-            kind: "TERMINAL",
-            decision: "TARGET_UNREACHABLE",
-            tempRootCleaned: true,
-        });
-        expect(pool.calls).toHaveLength(1);
-        expect(harnessCallCount(setup)).toBe(5);
-
-        const replayed = replaySetup(setup);
-        expect(replayed.aggregate.commandOrder.map((commandId) =>
-            replayed.aggregate.commands[commandId].command.kind)).toEqual([
-            "run_validation",
-            "search_candidate",
-            "verify_impossibility",
-        ]);
-        const [certificateEvidence] = impossibilityEvidenceItems(replayed.aggregate);
-        expect(certificateEvidence.unreachableBasis).toMatchObject({
-            kind: "v4_unreachable",
-            certificateVerdict: "target_unreachable",
-        });
-        expect(replayed.aggregate.terminal.basis).toMatchObject({
-            kind: "v4_unreachable",
-            certificateArtifactHash:
-                certificateEvidence.unreachableBasis.certificateArtifactHash,
-        });
-        expect(certificateEvidence.receipt.provenance).toMatchObject({
-            proposalArtifact: null,
-            validationCompositeArtifact: null,
-            measurementReuseArtifact: null,
-            impossibilityCertificateArtifact: {
-                artifactId: certificateEvidence.unreachableBasis.certificateArtifactId,
-            },
-        });
-        expect(replayed.aggregate.terminal.evidenceClosure).toMatchObject({
-            validation: {
-                evidenceId: replayed.aggregate.validation.currentEvidenceId,
-            },
-            decisive: {
-                kind: "impossibility_certificate",
-                evidence: {
-                    evidenceId: certificateEvidence.evidenceId,
-                    provenanceRoot: certificateEvidence.provenanceRoot,
-                },
-            },
-            receipts: { count: 5, evidenceCount: 3 },
-        });
-        const operational = replayed.adapter.listOperationalEvidence();
-        const certificateRow = operational.find((row) =>
-            row.kind === "runtime:impossibility_certificate");
-        expect(certificateRow?.payload).toMatchObject({
-            certificateVerdict: "target_unreachable",
-        });
-        for (const field of [
-            "certificateArtifactHash",
-            "measurementReceiptArtifactHash",
-            "measurementReceiptHash",
-            "rawStderrArtifactHash",
-            "rawStdoutArtifactHash",
-            "verificationSnapshotHash",
-        ]) {
-            expect(certificateRow.payload[field]).toMatch(
-                /^sha256:[a-z0-9][a-z0-9._-]*:[a-f0-9]{64}$/u,
-            );
+        try {
+            const { result } = await runImpossibilityRunnerFixture(setup);
+            expect(result, JSON.stringify(result, null, 2)).toMatchObject({
+                kind: "TERMINAL",
+                decision: "TARGET_UNREACHABLE",
+            });
+            const replayed = replayImpossibilityRunnerFixture(setup);
+            expect(replayed.aggregate.commandOrder.map((commandId) =>
+                replayed.aggregate.commands[commandId].command.kind))
+                .toEqual([
+                    "run_validation",
+                    "search_candidate",
+                    "verify_impossibility",
+                ]);
+            const [certificateEvidence] =
+                impossibilityEvidenceItems(replayed.aggregate);
+            expect(certificateEvidence.unreachableBasis).toMatchObject({
+                kind: "v4_unreachable",
+                certificateVerdict: "target_unreachable",
+            });
+            expect(replayed.aggregate.terminal.basis).toMatchObject({
+                certificateArtifactHash:
+                    certificateEvidence.unreachableBasis
+                        .certificateArtifactHash,
+            });
+            expect(replayed.adapter.listOperationalEvidence().filter((row) =>
+                row.kind === "runtime:impossibility_certificate"))
+                .toHaveLength(1);
+            replayed.repository.close();
+        } finally {
+            await cleanupImpossibilityRunnerFixture(setup);
         }
-        expect(replayed.repository.getArtifact(certificateRow.payload.certificateArtifactId))
-            .toMatchObject({ durable: true, storage: "external" });
-        expect(replayed.repository.getArtifact(certificateRow.payload.rawStdoutArtifactId))
-            .toMatchObject({ durable: true, storage: "external" });
-        expect(replayed.repository.getArtifact(
-            certificateRow.payload.measurementReceiptArtifactId,
-        )).toMatchObject({ durable: true, storage: "external" });
-        replayed.repository.close();
-    }, 60_000);
+    }, 120_000);
 
     it.each([
-        ["not_proven", { pass: false, searchSpaceExhausted: true }],
-        ["invalid", { pass: true, searchSpaceExhausted: false }],
-    ])("keeps a %s impossibility certificate as a non-result", async (verdict, output) => {
-        const setup = setupInvestigation(
-            `certified-${verdict}`,
-            {
-                hypothesisTopology: "certified_impossibility",
-                candidatesPerRound: 1,
-                maxRounds: 1,
-            },
-            { impossibilityResult: output },
+        ["not_proven", "REJECTED"],
+        ["invalid", "INVALID"],
+    ])("keeps a %s impossibility certificate as a non-result", async (
+        verdict,
+        verifierStatus,
+    ) => {
+        const setup = setupImpossibilityRunnerFixture(
+            `runner-release-${verdict}`,
+            { verifierStatus },
         );
-        const result = await runAutonomousInvestigation(
-            setup.config,
-            certifiedRunnerDependencies(
-                new ScriptedOrchestrationWorkerPool([20]),
-            ),
-        );
-        expect(result).toMatchObject({
-            kind: "NON_RESULT",
-            code: "IMPOSSIBILITY_CERTIFICATE_INCONCLUSIVE",
-        });
-        const replayed = replaySetup(setup);
-        expect(replayed.aggregate.terminal).toBeNull();
-        expect(replayed.aggregate.nonResults.at(-1)).toMatchObject({
-            code: "IMPOSSIBILITY_CERTIFICATE_INCONCLUSIVE",
-            certificateVerdict: verdict,
-        });
-        expect(impossibilityEvidenceItems(replayed.aggregate)[0].unreachableBasis)
-            .toBeNull();
-        replayed.repository.close();
-    }, 60_000);
+        try {
+            const { result } = await runImpossibilityRunnerFixture(setup);
+            expect(result).toMatchObject({
+                kind: "NON_RESULT",
+                code: "IMPOSSIBILITY_CERTIFICATE_INCONCLUSIVE",
+            });
+            const replayed = replayImpossibilityRunnerFixture(setup);
+            expect(replayed.aggregate.terminal).toBeNull();
+            expect(replayed.aggregate.nonResults.at(-1)).toMatchObject({
+                code: "IMPOSSIBILITY_CERTIFICATE_INCONCLUSIVE",
+                certificateVerdict: verdict,
+            });
+            expect(impossibilityEvidenceItems(
+                replayed.aggregate,
+            )[0].unreachableBasis).toBeNull();
+            replayed.repository.close();
+        } finally {
+            await cleanupImpossibilityRunnerFixture(setup);
+        }
+    }, 120_000);
 
     it("recovers a committed impossibility verifier effect without re-execution", async () => {
-        const setup = setupInvestigation(
-            "certified-crash-recovery",
-            {
-                hypothesisTopology: "certified_impossibility",
-                candidatesPerRound: 1,
-                maxRounds: 1,
-            },
-            {
-                countHarnessCalls: true,
-                impossibilityResult: {
-                    pass: true,
-                    searchSpaceExhausted: true,
-                },
-            },
+        const setup = setupImpossibilityRunnerFixture(
+            "runner-release-crash",
         );
-        let injected = false;
-        await expect(runAutonomousInvestigation(
-            setup.config,
-            certifiedRunnerDependencies(new ScriptedOrchestrationWorkerPool([20]), {
+        const branches = [];
+        try {
+            let injected = false;
+            await expect(runImpossibilityRunnerFixture(setup, {
                 faultInjector(point, details) {
                     if (!injected
                         && point === "after_effect_commit"
-                        && details.command?.kind === "impossibility-verification") {
+                        && details.command?.kind
+                            === "impossibility-verification") {
                         injected = true;
                         throw new InjectedCrashError(point);
                     }
                 },
-            }),
-        )).rejects.toMatchObject({
-            code: "CRUCIBLE_RUNTIME_INJECTED_CRASH",
-        });
-        expect(harnessCallCount(setup)).toBe(5);
+            })).rejects.toMatchObject({
+                code: "CRUCIBLE_RUNTIME_INJECTED_CRASH",
+            });
+            expect(injected).toBe(true);
+            branches.push(
+                cloneImpossibilityRunnerFixture(setup, "branch-a"),
+                cloneImpossibilityRunnerFixture(setup, "branch-b"),
+            );
+            const [{ result: resultA }, { result: resultB }] =
+                await Promise.all(branches.map((branch) =>
+                    runImpossibilityRunnerFixture(branch)));
+            expect(resultA).toMatchObject({
+                kind: "TERMINAL",
+                decision: "TARGET_UNREACHABLE",
+            });
+            expect(resultB).toMatchObject({
+                kind: "TERMINAL",
+                decision: "TARGET_UNREACHABLE",
+            });
+            expect(resultA).toMatchObject({
+                evidenceId: resultB.evidenceId,
+                seq: resultB.seq,
+            });
+        } finally {
+            await Promise.all([
+                cleanupImpossibilityRunnerFixture(setup),
+                ...branches.map((branch) =>
+                    cleanupImpossibilityRunnerFixture(branch)),
+            ]);
+        }
+    }, 180_000);
 
-        const branchA = clonePersistedSetup(setup, "certified-crash-branch-a");
-        const branchB = clonePersistedSetup(setup, "certified-crash-branch-b");
-        const resultA = await runAutonomousInvestigation(
-            branchA.config,
-            certifiedRunnerDependencies(new ScriptedOrchestrationWorkerPool([])),
+    it("recovers a capsule-persisted impossibility verifier effect", async () => {
+        const setup = setupImpossibilityRunnerFixture(
+            "runner-release-capsule",
         );
-        const resultB = await runAutonomousInvestigation(
-            branchB.config,
-            certifiedRunnerDependencies(new ScriptedOrchestrationWorkerPool([])),
-        );
-        expect(resultA).toMatchObject({
-            kind: "TERMINAL",
-            decision: "TARGET_UNREACHABLE",
-        });
-        expect(resultB).toMatchObject({
-            kind: "TERMINAL",
-            decision: "TARGET_UNREACHABLE",
-        });
-        expect(harnessCallCount(setup)).toBe(5);
-        const replayedA = replaySetup(branchA);
-        const replayedB = replaySetup(branchB);
-        expect(replayedA.aggregate.terminal.eventHash)
-            .toBe(replayedB.aggregate.terminal.eventHash);
-        expect(replayedA.aggregate.terminal.basis.certificateArtifactHash)
-            .toBe(replayedB.aggregate.terminal.basis.certificateArtifactHash);
-        replayedA.repository.close();
-        replayedB.repository.close();
-    }, 120_000);
+        try {
+            let injected = false;
+            await expect(runImpossibilityRunnerFixture(setup, {
+                faultInjector(point, details) {
+                    if (!injected
+                        && point === "after_effect_artifact_persistence"
+                        && details.command?.kind
+                            === "impossibility-verification") {
+                        injected = true;
+                        throw new InjectedCrashError(point);
+                    }
+                },
+            })).rejects.toMatchObject({
+                code: "CRUCIBLE_RUNTIME_INJECTED_CRASH",
+            });
+            expect(injected).toBe(true);
+            const { result } =
+                await runImpossibilityRunnerFixture(setup);
+            const replayed = replayImpossibilityRunnerFixture(setup);
+            const diagnostic = JSON.stringify({
+                result,
+                nonResult: replayed.aggregate.nonResults.at(-1),
+                evidence: impossibilityEvidenceItems(replayed.aggregate)
+                    .map((item) => ({
+                        evidenceId: item.evidenceId,
+                        unreachableBasis: item.unreachableBasis,
+                        verifierExecutionIdentity:
+                            item.verifierExecutionIdentity,
+                    })),
+            }, null, 2);
+            replayed.repository.close();
+            expect(result, diagnostic).toMatchObject({
+                kind: "TERMINAL",
+                decision: "TARGET_UNREACHABLE",
+            });
+        } finally {
+            await cleanupImpossibilityRunnerFixture(setup);
+        }
+    }, 180_000);
 
     it("feeds generation-one outcomes and findings into generation two", async () => {
         const setup = setupInvestigation("prompt-context", {
@@ -2450,7 +2757,7 @@ describe("Crucible autonomous runner", () => {
 
         expect(pool.calls).toHaveLength(3);
         expect(ESCAPE_SEARCH_OPERATORS).toContain(pool.calls[2].operator);
-        expectScientificConfirmationRequired(result);
+        expectScientificCohortUnresolved(result);
         const replayed = replaySetup(setup);
         const candidates = harnessCandidateEvidenceItems(replayed.aggregate);
         expect(candidates).toHaveLength(3);
@@ -2503,7 +2810,7 @@ describe("Crucible autonomous runner", () => {
             setup.config,
             runnerDependencies(pool),
         );
-        expect(result.kind).toBe("NON_RESULT");
+        expectVerifiedTerminal(result);
 
         const replayed = replaySetup(setup);
         const candidates = harnessCandidateEvidenceItems(replayed.aggregate);
@@ -2523,7 +2830,7 @@ describe("Crucible autonomous runner", () => {
             metrics: {},
         });
         replayed.repository.close();
-    }, 60_000);
+    }, 120_000);
 
     it("exposes only bounded assigned-parent tool authority to a worker-pool factory", async () => {
         const setup = setupInvestigation("parent-snapshot", {
@@ -2614,7 +2921,7 @@ describe("Crucible autonomous runner", () => {
             }),
         );
 
-        expectScientificConfirmationRequired(result);
+        expectScientificCohortUnresolved(result);
         expect(calls).toHaveLength(2);
         expect(calls[1].operator).toBe("refinement");
         expect(calls.every((request) =>
@@ -2800,6 +3107,7 @@ describe("Crucible autonomous runner", () => {
             {
                 idFactory: deterministicIds(),
                 sdkClient,
+                runtimeIdentityVerifier: async () => ({}),
                 parentReadLimits: {
                     maxParents: 2,
                     maxCalls: 4,
@@ -2811,7 +3119,7 @@ describe("Crucible autonomous runner", () => {
             },
         );
 
-        expectScientificConfirmationRequired(result);
+        expectScientificCohortUnresolved(result);
         expect(captured.started).toBe(true);
         expect(captured.stopped).toBe(true);
         expect(captured.prompts).toHaveLength(2);
@@ -2855,6 +3163,278 @@ describe("Crucible autonomous runner", () => {
         replayed.repository.close();
     }, 60_000);
 
+    it("recovers sealed SDK submission after accounting and release failure without duplicate cost", async () => {
+        const setup = setupInvestigation(
+            "sar",
+            {
+                candidatesPerRound: 1,
+                maxRounds: 2,
+            },
+            { countHarnessCalls: true },
+        );
+        const { admission } = enableRunnerResourceBroker(
+            setup,
+            "sar",
+        );
+        let modelCalls = 0;
+        let reconcileCalls = 0;
+        let releaseCalls = 0;
+        let sdkLeaseId = null;
+        const submittedCandidateIds = new Set();
+        const leases = new Map();
+        const successfulCostReports = [];
+        let chargedSdkCostUnits = 0;
+        let brokerInvestigation = null;
+        let nextLease = 0;
+        const sdkClient = {
+            async start() {},
+            async stop() {},
+            async createSession(config) {
+                modelCalls += 1;
+                const handlers = new Map();
+                return {
+                    on(type, handler) {
+                        handlers.set(type, handler);
+                        return () => handlers.delete(type);
+                    },
+                    async sendAndWait({ prompt }) {
+                        handlers.get("assistant.usage")?.({
+                            id: "sdk-accounting-usage",
+                            type: "assistant.usage",
+                            data: {
+                                model: "gpt-test",
+                                inputTokens: 1_000_000,
+                                outputTokens: 1_000_000,
+                            },
+                        });
+                        const candidateId = prompt.match(
+                            /Your assigned candidateId is exactly: ([^\r\n]+)/u,
+                        )?.[1];
+                        const challenge = prompt.match(
+                            /Your challenge nonce is exactly: ([^\r\n]+)/u,
+                        )?.[1];
+                        const submitTool = config.tools.find(
+                            (tool) =>
+                                tool.name === SUBMIT_CANDIDATE_TOOL_NAME,
+                        );
+                        if (submittedCandidateIds.has(candidateId)) {
+                            throw new Error(
+                                "sealed SDK submission was replayed",
+                            );
+                        }
+                        submittedCandidateIds.add(candidateId);
+                        await submitTool.handler({
+                            challenge,
+                            candidateId,
+                            annotations: {
+                                mechanism:
+                                    "durable SDK accounting recovery fixture",
+                            },
+                            files: [{
+                                path: "score.txt",
+                                content: "95\n",
+                            }],
+                        }, {
+                            sessionId: config.sessionId,
+                            toolName: submitTool.name,
+                        });
+                    },
+                    async abort() {},
+                    async disconnect() {},
+                };
+            },
+        };
+        const resourceBroker = {
+            config: admission.config,
+            configFingerprint: admission.configFingerprint,
+            getInvestigation() {
+                return brokerInvestigation;
+            },
+            registerInvestigation(input) {
+                brokerInvestigation = {
+                    investigationId: input.investigationId,
+                    supervisorGeneration: input.supervisorGeneration,
+                    runnerIncarnation: input.runnerIncarnation,
+                };
+                return brokerInvestigation;
+            },
+            acquire(input) {
+                nextLease += 1;
+                const lease = {
+                    investigationId: input.investigationId,
+                    leaseId: `fake-resource-lease-${nextLease}`,
+                    fencingToken: nextLease,
+                    leaseNonce: `fake-resource-nonce-${nextLease}`,
+                    ownerId: input.ownerId,
+                    supervisorGeneration: input.supervisorGeneration,
+                    runnerIncarnation: input.runnerIncarnation,
+                    attemptId: input.attemptId,
+                    logicalEffectId: input.logicalEffectId,
+                    status: "active",
+                };
+                leases.set(lease.leaseId, lease);
+                if (input.logicalEffectId.startsWith("sdk-effect-")
+                    && sdkLeaseId === null) {
+                    sdkLeaseId = lease.leaseId;
+                }
+                return { status: "acquired", lease };
+            },
+            renew({ lease }) {
+                return {
+                    status: "active",
+                    renewed: true,
+                    lease,
+                };
+            },
+            reconcileUsage({ lease, usage, reconciliationId }) {
+                reconcileCalls += 1;
+                if (reconcileCalls === 1) {
+                    throw Object.assign(
+                        new Error(
+                            "transient SDK usage reconciliation failure",
+                        ),
+                        {
+                            code: "TEST_SDK_USAGE_RECONCILE",
+                            recoverable: true,
+                        },
+                    );
+                }
+                if (lease.leaseId !== sdkLeaseId) {
+                    return { reconciled: [] };
+                }
+                const units = usage.modelCostUnits ?? 0;
+                successfulCostReports.push({
+                    reconciliationId,
+                    units,
+                });
+                chargedSdkCostUnits = Math.max(
+                    chargedSdkCostUnits,
+                    units,
+                );
+                return {
+                    reconciled: [{
+                        resourceKey: "model_cost_units",
+                        chargedUnits: chargedSdkCostUnits,
+                    }],
+                };
+            },
+            release({ lease, usage }) {
+                if (lease.leaseId === sdkLeaseId) {
+                    releaseCalls += 1;
+                    if (releaseCalls === 1) {
+                        throw Object.assign(
+                            new Error(
+                                "transient SDK lease release failure",
+                            ),
+                            {
+                                code: "TEST_SDK_RELEASE",
+                                recoverable: true,
+                            },
+                        );
+                    }
+                    const units = usage.modelCostUnits ?? 0;
+                    successfulCostReports.push({
+                        reconciliationId:
+                            `release-${lease.logicalEffectId}`,
+                        units,
+                    });
+                    chargedSdkCostUnits = Math.max(
+                        chargedSdkCostUnits,
+                        units,
+                    );
+                }
+                lease.status = "released";
+                return { status: "released", released: true, lease };
+            },
+            listActiveLeases({ investigationId } = {}) {
+                return [...leases.values()].filter((lease) =>
+                    lease.status === "active"
+                    && (investigationId === undefined
+                        || investigationId === null
+                        || lease.investigationId === investigationId));
+            },
+            reconcileStorageUsage(input) {
+                return {
+                    deduplicated: false,
+                    actualUnits: input.actualBytes,
+                };
+            },
+            close() {},
+        };
+        const resourceBrokerFactory = () => resourceBroker;
+        const dependencies = {
+            idFactory: deterministicIds(),
+            runtimeIdentityVerifier: async () => ({}),
+            sdkClient,
+            resourceBrokerFactory,
+        };
+
+        await expect(runAutonomousInvestigation(
+            setup.config,
+            dependencies,
+        )).rejects.toMatchObject({ code: "TEST_SDK_RELEASE" });
+        expect(modelCalls).toBe(1);
+
+        const recoveryIncarnation = "resource-runner-sar-recovery";
+        const repository = openRepository({
+            file: path.join(setup.stateDir, "events.sqlite"),
+        });
+        repository.issueRunnerIncarnation({
+            investigationId: setup.config.investigationId,
+            supervisorGeneration: setup.config.supervisorGeneration,
+            supervisorNonce: setup.config.supervisorNonce,
+            runnerIncarnation: recoveryIncarnation,
+        });
+        repository.close();
+        setup.config = {
+            ...setup.config,
+            runnerIncarnation: recoveryIncarnation,
+        };
+        brokerInvestigation = {
+            ...brokerInvestigation,
+            runnerIncarnation: recoveryIncarnation,
+        };
+        const recovered = await runAutonomousInvestigation(
+            setup.config,
+            dependencies,
+        );
+        expect(["TERMINAL", "NON_RESULT"]).toContain(recovered.kind);
+        expect(modelCalls).toBe(submittedCandidateIds.size);
+        expect(modelCalls).toBeGreaterThanOrEqual(1);
+        expect(reconcileCalls).toBeGreaterThanOrEqual(2);
+        expect(releaseCalls).toBeGreaterThanOrEqual(2);
+
+        const replayed = replaySetup(setup);
+        const operational = replayed.adapter.listOperationalEvidence();
+        expect(operational.filter((event) =>
+            event.kind === "runtime:sdk_submission_commit"))
+            .toHaveLength(modelCalls);
+        expect(operational.filter((event) =>
+            event.kind === "runtime:effect_failure"
+            && event.payload?.command?.kind === "sdk-proposal")).toEqual([]);
+        const accountingStates = operational
+            .filter((event) =>
+                event.kind === "runtime:sdk_accounting_state")
+            .map((event) => event.payload.record.status);
+        expect(accountingStates).toContain("pending");
+        expect(accountingStates).toContain("reconciled");
+        replayed.repository.close();
+
+        expect(successfulCostReports.length).toBeGreaterThanOrEqual(2);
+        expect(chargedSdkCostUnits).toBe(
+            Math.max(...successfulCostReports.map((report) => report.units)),
+        );
+        expect(successfulCostReports.at(-1).units).toBe(
+            chargedSdkCostUnits,
+        );
+        expect(chargedSdkCostUnits).toBeLessThan(
+            successfulCostReports.reduce(
+                (sum, report) => sum + report.units,
+                0,
+            ),
+        );
+    }, 120_000);
+
     it("honours a persisted stop request by validating and then pausing", async () => {
         const setup = setupInvestigation("pause");
         const stop = requestStop({
@@ -2871,12 +3451,19 @@ describe("Crucible autonomous runner", () => {
             runnerDependencies(pool),
         );
         expect(result).toMatchObject({
-            kind: "PAUSE",
+            kind: "QUIESCED",
             code: "INVESTIGATION_PAUSED",
         });
         expect(pool.calls).toHaveLength(0);
         const replayed = replaySetup(setup);
-        expect(replayed.aggregate.status).toBe("paused");
+        expect(replayed.aggregate.status).toBe("active");
+        expect(replayed.aggregate.pause).toBeNull();
+        expect(replayed.repository.getQuiescentStop(
+            replayed.adapter.investigationId,
+        )).toMatchObject({
+            state: "PAUSE_PENDING",
+            quiescent: false,
+        });
         replayed.repository.close();
     }, 60_000);
 
@@ -2917,7 +3504,7 @@ describe("Crucible autonomous runner", () => {
         });
         expect(requested).toBe(true);
         const replayed = replaySetup(setup);
-        expect(replayed.aggregate.pause).not.toBeNull();
+        expect(replayed.aggregate.pause).toBeNull();
         expect(replayed.adapter.latestOperationalNonResult()).toBeNull();
         replayed.repository.close();
         expect(removeRetainedRuntimeRoots(setup).length).toBeGreaterThan(0);
@@ -2953,8 +3540,7 @@ describe("Crucible autonomous runner", () => {
             setup.config,
             runnerDependencies(recoveredPool),
         );
-        expectScientificConfirmationRequired(result);
-        expect(result.recovery).toMatchObject({
+        expectExactCrashRecoveryTerminal(result, {
             abandonedCount: 1,
             uncertainDispatched: uncertain,
         });
@@ -2967,7 +3553,7 @@ describe("Crucible autonomous runner", () => {
         expect(attempts.some((attempt) => attempt.state === "committed")).toBe(true);
         expect(harnessCandidateEvidenceItems(replayed.aggregate)).toHaveLength(1);
         replayed.repository.close();
-    }, 60_000);
+    }, 180_000);
 
     it("fences a superseded runner before buffered proposal evidence can persist", async () => {
         const setup = setupInvestigation(
@@ -3012,13 +3598,17 @@ describe("Crucible autonomous runner", () => {
             code: PERSISTENCE_ERROR_CODES.FENCE_REJECTED,
         });
 
-        expectScientificConfirmationRequired(currentResult);
+        expectExactCrashRecoveryTerminal(currentResult, {
+            abandonedCount: 2,
+            uncertainDispatched: 2,
+            seq: 22,
+        });
         expect(stalePool.calls).toHaveLength(1);
         expect(currentPool.calls).toHaveLength(0);
         const replayed = replaySetup(setup);
         expect(replayed.repository.listEvents(replayed.adapter.investigationId)
             .filter((event) =>
-                event.kind === "domain:v4:non_result_recorded")).toHaveLength(1);
+                event.kind === "domain:v4:verified_result")).toHaveLength(1);
         expect(replayed.repository.listArtifactRefs(
             replayed.adapter.investigationId,
         ))
@@ -3069,17 +3659,24 @@ describe("Crucible autonomous runner", () => {
             branchB.config,
             runnerDependencies(recoveredPoolB),
         );
-        expectScientificConfirmationRequired(resultA);
-        expectScientificConfirmationRequired(resultB);
+        expectExactCrashRecoveryTerminal(resultA, {
+            abandonedCount: 1,
+            uncertainDispatched: 1,
+        });
+        expectExactCrashRecoveryTerminal(resultB, {
+            abandonedCount: 1,
+            uncertainDispatched: 1,
+        });
         expect(recoveredPoolA.calls).toHaveLength(0);
         expect(recoveredPoolB.calls).toHaveLength(0);
-        expect(harnessCallCount(setup)).toBe(5);
+        expect(harnessCallCount(setup)).toBe(13);
 
         const replayedA = replaySetup(branchA);
         const replayedB = replaySetup(branchB);
+        expectExactCrashRecoveryReplay(replayedA);
+        expectExactCrashRecoveryReplay(replayedB);
         const candidateA = harnessCandidateEvidenceItems(replayedA.aggregate)[0];
         const candidateB = harnessCandidateEvidenceItems(replayedB.aggregate)[0];
-        expect(candidateA.replication).toEqual(candidateB.replication);
         expect({
             metrics: candidateA.metrics,
             outcomeClass: candidateA.outcomeClass,
@@ -3147,16 +3744,23 @@ describe("Crucible autonomous runner", () => {
             branchB.config,
             runnerDependencies(recoveredPoolB),
         );
-        expectScientificConfirmationRequired(resultA);
-        expectScientificConfirmationRequired(resultB);
+        expectExactCrashRecoveryTerminal(resultA, {
+            abandonedCount: 1,
+            uncertainDispatched: 1,
+        });
+        expectExactCrashRecoveryTerminal(resultB, {
+            abandonedCount: 1,
+            uncertainDispatched: 1,
+        });
         expect(recoveredPoolA.calls).toHaveLength(0);
         expect(recoveredPoolB.calls).toHaveLength(0);
-        expect(harnessCallCount(setup)).toBe(4);
+        expect(harnessCallCount(setup)).toBe(12);
         const replayedA = replaySetup(branchA);
         const replayedB = replaySetup(branchB);
+        expectExactCrashRecoveryReplay(replayedA);
+        expectExactCrashRecoveryReplay(replayedB);
         const candidateA = harnessCandidateEvidenceItems(replayedA.aggregate)[0];
         const candidateB = harnessCandidateEvidenceItems(replayedB.aggregate)[0];
-        expect(candidateA.replication).toEqual(candidateB.replication);
         expect({
             metrics: candidateA.metrics,
             outcomeClass: candidateA.outcomeClass,
@@ -3250,17 +3854,23 @@ describe("Crucible autonomous runner", () => {
             branchB.config,
             runnerDependencies(recoveredPoolB),
         );
-        expectScientificConfirmationRequired(resultA);
-        expectScientificConfirmationRequired(resultB);
+        expectExactCrashRecoveryTerminal(resultA, {
+            abandonedCount: 2,
+            uncertainDispatched: 2,
+        });
+        expectExactCrashRecoveryTerminal(resultB, {
+            abandonedCount: 2,
+            uncertainDispatched: 2,
+        });
         expect(recoveredPoolA.calls).toHaveLength(0);
         expect(recoveredPoolB.calls).toHaveLength(0);
-        expect(harnessCallCount(setup)).toBe(5);
-        expect(resultA.recovery.uncertainDispatched).toBeGreaterThanOrEqual(1);
+        expect(harnessCallCount(setup)).toBe(13);
         const replayedA = replaySetup(branchA);
         const replayedB = replaySetup(branchB);
+        expectExactCrashRecoveryReplay(replayedA);
+        expectExactCrashRecoveryReplay(replayedB);
         const candidateA = harnessCandidateEvidenceItems(replayedA.aggregate)[0];
         const candidateB = harnessCandidateEvidenceItems(replayedB.aggregate)[0];
-        expect(candidateA.replication).toEqual(candidateB.replication);
         expect({
             metrics: candidateA.metrics,
             outcomeClass: candidateA.outcomeClass,
@@ -3333,10 +3943,9 @@ describe("Crucible autonomous runner", () => {
             } catch (error) {
                 failure = error;
             }
-            expect([
-                RUNTIME_ERROR_CODES.INJECTED_CRASH,
-                RUNTIME_ERROR_CODES.CHILD_CRASH,
-            ]).toContain(failure?.code);
+            expect(failure).toMatchObject({
+                code: RUNTIME_ERROR_CODES.INJECTED_CRASH,
+            });
             expect(injected).toBe(true);
             expect(harnessCallCount(setup)).toBe(callsBeforeRecovery);
 
@@ -3347,10 +3956,14 @@ describe("Crucible autonomous runner", () => {
                 setup.config,
                 runnerDependencies(recoveryPool),
             );
-            expectScientificConfirmationRequired(recovered);
+            expectExactCrashRecoveryTerminal(recovered, {
+                abandonedCount: 1,
+                uncertainDispatched: 1,
+            });
             expect(recoveryPool.calls).toHaveLength(recoveryProposalCount);
-            expect(harnessCallCount(setup)).toBe(4);
+            expect(harnessCallCount(setup)).toBe(8);
             const replayed = replaySetup(setup);
+            expectExactCrashRecoveryReplay(replayed);
             const measurements = replayed.adapter.listOperationalEvidence()
                 .filter((row) =>
                     row.kind === "runtime:measurement"
@@ -3377,11 +3990,6 @@ describe("H7 systematic runtime failure matrix", () => {
             label: "measurement effect committed",
             point: "after_effect_commit",
             commandKind: "replicate-measurement",
-        },
-        {
-            label: "science gate append",
-            point: "after_non_result_append",
-            commandKind: null,
         },
     ];
 
@@ -3450,12 +4058,12 @@ describe("H7 systematic runtime failure matrix", () => {
                 setup.config,
                 runnerDependencies(recoveredPool),
             );
-            expectScientificConfirmationRequired(result);
+            expectVerifiedTerminal(result);
             expect(result.tempRootCleaned).toBe(true);
             expect(recoveredPool.calls).toHaveLength(0);
             expect(fs.readFileSync(workerCallsPath, "utf8").trim().split(/\r?\n/u))
                 .toHaveLength(1);
-            expect(harnessCallCount(setup)).toBe(4);
+            expect(harnessCallCount(setup)).toBe(8);
 
             const replayed = replaySetup(setup);
             const operational = replayed.adapter.listOperationalEvidence();
@@ -3467,11 +4075,16 @@ describe("H7 systematic runtime failure matrix", () => {
                 row.kind === "runtime:measurement"
                 && row.payload.purpose === "candidate")).toHaveLength(2);
             expect(harnessCandidateEvidenceItems(replayed.aggregate)).toHaveLength(1);
-            expect(replayed.repository.listEvents(
+            const nonResultEvents = replayed.repository.listEvents(
                 replayed.adapter.investigationId,
             )
                 .filter((event) =>
-                    event.kind === "domain:v4:non_result_recorded")).toHaveLength(1);
+                    event.kind === "domain:v4:non_result_recorded");
+            expect(nonResultEvents).toHaveLength(0);
+            expect(replayed.repository.listEvents(
+                replayed.adapter.investigationId,
+            ).filter((event) =>
+                event.kind === "domain:v4:verified_result")).toHaveLength(1);
             const refs = replayed.repository.listArtifactRefs(
                 replayed.adapter.investigationId,
             );
@@ -3574,9 +4187,9 @@ describe("H7 systematic runtime failure matrix", () => {
                         processAdapter: makeProcessOwner(),
                     }),
                 );
-                expectScientificConfirmationRequired(recovered);
+                expectVerifiedTerminal(recovered);
                 expect(recovered.tempRootCleaned).toBe(true);
-                expect(harnessCallCount(setup)).toBe(4);
+                expect(harnessCallCount(setup)).toBe(8);
                 expect(processOwners[1].closeCalls).toBe(1);
                 expect(
                     await waitForNoExactWindowsProcess(exactPaths),

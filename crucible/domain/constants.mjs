@@ -210,7 +210,17 @@ export const ESCAPE_SEARCH_OPERATORS = Object.freeze([
     "restart",
 ]);
 
+export const LEGACY_SEARCH_STRATEGY_POLICY_VERSION =
+    "crucible-search-strategy-v1";
+export const SEARCH_STRATEGY_POLICY_VERSION =
+    "crucible-search-strategy-v2";
+export const SEARCH_STRATEGY_POLICY_VERSIONS = Object.freeze([
+    LEGACY_SEARCH_STRATEGY_POLICY_VERSION,
+    SEARCH_STRATEGY_POLICY_VERSION,
+]);
+
 export const DEFAULT_SEARCH_POLICY = Object.freeze({
+    version: SEARCH_STRATEGY_POLICY_VERSION,
     plateauWindow: 3,
     minRoundsBeforePlateau: 3,
     plateauMinImprovement: 0,

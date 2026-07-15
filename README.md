@@ -9,7 +9,7 @@ Eight interrelated Copilot CLI extensions for autonomous investigation, multi-mo
 | **triple-plan** | 3 planning agents in parallel → merged plan with consensus + alternatives + contested decisions |
 | **debate** | 2 debaters arguing opposing positions + 1 independent judge |
 | **duck-council** | 6 role-specialized rubber-ducks (security/stability/perf/maintainer/skeptic/user) with optional judge synthesis |
-| **crucible** | Domain-v3 evidence-judged investigation runner. Workers always get one bounded submission tool and conditionally get a read-only parent-artifact tool; an operator-selected, content-pinned harness is the measurement authority. Exposes `crucible_start`, `crucible_status`, `crucible_stop`, and `crucible_result`. |
+| **crucible** | Domain-v4 evidence-judged investigation runner with persistent active/archive/tombstone lifecycle, verified bundles, and catalog recovery. Exposes exactly `crucible_start`, `crucible_status`, `crucible_stop`, and `crucible_result`. |
 | **zerotrust-sourcecheck** | 32-role multi-model security council against a GitHub URL OR an on-disk local directory. API-direct URL wrappers do not intentionally create source files, although returned text can still be retained by Copilot CLI/session logging. Local-source mode reads an existing tree via `view`/`grep`/`glob`. Build-mode wrappers provide pinned clone/install/build operations. |
 | **mcp-autoreload** | On a recognized MCP transport failure, invokes the SDK's global MCP reload, polls the owning server, and asks the agent to retry or escalates. Exposes `mcp_reload_now`. (Hook-based utility; no automated tests.) |
 
@@ -152,12 +152,24 @@ Use `npm run test:crucible` for Crucible's fast credential-free suite and
 `npm run test:crucible:release-safe` for its long safe matrices. The mandatory
 real integration gate is `npm run test:crucible:integration`; it requires
 absolute `COPILOT_SDK_PATH` and `COPILOT_CLI_PATH` values plus an authenticated
-Copilot CLI, and fails rather than skipping when they are unavailable. Run the
-native boundary serially with
-`npm run test:crucible:windows-conformance`. The explicit
-`npm run test:crucible:release` gate is four layers: fast Crucible tests,
-release-safe matrices, authenticated SDK/CLI integration, and serial Windows
-conformance. `npm run test:release` adds the rest of the workspace suites.
+Copilot CLI, and fails rather than skipping when they are unavailable. The
+explicit `npm run test:crucible:release` gate is four layers: safe Crucible
+tests, release-safe matrices, the v4 science gate, and the unattended wrapper
+(authenticated SDK plus Windows containment, Task Scheduler recovery, and leak
+conformance). `npm run test:release` adds the rest of the workspace suites.
+
+`npm run test:crucible:changed` maps current Crucible source, PowerShell,
+fixtures, configs, and tests to narrow owners and fails closed when no owner
+exists. Pass `-- --release <path>` for release-only fixtures or native/
+integration owners; there is no unrelated unit-suite fallback.
+
+`npm run test:crucible:unattended-release` adds the curated unattended
+lifecycle matrix, authenticated SDK smoke, and Windows conformance while
+inventory-checking test roots, processes, scheduled tasks, AppContainer
+profiles, registry state, and the task-authenticated recovery environment. On
+supported Windows hosts the Task Scheduler case is mandatory and starts a
+genuinely eligible test investigation through the exact installed action.
+It tests process/logon-task recovery, not a physical reboot.
 
 If you change a packet wording deliberately in any orchestrator extension,
 regenerate vitest snapshots once with `npm run test:update`. That update command

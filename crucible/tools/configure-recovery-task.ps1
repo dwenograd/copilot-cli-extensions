@@ -33,8 +33,21 @@ if ($null -eq $task) {
     exit 0
 }
 
-$action = @($task.Actions)[0]
-$trigger = @($task.Triggers)[0]
+$actions = @($task.Actions)
+$triggers = @($task.Triggers)
+if ($actions.Count -ne 1 -or $triggers.Count -ne 1) {
+    throw "Crucible recovery task must contain exactly one action and one trigger"
+}
+$action = $actions[0]
+$trigger = $triggers[0]
+function Resolve-TaskSid([string]$Identity) {
+    if ($Identity -match '^S-1-') { return $Identity }
+    return (
+        New-Object System.Security.Principal.NTAccount($Identity)
+    ).Translate([System.Security.Principal.SecurityIdentifier]).Value
+}
+$principalSid = Resolve-TaskSid $task.Principal.UserId
+$triggerSid = Resolve-TaskSid $trigger.UserId
 $logonType = if ([string]$task.Principal.LogonType -eq "Interactive") {
     "InteractiveToken"
 }
@@ -59,6 +72,7 @@ else {
     }
     principal = [ordered]@{
         userId = $task.Principal.UserId
+        userSid = $principalSid
         logonType = $logonType
         runLevel = $runLevel
     }
@@ -70,6 +84,7 @@ else {
             $trigger.CimClass.CimClassName
         }
         userId = $trigger.UserId
+        userSid = $triggerSid
     }
     settings = [ordered]@{
         hidden = [bool]$task.Settings.Hidden
@@ -88,5 +103,7 @@ else {
         else {
             -1
         }
+        allowStartOnBatteries = -not [bool]$task.Settings.DisallowStartIfOnBatteries
+        stopOnBatteryTransition = [bool]$task.Settings.StopIfGoingOnBatteries
     }
 } | ConvertTo-Json -Depth 5 -Compress

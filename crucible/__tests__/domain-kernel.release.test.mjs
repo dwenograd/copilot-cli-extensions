@@ -62,6 +62,10 @@ import {
     fakeStatisticalPolicy,
     upgradeLegacyContractInput,
 } from "./v4-contract-fixture.mjs";
+import {
+    inheritAggregateImpossibilityExecutions,
+    issueVerifiedImpossibilityExecutionCapability,
+} from "../domain/private-verifier-execution.mjs";
 
 function artifactHash(character) {
     return `sha256:${character.repeat(64)}`;
@@ -1048,12 +1052,199 @@ function impossibilityObservationInput(context, command, label, {
     };
 }
 
+function verifiedVerifierCapability(context, input) {
+    const command = context.aggregate.commands[input.commandId].command;
+    const role = context.contract.harnessSuite.roles.impossibility_verifier;
+    const measurement = input.receipt.provenance.measurements[0];
+    const checker = input.data.checkerResult;
+    const requestArtifact = fakeArtifact(
+        `${input.observationId}-request`,
+        command.requestHash,
+    );
+    const proofArtifact = fakeArtifact(
+        `${input.observationId}-proof`,
+        command.proofArtifactHash,
+    );
+    const executionIdentity = hashCanonical(
+        {
+            commandId: input.commandId,
+            observationId: input.observationId,
+            receiptHash: measurement.receiptHash,
+        },
+        "sha256:crucible-verified-impossibility-execution-identity-v1",
+    );
+    const enumerandObservations = checker.enumerandResults.map((result) => {
+        const inputArtifact = fakeArtifact(
+            `verified-enumerand-${result.ordinal}`,
+            result.inputRoot,
+        );
+        const observationCore = {
+            ordinal: result.ordinal,
+            enumerandHash: result.enumerandHash,
+            inputRoot: result.inputRoot,
+            receiptBindingsRoot: result.receiptBindingsRoot,
+            claimStates: result.claimStates,
+            inputArtifact,
+        };
+        const observationHash = hashCanonical(
+            observationCore,
+            "sha256:crucible-verified-impossibility-enumerand-observation-v1",
+        );
+        const receiptCore = {
+            executionIdentity,
+            measurementReceiptHash: measurement.receiptHash,
+            rawStdoutHash: measurement.rawStdoutHash,
+            requestHash: command.requestHash,
+            requestArtifact,
+            observationHash,
+            inputArtifact,
+        };
+        return {
+            ...observationCore,
+            observationHash,
+            checkerReceipt: {
+                ...receiptCore,
+                receiptHash: hashCanonical(
+                    receiptCore,
+                    "sha256:crucible-verified-impossibility-checker-receipt-v1",
+                ),
+            },
+        };
+    });
+    const proofCheckerReceipt = checker.mode === "certificate_validation"
+        ? (() => {
+            const core = {
+                executionIdentity,
+                measurementReceiptHash: measurement.receiptHash,
+                rawStdoutHash: measurement.rawStdoutHash,
+                requestHash: command.requestHash,
+                requestArtifact,
+                proofArtifact,
+                proofArtifactHash: command.proofArtifactHash,
+                proofCheckerIdentity:
+                    command.request.verifier.proofChecker.identity,
+                certificateFormat:
+                    command.request.verifier.verificationPolicy
+                        .certificateFormat,
+                status: checker.status,
+            };
+            return {
+                ...core,
+                receiptHash: hashCanonical(
+                    core,
+                    "sha256:crucible-verified-impossibility-checker-receipt-v1",
+                ),
+            };
+        })()
+        : null;
+    const factsCore = {
+        status: checker.status,
+        verdict: checker.certificate.verdict,
+        mode: checker.mode,
+        complete: checker.complete,
+        disagreementCount: checker.disagreementCount,
+        requestHash: command.requestHash,
+        proposedCertificateArtifactHash:
+            command.proposedCertificateArtifactHash,
+        proofArtifactHash: command.proofArtifactHash,
+        coverageClosureRoot: checker.coverageClosureRoot,
+        enumerandManifestRoot: checker.enumerandManifestRoot,
+        enumerandCount: checker.enumerandCount,
+        checkedEnumerandCount: checker.checkedEnumerandCount,
+        enumerandObservations,
+        evidenceRoots: checker.evidenceRoots,
+        statisticalPolicyIdentity: checker.statisticalPolicyIdentity,
+        alphaLedgerRoot: checker.alphaLedgerRoot,
+        checkerEvidenceRoot: checker.checkerEvidenceRoot,
+        proofCheckerReceipt,
+    };
+    const reference = {
+        version: "crucible-verified-impossibility-execution-v1",
+        commandId: input.commandId,
+        observationId: input.observationId,
+        request: {
+            requestHash: command.requestHash,
+            artifact: requestArtifact,
+            snapshotManifestArtifact: measurement.snapshot.manifestArtifact,
+        },
+        proof: {
+            artifactHash: command.proofArtifactHash,
+            artifact: proofArtifact,
+            sizeBytes: 1,
+        },
+        certificate: {
+            artifact:
+                input.receipt.provenance.impossibilityCertificateArtifact,
+            artifactHash: input.data.certificateArtifactHash,
+            sizeBytes: 1,
+        },
+        measurement: {
+            subjectId: measurement.subjectId,
+            measurementRoot: measurement.measurementRoot,
+            receiptHash: measurement.receiptHash,
+            receiptArtifact: measurement.receiptArtifact,
+            rawStdoutHash: measurement.rawStdoutHash,
+            rawStdoutArtifact: measurement.rawStdoutArtifact,
+            rawStderrHash: measurement.rawStderrHash,
+            rawStderrArtifact: measurement.rawStderrArtifact,
+            snapshotHash: measurement.snapshot.snapshotHash,
+            snapshotClosureRoot: measurement.snapshot.closureRoot,
+        },
+        executionIdentity: {
+            identity: executionIdentity,
+            harnessId: role.harnessId,
+            harnessEntryHash: role.harnessEntryHash,
+            executableHash: role.executableHash,
+            stagedExecutableHash: role.executableHash,
+            applicationEntrypointHash: role.applicationEntrypointHash,
+            parserIdentity: role.parser,
+            sandbox: {
+                policyDigest: role.sandboxIdentity.policyDigest,
+                policyIdentity: {
+                    securityContext: {
+                        appContainer: true,
+                        lowIntegrity: true,
+                        capabilities: [],
+                    },
+                },
+            },
+        },
+        effectBinding: {
+            effectAttempt: { attemptId: input.receipt.attemptId },
+            observationAttempt: { attemptId: "domain-attempt" },
+            runnerEpochId: input.receipt.runnerEpochId,
+        },
+        facts: {
+            ...factsCore,
+            factsRoot: hashCanonical(
+                factsCore,
+                "sha256:crucible-verified-impossibility-facts-v1",
+            ),
+        },
+    };
+    return issueVerifiedImpossibilityExecutionCapability({
+        commandId: input.commandId,
+        observationId: input.observationId,
+        reference,
+    });
+}
+
+function constructVerifiedImpossibilityObservedEvent(context, input) {
+    return constructHarnessObservedEvent(context.aggregate, input, {
+        verifierExecutionCapability:
+            verifiedVerifierCapability(context, input),
+    });
+}
+
 function commitImpossibility(context, reserved, label, facts = {}) {
     const input = impossibilityObservationInput(context, {
         ...reserved.command,
         commandId: reserved.commandId,
     }, label, facts);
-    const observed = constructHarnessObservedEvent(context.aggregate, input);
+    const observed = constructVerifiedImpossibilityObservedEvent(
+        context,
+        input,
+    );
     append(context, observed);
     const evidenceId = `impossibility-evidence-${label}`;
     append(context, constructEvidenceCommittedEvent(context.aggregate, {
@@ -2978,19 +3169,43 @@ describe("Crucible domain version 4 kernel", () => {
             independentlyDerivedVerifierFacts: true,
         });
         const echoedFacts = structuredClone(context.aggregate);
-        echoedFacts.evidence[evidence.evidenceId]
-            .unreachableBasis.independentFactsRoot =
-                verifier.command.proposedCertificateArtifactHash;
+        inheritAggregateImpossibilityExecutions(
+            context.aggregate,
+            echoedFacts,
+        );
         expect(assessTargetUnreachableReadiness(
             echoedFacts,
             echoedFacts.evidence[evidence.evidenceId],
         )).toMatchObject({
-            ready: false,
+            ready: true,
+            independentVerifierRoleBound: true,
             independentlyDerivedVerifierFacts: true,
+            verifierClosureBound: true,
+        });
+        const originalFactsRoot = echoedFacts.evidence[evidence.evidenceId]
+            .unreachableBasis.verifierFactsRoot;
+        echoedFacts.evidence[evidence.evidenceId]
+            .unreachableBasis.verifierFactsRoot =
+                verifier.command.proposedCertificateArtifactHash;
+        expect(echoedFacts.evidence[evidence.evidenceId]
+            .unreachableBasis.verifierFactsRoot).not.toBe(originalFactsRoot);
+        const tamperedReadiness = assessTargetUnreachableReadiness(
+            echoedFacts,
+            echoedFacts.evidence[evidence.evidenceId],
+        );
+        expect(tamperedReadiness).toMatchObject({
+            ready: false,
+            independentVerifierRoleBound: true,
+            independentlyDerivedVerifierFacts: true,
+            verifierClosureBound: false,
+            independentVerifierSupported: false,
             missing: expect.arrayContaining([
                 "independent_impossibility_verifier_evidence",
             ]),
         });
+        expect(tamperedReadiness.missing).not.toContain(
+            "independently_derived_impossibility_verifier_facts",
+        );
 
         const terminal = constructKernelDecisionEvent(context.aggregate);
         expect(terminal).toMatchObject({
@@ -3314,7 +3529,7 @@ describe("Crucible domain version 4 kernel", () => {
         }, "checker-crash");
         append(
             context,
-            constructHarnessObservedEvent(context.aggregate, input),
+            constructVerifiedImpossibilityObservedEvent(context, input),
         );
 
         context.aggregate = replayEvents(context.history);
@@ -3510,7 +3725,10 @@ describe("Crucible domain version 4 kernel", () => {
             ...verifier.command,
             commandId: verifier.commandId,
         }, "forged");
-        const observed = constructHarnessObservedEvent(context.aggregate, input);
+        const observed = constructVerifiedImpossibilityObservedEvent(
+            context,
+            input,
+        );
 
         expect(() => replayEvents([
             ...context.history,
@@ -3528,7 +3746,7 @@ describe("Crucible domain version 4 kernel", () => {
                     certificateArtifactHash: hashCanonical({ forged: true }),
                 },
             }),
-        ])).toThrow(expect.objectContaining({ code: ERROR_CODES.INVALID_EVIDENCE }));
+        ])).toThrow(expect.objectContaining({ code: ERROR_CODES.INVALID_EVENT }));
     });
 
     it("rejects a verifier certificate that tampers with the exact coverage closure", () => {
@@ -3553,7 +3771,7 @@ describe("Crucible domain version 4 kernel", () => {
         input.data.checkerResult.certificate.coverageClosureRoot =
             tamperedRoot;
 
-        expect(() => constructHarnessObservedEvent(context.aggregate, input))
+        expect(() => constructVerifiedImpossibilityObservedEvent(context, input))
             .toThrow(expect.objectContaining({ code: ERROR_CODES.INVALID_EVENT }));
     });
 
@@ -3598,8 +3816,8 @@ describe("Crucible domain version 4 kernel", () => {
                 input.data.checkerResult.independentFactsRoot,
         });
 
-        expect(() => constructHarnessObservedEvent(
-            context.aggregate,
+        expect(() => constructVerifiedImpossibilityObservedEvent(
+            context,
             input,
         )).toThrow(expect.objectContaining({
             code: ERROR_CODES.INVALID_EVENT,

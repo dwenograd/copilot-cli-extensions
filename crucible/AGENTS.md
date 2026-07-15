@@ -23,7 +23,13 @@ run, then rerun the affected tier once.
 ## Runtime budget
 
 - Targeted/unit loop: under 30 seconds.
-- Changed-file loop: hard timeout of 120 seconds.
+- Changed-file unit loop: hard timeout of 120 seconds.
+- Ownership resolution covers every current Crucible source module, test fixture,
+  PowerShell helper, Vitest config, and release test. Unknown inputs fail closed;
+  the runner never substitutes an unrelated unit tier.
+- Release-only fixtures, integration tests, and native conformance inputs require
+  `npm run test:crucible:changed -- --release <path>`. Mappings stay narrow and
+  may use a test-name selector rather than launching a whole release matrix.
 - Phase-gate suite: run by the parent only.
 - Long native/crash matrices: release gate only.
 
@@ -41,3 +47,11 @@ raising its timeout.
 Never make a safe default test depend on credentials, external networking,
 real user secrets, interactive UI, unbounded resource use, or host-global
 registry/device state.
+
+Windows release conformance runs the Task Scheduler case whenever the platform
+provides the required cmdlets. It seeds a test-owned eligible investigation and
+proves discovery plus supervisor recovery through the exact installed action.
+This is process/logon-task conformance only: it does not reboot or power-cycle
+the host and must not be described as a physical reboot test. The fixture keeps
+its state root and cleanup manifest until exact task removal is verified; both
+test-finally and unattended-runner cleanup retry interrupted removals.

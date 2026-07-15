@@ -209,7 +209,7 @@ export function inspectInvestigationDomainCompatibility({
             eventCount: 0,
             headSeq: 0,
             readOnly: true,
-            archiveable: !compatible,
+            archiveable: false,
         });
     }
 
@@ -222,16 +222,10 @@ export function inspectInvestigationDomainCompatibility({
     );
     const currentKind =
         `${DOMAIN_KIND_PREFIX}${EVENT_TYPES.INVESTIGATION_OPENED}`;
-    const legacyKind =
-        `${LEGACY_DOMAIN_KIND_PREFIX}${EVENT_TYPES.INVESTIGATION_OPENED}`;
     // The repository kind is the outer version namespace. If it is the current
     // v4 kind, malformed/missing inner fields remain integrity failures during
     // replay rather than being mislabeled as archived legacy state.
     const compatible = first.seq === 1 && first.kind === currentKind;
-    const recognizableOpening = first.seq === 1
-        && [currentKind, legacyKind].includes(first.kind)
-        && domainEvent?.type === EVENT_TYPES.INVESTIGATION_OPENED;
-
     return Object.freeze({
         investigationId: id,
         present: true,
@@ -242,7 +236,7 @@ export function inspectInvestigationDomainCompatibility({
         eventCount: head.seq,
         headSeq: head.seq,
         readOnly: true,
-        archiveable: !compatible && recognizableOpening,
+        archiveable: false,
     });
 }
 
@@ -2245,7 +2239,6 @@ function deriveVerifiedImpossibilityExecutionCapability({
         )
         || measured.receipt.sandbox.policyIdentity.securityContext
             .capabilities.length !== 0
-        || measured.receipt.attemptId !== payload.receipt.attemptId
         || measured.receipt.runnerEpochId !== payload.receipt.runnerEpochId
         || commandRecord.capabilityEpochId
             !== measured.receipt.runnerEpochId
@@ -2262,9 +2255,10 @@ function deriveVerifiedImpossibilityExecutionCapability({
         operationalEvidence,
         (event) =>
             event.kind === "runtime:measurement"
-            && event.attemptId === measured.receipt.attemptId
             && event.payload?.commandId === payload.commandId
-            && event.payload?.purpose === "impossibility",
+            && event.payload?.purpose === "impossibility"
+            && event.payload?.receiptArtifactId
+                === measured.measurement.receiptArtifact.artifactId,
         "Impossibility measurement",
         { commandId: payload.commandId },
     );
@@ -2272,23 +2266,38 @@ function deriveVerifiedImpossibilityExecutionCapability({
         operationalEvidence,
         (event) =>
             event.kind === "runtime:impossibility_certificate"
-            && event.attemptId === measured.receipt.attemptId
-            && event.payload?.commandId === payload.commandId,
+            && event.payload?.commandId === payload.commandId
+            && event.payload?.measurementReceiptArtifactId
+                === measured.measurement.receiptArtifact.artifactId,
         "Impossibility certificate",
         { commandId: payload.commandId },
     );
+    const boundObservationAttemptId =
+        expectedObservationAttemptId
+        ?? payload.verifierExecution?.effectBinding
+            ?.observationAttempt?.attemptId
+        ?? null;
     const requestEvent = exactOperationalEvent(
         operationalEvidence,
         (event) =>
             event.kind === "runtime:impossibility_request"
-            && event.payload?.commandId === payload.commandId,
+            && event.payload?.commandId === payload.commandId
+            && (boundObservationAttemptId === null
+                || event.attemptId === boundObservationAttemptId),
         "Impossibility request",
         { commandId: payload.commandId },
     );
     const effectAttempt = repository.getCommandAttempt(
-        measured.receipt.attemptId,
+        measurementEvent.attemptId,
     );
     const mainAttempt = repository.getCommandAttempt(requestEvent.attemptId);
+    const recoveredEffectAuthority =
+        effectAttempt.state === "committed"
+        && mainAttempt.fencingToken > effectAttempt.fencingToken
+        && mainAttempt.owner === effectAttempt.owner
+        && mainAttempt.supervisorGeneration
+            === effectAttempt.supervisorGeneration
+        && mainAttempt.runnerIncarnation === effectAttempt.runnerIncarnation;
     const effectMetadata = parseAttemptMetadata(
         effectAttempt,
         "Impossibility effect",
@@ -2297,6 +2306,10 @@ function deriveVerifiedImpossibilityExecutionCapability({
         mainAttempt,
         "Impossibility domain command",
     );
+    const effectSourceBound =
+        effectAttempt.attemptId === measured.receipt.attemptId
+        || effectMetadata.recoveredFromAttemptId
+            === measured.receipt.attemptId;
     const expectedLogicalEffectKey = logicalEffectKey(
         investigationId,
         effectMetadata.effect ?? {},
@@ -2314,12 +2327,15 @@ function deriveVerifiedImpossibilityExecutionCapability({
         || effectMetadata.effect?.kind !== "impossibility-verification"
         || effectMetadata.effect?.commandId !== payload.commandId
         || effectMetadata.effect?.requestHash !== command.requestHash
+        || !effectSourceBound
+        || payload.receipt.attemptId !== effectAttempt.attemptId
         || effectMetadata.effect?.snapshot
             !== measurementEvent.payload.snapshotId
         || mainMetadata.scope !== "domain-command"
         || mainMetadata.commandId !== payload.commandId
         || !canonicalEqual(mainMetadata.command, command)
-        || !sameAttemptAuthority(effectAttempt, mainAttempt)
+        || (!sameAttemptAuthority(effectAttempt, mainAttempt)
+            && !recoveredEffectAuthority)
         || (expectedObservationAttemptId !== null
             && mainAttempt.attemptId !== expectedObservationAttemptId)
         || (expectedLease !== null
@@ -2345,7 +2361,46 @@ function deriveVerifiedImpossibilityExecutionCapability({
             !== certificateArtifact.artifactId) {
         integrityFailure(
             "Impossibility process effect is not bound to its runner attempt, lease, generation, and operational records",
-            { commandId: payload.commandId },
+            {
+                commandId: payload.commandId,
+                recoveredEffectAuthority,
+                expectedLogicalEffectKey,
+                effectLogicalEffectKey: effectMetadata.logicalEffectKey,
+                measurementLogicalEffectKey:
+                    measurementEvent.payload.logicalEffectKey,
+                certificateLogicalEffectKey:
+                    certificateEvent.payload.logicalEffectKey,
+                requestSnapshotId: requestEvent.payload.snapshotId,
+                measurementSnapshotId:
+                    measurementEvent.payload.snapshotId,
+                requestManifestObjectId:
+                    requestEvent.payload.snapshotProvenance
+                        ?.manifestArtifact?.objectId ?? null,
+                measurementManifestObjectId:
+                    measured.measurement.snapshot.manifestArtifact.objectId,
+                effectAttempt: {
+                    attemptId: effectAttempt?.attemptId ?? null,
+                    state: effectAttempt?.state ?? null,
+                    leaseId: effectAttempt?.leaseId ?? null,
+                    fencingToken: effectAttempt?.fencingToken ?? null,
+                    owner: effectAttempt?.owner ?? null,
+                    supervisorGeneration:
+                        effectAttempt?.supervisorGeneration ?? null,
+                    runnerIncarnation:
+                        effectAttempt?.runnerIncarnation ?? null,
+                },
+                mainAttempt: {
+                    attemptId: mainAttempt?.attemptId ?? null,
+                    state: mainAttempt?.state ?? null,
+                    leaseId: mainAttempt?.leaseId ?? null,
+                    fencingToken: mainAttempt?.fencingToken ?? null,
+                    owner: mainAttempt?.owner ?? null,
+                    supervisorGeneration:
+                        mainAttempt?.supervisorGeneration ?? null,
+                    runnerIncarnation:
+                        mainAttempt?.runnerIncarnation ?? null,
+                },
+            },
         );
     }
 

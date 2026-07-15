@@ -25,6 +25,7 @@ if (process.platform !== "win32") {
             env: {
                 ...process.env,
                 CRUCIBLE_WINDOWS_CONFORMANCE: "1",
+                CRUCIBLE_RUN_TASK_SCHEDULER_CONFORMANCE: "1",
             },
             stdio: "inherit",
             windowsHide: true,

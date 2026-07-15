@@ -40,6 +40,22 @@ const ARCHIVE_TRUST_LEVELS = new Set([
     "self-consistent",
 ]);
 const ARCHIVE_INTEGRITY_STATUSES = new Set(["verified", "blocked"]);
+const DELETE_CLEANUP_AUTHORITY_KINDS = new Set([
+    "pending_delete",
+    "legacy_tombstone",
+]);
+const DELETE_CLEANUP_SOURCE_AUTHORITIES = new Set([
+    "verified_bundle",
+    "legacy_preverified",
+    "legacy_discovery",
+]);
+const DELETE_CLEANUP_STATES = new Set([
+    "reserved",
+    "marked",
+    "moved",
+    "durability_pending",
+    "durable",
+]);
 const ARCHIVE_DIGEST_RE = /^sha256:[a-f0-9]{64}$/u;
 const TAGGED_HASH_RE =
     /^sha256:[a-z0-9][a-z0-9._-]*:[a-f0-9]{64}$/u;
@@ -50,6 +66,7 @@ const ARCHIVE_RELATIVE_PATH_RE =
     /^\.retention\/archives\/(?![^/]*\.\.)[A-Za-z0-9][A-Za-z0-9._@-]{0,127}$/u;
 const TOMBSTONE_RELATIVE_PATH_RE =
     /^\.retention\/tombstones\/(?![^/]*\.\.)[A-Za-z0-9][A-Za-z0-9._@-]{0,127}\.json$/u;
+const CLEANUP_MARKER_NONCE_RE = /^[a-f0-9]{64}$/u;
 const RECOVERY_OPERATION_STATES = new Set([
     "eligible",
     "running",
@@ -104,6 +121,36 @@ function requireArchiveDigest(value, field = "archiveDigest") {
         );
     }
     return value;
+}
+
+function cleanupRelativePath(investigationId, archiveDigest) {
+    const digest = createHash("sha256")
+        .update("crucible-delete-cleanup-v2\0")
+        .update(investigationId)
+        .update("\0")
+        .update(archiveDigest)
+        .digest("hex");
+    return `.retention/archives/cleanup-${digest}`;
+}
+
+function cleanupMarkerDigest({
+    investigationId,
+    archiveRelativePath,
+    cleanupRelativePath: cleanupPath,
+    archiveDigest,
+    nonce,
+}) {
+    const document = {
+        type: "crucible-delete-cleanup-marker",
+        version: 1,
+        investigationId,
+        archiveRelativePath,
+        cleanupRelativePath: cleanupPath,
+        archiveDigest,
+        nonce,
+    };
+    const bytes = Buffer.from(`${canonicalize(document)}\n`, "utf8");
+    return `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
 }
 
 function isRetentionRelativePath(value) {
@@ -376,6 +423,7 @@ export class ResourceCatalogRepository {
     #readOnly;
     #busyTimeoutMs;
     #integrityCheckAdapter;
+    #transactionActive = false;
 
     constructor(db, {
         file,
@@ -480,7 +528,8 @@ export class ResourceCatalogRepository {
                 integrityCheckAdapter,
             });
             if (readOnly === true) {
-                repository.#verifyCatalogConfiguration();
+                repository.#readSnapshot(() =>
+                    repository.#verifyCatalogConfiguration());
             } else {
                 repository.#initializeCatalogConfiguration();
             }
@@ -546,9 +595,11 @@ export class ResourceCatalogRepository {
         try {
             this.#db.exec("BEGIN IMMEDIATE;");
             began = true;
+            this.#transactionActive = true;
             const result = operation();
             this.#db.exec("COMMIT;");
             began = false;
+            this.#transactionActive = false;
             return result;
         } catch (error) {
             if (began) {
@@ -558,6 +609,7 @@ export class ResourceCatalogRepository {
                     error.rollbackError = rollbackError;
                 }
             }
+            this.#transactionActive = false;
             if (error instanceof CruciblePersistenceError) {
                 throw error;
             }
@@ -569,6 +621,65 @@ export class ResourceCatalogRepository {
             }
             throw error;
         }
+    }
+
+    #readSnapshot(operation) {
+        if (this.#transactionActive) return operation();
+        let began = false;
+        try {
+            this.#db.exec("BEGIN DEFERRED;");
+            began = true;
+            this.#transactionActive = true;
+            const result = operation();
+            this.#db.exec("COMMIT;");
+            began = false;
+            this.#transactionActive = false;
+            return result;
+        } catch (error) {
+            if (began) {
+                try {
+                    this.#db.exec("ROLLBACK;");
+                } catch (rollbackError) {
+                    error.rollbackError = rollbackError;
+                }
+            }
+            this.#transactionActive = false;
+            if (error instanceof CruciblePersistenceError) {
+                throw error;
+            }
+            if (isSqliteError(error)) {
+                throw new StorageError(
+                    `resource catalog read snapshot failed: ${error.message}`,
+                    error,
+                );
+            }
+            throw error;
+        }
+    }
+
+    #lifecycleGeneration() {
+        const value = this.#db.prepare(`
+            SELECT value
+            FROM schema_meta
+            WHERE key = 'lifecycle_generation'
+        `).get()?.value;
+        const generation = Number(value);
+        if (!Number.isSafeInteger(generation) || generation < 0) {
+            throw new SchemaIntegrityError(
+                "resource catalog lifecycle generation is missing or invalid",
+            );
+        }
+        return generation;
+    }
+
+    #advanceLifecycleGeneration() {
+        const generation = this.#lifecycleGeneration();
+        this.#db.prepare(`
+            UPDATE schema_meta
+            SET value = ?
+            WHERE key = 'lifecycle_generation'
+        `).run(String(generation + 1));
+        return generation + 1;
     }
 
     #initializeCatalogConfiguration() {
@@ -616,6 +727,7 @@ export class ResourceCatalogRepository {
     }
 
     #verifyCatalogConfiguration() {
+        this.#lifecycleGeneration();
         const row = this.#db.prepare(
             "SELECT * FROM catalog_config WHERE singleton_id = 1",
         ).get();
@@ -694,6 +806,11 @@ export class ResourceCatalogRepository {
                 FROM investigation_archives
                 WHERE investigation_id = ?
             `).get(investigation.investigation_id);
+            const deleteCleanup = this.#db.prepare(`
+                SELECT *
+                FROM investigation_delete_cleanup
+                WHERE investigation_id = ?
+            `).get(investigation.investigation_id);
             if (operation !== undefined) {
                 const parsed = this.#rowToLifecycleOperation(operation);
                 const expectedState = parsed.operationKind === "archive"
@@ -724,13 +841,36 @@ export class ResourceCatalogRepository {
                     );
                 }
             }
+            if (deleteCleanup !== undefined) {
+                const parsed = this.#rowToDeleteCleanup(deleteCleanup);
+                if (parsed.authorityKind !== "pending_delete"
+                    || lifecycle.lifecycle_state !== "archived"
+                    || archive === undefined
+                    || parsed.archiveRelativePath
+                        !== archive.archive_relpath
+                    || parsed.archiveDigest !== archive.archive_digest
+                    || parsed.deletedAtMs
+                        < Number(investigation.registered_at_ms)
+                    || (operation !== undefined
+                        && (operation.operation_kind !== "delete"
+                            || operation.expected_archive_digest
+                                !== parsed.archiveDigest))) {
+                    throw new SchemaIntegrityError(
+                        "catalog delete cleanup is inconsistent with its archived authority",
+                        {
+                            investigationId:
+                                investigation.investigation_id,
+                        },
+                    );
+                }
+            }
         }
         for (const tombstone of this.#db.prepare(`
             SELECT *
             FROM investigation_tombstones
             ORDER BY investigation_id
         `).all()) {
-            this.#rowToTombstone(tombstone);
+            const parsedTombstone = this.#rowToTombstone(tombstone);
             if (this.#db.prepare(`
                 SELECT 1 AS present
                 FROM investigations
@@ -741,8 +881,177 @@ export class ResourceCatalogRepository {
                     { investigationId: tombstone.investigation_id },
                 );
             }
+            const deleteCleanup = this.#db.prepare(`
+                SELECT *
+                FROM investigation_delete_cleanup
+                WHERE investigation_id = ?
+            `).get(tombstone.investigation_id);
+            if (deleteCleanup !== undefined) {
+                const parsedCleanup =
+                    this.#rowToDeleteCleanup(deleteCleanup);
+                const durable = parsedTombstone.tombstone;
+                if (parsedCleanup.authorityKind
+                        !== "legacy_tombstone"
+                    || parsedCleanup.archiveDigest
+                        !== durable.archiveDigest
+                    || parsedCleanup.tombstoneRelativePath
+                        !== durable.relativePath
+                    || parsedCleanup.tombstoneDigest
+                        !== durable.digest
+                    || parsedCleanup.signingKeyFingerprint
+                        !== durable.signingKeyFingerprint
+                    || parsedCleanup.signature !== durable.signature
+                    || parsedCleanup.tombstoneSizeBytes
+                        !== durable.sizeBytes
+                    || parsedCleanup.deletedAtMs
+                        !== durable.deletedAtMs) {
+                    throw new SchemaIntegrityError(
+                        "legacy tombstone cleanup is inconsistent with durable tombstone authority",
+                        {
+                            investigationId:
+                                tombstone.investigation_id,
+                        },
+                    );
+                }
+            }
         }
+        const orphanCleanup = this.#db.prepare(`
+            SELECT c.investigation_id
+            FROM investigation_delete_cleanup AS c
+            LEFT JOIN investigations AS i
+              ON i.investigation_id = c.investigation_id
+            LEFT JOIN investigation_tombstones AS t
+              ON t.investigation_id = c.investigation_id
+            WHERE i.investigation_id IS NULL
+              AND t.investigation_id IS NULL
+            LIMIT 1
+        `).get();
+        if (orphanCleanup !== undefined) {
+            throw new SchemaIntegrityError(
+                "catalog contains delete cleanup without lifecycle authority",
+                { investigationId: orphanCleanup.investigation_id },
+            );
+        }
+        this.#verifyRetentionPathOwnershipIntegrity();
         this.#verifyRecoveryCatalogIntegrity();
+    }
+
+    #retentionPathOwners(relativePath) {
+        return this.#db.prepare(`
+            SELECT investigation_id, source
+            FROM (
+                SELECT investigation_id,
+                       'archive_operation' AS source,
+                       archive_relpath AS relative_path
+                FROM lifecycle_operations
+                WHERE archive_relpath IS NOT NULL
+
+                UNION ALL
+
+                SELECT investigation_id,
+                       'archive' AS source,
+                       archive_relpath AS relative_path
+                FROM investigation_archives
+
+                UNION ALL
+
+                SELECT investigation_id,
+                       'cleanup_archive' AS source,
+                       archive_relpath AS relative_path
+                FROM investigation_delete_cleanup
+                WHERE archive_relpath IS NOT NULL
+
+                UNION ALL
+
+                SELECT investigation_id,
+                       'cleanup_target' AS source,
+                       cleanup_relpath AS relative_path
+                FROM investigation_delete_cleanup
+            )
+            WHERE relative_path = ?
+            ORDER BY source, investigation_id
+        `).all(relativePath);
+    }
+
+    #assertRetentionPathReservation({
+        relativePath,
+        investigationId,
+        allowedOwnSources = [],
+    }) {
+        const allowed = new Set(allowedOwnSources);
+        const conflicts = this.#retentionPathOwners(relativePath)
+            .filter((owner) =>
+                owner.investigation_id !== investigationId
+                || !allowed.has(owner.source));
+        if (conflicts.length !== 0) {
+            throw new FenceRejectedError(
+                "retention path is already owned by another lifecycle authority",
+                {
+                    investigationId,
+                    relativePath,
+                    conflicts,
+                },
+            );
+        }
+    }
+
+    #verifyRetentionPathOwnershipIntegrity() {
+        const rows = this.#db.prepare(`
+            SELECT investigation_id, source, relative_path
+            FROM (
+                SELECT investigation_id,
+                       'archive_operation' AS source,
+                       archive_relpath AS relative_path
+                FROM lifecycle_operations
+                WHERE archive_relpath IS NOT NULL
+
+                UNION ALL
+
+                SELECT investigation_id,
+                       'archive' AS source,
+                       archive_relpath AS relative_path
+                FROM investigation_archives
+
+                UNION ALL
+
+                SELECT investigation_id,
+                       'cleanup_archive' AS source,
+                       archive_relpath AS relative_path
+                FROM investigation_delete_cleanup
+                WHERE archive_relpath IS NOT NULL
+
+                UNION ALL
+
+                SELECT investigation_id,
+                       'cleanup_target' AS source,
+                       cleanup_relpath AS relative_path
+                FROM investigation_delete_cleanup
+            )
+            ORDER BY relative_path, source, investigation_id
+        `).all();
+        const grouped = new Map();
+        for (const row of rows) {
+            const owners = grouped.get(row.relative_path) ?? [];
+            owners.push(row);
+            grouped.set(row.relative_path, owners);
+        }
+        for (const [relativePath, owners] of grouped) {
+            if (owners.length <= 1) continue;
+            const investigationIds =
+                new Set(owners.map((owner) => owner.investigation_id));
+            const sources = new Set(owners.map((owner) => owner.source));
+            const allowedArchiveCleanupPair =
+                investigationIds.size === 1
+                && owners.length === 2
+                && sources.has("archive")
+                && sources.has("cleanup_archive");
+            if (!allowedArchiveCleanupPair) {
+                throw new SchemaIntegrityError(
+                    "retention path has conflicting catalog owners",
+                    { relativePath, owners },
+                );
+            }
+        }
     }
 
     #verifyRecoveryCatalogIntegrity() {
@@ -976,6 +1285,7 @@ export class ResourceCatalogRepository {
                     limitUnits: entry.units,
                 });
             }
+            this.#advanceLifecycleGeneration();
             return Object.freeze({
                 created: true,
                 investigation: this.getInvestigation(investigationId),
@@ -983,8 +1293,7 @@ export class ResourceCatalogRepository {
         });
     }
 
-    getInvestigation(investigationId) {
-        requireString(investigationId, "investigationId", 128);
+    #materializeInvestigation(investigationId, catalogGeneration) {
         const row = this.#db.prepare(
             "SELECT * FROM investigations WHERE investigation_id = ?",
         ).get(investigationId);
@@ -994,9 +1303,19 @@ export class ResourceCatalogRepository {
                 FROM investigation_tombstones
                 WHERE investigation_id = ?
             `).get(investigationId);
-            return tombstone === undefined
-                ? null
-                : this.#rowToTombstone(tombstone);
+            if (tombstone === undefined) return null;
+            const deleteCleanup = this.#db.prepare(`
+                SELECT *
+                FROM investigation_delete_cleanup
+                WHERE investigation_id = ?
+            `).get(investigationId);
+            return Object.freeze({
+                ...this.#rowToTombstone(tombstone),
+                catalogGeneration,
+                deleteCleanup: deleteCleanup === undefined
+                    ? null
+                    : this.#rowToDeleteCleanup(deleteCleanup),
+            });
         }
         const limits = this.#assertInvestigationLimitsIntegrity(row);
         this.#assertInvestigationAuthorityIntegrity(row);
@@ -1011,8 +1330,14 @@ export class ResourceCatalogRepository {
             FROM investigation_archives
             WHERE investigation_id = ?
         `).get(investigationId);
+        const deleteCleanup = this.#db.prepare(`
+            SELECT *
+            FROM investigation_delete_cleanup
+            WHERE investigation_id = ?
+        `).get(investigationId);
         return Object.freeze({
             ...this.#rowToInvestigation(row),
+            catalogGeneration,
             limits: Object.freeze(limits),
             lifecycleState: lifecycle.lifecycle_state,
             lifecycleUpdatedAtMs: numberFromSql(
@@ -1026,7 +1351,21 @@ export class ResourceCatalogRepository {
             archive: archive === undefined
                 ? null
                 : this.#rowToArchive(archive),
+            deleteCleanup: deleteCleanup === undefined
+                ? null
+                : this.#rowToDeleteCleanup(deleteCleanup),
             tombstone: null,
+        });
+    }
+
+    getInvestigation(investigationId) {
+        requireString(investigationId, "investigationId", 128);
+        return this.#readSnapshot(() => {
+            const generation = this.#lifecycleGeneration();
+            return this.#materializeInvestigation(
+                investigationId,
+                generation,
+            );
         });
     }
 
@@ -1035,6 +1374,7 @@ export class ResourceCatalogRepository {
         excludeFenced = false,
         afterInvestigationId = null,
         limit = null,
+        onSnapshotEstablished = null,
     } = {}) {
         if (lifecycleState !== null
             && !INVESTIGATION_LIFECYCLE_STATES.has(lifecycleState)) {
@@ -1059,7 +1399,15 @@ export class ResourceCatalogRepository {
                 maximum: 1000,
             });
         }
-        const ids = this.#db.prepare(`
+        if (onSnapshotEstablished !== null
+            && typeof onSnapshotEstablished !== "function") {
+            throw new InvalidArgumentError(
+                "onSnapshotEstablished must be a function or null",
+            );
+        }
+        return this.#readSnapshot(() => {
+            const generation = this.#lifecycleGeneration();
+            const ids = this.#db.prepare(`
             SELECT investigation_id
             FROM (
                 SELECT i.investigation_id AS investigation_id,
@@ -1085,14 +1433,24 @@ export class ResourceCatalogRepository {
               AND (:afterId IS NULL OR investigation_id > :afterId)
             ORDER BY investigation_id
             LIMIT :limit
-        `).all({
-            lifecycleState,
-            excludeFenced: excludeFenced ? 1 : 0,
-            afterId: afterInvestigationId,
-            limit: limit ?? -1,
+            `).all({
+                lifecycleState,
+                excludeFenced: excludeFenced ? 1 : 0,
+                afterId: afterInvestigationId,
+                limit: limit ?? -1,
+            });
+            onSnapshotEstablished?.();
+            const result = ids.map((entry) =>
+                this.#materializeInvestigation(
+                    entry.investigation_id,
+                    generation,
+                ));
+            Object.defineProperty(result, "catalogGeneration", {
+                value: generation,
+                enumerable: false,
+            });
+            return Object.freeze(result);
         });
-        return Object.freeze(ids.map((entry) =>
-            this.getInvestigation(entry.investigation_id)));
     }
 
     setInvestigationLifecycle({
@@ -1165,6 +1523,7 @@ export class ResourceCatalogRepository {
                 normalizedReason,
                 investigationId,
             );
+            this.#advanceLifecycleGeneration();
             return Object.freeze({
                 changed: true,
                 investigation: this.getInvestigation(investigationId),
@@ -1313,6 +1672,11 @@ export class ResourceCatalogRepository {
                     );
                 }
             } else {
+                this.#assertRetentionPathReservation({
+                    relativePath: reservedArchivePath,
+                    investigationId,
+                    allowedOwnSources: [],
+                });
                 const operationOwner = this.#db.prepare(`
                     SELECT investigation_id
                     FROM lifecycle_operations
@@ -1369,6 +1733,7 @@ export class ResourceCatalogRepository {
                 expectedDigest,
                 startedAtMs,
             );
+            this.#advanceLifecycleGeneration();
             return Object.freeze({
                 created: true,
                 operation: this.#rowToLifecycleOperation(
@@ -1407,6 +1772,7 @@ export class ResourceCatalogRepository {
                 DELETE FROM lifecycle_operations
                 WHERE investigation_id = ? AND operation_token = ?
             `).run(investigationId, operationToken);
+            this.#advanceLifecycleGeneration();
             return Object.freeze({ changed: true });
         });
     }
@@ -1487,6 +1853,11 @@ export class ResourceCatalogRepository {
                     { investigationId, activeLeaseCount },
                 );
             }
+            this.#assertRetentionPathReservation({
+                relativePath,
+                investigationId,
+                allowedOwnSources: ["archive_operation"],
+            });
             const archivedAtMs = this.#timestamp();
             this.#db.prepare(`
                 INSERT INTO investigation_archives(
@@ -1530,6 +1901,7 @@ export class ResourceCatalogRepository {
                 DELETE FROM lifecycle_operations
                 WHERE investigation_id = ? AND operation_token = ?
             `).run(investigationId, operationToken);
+            this.#advanceLifecycleGeneration();
             return Object.freeze({
                 changed: true,
                 investigation: this.getInvestigation(investigationId),
@@ -1537,23 +1909,105 @@ export class ResourceCatalogRepository {
         });
     }
 
+    #advanceDeleteCleanupState({
+        pending,
+        nextCleanupState,
+        archiveRemoved,
+        investigationId,
+        allowLegacyMissingSource,
+    }) {
+        if (archiveRemoved) {
+            if (pending.cleanup_state !== "durable") {
+                throw new FenceRejectedError(
+                    "delete finalization requires durable cleanup state",
+                    { investigationId },
+                );
+            }
+            return false;
+        }
+        if (nextCleanupState === null
+            || nextCleanupState === pending.cleanup_state) {
+            return false;
+        }
+        const transitions = new Map([
+            ["reserved", "marked"],
+            ["marked", "moved"],
+            ["moved", "durability_pending"],
+            ["durability_pending", "durable"],
+        ]);
+        const normal = transitions.get(pending.cleanup_state)
+            === nextCleanupState;
+        const legacyMissing = allowLegacyMissingSource
+            && pending.cleanup_state === "reserved"
+            && nextCleanupState === "durability_pending";
+        if (!normal && !legacyMissing) {
+            throw new FenceRejectedError(
+                "delete cleanup state transition is invalid",
+                {
+                    investigationId,
+                    currentState: pending.cleanup_state,
+                    requestedState: nextCleanupState,
+                },
+            );
+        }
+        this.#db.prepare(`
+            UPDATE investigation_delete_cleanup
+            SET cleanup_state = ?
+            WHERE investigation_id = ?
+        `).run(nextCleanupState, investigationId);
+        this.#advanceLifecycleGeneration();
+        return true;
+    }
+
     commitDelete({
         investigationId,
-        operationToken,
+        operationToken = null,
         expectedArchiveDigest,
+        cleanupRelativePath: requestedCleanupRelativePath,
+        cleanupMarkerNonce,
+        cleanupMarkerDigest: requestedCleanupMarkerDigest = null,
         tombstoneRelativePath,
         tombstoneDigest,
         signingKeyFingerprint,
         signature,
         tombstoneSizeBytes,
         deletedAtMs,
+        sourceAuthority = "verified_bundle",
+        discoveredArchiveRelativePath = null,
+        archiveAbsent = false,
+        nextCleanupState = null,
+        archiveRemoved = false,
     } = {}) {
         requireString(investigationId, "investigationId", 128);
-        requireString(operationToken, "operationToken", 256);
         const expectedDigest = requireArchiveDigest(
             expectedArchiveDigest,
             "expectedArchiveDigest",
         );
+        const cleanupPath = requireArchiveRelativePath(
+            requestedCleanupRelativePath,
+            "cleanupRelativePath",
+        );
+        if (cleanupPath !== cleanupRelativePath(
+            investigationId,
+            expectedDigest,
+        )) {
+            throw new InvalidArgumentError(
+                "cleanupRelativePath is not deterministic",
+                { investigationId },
+            );
+        }
+        if (typeof cleanupMarkerNonce !== "string"
+            || !CLEANUP_MARKER_NONCE_RE.test(cleanupMarkerNonce)) {
+            throw new InvalidArgumentError(
+                "cleanupMarkerNonce must be 64 lowercase hex characters",
+            );
+        }
+        const markerDigest = requestedCleanupMarkerDigest === null
+            ? null
+            : requireArchiveDigest(
+                requestedCleanupMarkerDigest,
+                "cleanupMarkerDigest",
+            );
         const relativePath = requireTombstoneRelativePath(
             tombstoneRelativePath,
             "tombstoneRelativePath",
@@ -1577,9 +2031,161 @@ export class ResourceCatalogRepository {
             deletedAtMs,
             "deletedAtMs",
         );
+        if (!DELETE_CLEANUP_SOURCE_AUTHORITIES.has(sourceAuthority)) {
+            throw new InvalidArgumentError(
+                "sourceAuthority is invalid",
+                { sourceAuthority },
+            );
+        }
+        const discoveredPath = discoveredArchiveRelativePath === null
+            ? null
+            : requireArchiveRelativePath(
+                discoveredArchiveRelativePath,
+                "discoveredArchiveRelativePath",
+            );
+        if (typeof archiveAbsent !== "boolean"
+            || typeof archiveRemoved !== "boolean") {
+            throw new InvalidArgumentError(
+                "archiveAbsent/archiveRemoved must be boolean",
+            );
+        }
+        if (nextCleanupState !== null
+            && !DELETE_CLEANUP_STATES.has(nextCleanupState)) {
+            throw new InvalidArgumentError(
+                "nextCleanupState is invalid",
+                { nextCleanupState },
+            );
+        }
         return this.#tx(() => {
-            const investigation =
-                this.#requireInvestigationInTransaction(investigationId);
+            const investigation = this.#db.prepare(`
+                SELECT *
+                FROM investigations
+                WHERE investigation_id = ?
+            `).get(investigationId);
+            const tombstone = this.#db.prepare(`
+                SELECT *
+                FROM investigation_tombstones
+                WHERE investigation_id = ?
+            `).get(investigationId);
+            let pending = this.#db.prepare(`
+                SELECT *
+                FROM investigation_delete_cleanup
+                WHERE investigation_id = ?
+            `).get(investigationId);
+
+            if (investigation === undefined) {
+                if (operationToken !== null
+                    || tombstone === undefined
+                    || pending === undefined
+                    || pending.authority_kind !== "legacy_tombstone"
+                    || pending.archive_digest !== expectedDigest
+                    || pending.cleanup_relpath !== cleanupPath
+                    || pending.cleanup_marker_nonce
+                        !== cleanupMarkerNonce
+                    || pending.tombstone_relpath !== relativePath
+                    || pending.tombstone_digest !== durableDigest
+                    || pending.signing_key_fingerprint
+                        !== signingKeyFingerprint
+                    || pending.signature !== signature
+                    || Number(pending.tombstone_size_bytes)
+                        !== sizeBytes
+                    || Number(pending.deleted_at_ms) !== deleted
+                    || tombstone.archive_digest !== expectedDigest
+                    || tombstone.tombstone_relpath !== relativePath
+                    || tombstone.tombstone_digest !== durableDigest) {
+                    throw new FenceRejectedError(
+                        "legacy tombstone cleanup lost exact catalog authority",
+                        { investigationId },
+                    );
+                }
+                if (pending.source_authority === "legacy_discovery") {
+                    if (discoveredPath !== null) {
+                        const expectedMarker = cleanupMarkerDigest({
+                            investigationId,
+                            archiveRelativePath: discoveredPath,
+                            cleanupRelativePath: cleanupPath,
+                            archiveDigest: expectedDigest,
+                            nonce: cleanupMarkerNonce,
+                        });
+                        if (markerDigest !== expectedMarker
+                            || archiveAbsent) {
+                            throw new FenceRejectedError(
+                                "legacy discovery marker binding is invalid",
+                                { investigationId },
+                            );
+                        }
+                        this.#assertRetentionPathReservation({
+                            relativePath: discoveredPath,
+                            investigationId,
+                            allowedOwnSources: [],
+                        });
+                        this.#db.prepare(`
+                            UPDATE investigation_delete_cleanup
+                            SET source_authority = 'verified_bundle',
+                                archive_relpath = ?,
+                                archive_absent = 0,
+                                cleanup_marker_digest = ?
+                            WHERE investigation_id = ?
+                        `).run(
+                            discoveredPath,
+                            markerDigest,
+                            investigationId,
+                        );
+                        this.#advanceLifecycleGeneration();
+                    } else if (archiveAbsent) {
+                        if (Number(pending.archive_absent) !== 1
+                            || pending.cleanup_state === "reserved") {
+                            this.#db.prepare(`
+                                UPDATE investigation_delete_cleanup
+                                SET archive_absent = 1,
+                                    cleanup_state = 'durability_pending'
+                                WHERE investigation_id = ?
+                            `).run(investigationId);
+                            this.#advanceLifecycleGeneration();
+                        }
+                    } else if (nextCleanupState !== null
+                        || archiveRemoved) {
+                        throw new FenceRejectedError(
+                            "legacy archive discovery must be resolved first",
+                            { investigationId },
+                        );
+                    }
+                    pending = this.#db.prepare(`
+                        SELECT *
+                        FROM investigation_delete_cleanup
+                        WHERE investigation_id = ?
+                    `).get(investigationId);
+                }
+                const changed = this.#advanceDeleteCleanupState({
+                    pending,
+                    nextCleanupState,
+                    archiveRemoved,
+                    investigationId,
+                    allowLegacyMissingSource:
+                        pending.source_authority
+                            === "legacy_preverified",
+                });
+                if (archiveRemoved) {
+                    this.#db.prepare(`
+                        DELETE FROM investigation_delete_cleanup
+                        WHERE investigation_id = ?
+                    `).run(investigationId);
+                    this.#advanceLifecycleGeneration();
+                    return Object.freeze({
+                        changed: true,
+                        cleanupPending: false,
+                        investigation:
+                            this.getInvestigation(investigationId),
+                    });
+                }
+                return Object.freeze({
+                    changed,
+                    cleanupPending: true,
+                    investigation: this.getInvestigation(investigationId),
+                });
+            }
+
+            requireString(operationToken, "operationToken", 256);
             const lifecycle =
                 this.#assertInvestigationLifecycleIntegrity(investigation);
             const operation = this.#db.prepare(`
@@ -1625,6 +2231,119 @@ export class ResourceCatalogRepository {
                     { deletedAtMs: deleted, createdAtMs },
                 );
             }
+            const archivePath = archive.archive_relpath;
+            const expectedMarker = cleanupMarkerDigest({
+                investigationId,
+                archiveRelativePath: archivePath,
+                cleanupRelativePath: cleanupPath,
+                archiveDigest: expectedDigest,
+                nonce: cleanupMarkerNonce,
+            });
+            if ((pending === undefined
+                    && sourceAuthority !== "verified_bundle")
+                || (pending !== undefined
+                    && sourceAuthority !== pending.source_authority)
+                || markerDigest !== expectedMarker
+                || discoveredPath !== null
+                || archiveAbsent) {
+                throw new FenceRejectedError(
+                    "pending delete cleanup binding is invalid",
+                    { investigationId },
+                );
+            }
+            const pendingMatches = pending !== undefined
+                && pending.authority_kind === "pending_delete"
+                && pending.source_authority === sourceAuthority
+                && pending.archive_relpath === archivePath
+                && pending.cleanup_relpath === cleanupPath
+                && pending.archive_digest === expectedDigest
+                && pending.cleanup_marker_nonce
+                    === cleanupMarkerNonce
+                && pending.cleanup_marker_digest === markerDigest
+                && pending.tombstone_relpath === relativePath
+                && pending.tombstone_digest === durableDigest
+                && pending.signing_key_fingerprint
+                    === signingKeyFingerprint
+                && pending.signature === signature
+                && Number(pending.tombstone_size_bytes) === sizeBytes
+                && Number(pending.deleted_at_ms) === deleted;
+            if (pending !== undefined && !pendingMatches) {
+                throw new FenceRejectedError(
+                    "delete cleanup metadata differs from persisted authority",
+                    { investigationId },
+                );
+            }
+            if (pending === undefined) {
+                if (archiveRemoved
+                    || (nextCleanupState !== null
+                        && nextCleanupState !== "reserved")) {
+                    throw new FenceRejectedError(
+                        "delete cleanup must be reserved before transition",
+                        { investigationId },
+                    );
+                }
+                this.#assertRetentionPathReservation({
+                    relativePath: archivePath,
+                    investigationId,
+                    allowedOwnSources: ["archive"],
+                });
+                this.#assertRetentionPathReservation({
+                    relativePath: cleanupPath,
+                    investigationId,
+                    allowedOwnSources: [],
+                });
+                this.#db.prepare(`
+                    INSERT INTO investigation_delete_cleanup(
+                        investigation_id, authority_kind,
+                        source_authority, cleanup_state,
+                        archive_relpath, cleanup_relpath,
+                        archive_absent, archive_digest,
+                        cleanup_marker_nonce, cleanup_marker_digest,
+                        tombstone_relpath, tombstone_digest,
+                        signing_key_fingerprint, signature,
+                        tombstone_size_bytes, deleted_at_ms,
+                        prepared_at_ms)
+                    VALUES(
+                        ?, 'pending_delete', 'verified_bundle',
+                        'reserved', ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                    )
+                `).run(
+                    investigationId,
+                    archivePath,
+                    cleanupPath,
+                    expectedDigest,
+                    cleanupMarkerNonce,
+                    markerDigest,
+                    relativePath,
+                    durableDigest,
+                    signingKeyFingerprint,
+                    signature,
+                    sizeBytes,
+                    deleted,
+                    this.#timestamp(),
+                );
+                this.#advanceLifecycleGeneration();
+                pending = this.#db.prepare(`
+                    SELECT *
+                    FROM investigation_delete_cleanup
+                    WHERE investigation_id = ?
+                `).get(investigationId);
+            }
+            const changed = this.#advanceDeleteCleanupState({
+                pending,
+                nextCleanupState,
+                archiveRemoved,
+                investigationId,
+                allowLegacyMissingSource: false,
+            });
+            if (!archiveRemoved) {
+                return Object.freeze({
+                    changed: changed || !pendingMatches,
+                    cleanupPending: true,
+                    investigation: this.getInvestigation(investigationId),
+                });
+            }
+
             this.#db.prepare(`
                 INSERT INTO investigation_tombstones(
                     investigation_id, created_at_ms, deleted_at_ms,
@@ -1636,14 +2355,14 @@ export class ResourceCatalogRepository {
             `).run(
                 investigationId,
                 createdAtMs,
-                deleted,
+                Number(pending.deleted_at_ms),
                 archive.domain_version,
-                archive.archive_digest,
-                relativePath,
-                durableDigest,
-                signingKeyFingerprint,
-                signature,
-                sizeBytes,
+                pending.archive_digest,
+                pending.tombstone_relpath,
+                pending.tombstone_digest,
+                pending.signing_key_fingerprint,
+                pending.signature,
+                Number(pending.tombstone_size_bytes),
                 archive.domain_head_seq,
                 archive.domain_head_hash,
             );
@@ -1670,6 +2389,7 @@ export class ResourceCatalogRepository {
                 "storage_usage",
                 "investigation_limits",
                 "authority_incarnations",
+                "investigation_delete_cleanup",
                 "investigation_archives",
                 "lifecycle_operations",
                 "investigation_lifecycle",
@@ -1681,6 +2401,7 @@ export class ResourceCatalogRepository {
             this.#db.prepare(
                 "DELETE FROM investigations WHERE investigation_id = ?",
             ).run(investigationId);
+            this.#advanceLifecycleGeneration();
             return Object.freeze({
                 changed: true,
                 investigation: this.getInvestigation(investigationId),
@@ -2100,6 +2821,130 @@ export class ResourceCatalogRepository {
         });
     }
 
+    #rowToDeleteCleanup(row) {
+        if (row === undefined
+            || !DELETE_CLEANUP_AUTHORITY_KINDS.has(
+                row.authority_kind,
+            )
+            || !DELETE_CLEANUP_SOURCE_AUTHORITIES.has(
+                row.source_authority,
+            )
+            || !DELETE_CLEANUP_STATES.has(row.cleanup_state)
+            || (row.archive_relpath !== null
+                && !ARCHIVE_RELATIVE_PATH_RE.test(
+                    row.archive_relpath,
+                ))
+            || !ARCHIVE_RELATIVE_PATH_RE.test(
+                row.cleanup_relpath ?? "",
+            )
+            || !ARCHIVE_DIGEST_RE.test(row.archive_digest ?? "")
+            || !CLEANUP_MARKER_NONCE_RE.test(
+                row.cleanup_marker_nonce ?? "",
+            )
+            || (row.cleanup_marker_digest !== null
+                && !ARCHIVE_DIGEST_RE.test(
+                    row.cleanup_marker_digest,
+                ))
+            || !TOMBSTONE_RELATIVE_PATH_RE.test(
+                row.tombstone_relpath ?? "",
+            )
+            || !ARCHIVE_DIGEST_RE.test(row.tombstone_digest ?? "")
+            || typeof row.signing_key_fingerprint !== "string"
+            || row.signing_key_fingerprint.length < 1
+            || row.signing_key_fingerprint.length > 256
+            || typeof row.signature !== "string"
+            || row.signature.length < 1
+            || row.signature.length > 4096
+            || ![0, 1].includes(Number(row.archive_absent))) {
+            throw new SchemaIntegrityError(
+                "catalog delete cleanup record is invalid",
+                { investigationId: row?.investigation_id ?? null },
+            );
+        }
+        if (row.cleanup_relpath !== cleanupRelativePath(
+            row.investigation_id,
+            row.archive_digest,
+        )) {
+            throw new SchemaIntegrityError(
+                "catalog cleanup target is not deterministic",
+                { investigationId: row.investigation_id },
+            );
+        }
+        if (row.source_authority === "legacy_discovery") {
+            if (row.archive_relpath !== null
+                || row.cleanup_marker_digest !== null
+                || (Number(row.archive_absent) === 1
+                    && !["durability_pending", "durable"].includes(
+                        row.cleanup_state,
+                    ))) {
+                throw new SchemaIntegrityError(
+                    "legacy discovery cleanup state is inconsistent",
+                    { investigationId: row.investigation_id },
+                );
+            }
+        } else {
+            const expectedMarkerDigest = cleanupMarkerDigest({
+                investigationId: row.investigation_id,
+                archiveRelativePath: row.archive_relpath,
+                cleanupRelativePath: row.cleanup_relpath,
+                archiveDigest: row.archive_digest,
+                nonce: row.cleanup_marker_nonce,
+            });
+            if (row.archive_relpath === null
+                || Number(row.archive_absent) !== 0
+                || row.cleanup_marker_digest
+                    !== expectedMarkerDigest) {
+                throw new SchemaIntegrityError(
+                    "catalog cleanup marker binding is inconsistent",
+                    { investigationId: row.investigation_id },
+                );
+            }
+        }
+        if (row.authority_kind === "pending_delete"
+            && row.source_authority === "legacy_discovery") {
+            throw new SchemaIntegrityError(
+                "pending delete cleanup cannot require archive discovery",
+                { investigationId: row.investigation_id },
+            );
+        }
+        const tombstoneSizeBytes = numberFromSql(
+            row.tombstone_size_bytes,
+            "deleteCleanup.tombstoneSizeBytes",
+        );
+        if (tombstoneSizeBytes < 1) {
+            throw new SchemaIntegrityError(
+                "catalog delete cleanup tombstone size is invalid",
+                { investigationId: row.investigation_id },
+            );
+        }
+        return Object.freeze({
+            investigationId: row.investigation_id,
+            authorityKind: row.authority_kind,
+            sourceAuthority: row.source_authority,
+            cleanupState: row.cleanup_state,
+            archiveRelativePath: row.archive_relpath ?? null,
+            cleanupRelativePath: row.cleanup_relpath,
+            archiveAbsent: Number(row.archive_absent) === 1,
+            archiveDigest: row.archive_digest,
+            cleanupMarkerNonce: row.cleanup_marker_nonce,
+            cleanupMarkerDigest:
+                row.cleanup_marker_digest ?? null,
+            tombstoneRelativePath: row.tombstone_relpath,
+            tombstoneDigest: row.tombstone_digest,
+            signingKeyFingerprint: row.signing_key_fingerprint,
+            signature: row.signature,
+            tombstoneSizeBytes,
+            deletedAtMs: numberFromSql(
+                row.deleted_at_ms,
+                "deleteCleanup.deletedAtMs",
+            ),
+            preparedAtMs: numberFromSql(
+                row.prepared_at_ms,
+                "deleteCleanup.preparedAtMs",
+            ),
+        });
+    }
+
     #rowToTombstone(row) {
         if (row === undefined
             || !ARCHIVE_DIGEST_RE.test(row.archive_digest ?? "")
@@ -2171,6 +3016,7 @@ export class ResourceCatalogRepository {
             lifecycleReasonCode: "operator_delete",
             lifecycleOperation: null,
             archive: null,
+            deleteCleanup: null,
             tombstone,
         });
     }

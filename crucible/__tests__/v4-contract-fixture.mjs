@@ -463,6 +463,7 @@ export function fakeStatisticalPolicy({
     maxConfirmations = 1,
     control = null,
     metrics = null,
+    alpha = 0.05,
 } = {}) {
     const normalizedMetrics = metrics ?? [{
         key: "score",
@@ -508,7 +509,7 @@ export function fakeStatisticalPolicy({
         goalMode,
         metrics: normalizedMetrics,
         investigationAlpha: 0.05,
-        familyAllocations: [{ family: "primary", alpha: 0.05 }],
+        familyAllocations: [{ family: "primary", alpha }],
         minBlocks,
         maxBlocks,
         control: {

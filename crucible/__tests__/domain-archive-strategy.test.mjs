@@ -3,6 +3,8 @@ import {
     DEFAULT_SEARCH_POLICY,
     ESCAPE_SEARCH_OPERATORS,
     CANDIDATE_NOVELTY_VERSION,
+    LEGACY_SEARCH_STRATEGY_POLICY_VERSION,
+    SEARCH_STRATEGY_POLICY_VERSION,
     adaptiveOperatorWeights,
     buildCandidateArchive,
     buildSearchCandidateCommand,
@@ -468,6 +470,198 @@ describe("Crucible deterministic archive and strategy", () => {
             .toEqual(adaptiveOperatorWeights(searchPolicy, archive));
         expect(selectAdaptiveOperator({ ...selection, archive: oneProfile }))
             .toBe(selectAdaptiveOperator({ ...selection, archive }));
+    });
+
+    it("uses versioned history-weight adaptation without overriding frozen weights", () => {
+        const searchPolicy = policy();
+        const incumbent = evidence({
+            evidenceId: "history-incumbent",
+            committedSeq: 1,
+            score: 100,
+            outcomeClass: "accepted",
+            artifact: hashCanonical({ artifact: "history-incumbent" }),
+        });
+        const archive = buildCandidateArchive(
+            aggregateFor([incumbent], searchPolicy),
+        );
+        const input = {
+            searchPolicy,
+            archive,
+            contractHash: hashCanonical({ contract: "operator-history" }),
+            round: 2,
+            slotIndex: 0,
+        };
+        const baseWeights = adaptiveOperatorWeights(searchPolicy, archive);
+        const counterfactualWeights = adaptiveOperatorWeights(
+            searchPolicy,
+            archive,
+            "normal",
+            ["fresh"],
+        );
+        const refinementWeights = adaptiveOperatorWeights(
+            searchPolicy,
+            archive,
+            "normal",
+            ["fresh", "adversarial"],
+        );
+        expect(counterfactualWeights.adversarial)
+            .toBeGreaterThan(baseWeights.adversarial);
+        expect(counterfactualWeights.fresh).toBe(baseWeights.fresh);
+        expect(refinementWeights.refinement)
+            .toBeGreaterThan(baseWeights.refinement);
+
+        const {
+            version: _version,
+            ...legacySearchPolicy
+        } = searchPolicy;
+        expect(adaptiveOperatorWeights(
+            legacySearchPolicy,
+            archive,
+            "normal",
+            ["fresh"],
+        )).toEqual(adaptiveOperatorWeights(
+            legacySearchPolicy,
+            archive,
+            "normal",
+        ));
+
+        const extremePolicy = policy({
+            operatorWeights: {
+                fresh: 1_000_000,
+                refinement: 0,
+                crossover: 0,
+                diversification: 1,
+                adversarial: 1,
+                restart: 1,
+            },
+        });
+        const extremeWeights = adaptiveOperatorWeights(
+            extremePolicy,
+            archive,
+            "normal",
+            ["fresh"],
+        );
+        expect(extremeWeights.refinement).toBe(0);
+        expect(extremeWeights.fresh).toBe(1_000_000);
+        expect(extremeWeights.adversarial).toBeGreaterThan(1);
+        expect(extremeWeights.adversarial).toBeLessThan(
+            extremeWeights.fresh,
+        );
+        expect(extremePolicy.operatorWeights[
+            selectAdaptiveOperator({
+                ...input,
+                searchPolicy: extremePolicy,
+                operatorHistory: ["fresh"],
+            })
+        ]).toBeGreaterThan(0);
+        expect(() => selectAdaptiveOperator({
+            ...input,
+            operatorHistory: ["unsupported"],
+        })).toThrow(/operator history/u);
+    });
+
+    it("replays golden unversioned v1 commands and separates v2 authority", () => {
+        function goldenContract(searchPolicy) {
+            return createInvestigationContract(makeV4ContractInput({
+                objective: "golden legacy operator replay",
+                candidatesPerRound: 1,
+                maxRounds: 64,
+                searchPolicy,
+            }));
+        }
+        function goldenAggregate(frozenContract) {
+            const parent = {
+                evidenceId: "legacy-parent",
+                observationId: "legacy-observation",
+                committedSeq: 1,
+                sourceKind: "harness",
+                purpose: "candidate",
+                candidateId: "candidate-r000001-s000",
+                round: 1,
+                slotIndex: 0,
+                invalidated: false,
+                rankable: true,
+                outcomeClass: "accepted",
+                acceptanceSatisfied: true,
+                metrics: { score: 75 },
+                receipt: { candidateArtifactHash: null },
+                duplicateOf: null,
+                novelty: null,
+                annotations: {
+                    mechanism: null,
+                    hypothesis: null,
+                    expectedEffects: [],
+                    citedEvidenceIds: [],
+                    finding: null,
+                },
+            };
+            return {
+                contract: frozenContract,
+                contractHash: contractHash(frozenContract),
+                evidenceOrder: [parent.evidenceId],
+                evidence: { [parent.evidenceId]: parent },
+                observations: {
+                    "legacy-observation": {
+                        commandId: "legacy-command",
+                    },
+                },
+                commands: {
+                    "legacy-command": {
+                        command: {
+                            kind: "search_candidate",
+                            operator: "fresh",
+                        },
+                    },
+                },
+            };
+        }
+
+        const {
+            version: _version,
+            ...legacySearchPolicy
+        } = policy();
+        const legacyContract = goldenContract(legacySearchPolicy);
+        const legacy = buildSearchCandidateCommand(
+            goldenAggregate(legacyContract),
+            { nextRound: 2, nextSlot: 0 },
+        );
+        expect(legacyContract.searchPolicy).not.toHaveProperty("version");
+        expect({
+            strategyPolicyVersion:
+                legacyContract.searchPolicy.version
+                ?? LEGACY_SEARCH_STRATEGY_POLICY_VERSION,
+            operator: legacy.operator,
+            seed: legacy.seed,
+            subjectIndex: legacy.replicationSchedule.subject.index,
+            scheduleHash: legacy.replicationSchedule.scheduleHash,
+        }).toEqual({
+            strategyPolicyVersion: LEGACY_SEARCH_STRATEGY_POLICY_VERSION,
+            operator: "fresh",
+            seed: 522677298,
+            subjectIndex: 3,
+            scheduleHash:
+                "sha256:crucible-replication-schedule-v1:48108a0c568034a54839dfe073918a601da79d7c5a21c8727de8f16f89a43fa4",
+        });
+
+        const currentContract = goldenContract(policy());
+        const current = buildSearchCandidateCommand(
+            goldenAggregate(currentContract),
+            { nextRound: 2, nextSlot: 0 },
+        );
+        expect(currentContract.searchPolicy.version)
+            .toBe(SEARCH_STRATEGY_POLICY_VERSION);
+        expect({
+            operator: current.operator,
+            seed: current.seed,
+            subjectIndex: current.replicationSchedule.subject.index,
+            scheduleHash: current.replicationSchedule.scheduleHash,
+        }).toEqual({
+            operator: "adversarial",
+            seed: 1122524115,
+            subjectIndex: 3,
+            scheduleHash:
+                "sha256:crucible-replication-schedule-v1:f668285179a85cea5065571b1441da7b3f089510b57624a494ad7d1aef315cf1",
+        });
     });
 
     it("uses an enabled parent-free escape operator when no incumbent exists", () => {

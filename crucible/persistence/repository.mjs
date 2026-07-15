@@ -20,6 +20,7 @@
 // broad catch-that-returns-success anywhere.
 
 import fs from "node:fs";
+import { pathToFileURL } from "node:url";
 
 import { DatabaseSync } from "./sqlite.mjs";
 
@@ -262,6 +263,7 @@ export class EventRepository {
             denyRoots,
             env,
             readOnly = false,
+            immutable = false,
             integrityCheckAdapter = undefined,
             segmentCatalogFile = undefined,
             segmentEventThreshold = undefined,
@@ -276,6 +278,11 @@ export class EventRepository {
         }
         if (typeof wallClock !== "function") {
             throw new InvalidArgumentError("wallClock must be a function");
+        }
+        if (typeof immutable !== "boolean" || (immutable && !readOnly)) {
+            throw new InvalidArgumentError(
+                "immutable must be boolean and requires readOnly",
+            );
         }
         const normalizedWalCheckpointBytes = positiveSafeInteger(
             walCheckpointBytes,
@@ -292,7 +299,10 @@ export class EventRepository {
 
         let db;
         try {
-            db = new DatabaseSync(resolved, { readOnly: readOnly === true });
+            const location = immutable
+                ? `${pathToFileURL(resolved).href}?immutable=1`
+                : resolved;
+            db = new DatabaseSync(location, { readOnly: readOnly === true });
         } catch (err) {
             throw new StorageError(`failed to open database at ${resolved}: ${err.message}`, err);
         }
@@ -301,7 +311,11 @@ export class EventRepository {
         try {
             if (readOnly === true) {
                 configureReadOnlyConnection(db, { busyTimeoutMs });
-                verifySchema(db, { busyTimeoutMs, integrityCheckAdapter });
+                verifySchema(db, {
+                    busyTimeoutMs,
+                    integrityCheckAdapter,
+                    expectedJournalMode: immutable ? "delete" : "wal",
+                });
             } else {
                 configureConnection(db, { busyTimeoutMs });
                 applySchema(db, { busyTimeoutMs, integrityCheckAdapter });

@@ -1131,11 +1131,17 @@ npm run test:crucible:changed
 ```
 
 `test:crucible:unit` covers pure domain/schema/parser behavior and is intended
-for the inner edit loop. `test:crucible:changed` asks Vitest for tests related
-to changed Crucible files and aborts after 120 seconds; reaching that limit
-means the next run should target explicit test files.
+for the inner edit loop. `test:crucible:changed` maps every current Crucible
+source module, PowerShell helper, fixture, config, and test to narrow owners.
+Unknown inputs fail closed rather than falling back to an unrelated unit tier.
+Unit mappings abort after 120 seconds; reaching that limit means the next run
+should target explicit test files.
 An explicit release phase gate may resolve release ownership with
 `npm run test:crucible:changed -- --release <source-or-release-test>`.
+The v4 scientific acceptance gate is
+`npm run test:crucible:science`; it runs the dedicated falsification/runner
+matrix and emits the deterministic benchmark metrics. The machine-readable
+benchmark alone is `npm run benchmark:crucible:v4-science`.
 
 The complete safe suite runs once at a phase gate. Hard-kill, multiprocess,
 credentialed SDK, and native AppContainer tests remain release-gate work and
@@ -1148,11 +1154,34 @@ Crucible release validation has four layers:
 1. `npm run test:crucible` — fast, credential-free, host-independent suite.
 2. `npm run test:crucible:release-safe` — release-only hard-kill,
    multiprocess, and long real-process matrices.
-3. `npm run test:crucible:integration` — mandatory authenticated real SDK/CLI
-   smoke; requires absolute `COPILOT_SDK_PATH` and `COPILOT_CLI_PATH`.
-4. `npm run test:crucible:windows-conformance` — serial native Windows
-   containment boundary.
+3. `npm run test:crucible:science` — falsifiable statistical and optimization
+   acceptance.
+4. `npm run test:crucible:unattended-release` — hard-kill recovery,
+   authenticated SDK/CLI, native containment, Task Scheduler, and leak
+   conformance.
 
 `npm run test:crucible:release` runs all four. `npm run test:release` adds the
 remaining workspace suites. Native containment and real authenticated SDK/CLI
 coverage are intentionally not part of the default developer command.
+
+`npm run test:crucible:unattended-release` is the v4 unattended lifecycle gate
+and the fourth release layer.
+It runs only runtime/persistence/API/Task Scheduler coverage, the authenticated
+SDK/CLI smoke, and Windows conformance; it does not run science benchmarks or
+the full workspace. The gate snapshots test-owned roots/CAS, processes,
+scheduled tasks, AppContainer profiles, and conformance registry state before
+and after. `--safe-only` is exposed as
+`npm run test:crucible:unattended-release-safe`.
+
+On Windows hosts with the required ScheduledTasks cmdlets, Task Scheduler
+conformance is mandatory. It installs a deterministic test-owned action, seeds
+an eligible investigation, proves that the scheduled daemon discovers it and
+starts recovery, exercises replacement and exact one-shot launches, then
+removes the exact action. This is process/logon-task recovery conformance only:
+it does not reboot or power-cycle the host and makes no physical-reboot claim.
+The pinned launcher carries the exact runtime and experiment-authority trust
+environment in its authenticated task manifest; the test does not rely on
+delayed user-environment propagation.
+The test keeps its state root and cleanup manifest until exact uninstall is
+confirmed; test-finally and unattended-runner cleanup both retry interrupted
+removals.

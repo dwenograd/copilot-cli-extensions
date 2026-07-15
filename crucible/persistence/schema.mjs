@@ -298,10 +298,15 @@ function readObservedPragmas(db) {
     };
 }
 
-function assertConnectionPragmas(db, { busyTimeoutMs, expectedVersion } = {}) {
+function assertConnectionPragmas(db, {
+    busyTimeoutMs,
+    expectedVersion,
+    expectedJournalMode = EXPECTED_CONNECTION_PRAGMAS.journalMode,
+} = {}) {
     const observed = readObservedPragmas(db);
     const expected = {
         ...EXPECTED_CONNECTION_PRAGMAS,
+        journalMode: expectedJournalMode,
         userVersion: expectedVersion,
     };
     if (canonicalize(observed) !== canonicalize(expected)) {
@@ -1221,17 +1226,26 @@ function createFreshSchema(db) {
 export function verifySchema(db, {
     busyTimeoutMs = undefined,
     integrityCheckAdapter = undefined,
+    expectedJournalMode = EXPECTED_CONNECTION_PRAGMAS.journalMode,
 } = {}) {
     assertVersionPair(db, SCHEMA_VERSION);
     const pragmas = assertConnectionPragmas(db, {
         busyTimeoutMs,
         expectedVersion: SCHEMA_VERSION,
+        expectedJournalMode,
     });
     verifyDatabaseIntegrity(db, { adapter: integrityCheckAdapter });
     const matched = assertKnownSchemaStructure(db, SCHEMA_VERSION);
+    const fingerprintPragmas = expectedJournalMode
+        === EXPECTED_CONNECTION_PRAGMAS.journalMode
+        ? pragmas
+        : {
+            ...pragmas,
+            journalMode: EXPECTED_CONNECTION_PRAGMAS.journalMode,
+        };
     const actualFingerprint = schemaFingerprint(
         matched.manifest,
-        pragmas,
+        fingerprintPragmas,
         SCHEMA_VERSION,
         EVENT_HASH_VERSION,
     );

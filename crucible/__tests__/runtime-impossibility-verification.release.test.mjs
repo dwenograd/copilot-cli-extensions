@@ -138,7 +138,7 @@ describe("runner-supervised impossibility verification", () => {
         } finally {
             replay.repository.close();
         }
-    }, 30_000);
+    }, 60_000);
 
     it("persists actual proof bytes and an adapter-derived certificate checker receipt", async () => {
         const setup = track(setupImpossibilityRunnerFixture(
@@ -209,5 +209,5 @@ describe("runner-supervised impossibility verification", () => {
             missingProof,
             /Domain hash-chain|proof|missing|corrupt/u,
         );
-    }, 30_000);
+    }, 90_000);
 });

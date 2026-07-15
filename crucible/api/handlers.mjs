@@ -156,6 +156,7 @@ function openInvestigationForRead(
     {
         verifyTerminalArtifacts = false,
         includeStorageTelemetry = true,
+        immutableDatabase = false,
     } = {},
 ) {
     const { eventsDbPath, artifactRoot } = paths;
@@ -167,6 +168,7 @@ function openInvestigationForRead(
     const repository = deps.openRepositoryReadOnly({
         file: eventsDbPath,
         env: deps.env,
+        immutable: immutableDatabase,
     });
     const artifactStore = deps.openArtifactStoreReadOnly({
         root: artifactRoot,
@@ -544,14 +546,14 @@ function legacyIncompatiblePayload(investigationId, details = {}) {
         contract_domain_version: details.contractDomainVersion ?? null,
         event_count: details.eventCount ?? null,
         read_only: true,
-        archiveable: details.archiveable === true,
+        archiveable: false,
         integrity_blocked: false,
         terminal_available: false,
         non_result: true,
         non_result_code: "LEGACY_INCOMPATIBLE",
         reason:
             "Persisted state belongs to an incompatible legacy Crucible domain. "
-            + "It may be inventoried or archived read-only, but it cannot resume, append, or emit a newly computed result.",
+            + "It may be inventoried read-only, but it cannot resume, archive, append, or emit a newly computed result.",
         message: NON_RESULT_BANNER,
     };
 }
@@ -568,6 +570,7 @@ function readInvestigationOrIntegrityBlock(
     {
         verifyTerminalArtifacts = false,
         includeStorageTelemetry = true,
+        immutableDatabase = false,
     } = {},
 ) {
     try {
@@ -581,6 +584,7 @@ function readInvestigationOrIntegrityBlock(
                 {
                     verifyTerminalArtifacts,
                     includeStorageTelemetry,
+                    immutableDatabase,
                 },
             ),
         };
@@ -696,6 +700,7 @@ export function statusInvestigation(args, deps) {
         {
             verifyTerminalArtifacts: true,
             includeStorageTelemetry: lifecycleState === "active",
+            immutableDatabase: lifecycleState === "archived",
         },
     );
     if (verifiedRead.blocked !== null) {
@@ -1094,6 +1099,7 @@ export function resultInvestigation(args, deps) {
         {
             verifyTerminalArtifacts: true,
             includeStorageTelemetry: lifecycleState === "active",
+            immutableDatabase: lifecycleState === "archived",
         },
     );
     if (verifiedRead.blocked !== null) {

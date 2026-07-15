@@ -81,6 +81,7 @@ function makeReadDeps({
         },
         log: () => {},
         pathExists: () => true,
+        inspectUncatalogedLegacyInvestigation: () => false,
         openRepositoryReadOnly: () => repository,
         createDomainRepositoryAdapter: () => adapter,
         openArtifactStoreReadOnly: () => ({}),
@@ -104,6 +105,24 @@ function makeReadDeps({
                 openResourceBrokerFromStateRoot: () => ({
                     close() {},
                     getInvestigation: () => catalogEntry,
+                    listInvestigations: () => {
+                        const entries = [catalogEntry];
+                        Object.defineProperty(entries, "catalogGeneration", {
+                            value: 1,
+                        });
+                        return entries;
+                    },
+                }),
+                openResourceBrokerReadOnlyFromStateRoot: () => ({
+                    close() {},
+                    getInvestigation: () => catalogEntry,
+                    listInvestigations: () => {
+                        const entries = [catalogEntry];
+                        Object.defineProperty(entries, "catalogGeneration", {
+                            value: 1,
+                        });
+                        return entries;
+                    },
                 }),
                 verifyBundleInPlace: () => ({
                     digest: catalogEntry.archive?.digest ?? null,
@@ -117,6 +136,7 @@ function makeReadDeps({
                 }),
                 verifySignedTombstone: () => ({
                     verified: true,
+                    digest: catalogEntry.tombstone?.digest ?? null,
                     sizeBytes:
                         catalogEntry.tombstone?.sizeBytes ?? null,
                     signingKeyFingerprint:

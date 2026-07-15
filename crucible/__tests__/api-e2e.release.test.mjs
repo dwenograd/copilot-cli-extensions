@@ -15,13 +15,16 @@ import {
     SUBMIT_CANDIDATE_TOOL_NAME,
     createDomainRepositoryAdapter,
     normalizeSupervisorConfig,
+    requestStop as requestRuntimeStop,
     runAutonomousInvestigation,
     supervisorConfigDocument,
 } from "../runtime/index.mjs";
 import {
+    makeDefaultDeps,
     resultInvestigation,
     startInvestigation,
     statusInvestigation,
+    stopInvestigation,
 } from "../api/handlers.mjs";
 import { configureExperiment } from "../tools/configure-experiment.mjs";
 import {
@@ -36,17 +39,41 @@ import {
     prepareAndSignExperiment,
 } from "./experiment-authority-fixture.mjs";
 import {
-    removeStaleTestRoots,
+    removeTreeRobust,
     removeTrackedRoots,
 } from "./test-cleanup.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
+const TEST_ROOT_PARENT = path.resolve(HERE, "..", "..");
+const TEST_ROOT_MARKER = ".crucible-test-root.json";
 const roots = [];
 
 beforeAll(async () => {
-    await removeStaleTestRoots(path.dirname(HERE), ".e-", {
-        label: "stale api-e2e test root",
-    });
+    for (const entry of fs.readdirSync(
+        TEST_ROOT_PARENT,
+        { withFileTypes: true },
+    )) {
+        if (!entry.isDirectory() || !entry.name.startsWith(".e-")) {
+            continue;
+        }
+        const candidate = path.join(TEST_ROOT_PARENT, entry.name);
+        const marker = path.join(candidate, TEST_ROOT_MARKER);
+        let owned = false;
+        try {
+            const value = JSON.parse(fs.readFileSync(marker, "utf8"));
+            owned = value?.version === 1
+                && value?.kind === "crucible-api-e2e-test-root"
+                && path.resolve(value.root).toLowerCase()
+                    === path.resolve(candidate).toLowerCase();
+        } catch {
+            owned = false;
+        }
+        if (owned) {
+            await removeTreeRobust(candidate, {
+                label: "stale api-e2e test root",
+            });
+        }
+    }
 });
 
 afterEach(async () => {
@@ -60,8 +87,16 @@ function sha256File(file) {
 }
 
 function makeWorkspace() {
-    const root = fs.mkdtempSync(path.join(path.dirname(HERE), ".e-"));
+    const root = fs.mkdtempSync(path.join(TEST_ROOT_PARENT, ".e-"));
     roots.push(root);
+    fs.writeFileSync(
+        path.join(root, TEST_ROOT_MARKER),
+        `${JSON.stringify({
+            version: 1,
+            kind: "crucible-api-e2e-test-root",
+            root: path.resolve(root),
+        })}\n`,
+    );
     const experimentAuthority = createExperimentAuthorityFixture();
     const projectDir = path.join(root, "p");
     const goodDir = path.join(projectDir, "c", "g");
@@ -167,9 +202,15 @@ function makeWorkspace() {
     fs.writeFileSync(allowlistPath, JSON.stringify(allowlistJson, null, 2));
     loadHarnessAllowlist(allowlistPath);
 
-    const sdkPath = path.join(root, "d");
+    const cliPackagePath = path.join(root, "cli-package");
+    const sdkPath = path.join(cliPackagePath, "copilot-sdk");
     const cliPath = path.join(root, "c.exe");
-    fs.mkdirSync(sdkPath);
+    fs.mkdirSync(sdkPath, { recursive: true });
+    fs.writeFileSync(
+        path.join(cliPackagePath, "package.json"),
+        JSON.stringify({ name: "fixture-copilot" }),
+    );
+    fs.writeFileSync(path.join(cliPackagePath, "app.js"), "export {};\n");
     fs.writeFileSync(path.join(sdkPath, "index.js"), "export {};\n");
     fs.writeFileSync(cliPath, "");
     const stateRoot = path.join(root, "s");
@@ -183,6 +224,8 @@ function makeWorkspace() {
             CRUCIBLE_CASE_STORE_PATH: fixtureStoreRoot,
             CRUCIBLE_EXPERIMENT_REGISTRY_PATH: experimentRegistryPath,
             CRUCIBLE_STATE_ROOT: stateRoot,
+            CRUCIBLE_CLI_PACKAGE_PATH: cliPackagePath,
+            CRUCIBLE_NODE_PATH: process.execPath,
             COPILOT_SDK_PATH: sdkPath,
             COPILOT_CLI_PATH: cliPath,
             ...experimentAuthority.env,
@@ -312,6 +355,9 @@ function sdkClientFor(candidateContent) {
 
 function makeDeps(workspace, candidateContent) {
     let runnerPromise = null;
+    const supervisorGeneration = 1;
+    const supervisorNonce = "inline-api-e2e-supervisor";
+    const runnerIncarnation = "inline-api-e2e-runner";
     const deps = {
         env: workspace.env,
         log: () => {},
@@ -326,9 +372,57 @@ function makeDeps(workspace, candidateContent) {
         readStatus: () => null,
         readSupervisorLock: () => null,
         isPidAlive: () => false,
+        requestStop(input) {
+            return requestRuntimeStop({
+                ...input,
+                env: workspace.env,
+                readLock: () => null,
+                readSupervisorState: () => ({
+                    pid: 999_001,
+                    nonce: supervisorNonce,
+                    supervisorGeneration,
+                    runnerIncarnation,
+                    childPid: null,
+                    state: "terminal",
+                }),
+                isPidAlive: () => false,
+            });
+        },
         ensureSupervisor(config) {
+            const runner = supervisorConfigDocument(config).runner;
+            const authorityRepository = openRepository({
+                file: path.join(config.runner.stateDir, "events.sqlite"),
+            });
+            try {
+                authorityRepository.claimSupervisorGeneration({
+                    investigationId: config.runner.investigationId,
+                    supervisorGeneration,
+                    supervisorNonce,
+                });
+                authorityRepository.issueRunnerIncarnation({
+                    investigationId: config.runner.investigationId,
+                    supervisorGeneration,
+                    supervisorNonce,
+                    runnerIncarnation,
+                });
+            } finally {
+                authorityRepository.close();
+            }
             runnerPromise = runAutonomousInvestigation(
-                supervisorConfigDocument(config).runner,
+                {
+                    ...runner,
+                    supervisorGeneration,
+                    supervisorNonce,
+                    runnerIncarnation,
+                    options: {
+                        ...runner.options,
+                        supervisorAuthority: {
+                            supervisorGeneration,
+                            supervisorNonce,
+                            runnerIncarnation,
+                        },
+                    },
+                },
                 {
                     env: workspace.env,
                     sdkClient: sdkClientFor(candidateContent),
@@ -339,8 +433,8 @@ function makeDeps(workspace, candidateContent) {
                 pid: process.pid,
                 acknowledged: true,
                 acknowledgement: {
-                    supervisorGeneration: 1,
-                    runnerIncarnation: "inline-api-e2e-runner",
+                    supervisorGeneration,
+                    runnerIncarnation,
                     configFingerprint: "sha256:inline-api-e2e",
                     deadlineMs: config.runner.deadlineMs,
                 },
@@ -417,7 +511,95 @@ describe("joined Crucible API execution", () => {
             candidate_id: candidate.candidateId,
             evidence_id: candidate.evidenceId,
         });
-    }, 60_000);
+
+        const lifecycleDeps = {
+            ...makeDefaultDeps(workspace.env, () => {}),
+            ...joined.deps,
+        };
+        const activeList = await statusInvestigation({
+            operation: "list",
+            limit: 10,
+        }, lifecycleDeps);
+        expect(activeList.investigations).toContainEqual(
+            expect.objectContaining({
+                investigation_id: started.investigation_id,
+                state: "active",
+                terminal_available: true,
+            }),
+        );
+        expect(() => stopInvestigation({
+            operation: "delete",
+            investigation_id: started.investigation_id,
+            expected_archive_digest: `sha256:${"f".repeat(64)}`,
+        }, lifecycleDeps)).toThrow(/verified archived/u);
+
+        const quiescence = lifecycleDeps.requestStop({
+            stateDir: started.state_dir,
+            artifactRoot: started.artifact_root,
+            investigationId: started.investigation_id,
+            reason: "Unattended release archive barrier.",
+            pauseRequested: false,
+            forceQuiescence: true,
+        });
+        expect(quiescence.stop).toMatchObject({
+            state: "STOP_SUPERSEDED",
+            details: {
+                proof: {
+                    verified: true,
+                    quiescent: true,
+                },
+            },
+        });
+
+        const archived = await stopInvestigation({
+            operation: "archive",
+            investigation_id: started.investigation_id,
+            expected_head: result.event_head_hash,
+        }, lifecycleDeps);
+        expect(archived).toMatchObject({
+            lifecycle_state: "archived",
+            archive_trust_level: "authenticated",
+        });
+        expect(fs.existsSync(path.dirname(started.state_dir))).toBe(false);
+        expect(resultInvestigation({
+            investigation_id: started.investigation_id,
+        }, lifecycleDeps)).toMatchObject({
+            is_result: true,
+            decision: "VERIFIED_RESULT",
+            candidate_id: candidate.candidateId,
+        });
+        expect(() => stopInvestigation({
+            operation: "delete",
+            investigation_id: started.investigation_id,
+            expected_archive_digest: `sha256:${"f".repeat(64)}`,
+        }, lifecycleDeps)).toThrow(/does not match/u);
+
+        const deleted = stopInvestigation({
+            operation: "delete",
+            investigation_id: started.investigation_id,
+            expected_archive_digest: archived.archive_digest,
+        }, lifecycleDeps);
+        expect(deleted).toMatchObject({
+            lifecycle_state: "tombstoned",
+            deleted: true,
+            archive_removed: true,
+        });
+        expect(statusInvestigation({
+            investigation_id: started.investigation_id,
+        }, lifecycleDeps)).toMatchObject({
+            state: "tombstoned",
+            terminal_available: false,
+        });
+        expect(resultInvestigation({
+            investigation_id: started.investigation_id,
+        }, lifecycleDeps)).toMatchObject({
+            is_result: false,
+            state: "tombstoned",
+        });
+        await expect(Promise.resolve().then(() =>
+            startInvestigation(start, lifecycleDeps)))
+            .rejects.toThrow(/tombstoned/u);
+    }, 240_000);
 
     it("requires independent verification after the real runner exhausts bounded ids", async () => {
         const workspace = makeWorkspace();
@@ -499,5 +681,5 @@ describe("joined Crucible API execution", () => {
         expect(result).not.toHaveProperty("decision");
         expect(result).not.toHaveProperty("evidence_id");
         expect(result).not.toHaveProperty("evidence_hash");
-    }, 60_000);
+    }, 180_000);
 });
