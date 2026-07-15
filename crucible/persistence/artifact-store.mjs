@@ -97,7 +97,6 @@ const STATE_MARKER_FILE_RE = /^([0-9a-f]{64})\.(installed|referenced)\.json$/u;
 const COORDINATION_DB_FILE = "coordination.sqlite";
 const COORDINATION_SCHEMA_VERSION = 1;
 const COORDINATION_BUSY_TIMEOUT_MS = 5000;
-const LEGACY_DIRECTORY_BARRIER_FILE = ".crucible-dirsync";
 
 const DEFAULT_LIMITS = Object.freeze({
     maxFiles: 100_000,
@@ -640,10 +639,6 @@ function validateStateMarker(value, options = {}) {
     return Object.freeze(validated);
 }
 
-function toPosix(p) {
-    return p.split(path.sep).join("/");
-}
-
 function asIoError(action, err, details = {}) {
     if (err instanceof CruciblePersistenceError) {
         return err;
@@ -1177,17 +1172,6 @@ export class ArtifactStore {
     objectPath(id) {
         const { hex } = parseObjectId(id);
         return path.join(this.#objectsRoot, hex.slice(0, 2), hex);
-    }
-
-    hasObject(id) {
-        try {
-            return fs.statSync(this.objectPath(id)).isFile();
-        } catch (err) {
-            if (err && err.code === "ENOENT") {
-                return false;
-            }
-            throw err;
-        }
     }
 
     // --- staging -----------------------------------------------------------
@@ -2209,72 +2193,6 @@ export class ArtifactStore {
             this.#commitStaged(this.#stageBytes(input), options.contentType));
     }
 
-    // Store the contents of an existing file (streamed, never fully buffered).
-    putFile(srcPath, options = {}) {
-        if (typeof srcPath !== "string" || srcPath.length === 0) {
-            throw new InvalidArgumentError("srcPath must be a non-empty string", { srcPath });
-        }
-        const lst = fs.lstatSync(srcPath);
-        if (lst.isSymbolicLink()) {
-            throw new SymlinkRejectedError("refusing to ingest a symlink/junction as an object", { srcPath });
-        }
-        if (!lst.isFile()) {
-            throw new UnsafePathError("source is not a regular file", { srcPath });
-        }
-        return this.withGenerationLock(() =>
-            this.#commitStaged(this.#stageFile(srcPath), options.contentType));
-    }
-
-    // Store bytes drained from a Node Readable stream.
-    async putStream(readable, options = {}) {
-        if (!readable || typeof readable[Symbol.asyncIterator] !== "function") {
-            throw new InvalidArgumentError("putStream requires an async-iterable readable stream");
-        }
-        const { transaction, stagingPath } = this.#newStagingTarget();
-        let wfd;
-        const hash = createHash(ALGO);
-        let size = 0;
-        try {
-            wfd = fs.openSync(stagingPath, "wx", 0o600);
-            for await (const chunk of readable) {
-                const b = toBuffer(chunk);
-                size += b.length;
-                if (size > this.#limits.maxFileBytes) {
-                    throw new LimitExceededError("stream exceeds maximum object size", {
-                        maxFileBytes: this.#limits.maxFileBytes,
-                    });
-                }
-                let off = 0;
-                while (off < b.length) {
-                    off += fs.writeSync(wfd, b, off, b.length - off);
-                }
-                hash.update(b);
-            }
-            this.#fsyncFd(wfd, "staging object file", stagingPath);
-        } catch (err) {
-            if (wfd !== undefined) {
-                try {
-                    fs.closeSync(wfd);
-                } catch {
-                    // Preserve the stream/staging failure.
-                }
-            }
-            try {
-                this.#unlinkPath(stagingPath, "failed to remove incomplete streamed staging object");
-            } catch {
-                // Preserve the stream/staging failure.
-            }
-            throw asIoError("failed to stage streamed object", err, { path: stagingPath });
-        }
-        this.#closeFd(wfd, "failed to close streamed staging object", { path: stagingPath });
-        return this.#commitStaged({
-            transaction,
-            stagingPath,
-            hash: hash.digest("hex"),
-            size,
-        }, options.contentType);
-    }
-
     // --- public read/verify API -------------------------------------------
 
     // Read an object's bytes, verifying the content address by default.
@@ -2912,7 +2830,7 @@ export class ArtifactStore {
             throw err;
         }
         for (const f of files) {
-            if (!f.isFile() || f.name === LEGACY_DIRECTORY_BARRIER_FILE) {
+            if (!f.isFile()) {
                 continue;
             }
             const abs = path.join(this.#stagingRoot, f.name);
@@ -2942,7 +2860,7 @@ export class ArtifactStore {
             throw asIoError("failed to enumerate installation journal", err, { path: this.#journalRoot });
         }
         for (const file of files) {
-            if (!file.isFile() || file.name === LEGACY_DIRECTORY_BARRIER_FILE) {
+            if (!file.isFile()) {
                 continue;
             }
             const filePath = path.join(this.#journalRoot, file.name);
@@ -3012,7 +2930,7 @@ export class ArtifactStore {
             const files = fs.readdirSync(prefixDir, { withFileTypes: true })
                 .sort((a, b) => a.name.localeCompare(b.name));
             for (const file of files) {
-                if (!file.isFile() || file.name === LEGACY_DIRECTORY_BARRIER_FILE) {
+                if (!file.isFile()) {
                     continue;
                 }
                 const filePath = path.join(prefixDir, file.name);
@@ -3821,7 +3739,7 @@ export class ArtifactStore {
             }
         }
         for (const file of quarantineFiles.sort((a, b) => a.name.localeCompare(b.name))) {
-            if (!file.isFile() || file.name === LEGACY_DIRECTORY_BARRIER_FILE) {
+            if (!file.isFile()) {
                 continue;
             }
             const filePath = path.join(this.#quarantineRoot, file.name);

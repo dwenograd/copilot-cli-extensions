@@ -1215,11 +1215,6 @@ export function evaluatePracticalEquivalence(interval, {
     return CLAIM_STATE.UNRESOLVED;
 }
 
-export function supportsPracticalEquivalence(interval, options) {
-    return evaluatePracticalEquivalence(interval, options)
-        === CLAIM_STATE.SUPPORTED;
-}
-
 export function statisticalMetricClaims(statisticalPolicy) {
     const inspected = inspectStatisticalPolicy(statisticalPolicy);
     return immutableCanonical(inspected.metrics.map((metric) => {

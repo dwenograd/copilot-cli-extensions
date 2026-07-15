@@ -138,25 +138,6 @@ function assertArchiveBounds(contract, archive) {
         archiveCap(contract, "lessonGroups"),
         "archive.lessonGroups",
     );
-    const noveltyNiches = archive.noveltyNiches;
-    if (noveltyNiches !== undefined && noveltyNiches !== null) {
-        requirePlainObject(noveltyNiches, "archive.noveltyNiches");
-        assertArrayBound(
-            noveltyNiches.content,
-            archiveCap(contract, "duplicateIndex"),
-            "archive.noveltyNiches.content",
-        );
-        assertArrayBound(
-            noveltyNiches.structural,
-            archiveCap(contract, "mechanismGroups"),
-            "archive.noveltyNiches.structural",
-        );
-        assertArrayBound(
-            noveltyNiches.behavioral,
-            archiveCap(contract, "lessonGroups"),
-            "archive.noveltyNiches.behavioral",
-        );
-    }
     const duplicateIndex = archive.duplicateIndex;
     if (duplicateIndex !== undefined
         && duplicateIndex !== null
@@ -211,17 +192,6 @@ function summarizeCandidate(evidence, keys) {
     const annotations = evidence.annotations && typeof evidence.annotations === "object"
         ? evidence.annotations
         : {};
-    const novelty = {
-        contentSignature:
-            stringOrNull(evidence.novelty?.content?.signature),
-        structuralSignature:
-            stringOrNull(
-                evidence.novelty?.structural?.structuralFingerprint,
-            ),
-        behavioralSignature:
-            stringOrNull(evidence.novelty?.behavioral?.signature),
-    };
-    const hasNovelty = Object.values(novelty).some((value) => value !== null);
     return {
         evidenceId: stringOrNull(evidence.evidenceId),
         outcomeClass: stringOrNull(evidence.outcomeClass),
@@ -241,7 +211,6 @@ function summarizeCandidate(evidence, keys) {
             ANNOTATION_LIMITS.findingBytes,
         ),
         artifactHash: stringOrNull(evidence.receipt?.candidateArtifactHash),
-        ...(hasNovelty ? { novelty } : {}),
     };
 }
 
@@ -405,9 +374,9 @@ function plateauNotice(plateau) {
             + "escape rounds complete). Propose a structurally different approach; avoid minor tweaks "
             + "to existing candidates.";
     } else if (phase === "plateau") {
-        notice = "The search remains on a plateau after the escape budget. A trusted structural "
-            + "fingerprint or statistically supported behavioral difference is required; "
-            + "annotation-only relabeling is not novelty.";
+        notice = "The search remains on a plateau after the escape budget. "
+            + "A measurable improvement or distinct candidate artifact is required; "
+            + "annotation-only relabeling does not count.";
     } else {
         notice = "No plateau detected. Run the standard search for the assigned operator.";
     }
@@ -633,28 +602,6 @@ export function buildPromptContext(input = {}) {
         ...asArray(archive.inconclusive),
         ...asArray(archive.invalidMetrics),
     ];
-    const candidateById = new Map(
-        allCandidateEvidence
-            .filter((evidence) =>
-                evidence !== null
-                && typeof evidence === "object"
-                && typeof evidence.evidenceId === "string")
-            .map((evidence) => [evidence.evidenceId, evidence]),
-    );
-    const trustedNoveltyParents = assignment.parentEvidenceIds
-        .map((evidenceId) => candidateById.get(evidenceId) ?? null)
-        .filter((evidence) => evidence !== null)
-        .map((evidence) => ({
-            evidenceId: evidence.evidenceId,
-            contentSignature:
-                stringOrNull(evidence.novelty?.content?.signature),
-            structuralSignature:
-                stringOrNull(
-                    evidence.novelty?.structural?.structuralFingerprint,
-                ),
-            behavioralSignature:
-                stringOrNull(evidence.novelty?.behavioral?.signature),
-        }));
     const visibleCandidateEvidence = allCandidateEvidence.filter(
         visibleEvidence,
     );
@@ -705,17 +652,6 @@ export function buildPromptContext(input = {}) {
         ...(harnessSuite === null ? {} : { harnessSuite }),
         assignment,
         plateau: plateauNotice(input.plateau ?? null),
-        trustedNovelty: {
-            parentCandidates: trustedNoveltyParents,
-            archiveNicheCounts: {
-                content: asArray(archive.noveltyNiches?.content).length,
-                structural:
-                    asArray(archive.noveltyNiches?.structural).length,
-                behavioral:
-                    asArray(archive.noveltyNiches?.behavioral).length,
-            },
-            annotationAuthority: "untrusted_explanatory_only",
-        },
         ...(allPredictionFindings.length === 0
             ? {}
             : {
@@ -838,5 +774,3 @@ export function assertPromptContractCoreFits(
     }
     return Object.freeze({ coreBytes, byteCap: normalizedCap });
 }
-
-export const createPromptContext = buildPromptContext;

@@ -1,15 +1,5 @@
 import { immutableCanonical } from "./canonical.mjs";
-import {
-    acceptanceSatisfied,
-    assessAcceptancePredicate,
-    candidateMetricValues,
-    candidateMetricsRankable,
-} from "./contract.mjs";
 import { replayDerivedCandidateEvidence } from "./scientific-replay.mjs";
-import {
-    replayDerivedCandidateNovelty,
-    supportedBehavioralDifference,
-} from "./novelty.mjs";
 
 function evidenceOrder(left, right) {
     const leftSeq = Number.isSafeInteger(left.committedSeq)
@@ -148,48 +138,6 @@ export function metricImprovement(metrics, candidate, incumbent) {
     return 0;
 }
 
-function bestRankable(contract, candidates) {
-    return candidates
-        .filter((candidate) => candidate.rankable === true)
-        .sort((left, right) => compareCandidateEvidence(contract.metrics, left, right))[0] ?? null;
-}
-
-export function classifyCandidateOutcome(
-    contract,
-    harnessResult,
-    {
-        metrics = candidateMetricValues(contract.metrics, harnessResult),
-        rankable = candidateMetricsRankable(contract.metrics, metrics),
-        accepted = acceptanceSatisfied(contract.acceptancePredicate, harnessResult),
-        priorCandidates = [],
-    } = {},
-) {
-    if (accepted) {
-        return "accepted";
-    }
-    if (!rankable) {
-        return "invalid_metrics";
-    }
-
-    const predicateAssessment = assessAcceptancePredicate(
-        contract.acceptancePredicate,
-        harnessResult,
-    );
-    if (predicateAssessment.near) {
-        return "near_miss";
-    }
-
-    const candidate = { metrics, rankable: true };
-    const previousBest = bestRankable(contract, priorCandidates);
-    if (previousBest !== null
-        && compareCandidateEvidence(contract.metrics, candidate, previousBest) < 0
-        && metricImprovement(contract.metrics, candidate, previousBest)
-            >= contract.searchPolicy.plateauMinImprovement) {
-        return "near_miss";
-    }
-    return "rejected";
-}
-
 export function boundedSelect(items, cap, comparator = evidenceOrder) {
     return [...items].sort(comparator).slice(0, cap);
 }
@@ -299,10 +247,7 @@ export function buildCandidateArchive(aggregate) {
             evidence.sourceKind === "harness"
             && evidence.purpose === "candidate")
         .map((evidence) =>
-            replayDerivedCandidateNovelty(
-                aggregate,
-                replayDerivedCandidateEvidence(aggregate, evidence),
-            ));
+            replayDerivedCandidateEvidence(aggregate, evidence));
     const primary = selectPrimaryEvidence(allCandidates);
     const comparator = (left, right) =>
         compareCandidateEvidence(contract.metrics, left, right);
@@ -331,33 +276,12 @@ export function buildCandidateArchive(aggregate) {
         caps.invalidMetrics,
         evidenceOrder,
     );
-    const noveltyNiches = {
-        content: signatureNiches(
-            primary,
-            (item) => item.novelty?.content?.signature,
-            caps.duplicateIndex,
-            caps.nearMisses,
-        ),
-        structural: signatureNiches(
-            primary,
-            (item) => item.novelty?.structural?.structuralFingerprint,
-            caps.mechanismGroups,
-            caps.nearMisses,
-        ),
-        behavioral: behavioralNiches(
-            primary,
-            caps.lessonGroups,
-            caps.nearMisses,
-        ),
-    };
-
     return immutableCanonical({
         accepted,
         nearMisses,
         rejected,
         inconclusive,
         invalidMetrics,
-        noveltyNiches,
         mechanismGroups: groupAnnotations(
             primary,
             "mechanism",
@@ -377,82 +301,6 @@ export function buildCandidateArchive(aggregate) {
     });
 }
 
-function isAlgorithmTaggedSignature(value) {
-    return typeof value === "string"
-        && /^sha256:[a-z0-9][a-z0-9._-]*:[a-f0-9]{64}$/u.test(value);
-}
-
-function signatureNiches(candidates, selector, cap, memberCap) {
-    const groups = new Map();
-    for (const evidence of [...candidates].sort((left, right) => {
-        const leftArtifact = artifactHashOf(left) ?? "";
-        const rightArtifact = artifactHashOf(right) ?? "";
-        if (leftArtifact !== rightArtifact) {
-            return leftArtifact < rightArtifact ? -1 : 1;
-        }
-        return evidenceOrder(left, right);
-    })) {
-        const signature = selector(evidence);
-        if (!isAlgorithmTaggedSignature(signature)) continue;
-        const existing = groups.get(signature) ?? [];
-        if (existing.length < memberCap) existing.push(evidence.evidenceId);
-        groups.set(signature, existing);
-    }
-    return [...groups.entries()]
-        .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)
-        .slice(0, cap)
-        .map(([signature, evidenceIds]) => ({
-            signature,
-            representativeEvidenceId: evidenceIds[0],
-            evidenceIds,
-        }));
-}
-
-function behavioralNiches(candidates, cap, memberCap) {
-    const groups = [];
-    const ordered = [...candidates].sort((left, right) => {
-        const leftArtifact = artifactHashOf(left) ?? "";
-        const rightArtifact = artifactHashOf(right) ?? "";
-        if (leftArtifact !== rightArtifact) {
-            return leftArtifact < rightArtifact ? -1 : 1;
-        }
-        return evidenceOrder(left, right);
-    });
-    for (const evidence of ordered) {
-        const behavioral = evidence.novelty?.behavioral;
-        if (!isAlgorithmTaggedSignature(behavioral?.signature)
-            || !Array.isArray(behavioral?.claims)
-            || behavioral.claims.length === 0) {
-            continue;
-        }
-        const group = groups.find((candidateGroup) =>
-            candidateGroup.members.every((member) =>
-                !supportedBehavioralDifference(behavioral, member.behavioral)));
-        if (group === undefined) {
-            groups.push({
-                signature: behavioral.signature,
-                representativeEvidenceId: evidence.evidenceId,
-                evidenceIds: [evidence.evidenceId],
-                members: [{ behavioral }],
-            });
-            continue;
-        }
-        group.members.push({ behavioral });
-        if (group.evidenceIds.length < memberCap) {
-            group.evidenceIds.push(evidence.evidenceId);
-        }
-    }
-    return groups.slice(0, cap).map((group) => ({
-        signature: group.signature,
-        representativeEvidenceId: group.representativeEvidenceId,
-        evidenceIds: group.evidenceIds,
-    }));
-}
-
-export const createCandidateArchive = buildCandidateArchive;
-export const buildArchive = buildCandidateArchive;
-export const classifyOutcome = classifyCandidateOutcome;
-
 function addUnique(target, seen, value, cap) {
     if (value === null || value === undefined || seen.has(value) || target.length >= cap) {
         return;
@@ -469,16 +317,6 @@ export function selectPromptEvidence(archive, searchPolicy) {
     for (const evidence of archive.nearMisses) {
         addUnique(refs, seen, evidence.evidenceId, cap);
     }
-    const policyNiches = [
-        ...(archive.noveltyNiches?.structural ?? []),
-        ...((archive.noveltyNiches?.behavioral?.length ?? 0) > 1
-            ? archive.noveltyNiches.behavioral
-            : []),
-        ...(archive.noveltyNiches?.content ?? []),
-    ];
-    for (const group of policyNiches) {
-        addUnique(refs, seen, group.representativeEvidenceId, cap);
-    }
     for (const evidence of archive.accepted) {
         addUnique(refs, seen, evidence.evidenceId, cap);
     }
@@ -487,5 +325,3 @@ export function selectPromptEvidence(archive, searchPolicy) {
     }
     return immutableCanonical(refs);
 }
-
-export const selectArchive = buildCandidateArchive;

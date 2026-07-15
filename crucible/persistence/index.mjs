@@ -47,26 +47,8 @@ export {
     verifyDatabaseIntegrity,
 } from "./schema.mjs";
 export {
-    EventSegmentManager,
-    SEGMENT_CATALOG_TYPE,
-    SEGMENT_CATALOG_VERSION,
-    SEGMENT_SCHEMA_VERSION,
-    SEGMENT_SEAL_STAGES,
-    SEGMENT_MANAGER_INTEGRATION_NOTES,
-    DEFAULT_SEGMENT_EVENT_THRESHOLD,
-    DEFAULT_SEGMENT_BYTE_THRESHOLD,
-    segmentCatalogPathFor,
-    inspectSegmentStorage,
-} from "./segment-manager.mjs";
-
-export {
-    WORKING_SET_INTEGRATION_NOTES,
-    WorkingSetController,
-    collectWorkingSetReferences,
     createWorkingSetController,
-    evaluateStorageBudget,
     publicWorkingSetTelemetry,
-    reconcileWorkingSetArtifacts,
 } from "./working-set.mjs";
 
 export {
@@ -105,13 +87,6 @@ export {
     objectRelPath,
 } from "./artifact-store.mjs";
 
-export {
-    materializeFiniteEnumerand,
-    stageBoundedParameterizedManifest,
-    stageFiniteEnumerandManifest,
-    verifyStagedFiniteEnumerands,
-} from "./enumerand-staging.mjs";
-
 // Self-contained audit bundle export/import.
 export {
     exportBundle,
@@ -127,7 +102,6 @@ export {
     BundleTamperError,
     BundleInventoryError,
     BundleManifestError,
-    BundleDomainVersionMismatchError,
     BundleAuthenticationError,
     BundleSourceChangedError,
     BundleUnsafePathError,

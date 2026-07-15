@@ -19,12 +19,6 @@ import {
     searchProgress,
 } from "../domain/state.mjs";
 import {
-    materializeFiniteEnumerand,
-    stageBoundedParameterizedManifest,
-    stageFiniteEnumerandManifest,
-    verifyStagedFiniteEnumerands,
-} from "../persistence/enumerand-staging.mjs";
-import {
     assertBoundedEnumerandRequest,
     assertFiniteEnumerandSnapshot,
     resolveCommandEnumerand,
@@ -307,81 +301,6 @@ describe("v4 immutable enumerand manifests", () => {
             topology: "open_generative",
             enumerandManifest: manifest,
         })).toBe(false);
-    });
-});
-
-describe("enumerand preflight staging", () => {
-    function fakeStore() {
-        const snapshots = new Map([
-            ["source-a", snapshot("a")],
-            ["source-b", snapshot("b")],
-            ["control-source", snapshot("c")],
-        ]);
-        const materializations = [];
-        return {
-            materializations,
-            ingestDirectory({ sourceDir }) {
-                return { snapshot: snapshots.get(sourceDir) };
-            },
-            verifySnapshot(value) {
-                return {
-                    ok: [...snapshots.values()].includes(value),
-                    snapshot: value,
-                };
-            },
-            loadManifest(value) {
-                return { version: 1, entries: [], snapshot: value };
-            },
-            materializeSnapshot(options) {
-                materializations.push(options);
-                return { fileCount: 1, totalBytes: 10, destDir: options.destDir };
-            },
-        };
-    }
-
-    it("stages finite sources before sealing and materializes the frozen snapshot", () => {
-        const artifactStore = fakeStore();
-        const staged = stageFiniteEnumerandManifest({
-            artifactStore,
-            entries: [
-                { id: "a", ordinal: 0, sourceDir: "source-a" },
-                { id: "b", ordinal: 1, sourceDir: "source-b" },
-            ],
-            control: { kind: "reference", sourceDir: "control-source" },
-        });
-
-        expect(staged.manifest.entries.map((entry) =>
-            entry.artifactSnapshotHash)).toEqual([snapshot("a"), snapshot("b")]);
-        expect(staged.manifest.control.referenceHash).toBe(snapshot("c"));
-        expect(verifyStagedFiniteEnumerands({
-            artifactStore,
-            manifest: staged.manifest,
-        }).snapshots).toHaveLength(2);
-
-        const materialized = materializeFiniteEnumerand({
-            artifactStore,
-            manifest: staged.manifest,
-            ordinal: 1,
-            destDir: "dest-b",
-        });
-        expect(materialized.binding.artifactSnapshotHash).toBe(snapshot("b"));
-        expect(artifactStore.materializations).toEqual([{
-            snapshot: snapshot("b"),
-            destDir: "dest-b",
-            readOnly: true,
-        }]);
-    });
-
-    it("seals bounded parameter tuples without accepting ranges", () => {
-        const manifest = stageBoundedParameterizedManifest(
-            boundedManifestInput(),
-        );
-        expect(manifest.topology).toBe("bounded_parameterized");
-        expect(() => stageBoundedParameterizedManifest({
-            entries: [],
-            control: boundedManifestInput().control,
-            parameterRanges: [{ min: 0, max: 1 }],
-        })).toThrow();
     });
 });
 

@@ -54,29 +54,6 @@ function normalizePathForIdentity(value, platform) {
     return platform === "win32" ? resolved.toLowerCase() : resolved;
 }
 
-function windowsQuote(value) {
-    const text = String(value);
-    if (text.length === 0) return "\"\"";
-    if (!/[\s"]/u.test(text)) return text;
-    let result = "\"";
-    let slashes = 0;
-    for (const character of text) {
-        if (character === "\\") {
-            slashes += 1;
-        } else if (character === "\"") {
-            result += "\\".repeat((slashes * 2) + 1);
-            result += "\"";
-            slashes = 0;
-        } else {
-            result += "\\".repeat(slashes);
-            result += character;
-            slashes = 0;
-        }
-    }
-    result += "\\".repeat(slashes * 2);
-    return `${result}"`;
-}
-
 function requireUserIdentity(value) {
     if (value === null
         || typeof value !== "object"
@@ -268,7 +245,7 @@ function requireInterval(intervalMs) {
     return intervalMs;
 }
 
-export function buildRecoveryTaskSpec({
+function buildRecoveryTaskSpec({
     stateRoot,
     runtime,
     user,
@@ -370,84 +347,6 @@ export function buildRecoveryTaskSpec({
     });
 }
 
-function buildLegacyRecoveryTaskSpec({
-    stateRoot,
-    runtime,
-    user,
-    intervalMs = 30_000,
-    platform = process.platform,
-} = {}) {
-    const interval = requireInterval(intervalMs);
-    const { taskIdentity, taskName } = recoveryTaskIdentity({
-        stateRoot,
-        user,
-        platform,
-    });
-    const argumentsList = [
-        runtime.daemonPath,
-        "--state-root",
-        stateRoot,
-        "--interval-ms",
-        String(interval),
-        "--expected-node-sha256",
-        runtime.nodeSha256,
-        "--expected-daemon-sha256",
-        runtime.daemonSha256,
-    ];
-    const argumentsText = argumentsList.map(windowsQuote).join(" ");
-    const actionDocument = {
-        version: 1,
-        execute: normalizePathForIdentity(runtime.nodePath, platform),
-        arguments: argumentsText,
-        workingDirectory: normalizePathForIdentity(
-            path.dirname(runtime.daemonPath),
-            platform,
-        ),
-        nodeSha256: runtime.nodeSha256,
-        daemonSha256: runtime.daemonSha256,
-    };
-    const actionFingerprint = `sha256:crucible-recovery-action-v1:${
-        sha256(canonicalize(actionDocument))
-    }`;
-    return Object.freeze({
-        version: 1,
-        taskPath: TASK_PATH,
-        taskName,
-        taskIdentity,
-        actionFingerprint,
-        description:
-            `Crucible same-user recovery v1; identity=${taskIdentity}; action=${actionFingerprint}`,
-        user,
-        stateRoot,
-        runtime,
-        action: Object.freeze({
-            execute: runtime.nodePath,
-            arguments: argumentsText,
-            workingDirectory: path.dirname(runtime.daemonPath),
-        }),
-        trigger: Object.freeze({
-            type: "logon",
-            userId: user.userId,
-        }),
-        principal: Object.freeze({
-            userId: user.userId,
-            userSid: user.userSid,
-            logonType: "InteractiveToken",
-            runLevel: "LeastPrivilege",
-        }),
-        settings: Object.freeze({
-            hidden: true,
-            startWhenAvailable: true,
-            restartCount: 999,
-            restartIntervalMinutes: 1,
-            multipleInstances: "IgnoreNew",
-            executionTimeLimitSeconds: 0,
-            allowStartOnBatteries: true,
-            stopOnBatteryTransition: false,
-        }),
-    });
-}
-
 function samePath(left, right, platform) {
     if (typeof left !== "string" || typeof right !== "string") return false;
     return normalizePathForIdentity(left, platform)
@@ -471,7 +370,7 @@ function schedulerUserMatches(
         .includes(observed.toLowerCase());
 }
 
-export function taskActionMatches(observed, expected, {
+function taskActionMatches(observed, expected, {
     platform = process.platform,
 } = {}) {
     if (observed?.exists !== true) return false;
@@ -497,7 +396,7 @@ export function taskActionMatches(observed, expected, {
         );
 }
 
-export function taskDefinitionMatches(observed, expected, options = {}) {
+function taskDefinitionMatches(observed, expected, options = {}) {
     return taskActionMatches(observed, expected, options)
         && observed.trigger?.type === expected.trigger.type
         && schedulerUserMatches(
@@ -731,31 +630,13 @@ async function preparedTask(
             }),
         };
     }
-    let spec;
-    try {
-        spec = reconstructPinnedRecoveryTaskSpec(observed, {
-            stateRoot,
-            runtime,
-            user,
-            intervalMs: options.intervalMs,
-            platform,
-        });
-    } catch (launcherError) {
-        const legacy = buildLegacyRecoveryTaskSpec({
-            stateRoot,
-            runtime,
-            user,
-            intervalMs: options.intervalMs,
-            platform,
-        });
-        if (!taskActionMatches(observed, legacy, { platform })) {
-            throw new Error(
-                "refusing to remove a task whose action does not exactly match",
-                { cause: launcherError },
-            );
-        }
-        spec = legacy;
-    }
+    const spec = reconstructPinnedRecoveryTaskSpec(observed, {
+        stateRoot,
+        runtime,
+        user,
+        intervalMs: options.intervalMs,
+        platform,
+    });
     return { adapter, observed, spec };
 }
 
@@ -899,28 +780,6 @@ export function createPowerShellTaskSchedulerAdapter(options = {}) {
         ],
         options,
     );
-    const control = (spec, mode) => {
-        const observed = inspect(spec);
-        if (!taskDefinitionMatches(observed, spec, {
-            platform: options.platform ?? process.platform,
-        })) {
-            throw new Error(
-                "refusing to control a recovery task whose definition does not exactly match",
-            );
-        }
-        return invokePowerShell(
-            script("control-recovery-task.ps1"),
-            [
-                "-Mode",
-                mode,
-                "-TaskPath",
-                spec.taskPath,
-                "-TaskName",
-                spec.taskName,
-            ],
-            options,
-        );
-    };
     return Object.freeze({
         currentUser() {
             return invokePowerShell(
@@ -965,26 +824,6 @@ export function createPowerShellTaskSchedulerAdapter(options = {}) {
                     "-WorkingDirectory", spec.action.workingDirectory,
                     "-UserId", spec.user.userId,
                     "-UserSid", spec.user.userSid,
-                ],
-                options,
-            );
-        },
-        start(spec) {
-            return control(spec, "Start");
-        },
-        stop(spec) {
-            return control(spec, "Stop");
-        },
-        runtime(spec) {
-            return invokePowerShell(
-                script("control-recovery-task.ps1"),
-                [
-                    "-Mode",
-                    "Runtime",
-                    "-TaskPath",
-                    spec.taskPath,
-                    "-TaskName",
-                    spec.taskName,
                 ],
                 options,
             );

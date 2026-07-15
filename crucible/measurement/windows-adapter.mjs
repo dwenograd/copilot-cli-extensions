@@ -174,7 +174,6 @@ export function createDefaultProcessAdapter(options = {}) {
     };
 
     const adapter = {
-        platform,
         spawn(executable, argv, launchOptions) {
             if (launchOptions?.executesCandidateCode !== false
                 || launchOptions?.launchPath !== "host-process-adapter") {

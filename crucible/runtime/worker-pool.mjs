@@ -1271,9 +1271,6 @@ export function buildProposalPrompt({
             `Worker-visible HarnessSuiteV4 projection: ${
                 canonicalJson(promptContext.harnessSuite ?? null)
             }`,
-            `Trusted novelty context (hashes only; model annotations are excluded): ${
-                canonicalJson(promptContext.trustedNovelty ?? null)
-            }`,
         );
         if (Array.isArray(assignment.parentEvidenceIds) && assignment.parentEvidenceIds.length > 0) {
             lines.push(`Assigned parent evidence: ${canonicalJson(assignment.parentEvidenceIds)}`);
@@ -1918,22 +1915,6 @@ export class SdkWorkerPool {
                 null,
             ]),
         );
-    }
-
-    get candidateLimits() {
-        return this.#options.candidateLimits;
-    }
-
-    get parentReadLimits() {
-        return this.#options.parentReadLimits;
-    }
-
-    get sdkRetryPolicy() {
-        return this.#options.sdkRetryPolicy;
-    }
-
-    get sdkOperationalEvidence() {
-        return Object.freeze([...this.#sdkOperationalEvidence]);
     }
 
     #normalizeVisibleEvidenceIds(value) {

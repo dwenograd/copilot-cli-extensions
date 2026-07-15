@@ -492,11 +492,6 @@ function manifestRoot(topology, entries, control) {
     }, ENUMERAND_MANIFEST_ROOT_HASH_ALGORITHM);
 }
 
-export function computeEnumerandMerkleRoot(input) {
-    const normalized = normalizeEnumerandManifest(input);
-    return normalized.merkleRoot;
-}
-
 export function normalizeEnumerandManifest(input, options = {}) {
     requireExactKeys(
         input,

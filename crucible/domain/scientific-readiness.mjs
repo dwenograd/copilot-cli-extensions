@@ -229,39 +229,11 @@ function terminalClosureBound(aggregate, terminal, decisiveEvidence) {
         );
 }
 
-function resolvedCohortEvidence(aggregate, incumbent = null) {
+function resolvedCohortEvidence(aggregate) {
     const cohort = aggregate?.scientificReplay?.candidateCohort ?? null;
     if (cohort?.resolved !== true
         || (cohort.status !== "UNIQUE_BEST"
             && cohort.status !== "TIE_COHORT")) {
-        const legacyEvidence = incumbent?.evidenceId === undefined
-            ? null
-            : ownEntry(aggregate?.evidence, incumbent.evidenceId);
-        const support = aggregate?.scientificReplay?.candidateSupport?.find(
-            (item) => item.evidenceId === incumbent?.evidenceId,
-        ) ?? null;
-        if (legacyEvidence !== null
-            && legacyEvidence?.invalidated !== true
-            && support?.requiredState === "SUPPORTED"
-            && support?.acceptanceSatisfied === true) {
-            return {
-                cohort: {
-                    status: "UNIQUE_BEST",
-                    resolved: true,
-                    comparisonHash: null,
-                    relationEvidenceHash: null,
-                    provisionalWinner: {
-                        evidenceId: legacyEvidence.evidenceId,
-                    },
-                    cohort: [{
-                        candidateId: legacyEvidence.candidateId,
-                        evidenceId: legacyEvidence.evidenceId,
-                        evidenceHash: legacyEvidence.commitEventHash,
-                    }],
-                },
-                evidence: [legacyEvidence],
-            };
-        }
         return { cohort, evidence: [] };
     }
     const evidence = cohort.cohort
@@ -276,7 +248,7 @@ function resolvedCohortEvidence(aggregate, incumbent = null) {
 
 export function assessVerifiedResultReadiness(aggregate, incumbent = null) {
     const policy = aggregate.contract.scientificTerminalPolicy;
-    const resolved = resolvedCohortEvidence(aggregate, incumbent);
+    const resolved = resolvedCohortEvidence(aggregate);
     const cohort = resolved.cohort;
     const cohortEvidence = resolved.evidence;
     const requestedEvidenceId = incumbent?.evidenceId
@@ -658,7 +630,7 @@ export function assessPersistedTerminalReadiness(aggregate) {
         && terminal.evidenceHash === evidence.commitEventHash;
 
     if (terminal.decision === "VERIFIED_RESULT") {
-        const resolved = resolvedCohortEvidence(aggregate, evidence);
+        const resolved = resolvedCohortEvidence(aggregate);
         const cohort = resolved.cohort;
         const cohortEvidence = resolved.evidence;
         const integrityBound = cohort?.resolved === true

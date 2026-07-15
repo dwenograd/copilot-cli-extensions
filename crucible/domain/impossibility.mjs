@@ -18,8 +18,6 @@ import {
     IMPOSSIBILITY_REQUEST_HASH_ALGORITHM,
     IMPOSSIBILITY_REQUEST_VERSION,
     IMPOSSIBILITY_ROLE_RECEIPTS_HASH_ALGORITHM,
-    IMPOSSIBILITY_SEARCH_EVIDENCE_HASH_ALGORITHM,
-    IMPOSSIBILITY_VERDICTS,
     IMPOSSIBILITY_PROOF_ARTIFACT_HASH_ALGORITHM,
     IMPOSSIBILITY_PROOF_ARTIFACT_VERSION,
     IMPOSSIBILITY_PROOF_CHECKER_HASH_ALGORITHM,
@@ -164,46 +162,6 @@ export function deriveImpossibilityVerdict(checkerResult) {
         default:
             return "invalid";
     }
-}
-
-export function isImpossibilityVerdict(value) {
-    return IMPOSSIBILITY_VERDICTS.includes(value);
-}
-
-export function impossibilitySearchEvidenceHash(candidates) {
-    return hashCanonical(
-        [...candidates]
-            .map((evidence) => ({
-                acceptanceSatisfied: evidence.acceptanceSatisfied,
-                candidateArtifactHash:
-                    evidence.receipt?.candidateArtifactHash ?? null,
-                candidateId: evidence.candidateId,
-                contentHash: evidence.contentHash,
-                enumerandHash: evidence.enumerandHash ?? null,
-                enumerandManifestRoot:
-                    evidence.enumerandManifestRoot ?? null,
-                enumerandOrdinal: evidence.enumerandOrdinal ?? null,
-                evidenceHash: evidence.commitEventHash,
-                evidenceId: evidence.evidenceId,
-                outcomeClass: evidence.outcomeClass,
-                provenanceRoot: evidence.provenanceRoot,
-                rankable: evidence.rankable,
-                rawAuthorityDigest: evidence.rawAuthorityDigest,
-                replicationControl:
-                    evidence.replication?.control ?? null,
-                replicationEvaluationHash:
-                    evidence.replication?.evaluationHash ?? null,
-                round: evidence.round,
-                slotIndex: evidence.slotIndex,
-            }))
-            .sort((left, right) =>
-                (left.enumerandOrdinal ?? Number.MAX_SAFE_INTEGER)
-                    - (right.enumerandOrdinal ?? Number.MAX_SAFE_INTEGER)
-                || left.round - right.round
-                || left.slotIndex - right.slotIndex
-                || left.evidenceId.localeCompare(right.evidenceId)),
-        IMPOSSIBILITY_SEARCH_EVIDENCE_HASH_ALGORITHM,
-    );
 }
 
 function ownEntry(record, key) {

@@ -64,7 +64,6 @@ import {
     HarnessNotAllowlistedError,
     InvestigationNotFoundError,
     InvestigationNotResumableError,
-    LegacyIncompatibleApiError,
     OperationalResetRequiredError,
     ExperimentNotFoundApiError,
     ExperimentAuthorityMismatchApiError,
@@ -74,7 +73,10 @@ import {
     StartFailedError,
     StartPreflightError,
 } from "./errors.mjs";
-import { crucibleStartSpec } from "./schema.mjs";
+import {
+    crucibleStartSpec,
+    isNormalizedCrucibleStartArgs,
+} from "./schema.mjs";
 import { assertInvestigationIdentityAvailable } from "./lifecycle.mjs";
 
 const PREFLIGHT_PLANS = new WeakSet();
@@ -112,24 +114,6 @@ function runtimeVerificationFailure(error, message, details = {}) {
         runtimeDrift(error, message, details);
     }
     authorityMismatch(error, message, details);
-}
-
-function throwLegacyIncompatible(error, investigationId) {
-    if (error?.code !== RUNTIME_ERROR_CODES.LEGACY_INCOMPATIBLE) {
-        throw error;
-    }
-    throw new LegacyIncompatibleApiError(
-        "This investigation belongs to an incompatible legacy domain and cannot be resumed; start a new investigation",
-        {
-            investigationId,
-            expectedDomainVersion: error?.details?.expectedDomainVersion ?? null,
-            actualDomainVersion: error?.details?.actualDomainVersion ?? null,
-            contractDomainVersion: error?.details?.contractDomainVersion ?? null,
-            eventCount: error?.details?.eventCount ?? null,
-            archiveable: error?.details?.archiveable === true,
-            readOnly: true,
-        },
-    );
 }
 
 function isThenable(value) {
@@ -487,12 +471,7 @@ function inspectExistingInvestigation({
             investigationId,
             ensure: false,
         });
-        let current;
-        try {
-            current = adapter.replay();
-        } catch (error) {
-            throwLegacyIncompatible(error, investigationId);
-        }
+        const current = adapter.replay();
         if (current.aggregate.contract === null) {
             throw new StartPreflightError(
                 "existing investigation repository has no frozen contract",
@@ -945,11 +924,7 @@ function preflightReattachInvestigation(args, deps, selection = null) {
             investigationId: args.investigation_id,
             ensure: false,
         });
-        try {
-            current = adapter.replay();
-        } catch (error) {
-            throwLegacyIncompatible(error, args.investigation_id);
-        }
+        current = adapter.replay();
         if (current.aggregate.contract === null) {
             throw new StartPreflightError(
                 "existing investigation repository has no frozen contract",
@@ -1369,7 +1344,9 @@ function finalizePreflight({
 }
 
 export function preflightStartInvestigation(rawArgs, deps) {
-    const args = crucibleStartSpec.parse(rawArgs);
+    const args = isNormalizedCrucibleStartArgs(rawArgs)
+        ? rawArgs
+        : crucibleStartSpec.parse(rawArgs);
     if (args.investigation_id !== undefined) {
         assertInvestigationIdentityAvailable({
             deps,
@@ -1677,12 +1654,7 @@ function publishSnapshotStagingPlan(plan, deps) {
 }
 
 function assertReattachState(plan, adapter) {
-    let current;
-    try {
-        current = adapter.replay();
-    } catch (error) {
-        throwLegacyIncompatible(error, plan.investigationId);
-    }
+    const current = adapter.replay();
     const operationalNonResult = adapter.latestOperationalNonResult();
     if (current.aggregate.contractHash !== plan.hashes.contractHash
         || current.aggregate.experimentAuthorityIdentity

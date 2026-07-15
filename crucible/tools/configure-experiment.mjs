@@ -83,21 +83,17 @@ function atomicWriteRegistry(targetPath, content) {
 function existingExperiments(registryPath, env) {
     if (!fs.existsSync(registryPath)) {
         return {
-            existed: false,
             experiments: {},
-            registryIdentity: null,
         };
     }
     const registry = loadExperimentRegistry(registryPath, { env });
     return {
-        existed: true,
         experiments: Object.fromEntries(
             registry.listExperimentIds().map((id) => [
                 id,
                 registry.getExperiment(id),
             ]),
         ),
-        registryIdentity: registry.registryIdentity,
     };
 }
 
@@ -253,7 +249,7 @@ export function prepareUnsignedExperimentManifest(options = {}) {
     });
 }
 
-export function parseArgs(argv) {
+function parseArgs(argv) {
     const out = {
         config: undefined,
         registry: undefined,
@@ -337,7 +333,7 @@ function errorPayload(error) {
     };
 }
 
-export function main(
+function main(
     argv = process.argv.slice(2),
     {
         env = process.env,

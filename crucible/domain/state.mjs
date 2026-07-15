@@ -203,18 +203,6 @@ export function uncommittedObservation(aggregate) {
     return null;
 }
 
-export function qualifyingCandidateEvidence(aggregate) {
-    const cohort = candidateCohortState(aggregate);
-    if (cohort?.status !== "UNIQUE_BEST"
-        || cohort.provisionalWinner === null) {
-        return null;
-    }
-    return ownEntry(
-        aggregate.evidence,
-        cohort.provisionalWinner.evidenceId,
-    );
-}
-
 export function candidateCohortState(aggregate) {
     return aggregate?.scientificReplay?.candidateCohort ?? null;
 }
@@ -261,76 +249,6 @@ export function harnessCandidateEvidenceItems(aggregate, { includeInvalidated = 
             replayDerivedCandidateEvidence(aggregate, evidence));
 }
 
-export function replicatedCandidateEvidenceItems(
-    aggregate,
-    { includeInvalidated = false } = {},
-) {
-    return harnessCandidateEvidenceItems(aggregate, { includeInvalidated })
-        .filter((evidence) =>
-            evidence.replication !== null
-            && typeof evidence.replication === "object");
-}
-
-export function candidateReplicationStatus(aggregate, candidateId) {
-    const evidence = replicatedCandidateEvidenceItems(
-        aggregate,
-        { includeInvalidated: true },
-    ).find((item) => item.candidateId === candidateId) ?? null;
-    if (evidence === null) return null;
-    return immutableCanonical({
-        evidenceId: evidence.evidenceId,
-        invalidated: evidence.invalidated,
-        ...evidence.replication,
-    });
-}
-
-export function candidatePredictionEvaluation(aggregate, candidateId) {
-    const evidence = harnessCandidateEvidenceItems(
-        aggregate,
-        { includeInvalidated: true },
-    ).find((item) => item.candidateId === candidateId) ?? null;
-    if (evidence === null) return null;
-    return replayCandidateSupport(
-        aggregate,
-        evidence.evidenceId,
-    )?.predictionEvaluation ?? null;
-}
-
-export function resolvedPredictionFindings(
-    aggregate,
-    { statuses = ["SUPPORTED", "REFUTED"] } = {},
-) {
-    const allowed = new Set(statuses);
-    return immutableCanonical(
-        harnessCandidateEvidenceItems(aggregate)
-            .flatMap((evidence) =>
-                (candidatePredictionEvaluation(
-                    aggregate,
-                    evidence.candidateId,
-                )?.predictions ?? [])
-                    .filter((prediction) =>
-                        allowed.has(prediction.status))
-                    .map((prediction) => ({
-                        candidateId: evidence.candidateId,
-                        evidenceId: evidence.evidenceId,
-                        predictionId: prediction.predictionId,
-                        predictionIdentity:
-                            prediction.predictionIdentity,
-                        requiredForResult:
-                            prediction.requiredForResult,
-                        status: prediction.status,
-                        estimate: prediction.estimate,
-                        confidenceBounds:
-                            prediction.confidenceBounds,
-                        evidenceReference:
-                            prediction.evidenceReference,
-                        blockReference: prediction.blockReference,
-                        alphaReference: prediction.alphaReference,
-                        limitations: prediction.limitations,
-                    }))),
-    );
-}
-
 export function impossibilityEvidenceItems(aggregate, { includeInvalidated = false } = {}) {
     return aggregate.evidenceOrder
         .map((evidenceId) => ownEntry(aggregate.evidence, evidenceId))
@@ -339,10 +257,6 @@ export function impossibilityEvidenceItems(aggregate, { includeInvalidated = fal
             && evidence.sourceKind === "harness"
             && evidence.purpose === "impossibility"
             && (includeInvalidated || !evidence.invalidated));
-}
-
-export function latestImpossibilityEvidence(aggregate, options = {}) {
-    return impossibilityEvidenceItems(aggregate, options).at(-1) ?? null;
 }
 
 function impossibilityEvidenceMatchesCurrentTrigger(aggregate, evidence) {
@@ -519,13 +433,6 @@ export function searchProgress(aggregate) {
             }),
     };
     return immutableCanonical(progress);
-}
-
-export function candidateSelectionReady(aggregate) {
-    const cohort = candidateCohortState(aggregate);
-    return cohort?.resolved === true
-        && cohort.cohort.length > 0
-        && searchProgress(aggregate).roundsExhausted;
 }
 
 export function boundedSearchExhaustion(aggregate) {

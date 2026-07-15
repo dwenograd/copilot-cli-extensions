@@ -1,6 +1,5 @@
 import fs from "node:fs";
 import path from "node:path";
-import { createHash } from "node:crypto";
 
 import { decideNext } from "../domain/index.mjs";
 import {
@@ -39,7 +38,6 @@ export const RECOVERY_DISCOVERY_CODES = Object.freeze({
     SUPERVISOR_RUNNING: "SUPERVISOR_RUNNING",
     LIFECYCLE_ARCHIVED: "LIFECYCLE_ARCHIVED",
     LIFECYCLE_TOMBSTONED: "LIFECYCLE_TOMBSTONED",
-    LEGACY_INCOMPATIBLE: "LEGACY_INCOMPATIBLE",
     TERMINAL: "TERMINAL",
     PAUSED: "PAUSED",
     NON_RESULT: "NON_RESULT",
@@ -157,32 +155,16 @@ export function verifyInvestigationArtifactIntegrity({
                 "persisted artifact metadata failed integrity verification",
             );
         }
-        if (metadata.storage === "external") {
-            const probe = artifactStore.verifyObject(
-                `sha256:${metadata.hashValue}`,
-            );
-            if (probe?.ok !== true || probe.size !== metadata.sizeBytes) {
-                throw new Error(
-                    "persisted external artifact failed integrity verification",
-                );
-            }
-        } else if (metadata.storage === "inline") {
-            if (typeof repository.getInlineArtifact !== "function") {
-                throw new Error(
-                    "inline artifact verification API is unavailable",
-                );
-            }
-            const inline = repository.getInlineArtifact(artifactId);
-            const bytes = Buffer.from(inline.bytes);
-            const digest = createHash("sha256").update(bytes).digest("hex");
-            if (bytes.length !== metadata.sizeBytes
-                || digest !== metadata.hashValue) {
-                throw new Error(
-                    "persisted inline artifact failed integrity verification",
-                );
-            }
-        } else {
+        if (metadata.storage !== "external") {
             throw new Error("persisted artifact storage kind is invalid");
+        }
+        const probe = artifactStore.verifyObject(
+            `sha256:${metadata.hashValue}`,
+        );
+        if (probe?.ok !== true || probe.size !== metadata.sizeBytes) {
+            throw new Error(
+                "persisted external artifact failed integrity verification",
+            );
         }
     }
     return Object.freeze({
@@ -494,13 +476,6 @@ export async function inspectRecoveryInvestigation({
                 ?? verifyInvestigationArtifactIntegrity
             )({ repository, artifactStore, investigationId });
         } catch (error) {
-            if (error?.code === "CRUCIBLE_RUNTIME_LEGACY_INCOMPATIBLE"
-                || error?.details?.compatibility === "legacy_incompatible") {
-                return decision(
-                    "skipped",
-                    RECOVERY_DISCOVERY_CODES.LEGACY_INCOMPATIBLE,
-                );
-            }
             return decision(
                 "blocked",
                 RECOVERY_DISCOVERY_CODES.INTEGRITY_BLOCKED,

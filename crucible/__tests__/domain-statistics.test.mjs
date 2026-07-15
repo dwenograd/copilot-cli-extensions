@@ -17,7 +17,6 @@ import {
     normalizeBoundedObservation,
     statisticalMetricClaims,
     statisticalScheduleWeight,
-    supportsPracticalEquivalence,
     supportsPracticalMargin,
 } from "../domain/index.mjs";
 import {
@@ -270,10 +269,6 @@ describe("v4 bounded statistics primitives", () => {
             { lower: 0.2, upper: 0.3 },
             { margin: 0.1 },
         )).toBe("REFUTED");
-        expect(supportsPracticalEquivalence(
-            { lower: -0.05, upper: 0.05 },
-            { margin: 0.1 },
-        )).toBe(true);
     });
 });
 

@@ -13,17 +13,17 @@ import { claimSetAlphaAllocation } from "./statistics.mjs";
 
 export const SCIENTIFIC_CONFIRMATION_VERSION =
     "crucible-scientific-confirmation-v1";
-export const SCIENTIFIC_CONFIRMATION_FREEZE_HASH_ALGORITHM =
+const SCIENTIFIC_CONFIRMATION_FREEZE_HASH_ALGORITHM =
     "sha256:crucible-scientific-confirmation-freeze-v1";
-export const SCIENTIFIC_CONFIRMATION_ROLE_MANIFEST_HASH_ALGORITHM =
+const SCIENTIFIC_CONFIRMATION_ROLE_MANIFEST_HASH_ALGORITHM =
     "sha256:crucible-scientific-confirmation-role-manifest-v1";
-export const SCIENTIFIC_CONFIRMATION_PROTOCOL_SEED_HASH_ALGORITHM =
+const SCIENTIFIC_CONFIRMATION_PROTOCOL_SEED_HASH_ALGORITHM =
     "sha256:crucible-scientific-confirmation-protocol-seed-v1";
-export const SCIENTIFIC_CONFIRMATION_PROTOCOL_MANIFEST_HASH_ALGORITHM =
+const SCIENTIFIC_CONFIRMATION_PROTOCOL_MANIFEST_HASH_ALGORITHM =
     "sha256:crucible-scientific-confirmation-protocol-manifest-v1";
-export const SCIENTIFIC_CONFIRMATION_ALPHA_USE_HASH_ALGORITHM =
+const SCIENTIFIC_CONFIRMATION_ALPHA_USE_HASH_ALGORITHM =
     "sha256:crucible-scientific-confirmation-alpha-use-v1";
-export const SCIENTIFIC_CONFIRMATION_CLOSURE_HASH_ALGORITHM =
+const SCIENTIFIC_CONFIRMATION_CLOSURE_HASH_ALGORITHM =
     "sha256:crucible-scientific-confirmation-closure-v1";
 
 export const SCIENTIFIC_CONFIRMATION_ROLES = Object.freeze([
@@ -325,7 +325,7 @@ export function deriveScientificConfirmationFreeze({
     });
 }
 
-export function scientificConfirmationEvidenceItems(
+function scientificConfirmationEvidenceItems(
     aggregate,
     role = null,
     { includeInvalidated = true } = {},
@@ -352,7 +352,6 @@ function roleEvidenceState(aggregate, freeze, member, role) {
             role,
             status: "PENDING",
             evidence: null,
-            validBinding: true,
         };
     }
     if (matches.length !== 1) {
@@ -360,7 +359,6 @@ function roleEvidenceState(aggregate, freeze, member, role) {
             role,
             status: "INVALID",
             evidence: null,
-            validBinding: false,
         };
     }
     const evidence = matches[0];
@@ -403,7 +401,6 @@ function roleEvidenceState(aggregate, freeze, member, role) {
             ? evidence.statisticalEvaluation?.requiredState ?? "INVALID"
             : "INVALID",
         evidence,
-        validBinding,
     };
 }
 

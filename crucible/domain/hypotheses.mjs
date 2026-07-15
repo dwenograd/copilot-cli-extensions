@@ -621,10 +621,6 @@ function normalizePredictionWithContext(value, context, field = "prediction") {
     }
 }
 
-export function normalizePrediction(value, options = {}) {
-    return normalizePredictionWithContext(value, predictionContext(options));
-}
-
 export function predictionIdentity(value, options = {}) {
     const context = predictionContext(options);
     const prediction = normalizePredictionWithContext(value, context);

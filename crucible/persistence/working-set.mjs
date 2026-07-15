@@ -16,17 +16,6 @@ const MAX_REFERENCE_SCAN_NODES = 2_000_000;
 const EFFECT_RECOVERY_CAPSULE_CONTENT_TYPE =
     "application/vnd.crucible.effect-recovery+json";
 
-export const WORKING_SET_INTEGRATION_NOTES = Object.freeze({
-    checkpoint:
-        "Active WAL checkpoints run only outside repository transactions. Transaction commits trigger a bounded threshold/interval probe; segment rotation forces a TRUNCATE checkpoint after its commit.",
-    references:
-        "CAS reconciliation acquires the store generation lock before scanning repository metadata, active and sealed event payloads, bundle manifests, transient unresolved-effect recovery capsules, and private installation state. Any incomplete reference scan defers deletion; resolved capsules become eligible only after their reference is released and orphan retention is satisfied.",
-    budgets:
-        "The signed workingSetPolicy freezes per-attempt/per-investigation bytes and maintenance thresholds. The resource broker storage_bytes lane atomically reserves global growth before effects; physical telemetry remains the current working-set authority.",
-    diagnostics:
-        "Referenced diagnostics remain evidence. Original deletion is deferred unless the signed diagnostic policy explicitly permits sealed_rollup and a caller supplies a sealed summary plus non-authoritative and non-bundle-required attestations.",
-});
-
 function requirePositiveSafeInteger(value, field, { allowZero = false } = {}) {
     const minimum = allowZero ? 0 : 1;
     if (!Number.isSafeInteger(value) || value < minimum) {
@@ -131,7 +120,7 @@ function scanObjectIds(value, output, counter = { nodes: 0 }) {
     }
 }
 
-export function collectWorkingSetReferences({
+function collectWorkingSetReferences({
     repository,
     investigationId,
     bundleDirs = [],
@@ -231,7 +220,7 @@ export function collectWorkingSetReferences({
     });
 }
 
-export function reconcileWorkingSetArtifacts({
+function reconcileWorkingSetArtifacts({
     repository,
     artifactStore,
     investigationId,
@@ -344,7 +333,7 @@ export function reconcileWorkingSetArtifacts({
     });
 }
 
-export function evaluateStorageBudget({
+function evaluateStorageBudget({
     currentBytes,
     requestedBytes = 0,
     limitBytes,
@@ -411,7 +400,7 @@ export function evaluateStorageBudget({
     });
 }
 
-export class WorkingSetController {
+class WorkingSetController {
     #repository;
     #artifactStore;
     #investigationId;

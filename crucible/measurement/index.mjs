@@ -31,46 +31,25 @@ export {
     ARGV_PLACEHOLDERS,
     ARGV_TEMPLATE_HASH_ALGORITHM,
     ENTRY_HASH_ALGORITHM,
-    HARNESS_IDENTITY_VERSION,
     PARSER_SOURCE_HASH_ALGORITHM,
     PARSER_VERSION_HASH_ALGORITHM,
     SANDBOX_POLICY_IDENTITY_HASH_ALGORITHM,
     applicationEntrypointHashForEntry,
-    buildFrozenHarnessIdentity,
-    isVerifiedHarnessEntry,
     loadHarnessAllowlist,
     trustedParserIdentity,
-    validateHarnessValidationCases,
-    verifyFrozenHarnessIdentity,
     verifyHarnessPreflight,
 } from "./allowlist.mjs";
 
 export {
     PARSER_MAX_INPUT_BYTES,
     PARSER_VERSION,
-    normalizeHarnessResultBinding,
     parseHarnessResult,
 } from "./parser.mjs";
 
 export {
-    VERIFIER_PARSER_MAX_INPUT_BYTES,
     VERIFIER_PARSER_VERSION,
     parseImpossibilityVerifierResult,
 } from "./verifier-parser.mjs";
-
-export {
-    NOVELTY_BINDING_SEED_ALGORITHM,
-    NOVELTY_MAX_STRUCTURAL_FEATURES,
-    NOVELTY_ROLE_ADAPTER_VERSION,
-    NOVELTY_ROLE_FINGERPRINT_ALGORITHM,
-    NOVELTY_STRUCTURAL_FINGERPRINT_ALGORITHM,
-    NoveltyRoleError,
-    adaptNoveltyRoleAttempt,
-    createNoveltyMeasurementBinding,
-    normalizeNoveltyRoleAttempt,
-    noveltyRoleFingerprint,
-    tryAdaptNoveltyRoleAttempt,
-} from "./novelty-role.mjs";
 
 export {
     HARNESS_SUITE_V4_CASE_MANIFEST_ALGORITHM,
@@ -92,12 +71,9 @@ export {
     hashHarnessEnvironmentV4,
     hashHarnessObservableSchemaV4,
     hashHarnessRoleConfigV4,
-    harnessSuiteV4Identity,
-    identifyHarnessSuiteV4,
     normalizeHarnessRoleConfigV4,
     normalizeHarnessSuiteV4,
     projectHarnessSuiteV4ForWorker,
-    validateHarnessSuiteV4,
     validateHarnessSuiteV4CaseClaims,
 } from "./harness-suite.mjs";
 
@@ -106,11 +82,8 @@ export {
     ENV_HASH_ALGORITHM,
     HARNESS_SUITE_RECEIPT_DETERMINISM_KEYS,
     HARNESS_SUITE_RECEIPT_VERSION,
-    RECEIPT_DETERMINISM_KEYS,
     RECEIPT_HASH_ALGORITHM,
-    RECEIPT_VERSION,
     buildMeasurementReceipt,
-    canonicalizeReceipt,
     hashArgv,
     hashEnv,
     hashReceipt,
@@ -135,5 +108,4 @@ export {
 export {
     DEFAULT_MEASUREMENT_BYTE_BUDGETS,
     createMeasurementExecutor,
-    toFileUrl,
 } from "./executor.mjs";

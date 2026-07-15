@@ -409,13 +409,6 @@ describe("independent impossibility verifier parser", () => {
             .toThrow(/certificate disagrees/u);
     });
 
-    it("rejects legacy pass plus exhausted output", () => {
-        expect(() => parseImpossibilityVerifierResult(JSON.stringify({
-            pass: true,
-            searchSpaceExhausted: true,
-        }))).toThrow(/formal checker fields/u);
-    });
-
     it("rejects duplicate JSON keys", () => {
         const { output } = validOutput();
         const raw = JSON.stringify(output).replace(

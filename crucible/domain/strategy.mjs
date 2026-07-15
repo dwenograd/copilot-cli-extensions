@@ -7,7 +7,6 @@ import {
 } from "./archive.mjs";
 import {
     ESCAPE_SEARCH_OPERATORS,
-    LEGACY_SEARCH_STRATEGY_POLICY_VERSION,
     SEARCH_OPERATORS,
     SEARCH_STRATEGY_POLICY_VERSION,
 } from "./constants.mjs";
@@ -22,16 +21,10 @@ import {
 } from "./replication.mjs";
 import { replayDerivedCandidateEvidence } from "./scientific-replay.mjs";
 import { searchAlphaSubjectOrdinal } from "./statistics.mjs";
-import {
-    behavioralRoleIdentity,
-    replayDerivedCandidateNovelty,
-    structuralRoleIdentity,
-    supportedBehavioralDifference,
-} from "./novelty.mjs";
 
-export const SEARCH_OPERATOR_POLICY_IDENTITY_ALGORITHM =
+const SEARCH_OPERATOR_POLICY_IDENTITY_ALGORITHM =
     "sha256:crucible-search-operator-policy-v1";
-export const SEARCH_OPERATOR_ARCHIVE_FINGERPRINT_ALGORITHM =
+const SEARCH_OPERATOR_ARCHIVE_FINGERPRINT_ALGORITHM =
     "sha256:crucible-search-operator-archive-v1";
 export const SEARCH_STRATEGY_V2_ADAPTATION = Object.freeze({
     version: SEARCH_STRATEGY_POLICY_VERSION,
@@ -49,10 +42,7 @@ function candidateEvidence(aggregate, { includeInvalidated = false } = {}) {
             && evidence.purpose === "candidate"
             && (includeInvalidated || !evidence.invalidated))
         .map((evidence) =>
-            replayDerivedCandidateNovelty(
-                aggregate,
-                replayDerivedCandidateEvidence(aggregate, evidence),
-            ));
+            replayDerivedCandidateEvidence(aggregate, evidence));
 }
 
 function expectedSlotsForRound(contract, round) {
@@ -119,9 +109,7 @@ function roundSignalSummaries(aggregate) {
     const contract = aggregate.contract;
     const completed = completedRoundNumbers(aggregate);
     const current = candidateEvidence(aggregate);
-    const seenContent = new Set();
-    const seenStructural = new Set();
-    const priorBehavioral = [];
+    const seenArtifacts = new Set();
     let acceptedSeen = false;
     let best = null;
     const summaries = [];
@@ -131,10 +119,8 @@ function roundSignalSummaries(aggregate) {
             .filter((evidence) => evidence.round === round)
             .sort((left, right) => left.slotIndex - right.slotIndex);
         let metricImproved = false;
-        let acceptanceNovelty = false;
-        let structuralNovelty = false;
-        let behavioralNovelty = false;
-        let contentNovelty = false;
+        let acceptanceProgress = false;
+        let contentProgress = false;
 
         for (const evidence of items) {
             if (evidence.rankable) {
@@ -153,43 +139,26 @@ function roundSignalSummaries(aggregate) {
                 }
             }
             if (evidence.outcomeClass === "accepted" && !acceptedSeen) {
-                acceptanceNovelty = true;
+                acceptanceProgress = true;
                 acceptedSeen = true;
             }
-            const content = evidence.novelty?.content?.signature;
-            if (typeof content !== "string" || seenContent.has(content)) continue;
-            seenContent.add(content);
-            contentNovelty = true;
-
-            const structural =
-                evidence.novelty?.structural?.structuralFingerprint;
-            if (typeof structural === "string"
-                && !seenStructural.has(structural)) {
-                seenStructural.add(structural);
-                structuralNovelty = true;
-            }
-            const behavioral = evidence.novelty?.behavioral;
-            if (behavioral !== null && behavioral !== undefined) {
-                if (priorBehavioral.some((prior) =>
-                    supportedBehavioralDifference(behavioral, prior))) {
-                    behavioralNovelty = true;
-                }
-                priorBehavioral.push(behavioral);
+            const artifactHash =
+                evidence.receipt?.candidateArtifactHash ?? null;
+            if (typeof artifactHash === "string"
+                && !seenArtifacts.has(artifactHash)) {
+                seenArtifacts.add(artifactHash);
+                contentProgress = true;
             }
         }
 
         summaries.push({
             round,
             metricImproved,
-            acceptanceNovelty,
-            structuralNovelty,
-            behavioralNovelty,
-            contentNovelty,
-            improvementOrNovelty: metricImproved
-                || acceptanceNovelty
-                || structuralNovelty
-                || behavioralNovelty
-                || contentNovelty,
+            acceptanceProgress,
+            contentProgress,
+            improvementOrProgress: metricImproved
+                || acceptanceProgress
+                || contentProgress,
         });
     }
     return summaries;
@@ -203,7 +172,7 @@ export function detectPlateau(aggregate) {
     let escapeRoundsCompleted = 0;
 
     for (const summary of summaries) {
-        if (summary.improvementOrNovelty) {
+        if (summary.improvementOrProgress) {
             stagnantRounds = 0;
             triggerRound = null;
             escapeRoundsCompleted = 0;
@@ -243,10 +212,7 @@ export function detectPlateau(aggregate) {
     });
 }
 
-export const analyzePlateau = detectPlateau;
-export const detectSearchPlateau = detectPlateau;
-
-export function deterministicHashInteger(value, modulus = 0x7fffffff) {
+function deterministicHashInteger(value, modulus = 0x7fffffff) {
     if (!Number.isSafeInteger(modulus) || modulus < 1) {
         throw new RangeError("modulus must be a positive safe integer");
     }
@@ -254,26 +220,17 @@ export function deterministicHashInteger(value, modulus = 0x7fffffff) {
     return Number(BigInt(`0x${digest.slice(0, 16)}`) % BigInt(modulus));
 }
 
-export function deterministicSeed(value) {
+function deterministicSeed(value) {
     return deterministicHashInteger(value, 0x7ffffffe) + 1;
 }
 
-export function searchOperatorPolicyIdentity(contract) {
+function searchOperatorPolicyIdentity(contract) {
     return hashCanonical({
         version: "crucible-search-operator-policy-v1",
         searchPolicy: contract.searchPolicy,
         statisticalPolicyIdentity:
             contract.statisticalPolicyIdentity ?? null,
-        structuralRoleIdentity: structuralRoleIdentity(contract),
-        behavioralRoleIdentity: behavioralRoleIdentity(contract),
     }, SEARCH_OPERATOR_POLICY_IDENTITY_ALGORITHM);
-}
-
-function exactNoveltySignature(value, domain) {
-    return typeof value === "string"
-        && value.startsWith(`${domain}:`)
-        && value.length === domain.length + 65
-        && /^[a-f0-9]{64}$/u.test(value.slice(-64));
 }
 
 function archivePolicyFingerprint(archive) {
@@ -288,51 +245,13 @@ function archivePolicyFingerprint(archive) {
         candidate !== null
         && candidate !== undefined
         && candidate.invalidated !== true);
-    const byId = new Map(
-        candidates
-            .filter((candidate) => typeof candidate.evidenceId === "string")
-            .map((candidate) => [candidate.evidenceId, candidate]),
-    );
     const artifactHashes = [...new Set(candidates
         .map((candidate) => candidate.receipt?.candidateArtifactHash)
         .filter((value) => typeof value === "string"))]
         .sort();
-    const structuralSignatures = [...new Set(
-        (archive.noveltyNiches?.structural ?? [])
-            .map((niche) => niche.signature)
-            .filter((value) => exactNoveltySignature(
-                value,
-                "sha256:crucible-novelty-structural-v1",
-            )),
-    )].sort();
-    const behavioralGroups = archive.noveltyNiches?.behavioral ?? [];
-    const behavioralNiches = (behavioralGroups.length > 1
-        ? behavioralGroups
-        : [])
-        .filter((niche) => exactNoveltySignature(
-            niche.signature,
-            "sha256:crucible-behavioral-novelty-v1",
-        ))
-        .map((niche) => ({
-            artifactHashes: [...new Set(
-                (niche.evidenceIds ?? [])
-                    .map((evidenceId) =>
-                        byId.get(evidenceId)
-                            ?.receipt?.candidateArtifactHash ?? null)
-                    .filter((value) => typeof value === "string"),
-            )].sort(),
-        }))
-        .filter((niche) => niche.artifactHashes.length > 0)
-        .sort((left, right) => {
-            const leftKey = left.artifactHashes.join("\0");
-            const rightKey = right.artifactHashes.join("\0");
-            return leftKey < rightKey ? -1 : leftKey > rightKey ? 1 : 0;
-        });
     return hashCanonical({
         version: "crucible-search-operator-archive-v1",
         artifactHashes,
-        structuralSignatures,
-        behavioralNiches,
     }, SEARCH_OPERATOR_ARCHIVE_FINGERPRINT_ALGORITHM);
 }
 
@@ -345,10 +264,6 @@ function deterministicStrategyError(message) {
 function configuredOperatorWeight(searchPolicy, operator) {
     const weight = searchPolicy.operatorWeights[operator];
     return Number.isSafeInteger(weight) && weight > 0 ? weight : 0;
-}
-
-function searchStrategyPolicyVersion(searchPolicy) {
-    return searchPolicy.version ?? LEGACY_SEARCH_STRATEGY_POLICY_VERSION;
 }
 
 function normalizeOperatorHistory(operatorHistory) {
@@ -376,15 +291,12 @@ function multiplyAdaptiveWeight(weight, multiplier) {
     return result;
 }
 
-function versionedOperatorEntropy(searchPolicy, history, entropy) {
-    const version = searchStrategyPolicyVersion(searchPolicy);
-    return version === LEGACY_SEARCH_STRATEGY_POLICY_VERSION
-        ? entropy
-        : {
-            ...entropy,
-            strategyPolicyVersion: version,
-            operatorHistory: history,
-        };
+function operatorEntropy(searchPolicy, history, entropy) {
+    return {
+        ...entropy,
+        strategyPolicyVersion: searchPolicy.version,
+        operatorHistory: history,
+    };
 }
 
 function selectWeightedOperator(weights, entropy, emptyReason) {
@@ -445,26 +357,24 @@ export function adaptiveOperatorWeights(
         nearMisses: archive.nearMisses,
         accepted: [],
     }).filter((candidate) => visibleIds.has(candidate.evidenceId));
+    const distinctVisibleCandidates = distinctParentCandidates(archive)
+        .filter((candidate) => visibleIds.has(candidate.evidenceId));
 
     if (refinementParents.length !== 1) {
         weights.refinement = 0;
     } else if (weights.refinement > 0) {
         weights.refinement += refinementPool.length;
     }
-    const structuralNicheCount =
-        archive.noveltyNiches?.structural?.length ?? 0;
-    const behavioralDifferenceCount = Math.max(
-        0,
-        (archive.noveltyNiches?.behavioral?.length ?? 0) - 1,
-    );
-    const trustedNicheCount =
-        structuralNicheCount + behavioralDifferenceCount;
     if (crossoverParents.length !== 2) {
         weights.crossover = 0;
     } else if (weights.crossover > 0) {
-        weights.crossover += Math.min(trustedNicheCount, 8);
+        weights.crossover += Math.min(
+            Math.max(0, distinctVisibleCandidates.length - 1),
+            8,
+        );
     }
-    if (weights.diversification > 0 && trustedNicheCount < 2) {
+    if (weights.diversification > 0
+        && distinctVisibleCandidates.length < 2) {
         weights.diversification += 1;
     }
     if (adversarialParents.length !== 1) {
@@ -482,14 +392,12 @@ export function adaptiveOperatorWeights(
         if (weights.adversarial > 0) {
             weights.adversarial += 1;
         }
-        if (weights.diversification > 0 && trustedNicheCount === 0) {
+        if (weights.diversification > 0
+            && distinctVisibleCandidates.length === 0) {
             weights.diversification += 1;
         }
     }
-    const versionedAdaptation = searchStrategyPolicyVersion(searchPolicy)
-        === SEARCH_STRATEGY_POLICY_VERSION;
-    if (versionedAdaptation
-        && phase === "normal"
+    if (phase === "normal"
         && history.length > 0
         && eligibleIncumbent(archive) !== null) {
         if (!history.includes("adversarial") && weights.adversarial > 0) {
@@ -536,7 +444,7 @@ export function selectAdaptiveOperator({
         phase,
         history,
     );
-    return selectWeightedOperator(weights, versionedOperatorEntropy(
+    return selectWeightedOperator(weights, operatorEntropy(
         searchPolicy,
         history,
         {
@@ -549,9 +457,6 @@ export function selectAdaptiveOperator({
         },
     ), `no positive-weight eligible operators for phase "${phase}"`);
 }
-
-export const selectOperator = selectAdaptiveOperator;
-export const assignSearchOperator = selectAdaptiveOperator;
 
 function eligibleParentCandidate(candidate) {
     return candidate !== null
@@ -620,32 +525,7 @@ function eligibleIncumbent(archive) {
         : null;
 }
 
-function preferredCrossoverParents(_archive, visible) {
-    for (let firstIndex = 0; firstIndex < visible.length - 1; firstIndex += 1) {
-        const first = visible[firstIndex];
-        const firstStructural =
-            first.novelty?.structural?.structuralFingerprint ?? null;
-        if (firstStructural === null) continue;
-        for (let secondIndex = firstIndex + 1; secondIndex < visible.length; secondIndex += 1) {
-            const secondStructural =
-                visible[secondIndex].novelty?.structural?.structuralFingerprint
-                ?? null;
-            if (secondStructural !== null
-                && secondStructural !== firstStructural) {
-                return [first, visible[secondIndex]];
-            }
-        }
-    }
-    for (let firstIndex = 0; firstIndex < visible.length - 1; firstIndex += 1) {
-        for (let secondIndex = firstIndex + 1; secondIndex < visible.length; secondIndex += 1) {
-            if (supportedBehavioralDifference(
-                visible[firstIndex].novelty?.behavioral,
-                visible[secondIndex].novelty?.behavioral,
-            )) {
-                return [visible[firstIndex], visible[secondIndex]];
-            }
-        }
-    }
+function preferredCrossoverParents(visible) {
     return visible.slice(0, 2);
 }
 
@@ -667,7 +547,7 @@ function parentEvidenceIds(archive, promptContextRefs, operator, cap) {
     if (visible.length < 2 || cap < 2) {
         return [];
     }
-    return preferredCrossoverParents(archive, visible)
+    return preferredCrossoverParents(visible)
         .map((candidate) => candidate.evidenceId);
 }
 
@@ -726,7 +606,7 @@ function fallbackOperator({
             return operator;
         }
     }
-    return selectWeightedOperator(weights, versionedOperatorEntropy(
+    return selectWeightedOperator(weights, operatorEntropy(
         searchPolicy,
         history,
         {
@@ -881,16 +761,13 @@ export function buildSearchCandidateCommand(aggregate, progress) {
             kind: assignedEnumerand === null ? "candidate" : "enumerand",
             index: statisticalSubjectIndex(
                 assignedEnumerand === null ? "candidate" : "enumerand",
-                searchStrategyPolicyVersion(policy)
-                        === LEGACY_SEARCH_STRATEGY_POLICY_VERSION
-                    ? globalSlot
-                    : searchAlphaSubjectOrdinal({
-                        searchSlots: searchSubjectCapacity(contract),
-                        maxConfirmations:
-                            contract.statisticalPolicy.maxConfirmations,
-                        globalSlot,
-                        replacementOrdinal: replacement,
-                    }),
+                searchAlphaSubjectOrdinal({
+                    searchSlots: searchSubjectCapacity(contract),
+                    maxConfirmations:
+                        contract.statisticalPolicy.maxConfirmations,
+                    globalSlot,
+                    replacementOrdinal: replacement,
+                }),
             ),
             id: candidateId,
             identity: deriveReplicationSubjectIdentity({
@@ -941,6 +818,3 @@ export function buildSearchCandidateCommand(aggregate, progress) {
             }),
     });
 }
-
-export const deriveSearchCandidateCommand = buildSearchCandidateCommand;
-export const createSearchCandidateCommand = buildSearchCandidateCommand;

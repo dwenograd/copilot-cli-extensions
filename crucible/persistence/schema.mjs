@@ -1,18 +1,12 @@
 // crucible/persistence/schema.mjs
 //
-// Canonical schema definition, migration, connection configuration, and
-// fail-closed verification for the Crucible event repository.
+// Canonical schema definition, connection configuration, and fail-closed
+// verification for the Crucible event repository.
 
 import { createHash } from "node:crypto";
 
 import { DatabaseSync } from "./sqlite.mjs";
-import {
-    canonicalize,
-    computeEventHash,
-    computeLegacyEventHash,
-    inspectCanonicalJson,
-    GENESIS_PREV_HASH,
-} from "./canonical.mjs";
+import { canonicalize } from "./canonical.mjs";
 import {
     CruciblePersistenceError,
     DatabaseIntegrityError,
@@ -92,40 +86,26 @@ CREATE TABLE quiescent_stops (
     )
 );`;
 
-function runnerLeasesTableDdl(name, {
-    supervisorGeneration = true,
-    runnerIncarnation = true,
-    generationCheck = true,
-} = {}) {
-    const definitions = [
+function runnerLeasesTableDdl(name) {
+    return `CREATE TABLE ${name} (
+    ${[
         "lease_id TEXT PRIMARY KEY",
         "investigation_id TEXT NOT NULL REFERENCES investigations(investigation_id)",
         "owner TEXT NOT NULL",
         "fencing_token INTEGER NOT NULL",
-    ];
-    if (supervisorGeneration) {
-        definitions.push("supervisor_generation INTEGER");
-    }
-    if (runnerIncarnation) {
-        definitions.push("runner_incarnation TEXT");
-    }
-    definitions.push(
+        "supervisor_generation INTEGER",
+        "runner_incarnation TEXT",
         "acquired_at TEXT NOT NULL",
         "released_at TEXT",
-    );
-    if (supervisorGeneration && generationCheck) {
-        definitions.push("CHECK (supervisor_generation IS NULL OR supervisor_generation > 0)");
-    }
-    definitions.push("UNIQUE (investigation_id, fencing_token)");
-    return `CREATE TABLE ${name} (\n    ${definitions.join(",\n    ")}\n);`;
+        "CHECK (supervisor_generation IS NULL OR supervisor_generation > 0)",
+        "UNIQUE (investigation_id, fencing_token)",
+    ].join(",\n    ")}
+);`;
 }
 
-function commandAttemptsTableDdl(name, {
-    supervisorGeneration = true,
-    runnerIncarnation = true,
-    generationCheck = true,
-} = {}) {
-    const definitions = [
+function commandAttemptsTableDdl(name) {
+    return `CREATE TABLE ${name} (
+    ${[
         "attempt_id TEXT PRIMARY KEY",
         "investigation_id TEXT NOT NULL REFERENCES investigations(investigation_id)",
         "command TEXT NOT NULL",
@@ -133,14 +113,8 @@ function commandAttemptsTableDdl(name, {
         "lease_id TEXT NOT NULL REFERENCES runner_leases(lease_id)",
         "fencing_token INTEGER NOT NULL",
         "owner TEXT NOT NULL",
-    ];
-    if (supervisorGeneration) {
-        definitions.push("supervisor_generation INTEGER");
-    }
-    if (runnerIncarnation) {
-        definitions.push("runner_incarnation TEXT");
-    }
-    definitions.push(
+        "supervisor_generation INTEGER",
+        "runner_incarnation TEXT",
         "reserved_at TEXT NOT NULL",
         "dispatched_at TEXT",
         "observed_at TEXT",
@@ -148,11 +122,9 @@ function commandAttemptsTableDdl(name, {
         "abandoned_at TEXT",
         "updated_at TEXT NOT NULL",
         "CHECK (state IN ('reserved', 'dispatched', 'observed', 'committed', 'abandoned'))",
-    );
-    if (supervisorGeneration && generationCheck) {
-        definitions.push("CHECK (supervisor_generation IS NULL OR supervisor_generation > 0)");
-    }
-    return `CREATE TABLE ${name} (\n    ${definitions.join(",\n    ")}\n);`;
+        "CHECK (supervisor_generation IS NULL OR supervisor_generation > 0)",
+    ].join(",\n    ")}
+);`;
 }
 
 const DDL = `
@@ -233,25 +205,12 @@ CREATE TABLE artifacts (
     storage          TEXT    NOT NULL,
     content_type     TEXT,
     size_bytes       INTEGER,
-    inline_blob      BLOB,
-    hash_algo        TEXT,
-    hash_value       TEXT,
+    hash_algo        TEXT    NOT NULL,
+    hash_value       TEXT    NOT NULL,
     durable          INTEGER NOT NULL DEFAULT 0,
     created_at       TEXT    NOT NULL,
-    CHECK (storage IN ('inline', 'external')),
-    CHECK (durable IN (0, 1)),
-    CHECK (
-        (storage = 'inline'
-            AND inline_blob IS NOT NULL
-            AND hash_algo IS NULL
-            AND hash_value IS NULL
-            AND durable = 1)
-        OR
-        (storage = 'external'
-            AND inline_blob IS NULL
-            AND hash_algo IS NOT NULL
-            AND hash_value IS NOT NULL)
-    )
+    CHECK (storage = 'external'),
+    CHECK (durable IN (0, 1))
 );
 
 CREATE TABLE artifact_refs (
@@ -263,14 +222,6 @@ CREATE TABLE artifact_refs (
     UNIQUE (artifact_id, seq)
 );
 
-CREATE TABLE projection_metadata (
-    projection_name  TEXT    NOT NULL,
-    investigation_id TEXT    NOT NULL DEFAULT '*',
-    last_applied_seq INTEGER NOT NULL DEFAULT 0,
-    checkpoint       TEXT,
-    updated_at       TEXT    NOT NULL,
-    PRIMARY KEY (projection_name, investigation_id)
-);
 `;
 
 function normalizeBusyTimeout(value) {
@@ -629,81 +580,20 @@ function schemaFingerprint(manifest, pragmas, schemaVersion, eventHashVersion) {
         .digest("hex");
 }
 
-function replaceExpectedRunnerTables(db, options) {
-    db.exec(`
-        DROP TABLE command_attempts;
-        DROP TABLE runner_leases;
-        ${runnerLeasesTableDdl("runner_leases", options)}
-        ${RUNNER_LEASE_INDEX_DDL}
-        ${commandAttemptsTableDdl("command_attempts", options)}
-        ${COMMAND_ATTEMPT_INDEX_DDL}
-    `);
-}
-
-function expectedManifestForVariant(variant) {
+function expectedManifest() {
     const db = new DatabaseSync(":memory:");
     try {
         db.exec(DDL);
-        if (variant !== "v6-current") {
-            db.exec("DROP TABLE quiescent_stops;");
-        }
-        if (variant === "v2") {
-            db.exec("DROP TABLE supervisor_authority; DROP TABLE runner_incarnations;");
-            replaceExpectedRunnerTables(db, {
-                supervisorGeneration: false,
-                runnerIncarnation: false,
-                generationCheck: false,
-            });
-        } else if (variant === "v3-migrated") {
-            db.exec("DROP TABLE supervisor_authority; DROP TABLE runner_incarnations;");
-            replaceExpectedRunnerTables(db, {
-                supervisorGeneration: true,
-                runnerIncarnation: false,
-                generationCheck: false,
-            });
-        } else if (variant === "v3-current") {
-            db.exec(`
-                DROP TABLE supervisor_authority;
-                DROP TABLE runner_incarnations;
-                ALTER TABLE command_attempts DROP COLUMN runner_incarnation;
-                ALTER TABLE runner_leases DROP COLUMN runner_incarnation;
-            `);
-        } else if (variant === "v4-migrated") {
-            replaceExpectedRunnerTables(db, {
-                supervisorGeneration: true,
-                runnerIncarnation: true,
-                generationCheck: false,
-            });
-        } else if (variant !== "v4-current"
-            && variant !== "v5-current"
-            && variant !== "v6-current") {
-            throw new Error(`unknown expected schema variant '${variant}'`);
-        }
         return buildSchemaManifest(db);
     } finally {
         db.close();
     }
 }
 
-const EXPECTED_VARIANTS = Object.freeze({
-    2: Object.freeze(["v2"]),
-    3: Object.freeze(["v3-migrated", "v3-current"]),
-    4: Object.freeze(["v4-migrated", "v4-current"]),
-    5: Object.freeze(["v5-current"]),
-    6: Object.freeze(["v6-current"]),
-});
-
-const EXPECTED_MANIFESTS = new Map();
-
-function getExpectedManifest(variant) {
-    if (!EXPECTED_MANIFESTS.has(variant)) {
-        EXPECTED_MANIFESTS.set(variant, expectedManifestForVariant(variant));
-    }
-    return EXPECTED_MANIFESTS.get(variant);
-}
+const EXPECTED_MANIFEST = expectedManifest();
 
 export const SCHEMA_FINGERPRINT = schemaFingerprint(
-    getExpectedManifest("v6-current"),
+    EXPECTED_MANIFEST,
     {
         ...EXPECTED_CONNECTION_PRAGMAS,
         userVersion: SCHEMA_VERSION,
@@ -712,35 +602,19 @@ export const SCHEMA_FINGERPRINT = schemaFingerprint(
     EVENT_HASH_VERSION,
 );
 
-export const SCHEMA_V5_FINGERPRINT = schemaFingerprint(
-    getExpectedManifest("v5-current"),
-    {
-        ...EXPECTED_CONNECTION_PRAGMAS,
-        userVersion: 5,
-    },
-    5,
-    EVENT_HASH_VERSION,
-);
-
-function assertKnownSchemaStructure(db, version) {
-    const variants = EXPECTED_VARIANTS[version] ?? [];
+function assertCurrentSchemaStructure(db) {
     const actualManifest = buildSchemaManifest(db);
     const actualFingerprint = structuralFingerprint(actualManifest);
-    for (const variant of variants) {
-        const expectedFingerprint = structuralFingerprint(getExpectedManifest(variant));
-        if (actualFingerprint === expectedFingerprint) {
-            return { variant, manifest: actualManifest, fingerprint: actualFingerprint };
-        }
+    const expectedFingerprint = structuralFingerprint(EXPECTED_MANIFEST);
+    if (actualFingerprint === expectedFingerprint) {
+        return { manifest: actualManifest, fingerprint: actualFingerprint };
     }
     throw new SchemaIntegrityError(
-        `database schema does not match any accepted schema-${version} definition`,
+        "database schema does not match the current canonical definition",
         {
-            schemaVersion: version,
+            schemaVersion: SCHEMA_VERSION,
             actualFingerprint,
-            expectedFingerprints: variants.map((variant) => ({
-                variant,
-                fingerprint: structuralFingerprint(getExpectedManifest(variant)),
-            })),
+            expectedFingerprint,
         },
     );
 }
@@ -789,21 +663,6 @@ function assertVersionPair(db, expected) {
         );
     }
     return pair;
-}
-
-function assertLegacyMetadata(db) {
-    const reserved = db.prepare(`
-        SELECT key, value
-        FROM schema_meta
-        WHERE key IN ('schema_fingerprint', 'event_hash_version')
-        ORDER BY key
-    `).all();
-    if (reserved.length > 0) {
-        throw new SchemaIntegrityError(
-            "legacy schema contains unexpected future integrity metadata",
-            { reservedMetadata: reserved },
-        );
-    }
 }
 
 function adapterRows(adapter, method, fallback, db, check) {
@@ -855,351 +714,11 @@ export function verifyDatabaseIntegrity(db, { adapter = undefined } = {}) {
     return { integrityCheck: "ok", foreignKeyViolations: 0 };
 }
 
-function validateLegacyEventLog(db) {
-    const rows = db.prepare(`
-        SELECT *
-        FROM events
-        ORDER BY investigation_id, seq
-    `).all();
-    const violations = [];
-    let currentInvestigation = null;
-    let expectedSeq = 1;
-    let expectedPrev = GENESIS_PREV_HASH;
-
-    for (const row of rows) {
-        if (row.investigation_id !== currentInvestigation) {
-            currentInvestigation = row.investigation_id;
-            expectedSeq = 1;
-            expectedPrev = GENESIS_PREV_HASH;
-        }
-        const seq = Number(row.seq);
-        const inspected = inspectCanonicalJson(row.payload);
-        if (!inspected.ok) {
-            violations.push({
-                investigationId: row.investigation_id,
-                seq,
-                kind: "payload_not_canonical",
-                detail: inspected.reason,
-            });
-        }
-        if (seq !== expectedSeq) {
-            violations.push({
-                investigationId: row.investigation_id,
-                seq,
-                kind: "sequence",
-                expected: expectedSeq,
-            });
-        }
-        if (row.prev_hash !== expectedPrev) {
-            violations.push({
-                investigationId: row.investigation_id,
-                seq,
-                kind: "prev_hash",
-                expected: expectedPrev,
-                actual: row.prev_hash,
-            });
-        }
-        if (inspected.ok) {
-            try {
-                const computed = computeLegacyEventHash({
-                    investigationId: row.investigation_id,
-                    seq,
-                    prevHash: row.prev_hash,
-                    kind: row.kind,
-                    payloadCanonical: row.payload,
-                    isTerminal: row.is_terminal,
-                    terminalKind: row.terminal_kind,
-                    attemptId: row.attempt_id,
-                    evidenceKind: row.evidence_kind,
-                    createdAt: row.created_at,
-                });
-                if (computed !== row.event_hash) {
-                    violations.push({
-                        investigationId: row.investigation_id,
-                        seq,
-                        kind: "event_hash",
-                        expected: computed,
-                        actual: row.event_hash,
-                    });
-                }
-            } catch (err) {
-                violations.push({
-                    investigationId: row.investigation_id,
-                    seq,
-                    kind: "event_hash",
-                    detail: err.message,
-                });
-            }
-        }
-        expectedSeq = seq + 1;
-        expectedPrev = row.event_hash;
-    }
-
-    if (violations.length > 0) {
-        throw new DatabaseIntegrityError(
-            "legacy event log failed authentication; refusing to migrate",
-            {
-                violationCount: violations.length,
-                violations: violations.slice(0, 50),
-            },
-        );
-    }
-}
-
-function rehashEventsToVersion2(db) {
-    const rows = db.prepare(`
-        SELECT *
-        FROM events
-        ORDER BY investigation_id, seq
-    `).all();
-    const updates = [];
-    let currentInvestigation = null;
-    let previousHash = GENESIS_PREV_HASH;
-
-    for (const row of rows) {
-        if (row.investigation_id !== currentInvestigation) {
-            currentInvestigation = row.investigation_id;
-            previousHash = GENESIS_PREV_HASH;
-        }
-        const eventHash = computeEventHash({
-            investigationId: row.investigation_id,
-            seq: Number(row.seq),
-            prevHash: previousHash,
-            kind: row.kind,
-            payloadCanonical: row.payload,
-            isTerminal: row.is_terminal,
-            terminalKind: row.terminal_kind,
-            attemptId: row.attempt_id,
-            evidenceKind: row.evidence_kind,
-            createdAt: row.created_at,
-        });
-        updates.push({
-            investigationId: row.investigation_id,
-            seq: Number(row.seq),
-            prevHash: previousHash,
-            eventHash,
-        });
-        previousHash = eventHash;
-    }
-
-    const setTemporaryHash = db.prepare(`
-        UPDATE events
-        SET event_hash = ?
-        WHERE investigation_id = ? AND seq = ?
-    `);
-    for (const update of updates) {
-        setTemporaryHash.run(
-            `schema5-migration:${update.seq}:${update.eventHash}`,
-            update.investigationId,
-            update.seq,
-        );
-    }
-
-    const setFinalHashes = db.prepare(`
-        UPDATE events
-        SET prev_hash = ?, event_hash = ?
-        WHERE investigation_id = ? AND seq = ?
-    `);
-    for (const update of updates) {
-        setFinalHashes.run(
-            update.prevHash,
-            update.eventHash,
-            update.investigationId,
-            update.seq,
-        );
-    }
-}
-
-function rebuildRunnerTablesToCurrent(db) {
-    db.exec(`
-        ${runnerLeasesTableDdl("__crucible_runner_leases_v5")}
-        ${commandAttemptsTableDdl("__crucible_command_attempts_v5")}
-
-        INSERT INTO __crucible_runner_leases_v5(
-            lease_id, investigation_id, owner, fencing_token,
-            supervisor_generation, runner_incarnation,
-            acquired_at, released_at
-        )
-        SELECT
-            lease_id, investigation_id, owner, fencing_token,
-            supervisor_generation, runner_incarnation,
-            acquired_at, released_at
-        FROM runner_leases;
-
-        INSERT INTO __crucible_command_attempts_v5(
-            attempt_id, investigation_id, command, state, lease_id,
-            fencing_token, owner, supervisor_generation, runner_incarnation,
-            reserved_at, dispatched_at, observed_at, committed_at,
-            abandoned_at, updated_at
-        )
-        SELECT
-            attempt_id, investigation_id, command, state, lease_id,
-            fencing_token, owner, supervisor_generation, runner_incarnation,
-            reserved_at, dispatched_at, observed_at, committed_at,
-            abandoned_at, updated_at
-        FROM command_attempts;
-
-        DROP TABLE command_attempts;
-        DROP TABLE runner_leases;
-        ALTER TABLE __crucible_runner_leases_v5 RENAME TO runner_leases;
-        ALTER TABLE __crucible_command_attempts_v5 RENAME TO command_attempts;
-        ${RUNNER_LEASE_INDEX_DDL}
-        ${COMMAND_ATTEMPT_INDEX_DDL}
-    `);
-}
-
 function rollbackQuietly(db) {
     try {
         db.exec("ROLLBACK;");
     } catch {
         // The original typed failure is more useful.
-    }
-}
-
-function migrateVersion2To3(db) {
-    db.exec("BEGIN IMMEDIATE;");
-    try {
-        assertVersionPair(db, 2);
-        assertLegacyMetadata(db);
-        assertKnownSchemaStructure(db, 2);
-        verifyDatabaseIntegrity(db);
-        validateLegacyEventLog(db);
-        db.exec(`
-            ALTER TABLE runner_leases ADD COLUMN supervisor_generation INTEGER;
-            ALTER TABLE command_attempts ADD COLUMN supervisor_generation INTEGER;
-        `);
-        db.prepare("UPDATE schema_meta SET value = '3' WHERE key = 'schema_version'").run();
-        db.exec("PRAGMA user_version = 3;");
-        db.exec("COMMIT;");
-    } catch (err) {
-        rollbackQuietly(db);
-        throw err;
-    }
-}
-
-function migrateVersion3To4(db) {
-    db.exec("BEGIN IMMEDIATE;");
-    try {
-        assertVersionPair(db, 3);
-        assertLegacyMetadata(db);
-        assertKnownSchemaStructure(db, 3);
-        verifyDatabaseIntegrity(db);
-        validateLegacyEventLog(db);
-        db.exec(`
-            ALTER TABLE runner_leases ADD COLUMN runner_incarnation TEXT;
-            ALTER TABLE command_attempts ADD COLUMN runner_incarnation TEXT;
-            CREATE TABLE runner_incarnations (
-                runner_incarnation    TEXT    PRIMARY KEY,
-                investigation_id     TEXT    NOT NULL REFERENCES investigations(investigation_id),
-                supervisor_generation INTEGER NOT NULL,
-                supervisor_nonce      TEXT    NOT NULL,
-                issued_at             TEXT    NOT NULL,
-                consumed_at           TEXT,
-                revoked_at            TEXT,
-                lease_id              TEXT    UNIQUE REFERENCES runner_leases(lease_id),
-                CHECK (supervisor_generation > 0),
-                CHECK ((consumed_at IS NULL) = (lease_id IS NULL))
-            );
-            CREATE INDEX ix_runner_incarnations_authority
-                ON runner_incarnations(investigation_id, supervisor_generation, issued_at);
-            CREATE TABLE supervisor_authority (
-                investigation_id          TEXT    PRIMARY KEY REFERENCES investigations(investigation_id),
-                supervisor_generation     INTEGER NOT NULL,
-                supervisor_nonce          TEXT    NOT NULL,
-                current_runner_incarnation TEXT REFERENCES runner_incarnations(runner_incarnation),
-                claimed_at                TEXT    NOT NULL,
-                updated_at                TEXT    NOT NULL,
-                CHECK (supervisor_generation > 0)
-            );
-        `);
-        db.prepare("UPDATE schema_meta SET value = '4' WHERE key = 'schema_version'").run();
-        db.exec("PRAGMA user_version = 4;");
-        db.exec("COMMIT;");
-    } catch (err) {
-        rollbackQuietly(db);
-        throw err;
-    }
-}
-
-function migrateVersion4ToCurrent(db) {
-    db.exec("PRAGMA foreign_keys = OFF;");
-    if (Number(pragmaScalar(db, "foreign_keys")) !== 0) {
-        throw new StorageError("failed to suspend foreign keys for canonical schema rebuild", null);
-    }
-
-    try {
-        db.exec("BEGIN IMMEDIATE;");
-        try {
-            assertVersionPair(db, 4);
-            assertLegacyMetadata(db);
-            const matched = assertKnownSchemaStructure(db, 4);
-            verifyDatabaseIntegrity(db);
-            validateLegacyEventLog(db);
-            if (matched.variant === "v4-migrated") {
-                rebuildRunnerTablesToCurrent(db);
-            }
-            rehashEventsToVersion2(db);
-            db.exec(QUIESCENT_STOPS_TABLE_DDL);
-            db.prepare("UPDATE schema_meta SET value = ? WHERE key = 'schema_version'")
-                .run(String(SCHEMA_VERSION));
-            db.prepare(`
-                INSERT INTO schema_meta(key, value)
-                VALUES('schema_fingerprint', ?)
-            `).run(SCHEMA_FINGERPRINT);
-            db.prepare(`
-                INSERT INTO schema_meta(key, value)
-                VALUES('event_hash_version', ?)
-            `).run(String(EVENT_HASH_VERSION));
-            db.exec(`PRAGMA user_version = ${SCHEMA_VERSION};`);
-            db.exec("COMMIT;");
-        } catch (err) {
-            rollbackQuietly(db);
-            throw err;
-        }
-    } finally {
-        db.exec("PRAGMA foreign_keys = ON;");
-        if (Number(pragmaScalar(db, "foreign_keys")) !== 1) {
-            throw new StorageError("failed to restore SQLite foreign key enforcement", null);
-        }
-    }
-}
-
-function migrateVersion5ToCurrent(db) {
-        db.exec("BEGIN IMMEDIATE;");
-        try {
-            assertVersionPair(db, 5);
-            const matched = assertKnownSchemaStructure(db, 5);
-            verifyDatabaseIntegrity(db);
-            if (matched.variant !== "v5-current") {
-                throw new SchemaIntegrityError(
-                    "schema-5 database does not match the canonical v5 layout",
-                    { variant: matched.variant },
-                );
-            }
-            const storedFingerprint = readMetaValue(db, "schema_fingerprint");
-            const storedHashVersion = readMetaValue(db, "event_hash_version");
-            if (storedFingerprint !== SCHEMA_V5_FINGERPRINT
-                || storedHashVersion !== String(EVENT_HASH_VERSION)) {
-                throw new SchemaIntegrityError(
-                    "schema-5 integrity metadata does not match the canonical predecessor",
-                    {
-                        expectedFingerprint: SCHEMA_V5_FINGERPRINT,
-                        storedFingerprint,
-                        expectedEventHashVersion: String(EVENT_HASH_VERSION),
-                        storedEventHashVersion: storedHashVersion,
-                    },
-                );
-            }
-            db.exec(QUIESCENT_STOPS_TABLE_DDL);
-            db.prepare("UPDATE schema_meta SET value = ? WHERE key = 'schema_version'")
-                .run(String(SCHEMA_VERSION));
-            db.prepare("UPDATE schema_meta SET value = ? WHERE key = 'schema_fingerprint'")
-                .run(SCHEMA_FINGERPRINT);
-            db.exec(`PRAGMA user_version = ${SCHEMA_VERSION};`);
-            db.exec("COMMIT;");
-        } catch (err) {
-            rollbackQuietly(db);
-            throw err;
     }
 }
 
@@ -1235,7 +754,7 @@ export function verifySchema(db, {
         expectedJournalMode,
     });
     verifyDatabaseIntegrity(db, { adapter: integrityCheckAdapter });
-    const matched = assertKnownSchemaStructure(db, SCHEMA_VERSION);
+    const matched = assertCurrentSchemaStructure(db);
     const fingerprintPragmas = expectedJournalMode
         === EXPECTED_CONNECTION_PRAGMAS.journalMode
         ? pragmas
@@ -1305,72 +824,14 @@ export function applySchema(db, {
         verifySchema(db, { busyTimeoutMs, integrityCheckAdapter });
         return {
             created: true,
-            migrated: false,
             version: SCHEMA_VERSION,
             fingerprint: SCHEMA_FINGERPRINT,
         };
-    }
-
-    const pair = readVersionPair(db);
-    if (pair.userVersion !== pair.metaVersion) {
-        throw new SchemaVersionError(
-            `schema version mismatch: file has user_version=${pair.userVersion}, schema_meta=${pair.metaValue ?? "<none>"}`,
-            {
-                fileUserVersion: pair.userVersion,
-                fileMetaVersion: pair.metaValue,
-                expected: SCHEMA_VERSION,
-            },
-        );
-    }
-
-    if (pair.userVersion === SCHEMA_VERSION) {
-        verifySchema(db, { busyTimeoutMs, integrityCheckAdapter });
-        return {
-            created: false,
-            migrated: false,
-            version: SCHEMA_VERSION,
-            fingerprint: SCHEMA_FINGERPRINT,
-        };
-    }
-    if (![2, 3, 4, 5].includes(pair.userVersion)) {
-        throw new SchemaVersionError(
-            `schema version mismatch: file has user_version=${pair.userVersion}, schema_meta=${pair.metaValue ?? "<none>"}, expected ${SCHEMA_VERSION}`,
-            {
-                fileUserVersion: pair.userVersion,
-                fileMetaVersion: pair.metaValue,
-                expected: SCHEMA_VERSION,
-            },
-        );
-    }
-
-    assertConnectionPragmas(db, {
-        busyTimeoutMs,
-        expectedVersion: pair.userVersion,
-    });
-    verifyDatabaseIntegrity(db, { adapter: integrityCheckAdapter });
-    if (pair.userVersion < 5) {
-        assertLegacyMetadata(db);
-    }
-    assertKnownSchemaStructure(db, pair.userVersion);
-    validateLegacyEventLog(db);
-
-    if (pair.userVersion === 2) {
-        migrateVersion2To3(db);
-    }
-    if (readUserVersion(db) === 3) {
-        migrateVersion3To4(db);
-    }
-    if (readUserVersion(db) === 4) {
-        migrateVersion4ToCurrent(db);
-    }
-    if (readUserVersion(db) === 5) {
-        migrateVersion5ToCurrent(db);
     }
 
     verifySchema(db, { busyTimeoutMs, integrityCheckAdapter });
     return {
         created: false,
-        migrated: true,
         version: SCHEMA_VERSION,
         fingerprint: SCHEMA_FINGERPRINT,
     };

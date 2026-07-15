@@ -28,8 +28,6 @@ const RESULT_ALLOWED_KEYS = new Set([
     "metrics",
     "observables",
     "validationCases",
-    "searchSpaceExhausted",
-    "impossibilityCertificateHash",
     "role",
     "phase",
     "replicateIndex",
@@ -85,13 +83,6 @@ const ROLE_BINDING_RULES = Object.freeze({
     }),
     challenge: Object.freeze({
         phases: Object.freeze(["calibration", "challenge"]),
-        replicateIndex: "required",
-        blockIndex: "required",
-        armIndex: "required",
-        armId: "required",
-    }),
-    novelty: Object.freeze({
-        phases: Object.freeze(["novelty"]),
         replicateIndex: "required",
         blockIndex: "required",
         armIndex: "required",
@@ -184,17 +175,13 @@ function normalizeBindingArmId(value, field, rule) {
 
 function normalizeBindingObject(value, {
     field = "measurement binding",
-    required = false,
     rejectUnknown = false,
 } = {}) {
     if (value === null || value === undefined) {
-        if (required) {
-            fail(
-                MEASUREMENT_ERROR_CODES.PARSE_SCHEMA,
-                `${field} is required`,
-            );
-        }
-        return null;
+        fail(
+            MEASUREMENT_ERROR_CODES.PARSE_SCHEMA,
+            `${field} is required`,
+        );
     }
     if (typeof value !== "object"
         || Array.isArray(value)
@@ -217,13 +204,10 @@ function normalizeBindingObject(value, {
     const present = BINDING_KEYS.filter((key) =>
         value[key] !== undefined && value[key] !== null);
     if (present.length === 0) {
-        if (required) {
-            fail(
-                MEASUREMENT_ERROR_CODES.PARSE_SCHEMA,
-                `${field} is required`,
-            );
-        }
-        return null;
+        fail(
+            MEASUREMENT_ERROR_CODES.PARSE_SCHEMA,
+            `${field} is required`,
+        );
     }
 
     const role = requireBindingString(value.role, `${field}.role`, 64);
@@ -307,7 +291,6 @@ function normalizeBindingObject(value, {
 export function normalizeHarnessResultBinding(value, options = {}) {
     return normalizeBindingObject(value, {
         field: options.field ?? "measurement binding",
-        required: options.required === true,
         rejectUnknown: true,
     });
 }
@@ -556,18 +539,15 @@ export function parseHarnessResult(raw, options = {}) {
     const validationCases = normalizeValidationCases(parsed.validationCases);
     const binding = normalizeBindingObject(parsed, {
         field: "harness result binding",
-        required: options.requireBinding === true
-            || options.expectedBinding !== undefined,
     });
     if (options.expectedBinding !== undefined) {
         const expectedBinding = normalizeHarnessResultBinding(
             options.expectedBinding,
             {
                 field: "expectedBinding",
-                required: true,
             },
         );
-        if (binding === null || !bindingEqual(binding, expectedBinding)) {
+        if (!bindingEqual(binding, expectedBinding)) {
             fail(
                 MEASUREMENT_ERROR_CODES.PARSE_SCHEMA,
                 "harness result binding does not match the trusted execution binding",
@@ -576,38 +556,11 @@ export function parseHarnessResult(raw, options = {}) {
         }
     }
 
-    let searchSpaceExhausted = null;
-    if (parsed.searchSpaceExhausted !== undefined) {
-        searchSpaceExhausted = requireBoolean(parsed.searchSpaceExhausted, "searchSpaceExhausted");
-    }
-
-    let impossibilityCertificateHash = null;
-    if (parsed.impossibilityCertificateHash !== undefined) {
-        if (typeof parsed.impossibilityCertificateHash !== "string"
-            || !isAlgorithmTaggedSha256(parsed.impossibilityCertificateHash)) {
-            fail(
-                MEASUREMENT_ERROR_CODES.PARSE_SCHEMA,
-                "impossibilityCertificateHash must be an algorithm-tagged SHA-256 string",
-            );
-        }
-        impossibilityCertificateHash = parsed.impossibilityCertificateHash;
-    }
-
-    if (binding !== null) {
-        if (binding.phase !== "calibration" && validationCases !== null) {
-            fail(
-                MEASUREMENT_ERROR_CODES.PARSE_SCHEMA,
-                `validationCases is not valid for phase ${binding.phase}`,
-            );
-        }
-        if (binding.role !== "impossibility_verifier"
-            && (searchSpaceExhausted !== null
-                || impossibilityCertificateHash !== null)) {
-            fail(
-                MEASUREMENT_ERROR_CODES.PARSE_SCHEMA,
-                `impossibility fields are not valid for role ${binding.role}`,
-            );
-        }
+    if (binding.phase !== "calibration" && validationCases !== null) {
+        fail(
+            MEASUREMENT_ERROR_CODES.PARSE_SCHEMA,
+            `validationCases is not valid for phase ${binding.phase}`,
+        );
     }
 
     // Build a canonical, frozen result object with fields in a fixed key
@@ -619,18 +572,16 @@ export function parseHarnessResult(raw, options = {}) {
         metrics,
         observables,
         validationCases,
-        searchSpaceExhausted,
-        impossibilityCertificateHash,
-        role: binding?.role ?? null,
-        phase: binding?.phase ?? null,
-        replicateIndex: binding?.replicateIndex ?? null,
-        blockIndex: binding?.blockIndex ?? null,
-        armIndex: binding?.armIndex ?? null,
-        armId: binding?.armId ?? null,
-        deterministicSeed: binding?.deterministicSeed ?? null,
-        subjectId: binding?.subjectId ?? null,
-        environmentIdentity: binding?.environmentIdentity ?? null,
-        suiteIdentity: binding?.suiteIdentity ?? null,
+        role: binding.role,
+        phase: binding.phase,
+        replicateIndex: binding.replicateIndex,
+        blockIndex: binding.blockIndex,
+        armIndex: binding.armIndex,
+        armId: binding.armId,
+        deterministicSeed: binding.deterministicSeed,
+        subjectId: binding.subjectId,
+        environmentIdentity: binding.environmentIdentity,
+        suiteIdentity: binding.suiteIdentity,
         parserVersion: PARSER_VERSION,
     });
     return normalized;

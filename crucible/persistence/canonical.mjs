@@ -153,41 +153,7 @@ export function computeEventHash({
         .digest("hex");
 }
 
-// Version-1 hashing is retained only to authenticate existing databases before
-// the schema-5 migration rewrites their chains to the byte-binding format.
-export function computeLegacyEventHash({
-    investigationId,
-    seq,
-    prevHash,
-    kind,
-    payloadCanonical,
-    isTerminal = false,
-    terminalKind = null,
-    attemptId = null,
-    evidenceKind = null,
-    createdAt,
-}) {
-    if (typeof payloadCanonical !== "string") {
-        throw new InvalidArgumentError("payloadCanonical must be a string");
-    }
-    const normalizedCreatedAt = normalizeCreatedAt(createdAt, "createdAt");
-    const envelope = canonicalize({
-        version: 1,
-        investigationId,
-        seq,
-        prevHash,
-        kind,
-        payload: JSON.parse(payloadCanonical),
-        isTerminal: isTerminal === true || isTerminal === 1,
-        terminalKind,
-        attemptId,
-        evidenceKind,
-        createdAt: normalizedCreatedAt,
-    });
-    return createHash("sha256").update("crucible-event:").update(envelope).digest("hex");
-}
-
-// SHA-256 of arbitrary bytes (used for inline artifact self-description).
+// SHA-256 of arbitrary bytes.
 export function sha256Hex(bytes) {
     return createHash("sha256").update(bytes).digest("hex");
 }

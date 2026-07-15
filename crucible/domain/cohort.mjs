@@ -2,18 +2,7 @@ import {
     hashCanonical,
     immutableCanonical,
 } from "./canonical.mjs";
-import {
-    candidateNoveltySignatures,
-    supportedBehavioralDifference,
-} from "./novelty.mjs";
 
-export const CANDIDATE_RELATIONS = Object.freeze([
-    "BETTER",
-    "WORSE",
-    "PRACTICALLY_EQUIVALENT",
-    "UNRESOLVED",
-    "INCOMPARABLE",
-]);
 export const CANDIDATE_COHORT_VERSION =
     "crucible-candidate-cohort-v1";
 export const CANDIDATE_RELATION_EVIDENCE_HASH_ALGORITHM =
@@ -91,18 +80,6 @@ function predictionEvidence(candidate) {
     };
 }
 
-function noveltyEvidence(candidate) {
-    const novelty = candidate.novelty ?? null;
-    return {
-        signatures: candidateNoveltySignatures({ novelty }),
-        contentSignature: novelty?.content?.signature ?? null,
-        structuralFingerprint:
-            novelty?.structural?.structuralFingerprint ?? null,
-        behavioralSignature: novelty?.behavioral?.signature ?? null,
-        behavioral: novelty?.behavioral ?? null,
-    };
-}
-
 function candidateEligibility(contract, candidate) {
     const reasons = [];
     if (candidate.active !== true || candidate.invalidated === true) {
@@ -128,7 +105,6 @@ function candidateEligibility(contract, candidate) {
         eligible: reasons.length === 0,
         reasons,
         predictions,
-        novelty: noveltyEvidence(candidate),
     };
 }
 
@@ -235,26 +211,6 @@ function metricRelation(metric, leftCandidate, rightCandidate) {
     };
 }
 
-function pairNoveltyEvidence(left, right) {
-    const leftNovelty = noveltyEvidence(left);
-    const rightNovelty = noveltyEvidence(right);
-    return {
-        sameContent:
-            leftNovelty.contentSignature !== null
-            && leftNovelty.contentSignature === rightNovelty.contentSignature,
-        sameStructuralFingerprint:
-            leftNovelty.structuralFingerprint !== null
-            && leftNovelty.structuralFingerprint
-                === rightNovelty.structuralFingerprint,
-        supportedBehavioralDifference: supportedBehavioralDifference(
-            leftNovelty.behavioral,
-            rightNovelty.behavioral,
-        ),
-        leftSignatures: leftNovelty.signatures,
-        rightSignatures: rightNovelty.signatures,
-    };
-}
-
 function invertRelation(relation) {
     if (relation === "BETTER") return "WORSE";
     if (relation === "WORSE") return "BETTER";
@@ -291,7 +247,6 @@ export function compareCandidatePair(contract, left, right) {
             left: predictionEvidence(left),
             right: predictionEvidence(right),
         },
-        novelty: pairNoveltyEvidence(left, right),
     };
     return immutableCanonical({
         ...core,
@@ -495,14 +450,6 @@ function candidateSummary(candidate, eligibility) {
             ?? candidate.statisticalEvaluation?.blockCount
             ?? 0,
         predictions: eligibility.predictions,
-        novelty: {
-            signatures: eligibility.novelty.signatures,
-            contentSignature: eligibility.novelty.contentSignature,
-            structuralFingerprint:
-                eligibility.novelty.structuralFingerprint,
-            behavioralSignature:
-                eligibility.novelty.behavioralSignature,
-        },
     };
 }
 

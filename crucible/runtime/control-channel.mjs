@@ -38,18 +38,6 @@ export const ACTIVE_QUIESCENT_STOP_STATES = Object.freeze([
 ]);
 const ACTIVE_STOP_STATES = new Set(ACTIVE_QUIESCENT_STOP_STATES);
 
-export const QUIESCENT_STOP_INTEGRATION_NOTES = Object.freeze({
-    protocolVersion: QUIESCENT_STOP_PROTOCOL_VERSION,
-    barrier:
-        "persistQuiescentStopBarrier atomically releases the active runner lease and abandons its committable attempts before any control signal is published",
-    resourceBroker:
-        "Broker authority must be retired and independently verified before buildQuiescenceSnapshot can prove zero active leases",
-    sdkRetries:
-        "late SDK responses must surface through the runner barrier and remain uncommitted; retry classification is intentionally outside this module",
-    completion:
-        "only PAUSED_QUIESCENT is resumable; PAUSE_PENDING retains supervisor authority and requires intervention",
-});
-
 function requireOwner(owner, label = "control owner") {
     if (!isPlainObject(owner)
         || !Number.isSafeInteger(owner.pid)
@@ -104,7 +92,6 @@ export function stopControlPaths(stateDir, investigationId) {
     const directory = path.join(path.resolve(stateDir), "supervisor");
     const token = safeFileToken(investigationId);
     return Object.freeze({
-        directory,
         supervisorRequestPath: path.join(
             directory,
             `${token}.stop-request.json`,

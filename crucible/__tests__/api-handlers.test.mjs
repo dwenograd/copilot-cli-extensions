@@ -81,7 +81,6 @@ function makeReadDeps({
         },
         log: () => {},
         pathExists: () => true,
-        inspectUncatalogedLegacyInvestigation: () => false,
         openRepositoryReadOnly: () => repository,
         createDomainRepositoryAdapter: () => adapter,
         openArtifactStoreReadOnly: () => ({}),
@@ -218,7 +217,7 @@ describe("compact four-tool API boundary", () => {
         }
     });
 
-    it("parses the operator-owned experiment_id start form without legacy model inputs", () => {
+    it("parses the operator-owned experiment_id start form without model-authored inputs", () => {
         let parsed = null;
         const response = runToolBoundary(
             crucibleStartSpec,

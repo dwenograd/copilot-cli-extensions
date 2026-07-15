@@ -15,7 +15,6 @@ import {
     constructHarnessObservedEvent,
     constructInvestigationResumedEvent,
     constructKernelDecisionEvent,
-    constructModelObservedEvent,
     createExternalEvent,
     createInvestigationOpenedEvent,
     createMeasurementProvenance,
@@ -40,12 +39,10 @@ import {
 } from "../api/experiment-authority.mjs";
 import {
     ERROR_CODES as PERSISTENCE_ERROR_CODES,
-    openRepository,
     sha256Hex,
 } from "../persistence/index.mjs";
 import {
     HARNESS_SUITE_RECEIPT_VERSION,
-    RECEIPT_VERSION,
     STREAM_HASH_ALGORITHM,
     hashReceipt,
     parseImpossibilityVerifierResult,
@@ -57,7 +54,6 @@ import {
 } from "../domain/private-verifier-execution.mjs";
 import {
     CrucibleRuntimeError,
-    LegacyIncompatibleRuntimeError,
     RUNTIME_ERROR_CODES,
     RuntimeConfigError,
     RuntimeIntegrityError,
@@ -71,7 +67,6 @@ import {
 import { PROMPT_CONTEXT_HASH_ALGORITHM } from "./prompt-context.mjs";
 
 const DOMAIN_KIND_PREFIX = `domain:v${DOMAIN_VERSION}:`;
-const LEGACY_DOMAIN_KIND_PREFIX = "domain:";
 const OPERATIONAL_INVESTIGATION_SUFFIX = ".runtime-evidence";
 const TERMINAL_METADATA = Object.freeze({
     [EVENT_TYPES.VERIFIED_RESULT]: "verified_result",
@@ -202,7 +197,7 @@ export function inspectInvestigationDomainCompatibility({
         return Object.freeze({
             investigationId: id,
             present: true,
-            compatibility: compatible ? "current_empty" : "legacy_incompatible",
+            compatibility: compatible ? "current_empty" : "incompatible",
             compatible,
             domainVersion: metadataDomainVersion,
             contractDomainVersion: null,
@@ -222,14 +217,11 @@ export function inspectInvestigationDomainCompatibility({
     );
     const currentKind =
         `${DOMAIN_KIND_PREFIX}${EVENT_TYPES.INVESTIGATION_OPENED}`;
-    // The repository kind is the outer version namespace. If it is the current
-    // v4 kind, malformed/missing inner fields remain integrity failures during
-    // replay rather than being mislabeled as archived legacy state.
     const compatible = first.seq === 1 && first.kind === currentKind;
     return Object.freeze({
         investigationId: id,
         present: true,
-        compatibility: compatible ? "current" : "legacy_incompatible",
+        compatibility: compatible ? "current" : "incompatible",
         compatible,
         domainVersion: eventDomainVersion ?? metadataDomainVersion,
         contractDomainVersion,
@@ -249,16 +241,14 @@ export function assertInvestigationDomainCompatible(
         investigationId,
     });
     if (!compatibility.compatible) {
-        throw new LegacyIncompatibleRuntimeError(
-            "Persisted investigation is not compatible with the active Crucible domain; start a new investigation",
+        throw new RuntimeIntegrityError(
+            "Persisted investigation does not match the active Crucible domain",
             {
                 investigationId: compatibility.investigationId,
                 expectedDomainVersion: DOMAIN_VERSION,
                 actualDomainVersion: compatibility.domainVersion,
                 contractDomainVersion: compatibility.contractDomainVersion,
                 eventCount: compatibility.eventCount,
-                archiveable: compatibility.archiveable,
-                readOnly: true,
             },
         );
     }
@@ -347,8 +337,7 @@ function receiptBindsExecutedBytes(receipt, snapshotHash) {
     const identity = receipt?.candidateSnapshotIdentitySummary;
     const stagedIdentity = receipt?.stagedCandidateSnapshotIdentitySummary;
     const mutation = receipt?.candidateSnapshotMutationCheck;
-    return (receipt?.version === RECEIPT_VERSION
-            || receipt?.version === HARNESS_SUITE_RECEIPT_VERSION)
+    return receipt?.version === HARNESS_SUITE_RECEIPT_VERSION
         && receipt.candidateSnapshotHash === snapshotHash
         && receipt.stagedCandidateSnapshotHash === snapshotHash
         && SNAPSHOT_CLOSURE_HASH_RE.test(
@@ -484,54 +473,34 @@ function artifactReader(repository, artifactStore, investigationId) {
             });
         }
 
-        if (metadata.storage === "external") {
-            if (metadata.durable !== true
-                || metadata.hashAlgo !== "sha256"
-                || metadata.hashValue !== expectedHash) {
-                integrityFailure("Terminal closure external artifact metadata is inconsistent", {
-                    artifactId: artifact.artifactId,
-                    label,
-                });
-            }
-            let probe;
-            try {
-                probe = artifactStore.verifyObject(artifact.objectId);
-            } catch (error) {
-                integrityFailure("Terminal closure external artifact could not be verified", {
-                    artifactId: artifact.artifactId,
-                    label,
-                }, error);
-            }
-            if (probe.ok !== true || probe.size !== metadata.sizeBytes) {
-                integrityFailure("Terminal closure external artifact is missing, corrupt, or size-mismatched", {
-                    artifactId: artifact.artifactId,
-                    label,
-                    reason: probe.reason ?? "size-mismatch",
-                });
-            }
-        } else if (metadata.storage === "inline") {
-            let inline;
-            try {
-                inline = repository.getInlineArtifact(artifact.artifactId);
-            } catch (error) {
-                integrityFailure("Terminal closure inline artifact could not be read", {
-                    artifactId: artifact.artifactId,
-                    label,
-                }, error);
-            }
-            const inlineBytes = Buffer.from(inline.bytes);
-            if (inlineBytes.length !== metadata.sizeBytes
-                || sha256Hex(inlineBytes) !== expectedHash) {
-                integrityFailure("Terminal closure inline artifact checksum or size is invalid", {
-                    artifactId: artifact.artifactId,
-                    label,
-                });
-            }
-            bytes.set(key, inlineBytes);
-        } else {
+        if (metadata.storage !== "external") {
             integrityFailure("Terminal closure artifact storage kind is invalid", {
                 artifactId: artifact.artifactId,
                 label,
+            });
+        }
+        if (metadata.durable !== true
+            || metadata.hashAlgo !== "sha256"
+            || metadata.hashValue !== expectedHash) {
+            integrityFailure("Terminal closure external artifact metadata is inconsistent", {
+                artifactId: artifact.artifactId,
+                label,
+            });
+        }
+        let probe;
+        try {
+            probe = artifactStore.verifyObject(artifact.objectId);
+        } catch (error) {
+            integrityFailure("Terminal closure external artifact could not be verified", {
+                artifactId: artifact.artifactId,
+                label,
+            }, error);
+        }
+        if (probe.ok !== true || probe.size !== metadata.sizeBytes) {
+            integrityFailure("Terminal closure external artifact is missing, corrupt, or size-mismatched", {
+                artifactId: artifact.artifactId,
+                label,
+                reason: probe.reason ?? "size-mismatch",
             });
         }
 
@@ -619,48 +588,21 @@ function assertArtifactBindings(repository, investigationId, seq, expectedRefs) 
                 },
             );
         }
-        if (artifact.storage === "external") {
-            if (artifact.durable !== true
-                || artifact.hashAlgo !== "sha256"
-                || artifact.hashValue !== expectedHash) {
-                throw new RuntimeIntegrityError(
-                    "Domain event provenance references missing or mismatched durable artifact metadata",
-                    {
-                        investigationId,
-                        seq,
-                        artifactId: expected.artifactId,
-                        objectId: expected.objectId,
-                    },
-                );
-            }
-            continue;
+        if (artifact.storage !== "external"
+            || artifact.durable !== true
+            || artifact.hashAlgo !== "sha256"
+            || artifact.hashValue !== expectedHash) {
+            throw new RuntimeIntegrityError(
+                "Domain event provenance references missing or mismatched durable external artifact metadata",
+                {
+                    investigationId,
+                    seq,
+                    artifactId: expected.artifactId,
+                    objectId: expected.objectId,
+                    storage: artifact.storage,
+                },
+            );
         }
-        if (artifact.storage === "inline") {
-            const inline = repository.getInlineArtifact(expected.artifactId);
-            const inlineBytes = Buffer.from(inline.bytes);
-            if (artifact.durable !== true
-                || artifact.sizeBytes !== inlineBytes.length
-                || sha256Hex(inlineBytes) !== expectedHash) {
-                throw new RuntimeIntegrityError(
-                    "Domain event provenance inline artifact checksum or size is invalid",
-                    {
-                        investigationId,
-                        seq,
-                        artifactId: expected.artifactId,
-                    },
-                );
-            }
-            continue;
-        }
-        throw new RuntimeIntegrityError(
-            "Domain event provenance artifact storage kind is invalid",
-            {
-                investigationId,
-                seq,
-                artifactId: expected.artifactId,
-                storage: artifact.storage,
-            },
-        );
     }
 }
 
@@ -1002,12 +944,7 @@ function verifyCandidateArtifacts(
     const searchMeasurements = measurements.filter(
         (item) => item.measurement.role === "search",
     );
-    const noveltyMeasurements = measurements.filter(
-        (item) => item.measurement.role === "novelty",
-    );
-    if (searchMeasurements.length + noveltyMeasurements.length
-        !== measurements.length
-        || noveltyMeasurements.length > 1
+    if (searchMeasurements.length !== measurements.length
         || searchMeasurements.length % schedule.arms.length !== 0) {
         integrityFailure("Candidate evidence does not contain complete replicate blocks", {
             evidenceId: evidence.evidenceId,
@@ -1157,39 +1094,6 @@ function verifyCandidateArtifacts(
                 evidenceId: evidence.evidenceId,
                 index,
             });
-        }
-    }
-    const rawNovelty = observation.data?.novelty ?? null;
-    if ((rawNovelty === null) !== (noveltyMeasurements.length === 0)) {
-        integrityFailure("Candidate novelty authority is not one-to-one with its receipt", {
-            evidenceId: evidence.evidenceId,
-        });
-    }
-    if (rawNovelty !== null) {
-        const measured = noveltyMeasurements[0];
-        if (measured.receipt.role !== "novelty"
-            || measured.receipt.phase !== "novelty"
-            || measured.receipt.replicateIndex !== rawNovelty.replicateIndex
-            || measured.receipt.blockIndex !== rawNovelty.blockIndex
-            || measured.receipt.armIndex !== rawNovelty.armIndex
-            || measured.receipt.armId !== rawNovelty.armId
-            || measured.receipt.deterministicSeed
-                !== rawNovelty.deterministicSeed
-            || measured.receipt.subjectId !== rawNovelty.subjectId
-            || measured.measurement.subjectId !== rawNovelty.subjectId
-            || measured.measurement.snapshot.snapshotHash
-                !== observation.receipt.candidateArtifactHash
-            || rawNovelty.attemptId !== measured.receipt.attemptId
-            || rawNovelty.receiptHash !== measured.measurement.receiptHash
-            || rawNovelty.measurementRoot
-                !== measured.measurement.measurementRoot
-            || !canonicalEqual(rawNovelty.parsed, measured.receipt.parsed)
-            || (rawNovelty.invalid === null)
-                !== (measured.receipt.parsed !== null)) {
-            integrityFailure(
-                "Candidate novelty observation disagrees with its role-tagged receipt",
-                { evidenceId: evidence.evidenceId },
-            );
         }
     }
     const proposalArtifact = reader.readJson(
@@ -2736,8 +2640,7 @@ export class DomainRepositoryAdapter {
             || typeof repository.ingestEvidenceBatchWithAttemptTransition !== "function"
             || typeof repository.verifyInvestigation !== "function"
             || typeof repository.listArtifactRefsForEvent !== "function"
-            || typeof repository.getArtifact !== "function"
-            || typeof repository.getInlineArtifact !== "function") {
+            || typeof repository.getArtifact !== "function") {
             throw new RuntimeConfigError("repository must be an EventRepository");
         }
         if (beforeCasAttempt !== null && typeof beforeCasAttempt !== "function") {
@@ -2768,15 +2671,14 @@ export class DomainRepositoryAdapter {
             );
             if (operational !== null
                 && operational.metadata?.domainVersion !== DOMAIN_VERSION) {
-                throw new LegacyIncompatibleRuntimeError(
-                    "Persisted operational evidence belongs to an incompatible Crucible domain",
+                throw new RuntimeIntegrityError(
+                    "Persisted operational evidence does not match the active Crucible domain",
                     {
                         investigationId: this.#investigationId,
                         operationalInvestigationId: this.#operationalInvestigationId,
                         expectedDomainVersion: DOMAIN_VERSION,
                         actualDomainVersion:
                             domainVersionOrNull(operational.metadata?.domainVersion),
-                        readOnly: true,
                     },
                 );
             }
@@ -2796,52 +2698,6 @@ export class DomainRepositoryAdapter {
                 },
             });
         }
-    }
-
-    get repository() {
-        return this.#repository;
-    }
-
-    get investigationId() {
-        return this.#investigationId;
-    }
-
-    get operationalInvestigationId() {
-        return this.#operationalInvestigationId;
-    }
-
-    inspectCompatibility() {
-        return inspectInvestigationDomainCompatibility({
-            repository: this.#repository,
-            investigationId: this.#investigationId,
-        });
-    }
-
-    rotateSegmentsAtQuiescence({
-        includeOperational = true,
-        ...options
-    } = {}) {
-        if (typeof this.#repository.rotateEventSegment !== "function") {
-            throw new RuntimeConfigError(
-                "repository does not expose immutable event segmentation",
-            );
-        }
-        if (typeof includeOperational !== "boolean") {
-            throw new RuntimeConfigError("includeOperational must be boolean");
-        }
-        const domain = this.#repository.rotateEventSegment({
-            ...options,
-            investigationId: this.#investigationId,
-            quiescent: true,
-        });
-        const operational = includeOperational
-            ? this.#repository.rotateEventSegment({
-                ...options,
-                investigationId: this.#operationalInvestigationId,
-                quiescent: true,
-            })
-            : null;
-        return { domain, operational };
     }
 
     domainFactIdentity(domainEvent) {
@@ -3412,17 +3268,6 @@ export class DomainRepositoryAdapter {
         );
     }
 
-    appendHarnessObservation(payload) {
-        if (payload?.purpose === "impossibility") {
-            throw new RuntimeIntegrityError(
-                "Impossibility observations require the fenced runner/domain-adapter verification path",
-                { commandId: payload?.commandId ?? null },
-            );
-        }
-        return this.appendFromFactory((aggregate) =>
-            constructHarnessObservedEvent(aggregate, payload));
-    }
-
     appendHarnessObservationFenced(payload, {
         attemptId,
         command,
@@ -3462,30 +3307,6 @@ export class DomainRepositoryAdapter {
                 }),
             },
         );
-    }
-
-    appendModelObservationFenced(payload, {
-        attemptId,
-        command,
-        lease,
-    } = {}) {
-        return this.appendFromFactory(
-            (aggregate) => constructModelObservedEvent(aggregate, payload),
-            {
-                attemptTransition: this.#attemptTransition({
-                    attemptId,
-                    command,
-                    lease,
-                    fromState: "dispatched",
-                    toState: "observed",
-                }),
-            },
-        );
-    }
-
-    appendEvidenceCommit(input) {
-        return this.appendFromFactory((aggregate) =>
-            constructEvidenceCommittedEvent(aggregate, input));
     }
 
     appendEvidenceCommitFenced(input, {
@@ -3703,10 +3524,6 @@ export class DomainRepositoryAdapter {
         });
     }
 
-    getAttempt(attemptId) {
-        return this.#repository.getCommandAttempt(attemptId);
-    }
-
     listAttempts() {
         return this.#repository.listCommandAttempts(this.#investigationId);
     }
@@ -3863,21 +3680,6 @@ export class DomainRepositoryAdapter {
 
 export function createDomainRepositoryAdapter(options) {
     return new DomainRepositoryAdapter(options);
-}
-
-export function openDomainRepositoryAdapter({
-    file,
-    investigationId,
-    artifactStore = null,
-    repositoryOptions = {},
-} = {}) {
-    const repository = openRepository({ ...repositoryOptions, file });
-    const adapter = new DomainRepositoryAdapter({
-        repository,
-        artifactStore,
-        investigationId,
-    });
-    return { repository, adapter };
 }
 
 export function formatAttemptCommand(scope, fields = {}) {

@@ -8,7 +8,6 @@ export {
 
 export {
     CANONICAL_HASH_ALGORITHM,
-    CANONICAL_JSON_VERSION,
     CONTRACT_HASH_ALGORITHM,
     EVENT_HASH_ALGORITHM,
     canonicalClone,
@@ -66,23 +65,13 @@ export {
 } from "./runtime-authority.mjs";
 
 export {
-    acceptanceSatisfied,
-    availableCandidateMetricValues,
-    assessAcceptancePredicate,
-    candidateMetricValues,
-    candidateMetricsRankable,
-    commandBudget,
     contractHash,
     createInvestigationContract,
     createSearchPolicy,
     createStatisticalPolicy,
-    defaultSearchPolicy,
     harnessSuiteRoleCases,
-    normalizeSearchPolicy,
-    normalizeStatisticalPolicy,
     requiredHarnessRoles,
     statisticalEvaluationRequirements,
-    statisticalPolicyHash,
 } from "./contract.mjs";
 
 export {
@@ -100,7 +89,6 @@ export {
     normalizeHypotheses,
     normalizeHypothesisPolicy,
     normalizeObservableRegistry,
-    normalizePrediction,
     normalizeSealedHypotheses,
     observableRegistryIdentity,
     predictionIdentity,
@@ -118,7 +106,6 @@ export {
     ENUMERAND_NODE_HASH_ALGORITHM,
     ENUMERAND_PARAMETER_TUPLE_HASH_ALGORITHM,
     assertEnumerandBinding,
-    computeEnumerandMerkleRoot,
     enumerandArtifactMeasurementHash,
     enumerandBinding,
     enumerandBindingHash,
@@ -136,16 +123,13 @@ export {
 
 export {
     ANNOTATION_LIMITS,
-    CANDIDATE_OUTCOME_CLASSES,
     CONTRACT_LIMITS,
     DEFAULT_SCIENTIFIC_TERMINAL_POLICY,
     DEFAULT_IMPOSSIBILITY_POLICY,
     DEFAULT_SEARCH_POLICY,
     DOMAIN_VERSION,
     ESCAPE_SEARCH_OPERATORS,
-    EVIDENCE_EVENT_TYPES,
     EVIDENCE_PURPOSES,
-    EVENT_CATEGORIES,
     EVENT_TYPES,
     EVENT_VOCABULARY,
     EXTERNAL_EVENT_TYPES,
@@ -173,7 +157,6 @@ export {
     IMPOSSIBILITY_REQUEST_HASH_ALGORITHM,
     IMPOSSIBILITY_REQUEST_VERSION,
     IMPOSSIBILITY_ROLE_RECEIPTS_HASH_ALGORITHM,
-    IMPOSSIBILITY_SEARCH_EVIDENCE_HASH_ALGORITHM,
     IMPOSSIBILITY_VERIFIER_ENUMERAND_RESULTS_HASH_ALGORITHM,
     IMPOSSIBILITY_VERIFIER_FACTS_HASH_ALGORITHM,
     IMPOSSIBILITY_VERIFIER_INPUT_HASH_ALGORITHM,
@@ -185,16 +168,12 @@ export {
     IMPOSSIBILITY_VERIFIER_REFUTATION_HASH_ALGORITHM,
     IMPOSSIBILITY_VERIFIER_REFUTATION_RECEIPT_HASH_ALGORITHM,
     IMPOSSIBILITY_VERIFIER_ROLE_HASH_ALGORITHM,
-    IMPOSSIBILITY_VERDICTS,
     KERNEL_DECISION_EVENT_TYPES,
-    KERNEL_CONTROL_EVENT_TYPES,
-    LEGACY_SEARCH_STRATEGY_POLICY_VERSION,
     NON_RESULT_CODES,
     MISSINGNESS_MODES,
     SEARCH_POLICY_LIMITS,
     SEARCH_OPERATORS,
     SEARCH_STRATEGY_POLICY_VERSION,
-    SEARCH_STRATEGY_POLICY_VERSIONS,
     SCIENTIFIC_TERMINAL_POLICY_VERSION,
     SOURCE_KINDS,
     STATISTICAL_ALLOCATION_SCHEDULE,
@@ -205,7 +184,6 @@ export {
     STATISTICAL_METRIC_DIRECTIONS,
     STATISTICAL_POLICY_HASH_ALGORITHM,
     STATISTICAL_POLICY_VERSION,
-    TERMINAL_EVENT_TYPES,
     VALIDATION_HARNESS_ROLES,
 } from "./constants.mjs";
 
@@ -227,7 +205,6 @@ export {
     statisticalAcceptanceClaimSet,
     statisticalMetricClaims,
     statisticalScheduleWeight,
-    supportsPracticalEquivalence,
     supportsPracticalMargin,
 } from "./statistics.mjs";
 
@@ -251,26 +228,9 @@ export {
 } from "./statistical-evaluation.mjs";
 
 export {
-    BEHAVIORAL_NOVELTY_BASIS_ALGORITHM,
-    BEHAVIORAL_NOVELTY_SIGNATURE_ALGORITHM,
-    BEHAVIORAL_ROLE_FINGERPRINT_ALGORITHM,
-    CANDIDATE_NOVELTY_VERSION,
-    CONTENT_NOVELTY_SIGNATURE_ALGORITHM,
-    behavioralRoleIdentity,
-    candidateNoveltySignatures,
-    contentNoveltySignature,
-    deriveBehavioralNovelty,
-    deriveCandidateNovelty,
-    replayDerivedCandidateNovelty,
-    structuralRoleIdentity,
-    supportedBehavioralDifference,
-} from "./novelty.mjs";
-
-export {
     CANDIDATE_COHORT_HASH_ALGORITHM,
     CANDIDATE_COHORT_VERSION,
     CANDIDATE_RELATION_EVIDENCE_HASH_ALGORITHM,
-    CANDIDATE_RELATIONS,
     TIE_RESOLUTION_PLAN_HASH_ALGORITHM,
     compareCandidatePair,
     deriveCandidateCohortComparison,
@@ -278,28 +238,14 @@ export {
 } from "./cohort.mjs";
 
 export {
-    SCIENTIFIC_CONFIRMATION_ALPHA_USE_HASH_ALGORITHM,
-    SCIENTIFIC_CONFIRMATION_CLOSURE_HASH_ALGORITHM,
-    SCIENTIFIC_CONFIRMATION_FREEZE_HASH_ALGORITHM,
-    SCIENTIFIC_CONFIRMATION_PROTOCOL_MANIFEST_HASH_ALGORITHM,
-    SCIENTIFIC_CONFIRMATION_PROTOCOL_SEED_HASH_ALGORITHM,
-    SCIENTIFIC_CONFIRMATION_ROLE_MANIFEST_HASH_ALGORITHM,
     SCIENTIFIC_CONFIRMATION_ROLES,
     SCIENTIFIC_CONFIRMATION_VERSION,
     deriveScientificConfirmationFreeze,
     deriveScientificConfirmationState,
     nextScientificConfirmationCommand,
-    scientificConfirmationEvidenceItems,
 } from "./confirmation.mjs";
 
 export {
-    SCIENTIFIC_AGGREGATE_HASH_ALGORITHM,
-    SCIENTIFIC_ALPHA_LEDGER_HASH_ALGORITHM,
-    SCIENTIFIC_CLAIM_STATES_HASH_ALGORITHM,
-    SCIENTIFIC_CONCLUSION_HASH_ALGORITHM,
-    SCIENTIFIC_CONCLUSION_VERSION,
-    SCIENTIFIC_RAW_AUTHORITY_HASH_ALGORITHM,
-    SCIENTIFIC_REPLAY_CLOSURE_HASH_ALGORITHM,
     SCIENTIFIC_REPLAY_VERSION,
     deriveScientificConclusion,
     deriveScientificReplayState,
@@ -321,7 +267,6 @@ export {
     REPLICATION_SUBJECT_HASH_ALGORITHM,
     ReplicationScheduleError,
     analyzeReplicationAttempts,
-    assertReplicationScheduleMatches,
     assertReplicationSchedulePolicyBinding,
     deriveReplicationControlBinding,
     deriveReplicationSchedule,
@@ -341,12 +286,10 @@ export {
     deriveUnreachableCoverageClosure,
     deriveImpossibilityVerdict,
     impossibilityProofValidationReceiptHash,
-    impossibilitySearchEvidenceHash,
     impossibilityVerifierEnumerandResultsRoot,
     impossibilityVerifierFactsRoot,
     impossibilityVerifierRefutationReceiptHash,
     impossibilityVerifierRefutationRoot,
-    isImpossibilityVerdict,
     normalizeImpossibilityCheckerResult,
     normalizeImpossibilityEvidenceRoots,
 } from "./impossibility.mjs";
@@ -366,7 +309,6 @@ export {
     SNAPSHOT_EXECUTION_HASH_ALGORITHM,
     SNAPSHOT_PROVENANCE_HASH_ALGORITHM,
     STATISTICAL_CACHE_HASH_ALGORITHM,
-    artifactIdsFromProvenance,
     artifactRefsFromProvenance,
     createEvidenceProvenance,
     createMeasurementProvenance,
@@ -396,18 +338,11 @@ export {
     constructHarnessObservedEvent,
     constructInvestigationResumedEvent,
     constructKernelDecisionEvent,
-    constructModelObservedEvent,
-    constructStorageBudgetNonResultEvent,
     createExternalEvent,
     createInvestigationOpenedEvent,
-    normalizeCapabilityEpochPayload,
-    normalizeCommandDispatchedPayload,
     normalizeCommandObservedPayload,
     normalizeEventIdentifier,
-    normalizeEvidenceInvalidatedPayload,
     normalizeExternalEventPayload,
-    normalizeStopRequestedPayload,
-    normalizeStorageBudgetExhaustedPayload,
 } from "./events.mjs";
 
 export {
@@ -418,43 +353,26 @@ export {
     DomainError,
     ERROR_CODES,
     EventChainError,
-    RestartRequiredError,
     TransitionError,
 } from "./errors.mjs";
 
 export {
     boundedSelect,
-    buildArchive,
     buildCandidateArchive,
     buildDuplicateIndex,
-    classifyCandidateOutcome,
-    classifyOutcome,
     compareCandidateEvidence,
-    createCandidateArchive,
     duplicateEvidenceId,
     metricImprovement,
-    selectArchive,
     selectIncumbent,
     selectPromptEvidence,
 } from "./archive.mjs";
 
 export {
-    SEARCH_OPERATOR_ARCHIVE_FINGERPRINT_ALGORITHM,
-    SEARCH_OPERATOR_POLICY_IDENTITY_ALGORITHM,
     SEARCH_STRATEGY_V2_ADAPTATION,
     adaptiveOperatorWeights,
-    analyzePlateau,
-    assignSearchOperator,
     buildSearchCandidateCommand,
-    createSearchCandidateCommand,
-    deriveSearchCandidateCommand,
     detectPlateau,
-    detectSearchPlateau,
-    deterministicHashInteger,
-    deterministicSeed,
-    searchOperatorPolicyIdentity,
     selectAdaptiveOperator,
-    selectOperator,
 } from "./strategy.mjs";
 
 export {
@@ -467,23 +385,16 @@ export {
     activeCommand,
     boundedSearchExhaustion,
     candidateCohortState,
-    candidatePredictionEvaluation,
-    candidateReplicationStatus,
-    candidateSelectionReady,
     createInitialAggregate,
     currentValidationEvidence,
     harnessCandidateEvidenceItems,
     impossibilityEvidenceItems,
     latestApplicableImpossibilityEvidence,
     latestUnhandledStopRequest,
-    latestImpossibilityEvidence,
-    qualifyingCandidateEvidence,
     qualifyingCandidateCohort,
     qualifyingCandidateEvidenceItems,
     qualifyingUnreachableEvidence,
     qualifyingValidationEvidence,
-    replicatedCandidateEvidenceItems,
-    resolvedPredictionFindings,
     searchProgress,
     uncommittedObservation,
     validationAttemptIndexes,

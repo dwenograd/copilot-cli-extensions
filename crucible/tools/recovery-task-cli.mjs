@@ -14,7 +14,7 @@ function parseInteger(value, flag) {
     return Number(value);
 }
 
-export function parseRecoveryTaskArgv(argv) {
+function parseRecoveryTaskArgv(argv) {
     const command = argv[0];
     if (!["configure", "install", "uninstall"].includes(command)) {
         throw new TypeError(

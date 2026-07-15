@@ -4,7 +4,6 @@ import {
     HYPOTHESES_IDENTITY_HASH_ALGORITHM,
     HYPOTHESES_VERSION,
     hypothesesIdentity,
-    normalizeCommandObservedPayload,
     normalizeHypotheses,
     normalizeObservableRegistry,
     predictionIdentity,
@@ -192,54 +191,4 @@ describe("v4 preregistered hypotheses", () => {
         }, OPTIONS)).toThrow(/unknown field/);
     });
 
-    it("rejects post-seal mutation and keeps prose non-authoritative in event annotations", () => {
-        const sealed = normalizeHypotheses({ predictions: predictionForms() }, OPTIONS);
-        const mutated = structuredClone(sealed);
-        const changedThreshold = mutated.predictions
-            .find((prediction) => prediction.id === "p-threshold");
-        changedThreshold.value = 0.9;
-        changedThreshold.refutation.value = 0.9;
-        expect(() => normalizeHypotheses(mutated, OPTIONS)).toThrow(/mutated/);
-
-        const payload = normalizeCommandObservedPayload({
-            commandId: "cmd-1",
-            observationId: "obs-1",
-            sourceKind: "model_review",
-            purpose: "candidate",
-            annotations: {
-                mechanism: "test the preregistered predictions",
-                hypothesis: "This prose explains why the candidate might work.",
-                hypotheses: sealed,
-            },
-            data: { ignoredModelVerdict: "VERIFIED_RESULT" },
-        }, null, OPTIONS);
-        expect(payload.annotations.hypothesis).toMatch(/prose explains/);
-        expect(payload.annotations.hypotheses.identity).toBe(sealed.identity);
-        expect(payload.annotations.hypotheses).not.toHaveProperty("decision");
-        expect(payload.annotations.hypotheses).not.toHaveProperty("result");
-
-        expect(() => normalizeCommandObservedPayload({
-            commandId: "cmd-raw",
-            observationId: "obs-raw",
-            sourceKind: "model_review",
-            purpose: "candidate",
-            annotations: {
-                mechanism: "late preregistration",
-                hypotheses: { predictions: predictionForms() },
-            },
-            data: {},
-        }, null, OPTIONS)).toThrow(/sealed in the proposal before any measurement/);
-
-        expect(() => normalizeCommandObservedPayload({
-            commandId: "cmd-2",
-            observationId: "obs-2",
-            sourceKind: "model_review",
-            purpose: "candidate",
-            annotations: {
-                mechanism: "mutate after receipt",
-                hypotheses: mutated,
-            },
-            data: {},
-        }, null, OPTIONS)).toThrow(/mutated/);
-    });
 });

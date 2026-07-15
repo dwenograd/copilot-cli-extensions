@@ -118,7 +118,7 @@ export function terminalAvailable(investigationId) {
     };
 }
 
-export function assertPublicToolPayload(toolName, data) {
+function assertPublicToolPayload(toolName, data) {
     if (data === null || typeof data !== "object" || Array.isArray(data)) {
         throw publicPayloadInvariant(`${toolName} returned a non-object payload`);
     }
@@ -157,7 +157,7 @@ export function assertPublicToolPayload(toolName, data) {
     return data;
 }
 
-export function success(data) {
+function success(data) {
     return {
         textResultForLlm: JSON.stringify({ ...data, ok: true }, null, 2),
         resultType: "success",

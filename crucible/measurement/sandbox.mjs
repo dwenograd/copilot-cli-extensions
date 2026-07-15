@@ -882,7 +882,6 @@ export async function launchSandboxCapability(capability, expected, launchInput)
             shell: false,
             windowsHide: true,
             executesCandidateCode: true,
-            launchPath: "sandbox-capability",
         }),
     });
 

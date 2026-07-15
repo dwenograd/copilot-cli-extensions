@@ -3,7 +3,6 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 
 import {
-    ANNOTATION_LIMITS,
     EVENT_TYPES,
     IMPOSSIBILITY_REQUEST_HASH_ALGORITHM,
     IMPOSSIBILITY_PROPOSAL_HASH_ALGORITHM,
@@ -24,8 +23,8 @@ import {
     decideNext,
     deriveReplicationControlBinding,
     detectPlateau,
-    duplicateEvidenceId,
     enumerandBindingHash,
+    evaluateReplicationProgress,
     hashCanonical,
     harnessCandidateEvidenceItems,
     immutableCanonical,
@@ -47,7 +46,6 @@ import {
     PARSER_VERSION,
     VERIFIER_PARSER_VERSION,
     trustedParserIdentity,
-    RECEIPT_VERSION,
     HARNESS_SUITE_RECEIPT_VERSION,
     SANDBOX_POLICY_IDENTITY_HASH_ALGORITHM,
     STREAM_HASH_ALGORITHM,
@@ -103,10 +101,9 @@ import {
     resolveCommandEnumerand,
 } from "./enumerand-execution.mjs";
 import {
-    evaluateReplicationProgress,
     normalizeReplicationSchedule,
     replicationBlockPlan,
-} from "./measurement-scheduler.mjs";
+} from "../domain/replication.mjs";
 import { buildPromptContext } from "./prompt-context.mjs";
 import {
     RUNTIME_TEMP_OWNER_MARKER,
@@ -365,8 +362,7 @@ function receiptHasVerifiedSnapshotBytes(
     const identity = receipt?.candidateSnapshotIdentitySummary;
     const stagedIdentity = receipt?.stagedCandidateSnapshotIdentitySummary;
     const mutation = receipt?.candidateSnapshotMutationCheck;
-    return (receipt?.version === RECEIPT_VERSION
-            || receipt?.version === HARNESS_SUITE_RECEIPT_VERSION)
+    return receipt?.version === HARNESS_SUITE_RECEIPT_VERSION
         && receipt.candidateSnapshotHash === candidateSnapshotHash
         && receipt.stagedCandidateSnapshotHash === candidateSnapshotHash
         && SNAPSHOT_CLOSURE_HASH.test(
@@ -2469,12 +2465,6 @@ export class AutonomousRunner {
             }
 
             const recommendation = decideNext(aggregate);
-            if (recommendation.recorded === true) {
-                if (recommendation.kind === "TERMINAL") {
-                    return terminalResult(aggregate);
-                }
-                return aggregate.pause === null ? nonResult(aggregate) : pauseResult(aggregate);
-            }
             if (recommendation.event !== null) {
                 try {
                     const finalNonResult =
@@ -7097,175 +7087,6 @@ export class AutonomousRunner {
             }
         }
         return Object.freeze({ snapshotId: payload.snapshotId });
-    }
-
-    #findReusableMeasurement(aggregate, duplicateOf, candidateArtifactHash) {
-        const seen = new Set();
-        let evidence = aggregate.evidence[duplicateOf] ?? null;
-        while (evidence !== null && evidence.duplicateOf !== null) {
-            if (seen.has(evidence.evidenceId)) {
-                return null;
-            }
-            seen.add(evidence.evidenceId);
-            evidence = aggregate.evidence[evidence.duplicateOf] ?? null;
-        }
-        if (evidence === null
-            || evidence.receipt?.candidateArtifactHash !== candidateArtifactHash) {
-            return null;
-        }
-        const observation = aggregate.observations[evidence.observationId] ?? null;
-        if (observation === null
-            || observation.receipt?.candidateArtifactHash !== candidateArtifactHash) {
-            return null;
-        }
-
-        const verifiedEntry = this.#validateHarnessContract(
-            aggregate.contract,
-            "search",
-        ).verifiedEntry;
-        const expectedDependencies = verifiedEntry.dependencies
-            .map((dependency) => ({
-                path: dependency.path,
-                role: dependency.role,
-                sha256: dependency.sha256,
-            }))
-            .sort((left, right) => left.path.localeCompare(right.path));
-        const operational = this.#adapter.listOperationalEvidence();
-        for (let index = operational.length - 1; index >= 0; index -= 1) {
-            const row = operational[index];
-            const payload = row.payload;
-            if (row.kind !== "runtime:measurement"
-                || payload?.purpose !== "candidate"
-                || payload.candidateId !== evidence.candidateId
-                || payload.snapshotId === undefined
-                || measurementSnapshotHash(payload.snapshotId) !== candidateArtifactHash
-                || !canonicalEqual(payload.parsed, observation.data)
-                || payload.stdoutHash !== observation.receipt.rawStdoutHash
-                || payload.stderrHash !== observation.receipt.rawStderrHash
-                || hashReceipt(payload.receipt) !== payload.receiptHash
-                || payload.receipt.allowlistFileHash !== verifiedEntry.allowlistFileHash
-                || payload.receipt.harnessEntryHash !== verifiedEntry.entryHash
-                || payload.receipt.executableHash !== verifiedEntry.executableHash
-                || payload.receipt.parserVersion
-                    !== aggregate.contract.harnessSuite.roles.search.parser.version
-                || !receiptHasVerifiedSnapshotBytes(
-                    payload.receipt,
-                    candidateArtifactHash,
-                )
-                || !canonicalEqual(payload.receipt.dependencyHashes, expectedDependencies)
-                || !canonicalEqual(
-                    payload.measurementProvenance,
-                    observation.receipt.provenance.measurements[0],
-                )) {
-                continue;
-            }
-            const snapshotStatus = this.#artifactStore.verifySnapshot(payload.snapshotId);
-            if (!snapshotStatus.ok) {
-                continue;
-            }
-            const receiptArtifact = this.#repository.getArtifact(payload.receiptArtifactId);
-            if (receiptArtifact === null
-                || receiptArtifact.durable !== true
-                || receiptArtifact.hashAlgo !== "sha256"
-                || typeof receiptArtifact.hashValue !== "string") {
-                continue;
-            }
-            const receiptObjectId = `sha256:${receiptArtifact.hashValue}`;
-            let receiptBytes;
-            try {
-                receiptBytes = this.#artifactStore.readObject(receiptObjectId, { verify: true });
-            } catch {
-                continue;
-            }
-            if (receiptArtifact.sizeBytes !== receiptBytes.length) {
-                continue;
-            }
-            let persistedReceipt;
-            try {
-                persistedReceipt = JSON.parse(receiptBytes.toString("utf8"));
-            } catch {
-                continue;
-            }
-            if (!canonicalEqual(persistedReceipt, payload.receipt)) {
-                continue;
-            }
-            try {
-                const rawStdoutBytes = this.#readRegisteredBytesArtifact(
-                    payload.rawStdoutArtifactId,
-                    "Reusable measurement stdout",
-                );
-                const rawStderrBytes = this.#readRegisteredBytesArtifact(
-                    payload.rawStderrArtifactId,
-                    "Reusable measurement stderr",
-                );
-                if (sha256Bytes(rawStdoutBytes, STREAM_HASH_ALGORITHM) !== payload.stdoutHash
-                    || sha256Bytes(rawStderrBytes, STREAM_HASH_ALGORITHM)
-                        !== payload.stderrHash) {
-                    continue;
-                }
-                this.#verifySnapshotProvenance(
-                    payload.measurementProvenance.snapshot,
-                    payload.snapshotId,
-                    "Reusable measurement snapshot",
-                );
-            } catch {
-                continue;
-            }
-            return {
-                evidence,
-                observation,
-                measurementRecord: row,
-                measurementProvenance: payload.measurementProvenance,
-                snapshotId: payload.snapshotId,
-            };
-        }
-        return null;
-    }
-
-    #persistDuplicateMeasurementReuse({
-        attemptId,
-        commandId,
-        command,
-        snapshotId,
-        candidateArtifactHash,
-        duplicateOf,
-        reusable,
-    }) {
-        const value = {
-            version: 1,
-            policy: "mark",
-            commandId,
-            candidateId: command.candidateId,
-            candidateArtifactHash,
-            snapshotId,
-            duplicateOf,
-            sourceEvidenceId: reusable.evidence.evidenceId,
-            sourceObservationId: reusable.observation.observationId,
-            sourceMeasurementAttemptId: reusable.observation.receipt.attemptId,
-            sourceReceiptHash: reusable.measurementRecord.payload.receiptHash,
-        };
-        const artifact = this.#persistJsonArtifact({
-            attemptId,
-            kind: `measurement-reuse-${command.candidateId}`,
-            value,
-            contentType: "application/vnd.crucible.measurement-reuse+json",
-        });
-        this.#ingestOperationalEvidence({
-            attemptId,
-            evidenceKind: `measurement-reuse:candidate:${command.candidateId}`,
-            kind: "runtime:measurement_reuse",
-            payload: {
-                ...value,
-                round: command.round,
-                slotIndex: command.slotIndex,
-                purpose: "candidate",
-                parsed: reusable.observation.data,
-                receipt: reusable.measurementRecord.payload.receipt,
-                receiptArtifactId: reusable.measurementRecord.payload.receiptArtifactId,
-                artifactId: artifact.artifactId,
-            },
-        });
-        return { artifact };
     }
 
     #resolveParentSnapshot(aggregate, evidenceId) {

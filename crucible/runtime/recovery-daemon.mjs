@@ -33,38 +33,11 @@ function boundedInteger(value, field, fallback, minimum, maximum) {
     return normalized;
 }
 
-function operationAuthority(result) {
-    const supervisorGeneration =
-        result?.acknowledgement?.supervisorGeneration
-        ?? result?.status?.supervisorGeneration
-        ?? result?.supervisorGeneration
-        ?? null;
-    const runnerIncarnation =
-        result?.acknowledgement?.runnerIncarnation
-        ?? result?.status?.runnerIncarnation
-        ?? result?.runnerIncarnation
-        ?? null;
-    return Number.isSafeInteger(supervisorGeneration)
-        && supervisorGeneration > 0
-        && typeof runnerIncarnation === "string"
-        && runnerIncarnation.length > 0
-        ? { supervisorGeneration, runnerIncarnation }
-        : {};
-}
-
 function operationStateForDiscovery(discovery) {
     if (discovery.state === "running") return "running";
     if (discovery.state === "skipped") return "skipped";
     if (discovery.state === "blocked") return "blocked";
     return "eligible";
-}
-
-function safeRecord(broker, leaseController, input) {
-    leaseController.assertCurrent();
-    return broker.recordRecoveryOperation({
-        lease: leaseController.lease,
-        ...input,
-    });
 }
 
 function createLeaseController({
@@ -180,13 +153,7 @@ export async function runRecoveryCycle({
         }
 
         if (discovery.eligible !== true) {
-            const authority = operationAuthority(discovery);
-            safeRecord(broker, leaseController, {
-                investigationId: catalogInvestigation.investigationId,
-                state: operationStateForDiscovery(discovery),
-                code: discovery.code,
-                ...authority,
-            });
+            leaseController.assertCurrent();
             operations.push(Object.freeze({
                 investigationId: catalogInvestigation.investigationId,
                 state: operationStateForDiscovery(discovery),
@@ -195,11 +162,6 @@ export async function runRecoveryCycle({
             continue;
         }
 
-        safeRecord(broker, leaseController, {
-            investigationId: catalogInvestigation.investigationId,
-            state: "eligible",
-            code: discovery.code,
-        });
         leaseController.renew();
         try {
             const ensured = await ensure(discovery.config, {
@@ -207,24 +169,17 @@ export async function runRecoveryCycle({
                 requireAcknowledgement: true,
                 ...(dependencies.ensureDependencies ?? {}),
             });
-            let state;
-            let code;
-            if (ensured?.action === "started") {
-                state = "started";
-                code = RECOVERY_DAEMON_CODES.SUPERVISOR_STARTED;
-            } else if (ensured?.action === "already-running") {
-                state = "running";
-                code = RECOVERY_DAEMON_CODES.SUPERVISOR_ALREADY_RUNNING;
-            } else {
-                state = "waiting";
-                code = RECOVERY_DAEMON_CODES.SUPERVISOR_WAITING;
+            if (!["started", "already-running"].includes(ensured?.action)) {
+                throw new Error(
+                    "Supervisor acknowledgement resolved with an unexpected action",
+                );
             }
-            safeRecord(broker, leaseController, {
-                investigationId: catalogInvestigation.investigationId,
-                state,
-                code,
-                ...operationAuthority(ensured),
-            });
+            const started = ensured.action === "started";
+            const state = started ? "started" : "running";
+            const code = started
+                ? RECOVERY_DAEMON_CODES.SUPERVISOR_STARTED
+                : RECOVERY_DAEMON_CODES.SUPERVISOR_ALREADY_RUNNING;
+            leaseController.assertCurrent();
             operations.push(Object.freeze({
                 investigationId: catalogInvestigation.investigationId,
                 state,
@@ -238,11 +193,7 @@ export async function runRecoveryCycle({
             const code = waiting
                 ? RECOVERY_DAEMON_CODES.SUPERVISOR_WAITING
                 : RECOVERY_DAEMON_CODES.SUPERVISOR_ENSURE_FAILED;
-            safeRecord(broker, leaseController, {
-                investigationId: catalogInvestigation.investigationId,
-                state,
-                code,
-            });
+            leaseController.assertCurrent();
             operations.push(Object.freeze({
                 investigationId: catalogInvestigation.investigationId,
                 state,

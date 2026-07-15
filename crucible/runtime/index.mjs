@@ -1,7 +1,6 @@
 export {
     RUNTIME_ERROR_CODES,
     CrucibleRuntimeError,
-    LegacyIncompatibleRuntimeError,
     RuntimeConfigError,
     RuntimeDriftError,
     RuntimeIntegrityError,
@@ -12,7 +11,6 @@ export {
     SupervisorLockError,
     InjectedCrashError,
     isRecoverableRuntimeError,
-    serializeRuntimeError,
 } from "./errors.mjs";
 
 export {
@@ -24,17 +22,13 @@ export {
     SDK_RETRY_BUDGET_HASH_ALGORITHM,
     SDK_RETRY_BUDGET_VERSION,
     SDK_RETRY_DISABLED_POLICY,
-    SDK_RETRY_INTEGRATION_NOTES,
-    SDK_RETRY_POLICY_VERSION,
     SDK_SUBMISSION_COMMIT_HASH_ALGORITHM,
     SDK_SUBMISSION_COMMIT_VERSION,
     SDK_SUBMISSION_HASH_ALGORITHM,
     classifySdkFailure,
     computeSdkRetryDelay,
-    createInMemorySdkSubmissionJournal,
     createRetryingSdkClient,
     createSdkOperationalEvidence,
-    createSdkOperationIdentity,
     createSdkQuarantineRecord,
     createSdkRetryBudget,
     createSdkSubmissionGate,
@@ -82,7 +76,6 @@ export {
 
 export {
     ACTIVE_QUIESCENT_STOP_STATES,
-    QUIESCENT_STOP_INTEGRATION_NOTES,
     QUIESCENT_STOP_PROTOCOL_VERSION,
     QUIESCENT_STOP_STATES,
     buildQuiescenceSnapshot,
@@ -126,7 +119,6 @@ export {
 } from "./config-validation.mjs";
 
 export {
-    RESOURCE_BROKER_INTEGRATION_NOTES,
     RESOURCE_CATALOG_FILENAME,
     ResourceBroker,
     openResourceBroker,
@@ -144,7 +136,6 @@ export {
 export {
     captureProcessIdentity,
     createProcessIdentityAdapter,
-    normalizeProcessIdentity,
     parseWindowsCommandLine,
     readProcessIdentity,
     readProcessStartId,
@@ -169,18 +160,7 @@ export {
 } from "./recovery-daemon.mjs";
 
 export {
-    SUBMIT_CANDIDATE_TOOL_NAME,
-    READ_PARENT_ARTIFACT_TOOL_NAME,
-    MAX_PROPOSAL_PROMPT_BYTES,
-    MAX_TRUSTED_OPERATOR_CONTEXT_BYTES,
-    DEFAULT_CANDIDATE_LIMITS,
-    DEFAULT_PARENT_READ_LIMITS,
-    SdkWorkerPool,
-    createBoundedParentReadAuthority,
-    createSdkWorkerPool,
-    normalizeParentReadLimits,
     validateCandidateSubmission,
-    validateWorkerProposal,
     buildProposalPrompt,
 } from "./worker-pool.mjs";
 
@@ -191,14 +171,12 @@ export {
 } from "./enumerand-execution.mjs";
 
 export {
-    REPLICATION_CONTROL_TOLERANCE_HASH_ALGORITHM,
     REPLICATION_SCHEDULE_ALGORITHM,
     REPLICATION_SCHEDULE_HASH_ALGORITHM,
     REPLICATION_SCHEDULE_VERSION,
     REPLICATION_STATISTICAL_SUMMARY_HASH_ALGORITHM,
     ReplicationScheduleError,
     analyzeReplicationAttempts,
-    assertReplicationScheduleMatches,
     deriveControlToleranceMetadata,
     deriveReplicationSchedule,
     deriveReplicationSubjectIdentity,
@@ -207,7 +185,7 @@ export {
     normalizeReplicationSchedule,
     replicationAttemptKey,
     replicationBlockPlan,
-} from "./measurement-scheduler.mjs";
+} from "../domain/index.mjs";
 
 export {
     PROMPT_CONTEXT_VERSION,
@@ -215,7 +193,6 @@ export {
     DEFAULT_PROMPT_CONTEXT_BYTE_CAP,
     assertPromptContractCoreFits,
     buildPromptContext,
-    createPromptContext,
 } from "./prompt-context.mjs";
 
 export {
@@ -223,7 +200,6 @@ export {
     assertInvestigationDomainCompatible,
     createDomainRepositoryAdapter,
     inspectInvestigationDomainCompatibility,
-    openDomainRepositoryAdapter,
     formatAttemptCommand,
 } from "./domain-adapter.mjs";
 
@@ -240,7 +216,6 @@ export {
     releaseSupervisorLock,
     runSupervisor,
     readSupervisorStatus,
-    terminateExactSupervisor,
 } from "./supervisor.mjs";
 
 export {
@@ -251,6 +226,5 @@ export {
     ensureSupervisor,
     waitForSupervisorAcknowledgement,
     waitForStopAcknowledgement,
-    terminateSupervisor,
     validateSupervisorAdmission,
 } from "./extension-adapter.mjs";

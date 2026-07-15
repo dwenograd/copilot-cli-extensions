@@ -12,10 +12,7 @@ import {
 function fakeBroker({
     investigations = [],
     singletonHeld = false,
-    failRecordAt = null,
 } = {}) {
-    const operations = [];
-    let recordCount = 0;
     let released = false;
     const lease = {
         daemonGeneration: 1,
@@ -27,7 +24,6 @@ function fakeBroker({
         expiresAtMs: 10_000,
     };
     return {
-        operations,
         get released() {
             return released;
         },
@@ -40,17 +36,6 @@ function fakeBroker({
             return { released: true };
         },
         listInvestigations: () => investigations,
-        recordRecoveryOperation(input) {
-            recordCount += 1;
-            if (recordCount === failRecordAt) {
-                throw Object.assign(
-                    new Error("simulated daemon death before operation record"),
-                    { recoveryDaemonFatal: true },
-                );
-            }
-            operations.push(input);
-            return input;
-        },
     };
 }
 
@@ -84,7 +69,7 @@ describe("same-user recovery daemon", () => {
         expect(inspected).toBe(false);
     });
 
-    it("ensures one eligible investigation and records fenced authority", async () => {
+    it("ensures one eligible investigation", async () => {
         const broker = fakeBroker({
             investigations: [{
                 investigationId: "eligible-investigation",
@@ -120,11 +105,6 @@ describe("same-user recovery daemon", () => {
             state: "started",
             code: RECOVERY_DAEMON_CODES.SUPERVISOR_STARTED,
         }]);
-        expect(broker.operations.at(-1)).toMatchObject({
-            state: "started",
-            supervisorGeneration: 4,
-            runnerIncarnation: "runner-g4",
-        });
         expect(broker.released).toBe(true);
     });
 
@@ -204,7 +184,7 @@ describe("same-user recovery daemon", () => {
             .toEqual([...codes.values()].sort());
     });
 
-    it("records a stale-lock wait without treating it as a launch", async () => {
+    it("reports a stale-lock wait without treating it as a launch", async () => {
         const broker = fakeBroker({
             investigations: [{
                 investigationId: "stale-lock",
@@ -233,74 +213,6 @@ describe("same-user recovery daemon", () => {
             state: "waiting",
             code: RECOVERY_DAEMON_CODES.SUPERVISOR_WAITING,
             errorCode: null,
-        }]);
-    });
-
-    it("recovers one-shot after daemon death without a duplicate supervisor launch", async () => {
-        let supervisorAlive = false;
-        let launches = 0;
-        const investigations = [{
-            investigationId: "crash-recovery",
-            lifecycleState: "active",
-        }];
-        const firstBroker = fakeBroker({
-            investigations,
-            failRecordAt: 2,
-        });
-        await expect(runRecoveryDaemon(
-            daemonOptions(),
-            {
-                broker: firstBroker,
-                inspectRecoveryInvestigation: async () => ({
-                    eligible: true,
-                    state: "eligible",
-                    code: RECOVERY_DISCOVERY_CODES.ELIGIBLE,
-                    config: {},
-                }),
-                ensureSupervisor: async () => {
-                    launches += 1;
-                    supervisorAlive = true;
-                    return {
-                        action: "started",
-                        acknowledgement: {
-                            supervisorGeneration: 2,
-                            runnerIncarnation: "runner-g2",
-                        },
-                    };
-                },
-            },
-        )).rejects.toThrow(/simulated daemon death/u);
-
-        const secondBroker = fakeBroker({ investigations });
-        const recovered = await runRecoveryDaemon(
-            daemonOptions(),
-            {
-                broker: secondBroker,
-                inspectRecoveryInvestigation: async () => supervisorAlive
-                    ? {
-                        eligible: false,
-                        state: "running",
-                        code: RECOVERY_DISCOVERY_CODES.SUPERVISOR_RUNNING,
-                        supervisorGeneration: 2,
-                        runnerIncarnation: "runner-g2",
-                    }
-                    : {
-                        eligible: true,
-                        state: "eligible",
-                        code: RECOVERY_DISCOVERY_CODES.ELIGIBLE,
-                        config: {},
-                    },
-                ensureSupervisor: async () => {
-                    launches += 1;
-                    return { action: "started" };
-                },
-            },
-        );
-        expect(launches).toBe(1);
-        expect(recovered.operations).toEqual([{
-            investigationId: "crash-recovery",
-            state: "running",
-            code: RECOVERY_DISCOVERY_CODES.SUPERVISOR_RUNNING,
         }]);
     });
 

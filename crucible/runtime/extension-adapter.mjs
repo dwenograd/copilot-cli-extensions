@@ -31,7 +31,6 @@ import {
     isExactPidAlive,
     readSupervisorLock,
     readSupervisorStatus,
-    terminateExactSupervisor,
 } from "./supervisor.mjs";
 import {
     CrucibleRuntimeError,
@@ -356,7 +355,7 @@ export async function waitForSupervisorAcknowledgement(
                 && status.supervisorGeneration > 0
                 && (ensured?.action !== "started"
                     || status.supervisorGeneration > previousGeneration);
-            const exactConfig = status.version >= 4
+            const exactConfig = status.version === 4
                 && status.configFingerprint === expectedConfigFingerprint
                 && status.deadlineMs === expectedDeadlineMs;
             const exactIncarnation = (
@@ -975,25 +974,5 @@ export function ensureSupervisor(input, dependencies = {}) {
         action: "started",
         ...startSupervisor(config, dependencies),
         previousStatus: status,
-    });
-}
-
-export function terminateSupervisor({
-    stateDir,
-    investigationId,
-    expectedNonce,
-    expectedGeneration,
-    signal = "SIGTERM",
-    processApi = process,
-} = {}) {
-    const paths = supervisorPaths(stateDir, investigationId);
-    return terminateExactSupervisor({
-        lockPath: paths.lockPath,
-        statusPath: paths.statusPath,
-        stopRequestPath: paths.stopRequestPath,
-        expectedNonce,
-        expectedGeneration,
-        signal,
-        processApi,
     });
 }

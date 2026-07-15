@@ -25,9 +25,6 @@ import {
     prepareReplicatedStatisticalEvaluation,
 } from "./statistical-evaluation.mjs";
 import {
-    deriveCandidateNovelty,
-} from "./novelty.mjs";
-import {
     verifiedImpossibilityExecutionFor,
 } from "./private-verifier-execution.mjs";
 
@@ -544,18 +541,11 @@ function assertPurposeShape(provenance, { purpose, command, contract }) {
         const searchMeasurements = provenance.measurements.filter(
             (measurement) => measurement.role === "search",
         );
-        const noveltyMeasurements = provenance.measurements.filter(
-            (measurement) => measurement.role === "novelty",
-        );
-        if (searchMeasurements.length + noveltyMeasurements.length
-            !== provenance.measurements.length
-            || noveltyMeasurements.length > 1) {
+        if (searchMeasurements.length !== provenance.measurements.length) {
             fail("Candidate provenance contains an unsupported measurement role");
         }
         if (searchMeasurements.some((measurement) =>
-            measurement.phase !== "search")
-            || noveltyMeasurements.some((measurement) =>
-                measurement.phase !== "novelty")) {
+            measurement.phase !== "search")) {
             fail("Candidate provenance measurement phases do not match their roles");
         }
         if (searchMeasurements.length % schedule.arms.length !== 0) {
@@ -581,31 +571,6 @@ function assertPurposeShape(provenance, { purpose, command, contract }) {
                 subjects: searchSubjects,
                 expectedSubjects: scheduledSubjects,
             });
-        }
-        if (noveltyMeasurements.length === 1) {
-            const bySubject = new Map(
-                searchMeasurements.map((measurement) => [
-                    measurement.subjectId,
-                    measurement,
-                ]),
-            );
-            const candidateSnapshots = [];
-            for (let blockIndex = 0; blockIndex < blockCount; blockIndex += 1) {
-                for (const arm of replicationBlockPlan(schedule, blockIndex).arms) {
-                    if (arm.armId === "candidate") {
-                        candidateSnapshots.push(
-                            bySubject.get(arm.subjectId)?.snapshot?.snapshotHash
-                                ?? null,
-                        );
-                    }
-                }
-            }
-            if (candidateSnapshots.length !== blockCount
-                || new Set(candidateSnapshots).size !== 1
-                || noveltyMeasurements[0].snapshot.snapshotHash
-                    !== candidateSnapshots[0]) {
-                fail("Novelty measurement is not bound to the immutable candidate snapshot");
-            }
         }
         if (provenance.proposalArtifact === null
             || provenance.promptContextHash === null
@@ -822,12 +787,6 @@ export function artifactRefsFromProvenance(provenance) {
         unique.set(artifact.artifactId, artifact);
     }
     return immutableCanonical([...unique.values()].sort(compareArtifactRefs));
-}
-
-export function artifactIdsFromProvenance(provenance) {
-    return artifactRefsFromProvenance(provenance)
-        .map((artifact) => artifact.artifactId)
-        .sort();
 }
 
 function ownEntry(record, key) {
@@ -1329,22 +1288,6 @@ export function deriveEvidencePayload(aggregate, observation, evidenceId) {
                 validationControlBindings: validationControls,
             }
             : null;
-    const novelty = candidateEvidence
-        ? deriveCandidateNovelty({
-            aggregate,
-            evidence: {
-                evidenceId,
-                observationId: observation.observationId,
-                sourceKind: observation.sourceKind,
-                purpose: observation.purpose,
-                receipt: observation.receipt,
-            },
-            observation,
-            command,
-            candidateEvaluation,
-        })
-        : null;
-
     return {
         evidenceId,
         observationId: observation.observationId,
@@ -1390,7 +1333,6 @@ export function deriveEvidencePayload(aggregate, observation, evidenceId) {
         hypothesesIdentity:
             claimPlan?.hypothesesIdentity ?? null,
         predictionEvaluation,
-        novelty,
         annotations: replicatedEvidence ? observation.annotations : null,
         duplicateOf: candidateEvidence
             ? duplicateEvidenceId(allPriorCandidates, candidateArtifactHash)

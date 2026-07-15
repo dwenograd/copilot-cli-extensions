@@ -56,7 +56,6 @@ const EVENT_KEYS = Object.freeze(["eventHash", "payload", "prevHash", "seq", "ty
 const SCIENTIFIC_REPLAY_EVENT_TYPES = new Set([
     EVENT_TYPES.INVESTIGATION_OPENED,
     EVENT_TYPES.EVIDENCE_COMMITTED,
-    EVENT_TYPES.EVIDENCE_INVALIDATED,
     EVENT_TYPES.VALIDATION_COMPLETED,
     EVENT_TYPES.SCIENTIFIC_CONFIRMATION_FROZEN,
 ]);
@@ -672,13 +671,11 @@ function applyCommandObserved(next, event) {
         observedSeq: event.seq,
         evidenceId: null,
     };
-    observation.rawAuthorityDigest = payload.sourceKind === "harness"
-        ? deriveRawObservationAuthorityDigest(
-            next,
-            observation,
-            command.command,
-        )
-        : null;
+    observation.rawAuthorityDigest = deriveRawObservationAuthorityDigest(
+        next,
+        observation,
+        command.command,
+    );
     next.observations[payload.observationId] = observation;
     next.observationOrder.push(payload.observationId);
     command.status = "observed";
@@ -714,29 +711,6 @@ function applyEvidenceCommitted(next, event) {
         if (duplicateCandidate) {
             duplicate("candidate", observation.candidateId);
         }
-        if (observation.sourceKind === "harness"
-            && (observation.purpose === "confirmation"
-                || observation.purpose === "challenge")) {
-            const duplicateRoleEvidence = next.evidenceOrder.some((existingId) => {
-                const existing = ownEntry(next.evidence, existingId);
-                return existing !== null
-                    && existing.sourceKind === "harness"
-                    && existing.purpose === observation.purpose
-                    && existing.confirmationFreezeHash
-                        === next.commands[observation.commandId]
-                            ?.command?.confirmationFreezeHash
-                    && existing.candidateEvidenceId
-                        === next.commands[observation.commandId]
-                            ?.command?.candidateEvidenceId;
-            });
-            if (duplicateRoleEvidence) {
-                duplicate(
-                    `${observation.purpose} cohort member`,
-                    next.commands[observation.commandId]
-                        ?.command?.candidateEvidenceId,
-                );
-            }
-        }
         const duplicateSlot = next.evidenceOrder.some((existingId) => {
             const existing = ownEntry(next.evidence, existingId);
             return existing !== null
@@ -770,37 +744,6 @@ function applyEvidenceCommitted(next, event) {
     observation.evidenceId = evidenceId;
     if (payload.sourceKind === "harness" && payload.purpose === "validation") {
         next.validation.attemptEvidenceIds.push(evidenceId);
-    }
-}
-
-function applyEvidenceInvalidated(next, event) {
-    const evidence = ownEntry(next.evidence, event.payload.evidenceId);
-    if (evidence === null) {
-        throw new TransitionError(
-            ERROR_CODES.EVIDENCE_NOT_FOUND,
-            "Cannot invalidate unknown evidence",
-            { evidenceId: event.payload.evidenceId },
-        );
-    }
-    if (evidence.invalidated) {
-        throw new TransitionError(
-            ERROR_CODES.ILLEGAL_TRANSITION,
-            "Evidence may only be invalidated once",
-            { evidenceId: evidence.evidenceId },
-        );
-    }
-    evidence.invalidated = true;
-    evidence.invalidatedSeq = event.seq;
-    evidence.invalidationReason = event.payload.reason;
-    const currentValidation = ownEntry(
-        next.evidence,
-        next.validation.currentEvidenceId,
-    );
-    if (next.validation.currentEvidenceId === evidence.evidenceId
-        || currentValidation?.validationBasisEvidenceIds?.includes(
-            evidence.evidenceId,
-        )) {
-        next.validation.currentEvidenceId = null;
     }
 }
 
@@ -841,20 +784,6 @@ function applyScientificConfirmationFrozen(next, event) {
         seq: event.seq,
         eventHash: event.eventHash,
     };
-}
-
-function applySearchStrategyRevised(next, event) {
-    if (event.payload.revision !== next.searchStrategy.revision + 1) {
-        throw new TransitionError(
-            ERROR_CODES.ILLEGAL_TRANSITION,
-            "Search strategy revisions must be contiguous",
-        );
-    }
-    next.searchStrategy.revision = event.payload.revision;
-    next.searchStrategy.history.push({
-        ...event.payload,
-        seq: event.seq,
-    });
 }
 
 function applyStopRequested(next, event) {
@@ -959,17 +888,11 @@ function applyTransition(next, event) {
         case EVENT_TYPES.EVIDENCE_COMMITTED:
             applyEvidenceCommitted(next, event);
             break;
-        case EVENT_TYPES.EVIDENCE_INVALIDATED:
-            applyEvidenceInvalidated(next, event);
-            break;
         case EVENT_TYPES.VALIDATION_COMPLETED:
             applyValidationCompleted(next, event);
             break;
         case EVENT_TYPES.SCIENTIFIC_CONFIRMATION_FROZEN:
             applyScientificConfirmationFrozen(next, event);
-            break;
-        case EVENT_TYPES.SEARCH_STRATEGY_REVISED:
-            applySearchStrategyRevised(next, event);
             break;
         case EVENT_TYPES.STORAGE_BUDGET_EXHAUSTED:
             applyStorageBudgetExhausted(next, event);

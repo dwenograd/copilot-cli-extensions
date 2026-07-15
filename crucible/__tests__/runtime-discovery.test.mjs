@@ -1,5 +1,4 @@
 import path from "node:path";
-import { createHash } from "node:crypto";
 
 import { describe, expect, it } from "vitest";
 
@@ -172,35 +171,19 @@ describe("recovery discovery eligibility", () => {
         }).code).toBe(RECOVERY_DISCOVERY_CODES.NON_RESULT);
     });
 
-    it("verifies referenced inline and external artifact bytes", () => {
-        const bytes = Buffer.from("inline artifact", "utf8");
-        const inlineHash = createHash("sha256").update(bytes).digest("hex");
+    it("verifies referenced external artifact bytes", () => {
         const repository = {
-            listArtifactRefs: () => [
-                { artifactId: "external-artifact" },
-                { artifactId: "inline-artifact" },
-            ],
-            getArtifact: (artifactId) => artifactId === "external-artifact"
-                ? {
-                    artifactId,
-                    investigationId: "investigation",
-                    durable: true,
-                    sizeBytes: 4,
-                    hashAlgo: "sha256",
-                    hashValue:
-                        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                    storage: "external",
-                }
-                : {
-                    artifactId,
-                    investigationId: "investigation",
-                    durable: true,
-                    sizeBytes: bytes.length,
-                    hashAlgo: "sha256",
-                    hashValue: inlineHash,
-                    storage: "inline",
-                },
-            getInlineArtifact: () => ({ bytes }),
+            listArtifactRefs: () => [{ artifactId: "external-artifact" }],
+            getArtifact: (artifactId) => ({
+                artifactId,
+                investigationId: "investigation",
+                durable: true,
+                sizeBytes: 4,
+                hashAlgo: "sha256",
+                hashValue:
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                storage: "external",
+            }),
         };
         const artifactStore = {
             verifyObject: () => ({ ok: true, size: 4 }),
@@ -209,7 +192,7 @@ describe("recovery discovery eligibility", () => {
             repository,
             artifactStore,
             investigationId: "investigation",
-        })).toEqual({ verified: true, artifactCount: 2 });
+        })).toEqual({ verified: true, artifactCount: 1 });
         artifactStore.verifyObject = () => ({ ok: false, reason: "corrupt" });
         expect(() => verifyInvestigationArtifactIntegrity({
             repository,

@@ -5,7 +5,6 @@ export const RUNTIME_ERROR_CODES = Object.freeze({
     INVESTIGATION_NOT_OPEN: "CRUCIBLE_RUNTIME_INVESTIGATION_NOT_OPEN",
     DOMAIN_SEQUENCE_MISMATCH: "CRUCIBLE_RUNTIME_DOMAIN_SEQUENCE_MISMATCH",
     DOMAIN_EVENT_INVALID: "CRUCIBLE_RUNTIME_DOMAIN_EVENT_INVALID",
-    LEGACY_INCOMPATIBLE: "CRUCIBLE_RUNTIME_LEGACY_INCOMPATIBLE",
     HARNESS_CONFIGURATION_INVALID: "CRUCIBLE_RUNTIME_HARNESS_CONFIGURATION_INVALID",
     WORKER_PROTOCOL: "CRUCIBLE_RUNTIME_WORKER_PROTOCOL",
     WORKER_NO_SUBMISSION: "CRUCIBLE_RUNTIME_WORKER_NO_SUBMISSION",
@@ -71,18 +70,6 @@ export class RuntimeDriftError extends CrucibleRuntimeError {
     }
 }
 
-export class LegacyIncompatibleRuntimeError extends CrucibleRuntimeError {
-    constructor(message, details) {
-        super(RUNTIME_ERROR_CODES.LEGACY_INCOMPATIBLE, message, {
-            compatibility: "legacy_incompatible",
-            legacyIncompatible: true,
-            restartRequired: true,
-            requiredAction: "start_new_investigation",
-            ...details,
-        });
-    }
-}
-
 export class WorkerProtocolError extends CrucibleRuntimeError {
     constructor(code, message, details) {
         super(code, message, details);
@@ -136,14 +123,4 @@ export function isRecoverableRuntimeError(error) {
         RUNTIME_ERROR_CODES.NO_ELIGIBLE_CANDIDATE,
         RUNTIME_ERROR_CODES.INJECTED_CRASH,
     ].includes(error?.code);
-}
-
-export function serializeRuntimeError(error) {
-    return {
-        name: typeof error?.name === "string" ? error.name : "Error",
-        code: typeof error?.code === "string" ? error.code : "UNEXPECTED_ERROR",
-        message: typeof error?.message === "string" ? error.message : String(error),
-        details: error?.details ?? null,
-        recoverable: isRecoverableRuntimeError(error),
-    };
 }

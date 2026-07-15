@@ -8,27 +8,24 @@ import {
     summarizeCandidateCohortComparison,
 } from "./cohort.mjs";
 import { deriveScientificConfirmationState } from "./confirmation.mjs";
-import {
-    LEGACY_SEARCH_STRATEGY_POLICY_VERSION,
-} from "./constants.mjs";
 import { statisticalSubjectIndex } from "./replication.mjs";
 import { searchAlphaSubjectOrdinal } from "./statistics.mjs";
 
 export const SCIENTIFIC_REPLAY_VERSION =
     "crucible-scientific-replay-v1";
-export const SCIENTIFIC_RAW_AUTHORITY_HASH_ALGORITHM =
+const SCIENTIFIC_RAW_AUTHORITY_HASH_ALGORITHM =
     "sha256:crucible-scientific-raw-authority-v1";
-export const SCIENTIFIC_AGGREGATE_HASH_ALGORITHM =
+const SCIENTIFIC_AGGREGATE_HASH_ALGORITHM =
     "sha256:crucible-scientific-aggregate-v1";
-export const SCIENTIFIC_CLAIM_STATES_HASH_ALGORITHM =
+const SCIENTIFIC_CLAIM_STATES_HASH_ALGORITHM =
     "sha256:crucible-scientific-claim-states-v1";
-export const SCIENTIFIC_ALPHA_LEDGER_HASH_ALGORITHM =
+const SCIENTIFIC_ALPHA_LEDGER_HASH_ALGORITHM =
     "sha256:crucible-scientific-alpha-ledger-v1";
-export const SCIENTIFIC_REPLAY_CLOSURE_HASH_ALGORITHM =
+const SCIENTIFIC_REPLAY_CLOSURE_HASH_ALGORITHM =
     "sha256:crucible-scientific-replay-closure-v1";
-export const SCIENTIFIC_CONCLUSION_VERSION =
+const SCIENTIFIC_CONCLUSION_VERSION =
     "crucible-scientific-conclusion-v1";
-export const SCIENTIFIC_CONCLUSION_HASH_ALGORITHM =
+const SCIENTIFIC_CONCLUSION_HASH_ALGORITHM =
     "sha256:crucible-scientific-conclusion-v1";
 
 function ownEntry(record, key) {
@@ -65,16 +62,13 @@ function failSearchAlphaReplay(message, details) {
     throw error;
 }
 
-export function assertScientificSearchAlphaLanes(aggregate) {
+function assertScientificSearchAlphaLanes(aggregate) {
     const contract = aggregate?.contract;
     if (contract === null || contract === undefined) {
         return immutableCanonical({ laneCount: 0, lanes: [] });
     }
     const searchSlots = searchSubjectCapacity(contract);
-    const strategyPolicyVersion = contract.searchPolicy.version
-        ?? LEGACY_SEARCH_STRATEGY_POLICY_VERSION;
-    const legacyStrategy = strategyPolicyVersion
-        === LEGACY_SEARCH_STRATEGY_POLICY_VERSION;
+    const strategyPolicyVersion = contract.searchPolicy.version;
     const seenLanes = new Map();
     const attemptsBySlot = new Map();
     const lanes = [];
@@ -134,20 +128,17 @@ export function assertScientificSearchAlphaLanes(aggregate) {
             : "enumerand";
         const expectedIndex = statisticalSubjectIndex(
             expectedKind,
-            legacyStrategy
-                ? globalSlot
-                : searchAlphaSubjectOrdinal({
-                    searchSlots,
-                    maxConfirmations:
-                        contract.statisticalPolicy.maxConfirmations,
-                    globalSlot,
-                    replacementOrdinal,
-                }),
+            searchAlphaSubjectOrdinal({
+                searchSlots,
+                maxConfirmations:
+                    contract.statisticalPolicy.maxConfirmations,
+                globalSlot,
+                replacementOrdinal,
+            }),
         );
         const subject = command.replicationSchedule.subject;
         const priorEvidenceId = seenLanes.get(subject.index);
-        // V1 histories retain their original shared-lane authority verbatim.
-        if (!legacyStrategy && priorEvidenceId !== undefined) {
+        if (priorEvidenceId !== undefined) {
             failSearchAlphaReplay(
                 "multiple candidate observations reused one preregistered alpha lane",
                 {
@@ -210,7 +201,6 @@ function candidateProjection(evidence) {
         metrics: evidence.metrics,
         replication: evidence.replication,
         statisticalEvaluation: evidence.statisticalEvaluation,
-        novelty: evidence.novelty ?? null,
         hypothesesIdentity: evidence.hypothesesIdentity ?? null,
         predictionEvaluation: evidence.predictionEvaluation ?? null,
     };
@@ -541,7 +531,6 @@ function candidateSupport(candidates) {
             evaluationHash:
                 candidate.statisticalEvaluation?.evaluationHash ?? null,
             statisticalCacheDigest: candidate.statisticalCacheDigest,
-            novelty: candidate.novelty,
             hypothesesIdentity: candidate.hypothesesIdentity,
             predictionEvaluation: effectivePredictionEvaluation(
                 candidate,
@@ -575,7 +564,6 @@ export function replayDerivedCandidateEvidence(aggregate, evidence) {
         rankable: support.rankable,
         outcomeClass: support.outcomeClass,
         acceptanceSatisfied: support.acceptanceSatisfied,
-        novelty: support.novelty,
         hypothesesIdentity: support.hypothesesIdentity,
         predictionEvaluation: support.predictionEvaluation,
     });

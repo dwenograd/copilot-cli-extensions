@@ -12,7 +12,6 @@ import {
     measureRetainedTree,
     canonicalize,
     openArtifactStoreReadOnly,
-    openRepositoryReadOnly,
     removeRetainedTree,
     removeVerifiedBundle,
     verifyBundleInPlace,
@@ -22,7 +21,6 @@ import {
 import {
     createDomainRepositoryAdapter,
     createProcessIdentityAdapter,
-    inspectInvestigationDomainCompatibility,
     openResourceBrokerFromStateRoot,
     openResourceBrokerReadOnlyFromStateRoot,
     resourceCatalogPath,
@@ -165,32 +163,6 @@ function safeClose(value) {
         value?.close?.();
     } catch {
         // Preserve the lifecycle operation result.
-    }
-}
-
-function isUncatalogedLegacyInvestigation(deps, investigationId, paths) {
-    if (!(deps.pathExists ?? fs.existsSync)(paths.eventsDbPath)) {
-        return false;
-    }
-    if (typeof deps.inspectUncatalogedLegacyInvestigation === "function") {
-        return deps.inspectUncatalogedLegacyInvestigation({
-            investigationId,
-            paths,
-        }) === true;
-    }
-    const repository = (deps.openRepositoryReadOnly ?? openRepositoryReadOnly)({
-        file: paths.eventsDbPath,
-        env: deps.env,
-    });
-    try {
-        const compatibility = inspectInvestigationDomainCompatibility({
-            repository,
-            investigationId,
-        });
-        return compatibility.present
-            && compatibility.compatibility === "legacy_incompatible";
-    } finally {
-        safeClose(repository);
     }
 }
 
@@ -499,8 +471,6 @@ function cleanupCommitOptions({
         signature: cleanup.signature,
         tombstoneSizeBytes: cleanup.tombstoneSizeBytes,
         deletedAtMs: cleanup.deletedAtMs,
-        sourceAuthority: cleanup.sourceAuthority,
-        archiveAbsent: cleanup.archiveAbsent,
         ...changes,
     };
 }
@@ -528,153 +498,6 @@ function completedDeleteResponse(
         integrity_status: "verified",
         terminal_available: false,
     };
-}
-
-function discoverLegacyArchive({
-    broker,
-    snapshot,
-    entry,
-    stateRoot,
-    retention,
-    deps,
-    attempt = 0,
-}) {
-    const cleanup = entry.deleteCleanup;
-    if (cleanup?.sourceAuthority !== "legacy_discovery") {
-        return entry;
-    }
-    const cleanupDir = resolveCatalogRetentionPath(
-        stateRoot,
-        cleanup.cleanupRelativePath,
-        { kind: "archive", env: deps.env },
-    );
-    if (pathExists(deps, cleanupDir)) {
-        throw new InvestigationNotResumableError(
-            "legacy cleanup target exists before archive discovery",
-            { investigationId: entry.investigationId },
-        );
-    }
-    const owned = new Set();
-    for (const candidate of snapshot) {
-        if (candidate.archive?.relativePath) {
-            owned.add(candidate.archive.relativePath);
-        }
-        if (candidate.lifecycleOperation?.operationKind === "archive"
-            && candidate.lifecycleOperation.archiveRelativePath) {
-            owned.add(
-                candidate.lifecycleOperation.archiveRelativePath,
-            );
-        }
-        if (candidate.deleteCleanup?.archiveRelativePath) {
-            owned.add(
-                candidate.deleteCleanup.archiveRelativePath,
-            );
-        }
-        if (candidate.deleteCleanup?.cleanupRelativePath) {
-            owned.add(
-                candidate.deleteCleanup.cleanupRelativePath,
-            );
-        }
-    }
-    const unowned = safeDirectoryEntries(
-        retention.archiveRoot,
-        "Crucible archive root",
-    ).filter((child) =>
-        !owned.has(retentionRelativePath(stateRoot, child.path)));
-    const matches = [];
-    const rejected = [];
-    for (const child of unowned) {
-        if (!child.directory) {
-            rejected.push(child.path);
-            continue;
-        }
-        try {
-            const verified = (deps.verifyBundleInPlace
-                ?? verifyBundleInPlace)({
-                bundleDir: child.path,
-                expectedDigest: cleanup.archiveDigest,
-                expectedInvestigationId: entry.investigationId,
-                requiredDomainVersion: DOMAIN_VERSION,
-            });
-            if (verified.digest !== cleanup.archiveDigest
-                || verified.investigationId !== entry.investigationId
-                || verified.verified !== true
-                || verified.authenticated !== true) {
-                rejected.push(child.path);
-            } else {
-                matches.push(child);
-            }
-        } catch {
-            rejected.push(child.path);
-        }
-    }
-    const generation = snapshotGeneration(snapshot);
-    const confirmation = broker.listInvestigations({ limit: 1 });
-    const confirmedGeneration = snapshotGeneration(confirmation);
-    if (generation !== null && confirmedGeneration !== generation) {
-        if (attempt >= 3) {
-            throw new InvestigationNotResumableError(
-                "catalog changed during legacy archive discovery",
-                { investigationId: entry.investigationId },
-            );
-        }
-        const refreshed = broker.listInvestigations({ limit: null });
-        const refreshedEntry = refreshed.find((candidate) =>
-            candidate.investigationId === entry.investigationId);
-        if (refreshedEntry === undefined) {
-            throw new InvestigationNotResumableError(
-                "legacy cleanup authority disappeared during discovery",
-                { investigationId: entry.investigationId },
-            );
-        }
-        return discoverLegacyArchive({
-            broker,
-            snapshot: refreshed,
-            entry: refreshedEntry,
-            stateRoot,
-            retention,
-            deps,
-            attempt: attempt + 1,
-        });
-    }
-    if (matches.length > 1
-        || rejected.length !== 0
-        || (matches.length === 0 && unowned.length !== 0)) {
-        throw new InvestigationNotResumableError(
-            "legacy archive discovery is ambiguous",
-            {
-                investigationId: entry.investigationId,
-                matches: matches.map((candidate) => candidate.path),
-                rejected,
-            },
-        );
-    }
-    if (matches.length === 0) {
-        return broker.commitDelete(cleanupCommitOptions({
-            entry,
-            cleanup,
-            operationToken: null,
-            archiveAbsent: true,
-        })).investigation;
-    }
-    const archiveRelativePath = retentionRelativePath(
-        stateRoot,
-        matches[0].path,
-    );
-    const markerDigest = cleanupMarkerDigest({
-        investigationId: entry.investigationId,
-        archiveRelativePath,
-        cleanupRelativePath: cleanup.cleanupRelativePath,
-        archiveDigest: cleanup.archiveDigest,
-        nonce: cleanup.cleanupMarkerNonce,
-    });
-    return broker.commitDelete(cleanupCommitOptions({
-        entry,
-        cleanup,
-        operationToken: null,
-        discoveredArchiveRelativePath: archiveRelativePath,
-        cleanupMarkerDigest: markerDigest,
-    })).investigation;
 }
 
 function retentionRelativePath(stateRoot, target) {
@@ -802,14 +625,6 @@ function assertCatalogStorageAuthority(stateRoot, entries, deps) {
         "resource-catalog.sqlite-shm",
     ]);
     for (const entry of entries) {
-        if (entry.deleteCleanup?.sourceAuthority
-            === "legacy_discovery"
-            && entry.deleteCleanup.archiveAbsent !== true) {
-            throw new InvestigationNotResumableError(
-                "legacy archive discovery requires an explicit lifecycle mutation",
-                { investigationId: entry.investigationId },
-            );
-        }
         if (entry.lifecycleState !== "tombstoned") {
             activePaths.add(retentionRelativePath(
                 stateRoot,
@@ -869,17 +684,9 @@ function assertCatalogStorageAuthority(stateRoot, entries, deps) {
                 stateRoot,
                 child.path,
             ));
-        const verifiedLegacy = recognizedInvestigation
-            && child.directory
-            && !cataloged
-            && isUncatalogedLegacyInvestigation(
-                deps,
-                child.name,
-                resolveInvestigationPaths(stateRoot, child.name),
-            );
         if (!catalogFiles.has(child.name)
             && recognizedInvestigation
-            && (!child.directory || (!cataloged && !verifiedLegacy))) {
+            && (!child.directory || !cataloged)) {
             throw new InvestigationNotResumableError(
                 "active Crucible state has no catalog authority",
                 { path: child.path },
@@ -962,7 +769,7 @@ function readStableCatalogSnapshot(broker, stateRoot, deps) {
     );
 }
 
-function standaloneTombstoneTarget(
+function verifyStandaloneTombstone(
     deps,
     stateRoot,
     investigationId,
@@ -973,48 +780,12 @@ function standaloneTombstoneTarget(
         { env: deps.env },
     );
     if (!fs.existsSync(retention.tombstonePath)) return null;
-    const verification = (deps.verifySignedTombstone
+    return (deps.verifySignedTombstone
         ?? verifySignedTombstone)({
         file: retention.tombstonePath,
         keyRoot: retention.tombstoneKeyRoot,
         expectedInvestigationId: investigationId,
         env: deps.env,
-    });
-    const deletedAtMs = Date.parse(verification.payload.deletedAt);
-    const entry = Object.freeze({
-        investigationId,
-        registeredAtMs: verification.payload.createdAtMs,
-        authorityUpdatedAtMs: deletedAtMs,
-        lifecycleState: "tombstoned",
-        lifecycleUpdatedAtMs: deletedAtMs,
-        lifecycleReasonCode: "operator_delete",
-        lifecycleOperation: null,
-        archive: null,
-        tombstone: Object.freeze({
-            relativePath: retentionRelativePath(
-                stateRoot,
-                retention.tombstonePath,
-            ),
-            digest: verification.digest,
-            signingKeyFingerprint:
-                verification.signingKeyFingerprint,
-            signature: verification.signature,
-            archiveDigest:
-                verification.payload.archiveDigest,
-            domainVersion:
-                verification.payload.domainVersion,
-            domainHead: verification.payload.domainHead,
-            sizeBytes: verification.sizeBytes,
-            deletedAtMs,
-            integrityStatus: "verified",
-        }),
-    });
-    return Object.freeze({
-        stateRoot,
-        state: "tombstoned",
-        entry,
-        verification,
-        paths: null,
     });
 }
 
@@ -1302,7 +1073,6 @@ function archiveSummary(entry, stateRoot, deps) {
             bundleDir,
             expectedDigest: entry.archive.digest,
             expectedInvestigationId: entry.investigationId,
-            requiredDomainVersion: DOMAIN_VERSION,
         });
         assertArchiveCatalogBinding(entry, verified);
         if (verified.verified !== true
@@ -1348,7 +1118,6 @@ function archiveSummary(entry, stateRoot, deps) {
 export function resolveLifecycleTarget({
     deps,
     investigationId,
-    verifyArchive = true,
 } = {}) {
     const stateRoot = resolveStateRoot(deps.env);
     const activePaths = resolveInvestigationPaths(
@@ -1357,7 +1126,7 @@ export function resolveLifecycleTarget({
     );
     const broker = openCatalogForRead(deps, stateRoot);
     if (broker === null) {
-        if (standaloneTombstoneTarget(
+        if (verifyStandaloneTombstone(
             deps,
             stateRoot,
             investigationId,
@@ -1369,19 +1138,6 @@ export function resolveLifecycleTarget({
                     source: "uncommitted_signed_tombstone",
                 },
             );
-        }
-        if (isUncatalogedLegacyInvestigation(
-            deps,
-            investigationId,
-            activePaths,
-        )) {
-            return Object.freeze({
-                stateRoot,
-                state: "active",
-                entry: null,
-                paths: activePaths,
-                verification: null,
-            });
         }
         assertStateRootTrulyEmpty(stateRoot);
         return Object.freeze({
@@ -1401,7 +1157,7 @@ export function resolveLifecycleTarget({
         const entry = entries.find((candidate) =>
             candidate.investigationId === investigationId) ?? null;
         if (entry === null) {
-            if (standaloneTombstoneTarget(
+            if (verifyStandaloneTombstone(
                 deps,
                 stateRoot,
                 investigationId,
@@ -1414,12 +1170,7 @@ export function resolveLifecycleTarget({
                     },
                 );
             }
-            if ((deps.pathExists ?? fs.existsSync)(activePaths.eventsDbPath)
-                && !isUncatalogedLegacyInvestigation(
-                    deps,
-                    investigationId,
-                    activePaths,
-                )) {
+            if ((deps.pathExists ?? fs.existsSync)(activePaths.eventsDbPath)) {
                 throw new InvestigationNotResumableError(
                     "active investigation has no catalog authority",
                     { investigationId, source: "uncataloged_active_state" },
@@ -1453,22 +1204,11 @@ export function resolveLifecycleTarget({
                 entry.archive.relativePath,
                 { kind: "archive", env: deps.env },
             );
-            const verification = verifyArchive
-                ? (deps.verifyBundleInPlace ?? verifyBundleInPlace)({
-                    bundleDir: archiveDir,
-                    expectedDigest: entry.archive.digest,
-                    expectedInvestigationId: investigationId,
-                    requiredDomainVersion: DOMAIN_VERSION,
-                })
-                : null;
-            if (verification !== null) {
-                assertArchiveCatalogBinding(entry, verification);
-            }
             return Object.freeze({
                 stateRoot,
                 state: "archived",
                 entry,
-                verification,
+                verification: null,
                 paths: Object.freeze({
                     investigationDir: archiveDir,
                     stateDir: path.join(archiveDir, "db"),
@@ -1518,7 +1258,6 @@ export function verifyArchivedTarget(target, deps) {
         bundleDir: target.paths.investigationDir,
         expectedDigest: target.entry.archive.digest,
         expectedInvestigationId: target.entry.investigationId,
-        requiredDomainVersion: DOMAIN_VERSION,
     });
     assertArchiveCatalogBinding(target.entry, verification);
     return verification;
@@ -1819,7 +1558,6 @@ function cleanupUnpublishedArchive({
                 expectedDigest: archiveDigest,
                 expectedInvestigationId:
                     path.basename(paths.investigationDir),
-                requiredDomainVersion: DOMAIN_VERSION,
             });
         } catch {
             (deps.removeRetainedTree ?? removeRetainedTree)({
@@ -1932,7 +1670,6 @@ export async function archiveInvestigation(
                 bundleDir: catalogArchiveDir,
                 expectedDigest: catalogEntry.archive.digest,
                 expectedInvestigationId: investigationId,
-                requiredDomainVersion: DOMAIN_VERSION,
             });
             assertArchiveCatalogBinding(
                 catalogEntry,
@@ -2014,7 +1751,7 @@ export async function archiveInvestigation(
         }
         if (args.expected_head !== undefined
             && read.aggregate.lastEventHash !== args.expected_head
-            && read.repositoryHead?.eventHash !== args.expected_head) {
+            && read.repositoryHeadEventHash !== args.expected_head) {
             throw new InvestigationNotResumableError(
                 "investigation head changed before archive",
                 {
@@ -2110,7 +1847,6 @@ export async function archiveInvestigation(
                     bundleDir: paths.archiveDir,
                     expectedDigest: exported.digest,
                     expectedInvestigationId: investigationId,
-                    requiredDomainVersion: DOMAIN_VERSION,
                 });
                 imported = {
                     ...existing,
@@ -2259,8 +1995,12 @@ export function deleteInvestigation(args, deps) {
     let archiveDir = null;
     let cleanupDir = null;
     try {
-        const rawSnapshot = broker.listInvestigations({ limit: null });
-        let entry = rawSnapshot.find((candidate) =>
+        const snapshot = readStableCatalogSnapshot(
+            broker,
+            stateRoot,
+            deps,
+        );
+        let entry = snapshot.find((candidate) =>
             candidate.investigationId === investigationId) ?? null;
         if (entry === null) {
             throw new InvestigationNotFoundError(
@@ -2268,24 +2008,6 @@ export function deleteInvestigation(args, deps) {
                 { investigationId },
             );
         }
-        if (entry.deleteCleanup?.sourceAuthority
-            === "legacy_discovery") {
-            entry = discoverLegacyArchive({
-                broker,
-                snapshot: rawSnapshot,
-                entry,
-                stateRoot,
-                retention,
-                deps,
-            });
-        }
-        const snapshot = readStableCatalogSnapshot(
-            broker,
-            stateRoot,
-            deps,
-        );
-        entry = snapshot.find((candidate) =>
-            candidate.investigationId === investigationId) ?? entry;
         if (entry.lifecycleState !== "tombstoned") {
             entry = reclaimStaleLifecycleFence(
                 broker,
@@ -2386,7 +2108,6 @@ export function deleteInvestigation(args, deps) {
                 bundleDir: archiveDir,
                 expectedDigest: args.expected_archive_digest,
                 expectedInvestigationId: investigationId,
-                requiredDomainVersion: DOMAIN_VERSION,
             });
             assertArchiveCatalogBinding(entry, verified);
             const archiveSize = (deps.measureRetainedTree
@@ -2477,8 +2198,7 @@ export function deleteInvestigation(args, deps) {
             investigationId,
         });
 
-        if (cleanup.archiveAbsent !== true
-            && cleanup.cleanupState === "reserved") {
+        if (cleanup.cleanupState === "reserved") {
             const sourceExists = archiveDir !== null
                 && pathExists(deps, archiveDir);
             const cleanupExists = pathExists(deps, cleanupDir);
@@ -2494,25 +2214,12 @@ export function deleteInvestigation(args, deps) {
                     ? cleanupDir
                     : null;
             if (markerRoot === null) {
-                if (cleanup.sourceAuthority !== "legacy_preverified") {
-                    throw new InvestigationNotResumableError(
-                        "cleanup reservation lost both owned paths",
-                        { investigationId },
-                    );
-                }
-                entry = broker.commitDelete(cleanupCommitOptions({
-                    entry,
-                    cleanup,
-                    operationToken:
-                        entry.lifecycleState === "archived"
-                            ? operationToken
-                            : null,
-                    nextCleanupState: "durability_pending",
-                })).investigation;
-                cleanup = entry.deleteCleanup;
+                throw new InvestigationNotResumableError(
+                    "cleanup reservation lost both owned paths",
+                    { investigationId },
+                );
             } else {
                 if (sourceExists
-                    && cleanup.sourceAuthority === "verified_bundle"
                     && !pathExists(
                         deps,
                         path.join(
@@ -2525,17 +2232,8 @@ export function deleteInvestigation(args, deps) {
                         bundleDir: markerRoot,
                         expectedDigest: cleanup.archiveDigest,
                         expectedInvestigationId: investigationId,
-                        requiredDomainVersion: DOMAIN_VERSION,
                     });
-                    if (entry.lifecycleState === "archived") {
-                        assertArchiveCatalogBinding(entry, verified);
-                    } else if (verified.digest !== cleanup.archiveDigest
-                        || verified.investigationId !== investigationId) {
-                        throw new InvestigationNotResumableError(
-                            "discovered archive no longer matches cleanup authority",
-                            { investigationId },
-                        );
-                    }
+                    assertArchiveCatalogBinding(entry, verified);
                 }
                 ensureCleanupOwnershipMarker({
                     root: markerRoot,
@@ -2775,7 +2473,7 @@ export function assertInvestigationIdentityAvailable({
 } = {}) {
     const broker = openCatalogForRead(deps, stateRoot);
     if (broker === null) {
-        if (standaloneTombstoneTarget(
+        if (verifyStandaloneTombstone(
             deps,
             stateRoot,
             investigationId,
@@ -2787,17 +2485,6 @@ export function assertInvestigationIdentityAvailable({
                     source: "uncommitted_signed_tombstone",
                 },
             );
-        }
-        const activePaths = resolveInvestigationPaths(
-            stateRoot,
-            investigationId,
-        );
-        if (isUncatalogedLegacyInvestigation(
-            deps,
-            investigationId,
-            activePaths,
-        )) {
-            return null;
         }
         assertStateRootTrulyEmpty(stateRoot);
         return null;
@@ -2842,7 +2529,7 @@ export function assertInvestigationIdentityAvailable({
             );
         }
         if (entry === null
-            && standaloneTombstoneTarget(
+            && verifyStandaloneTombstone(
                 deps,
                 stateRoot,
                 investigationId,

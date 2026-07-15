@@ -40,15 +40,8 @@ const ARCHIVE_TRUST_LEVELS = new Set([
     "self-consistent",
 ]);
 const ARCHIVE_INTEGRITY_STATUSES = new Set(["verified", "blocked"]);
-const DELETE_CLEANUP_AUTHORITY_KINDS = new Set([
-    "pending_delete",
-    "legacy_tombstone",
-]);
-const DELETE_CLEANUP_SOURCE_AUTHORITIES = new Set([
-    "verified_bundle",
-    "legacy_preverified",
-    "legacy_discovery",
-]);
+const DELETE_CLEANUP_AUTHORITY_KINDS = new Set(["pending_delete"]);
+const DELETE_CLEANUP_SOURCE_AUTHORITIES = new Set(["verified_bundle"]);
 const DELETE_CLEANUP_STATES = new Set([
     "reserved",
     "marked",
@@ -67,15 +60,6 @@ const ARCHIVE_RELATIVE_PATH_RE =
 const TOMBSTONE_RELATIVE_PATH_RE =
     /^\.retention\/tombstones\/(?![^/]*\.\.)[A-Za-z0-9][A-Za-z0-9._@-]{0,127}\.json$/u;
 const CLEANUP_MARKER_NONCE_RE = /^[a-f0-9]{64}$/u;
-const RECOVERY_OPERATION_STATES = new Set([
-    "eligible",
-    "running",
-    "started",
-    "waiting",
-    "skipped",
-    "blocked",
-    "failed",
-]);
 const MAX_RECOVERY_DAEMON_LEASE_MS = 10 * 60_000;
 
 function requireString(value, field, maximum = 512) {
@@ -870,7 +854,7 @@ export class ResourceCatalogRepository {
             FROM investigation_tombstones
             ORDER BY investigation_id
         `).all()) {
-            const parsedTombstone = this.#rowToTombstone(tombstone);
+            this.#rowToTombstone(tombstone);
             if (this.#db.prepare(`
                 SELECT 1 AS present
                 FROM investigations
@@ -880,39 +864,6 @@ export class ResourceCatalogRepository {
                     "catalog contains both a live investigation and tombstone for one identity",
                     { investigationId: tombstone.investigation_id },
                 );
-            }
-            const deleteCleanup = this.#db.prepare(`
-                SELECT *
-                FROM investigation_delete_cleanup
-                WHERE investigation_id = ?
-            `).get(tombstone.investigation_id);
-            if (deleteCleanup !== undefined) {
-                const parsedCleanup =
-                    this.#rowToDeleteCleanup(deleteCleanup);
-                const durable = parsedTombstone.tombstone;
-                if (parsedCleanup.authorityKind
-                        !== "legacy_tombstone"
-                    || parsedCleanup.archiveDigest
-                        !== durable.archiveDigest
-                    || parsedCleanup.tombstoneRelativePath
-                        !== durable.relativePath
-                    || parsedCleanup.tombstoneDigest
-                        !== durable.digest
-                    || parsedCleanup.signingKeyFingerprint
-                        !== durable.signingKeyFingerprint
-                    || parsedCleanup.signature !== durable.signature
-                    || parsedCleanup.tombstoneSizeBytes
-                        !== durable.sizeBytes
-                    || parsedCleanup.deletedAtMs
-                        !== durable.deletedAtMs) {
-                    throw new SchemaIntegrityError(
-                        "legacy tombstone cleanup is inconsistent with durable tombstone authority",
-                        {
-                            investigationId:
-                                tombstone.investigation_id,
-                        },
-                    );
-                }
             }
         }
         const orphanCleanup = this.#db.prepare(`
@@ -1090,25 +1041,6 @@ export class ResourceCatalogRepository {
                     activeHistoryCount: activeHistory.length,
                 },
             );
-        }
-        for (const row of this.#db.prepare(`
-            SELECT o.*, d.daemon_generation AS incarnation_generation
-            FROM recovery_operations AS o
-            JOIN recovery_daemon_incarnations AS d
-              ON d.daemon_incarnation = o.daemon_incarnation
-            ORDER BY investigation_id
-        `).all()) {
-            if (!RECOVERY_OPERATION_STATES.has(row.operation_state)
-                || typeof row.operation_code !== "string"
-                || row.operation_code.length < 1
-                || row.operation_code.length > 128
-                || Number(row.daemon_generation)
-                    !== Number(row.incarnation_generation)) {
-                throw new SchemaIntegrityError(
-                    "recovery operation state is invalid",
-                    { investigationId: row.investigation_id },
-                );
-            }
         }
     }
 
@@ -1914,7 +1846,6 @@ export class ResourceCatalogRepository {
         nextCleanupState,
         archiveRemoved,
         investigationId,
-        allowLegacyMissingSource,
     }) {
         if (archiveRemoved) {
             if (pending.cleanup_state !== "durable") {
@@ -1935,12 +1866,7 @@ export class ResourceCatalogRepository {
             ["moved", "durability_pending"],
             ["durability_pending", "durable"],
         ]);
-        const normal = transitions.get(pending.cleanup_state)
-            === nextCleanupState;
-        const legacyMissing = allowLegacyMissingSource
-            && pending.cleanup_state === "reserved"
-            && nextCleanupState === "durability_pending";
-        if (!normal && !legacyMissing) {
+        if (transitions.get(pending.cleanup_state) !== nextCleanupState) {
             throw new FenceRejectedError(
                 "delete cleanup state transition is invalid",
                 {
@@ -1972,9 +1898,6 @@ export class ResourceCatalogRepository {
         signature,
         tombstoneSizeBytes,
         deletedAtMs,
-        sourceAuthority = "verified_bundle",
-        discoveredArchiveRelativePath = null,
-        archiveAbsent = false,
         nextCleanupState = null,
         archiveRemoved = false,
     } = {}) {
@@ -2031,22 +1954,9 @@ export class ResourceCatalogRepository {
             deletedAtMs,
             "deletedAtMs",
         );
-        if (!DELETE_CLEANUP_SOURCE_AUTHORITIES.has(sourceAuthority)) {
+        if (typeof archiveRemoved !== "boolean") {
             throw new InvalidArgumentError(
-                "sourceAuthority is invalid",
-                { sourceAuthority },
-            );
-        }
-        const discoveredPath = discoveredArchiveRelativePath === null
-            ? null
-            : requireArchiveRelativePath(
-                discoveredArchiveRelativePath,
-                "discoveredArchiveRelativePath",
-            );
-        if (typeof archiveAbsent !== "boolean"
-            || typeof archiveRemoved !== "boolean") {
-            throw new InvalidArgumentError(
-                "archiveAbsent/archiveRemoved must be boolean",
+                "archiveRemoved must be boolean",
             );
         }
         if (nextCleanupState !== null
@@ -2062,11 +1972,6 @@ export class ResourceCatalogRepository {
                 FROM investigations
                 WHERE investigation_id = ?
             `).get(investigationId);
-            const tombstone = this.#db.prepare(`
-                SELECT *
-                FROM investigation_tombstones
-                WHERE investigation_id = ?
-            `).get(investigationId);
             let pending = this.#db.prepare(`
                 SELECT *
                 FROM investigation_delete_cleanup
@@ -2074,115 +1979,10 @@ export class ResourceCatalogRepository {
             `).get(investigationId);
 
             if (investigation === undefined) {
-                if (operationToken !== null
-                    || tombstone === undefined
-                    || pending === undefined
-                    || pending.authority_kind !== "legacy_tombstone"
-                    || pending.archive_digest !== expectedDigest
-                    || pending.cleanup_relpath !== cleanupPath
-                    || pending.cleanup_marker_nonce
-                        !== cleanupMarkerNonce
-                    || pending.tombstone_relpath !== relativePath
-                    || pending.tombstone_digest !== durableDigest
-                    || pending.signing_key_fingerprint
-                        !== signingKeyFingerprint
-                    || pending.signature !== signature
-                    || Number(pending.tombstone_size_bytes)
-                        !== sizeBytes
-                    || Number(pending.deleted_at_ms) !== deleted
-                    || tombstone.archive_digest !== expectedDigest
-                    || tombstone.tombstone_relpath !== relativePath
-                    || tombstone.tombstone_digest !== durableDigest) {
-                    throw new FenceRejectedError(
-                        "legacy tombstone cleanup lost exact catalog authority",
-                        { investigationId },
-                    );
-                }
-                if (pending.source_authority === "legacy_discovery") {
-                    if (discoveredPath !== null) {
-                        const expectedMarker = cleanupMarkerDigest({
-                            investigationId,
-                            archiveRelativePath: discoveredPath,
-                            cleanupRelativePath: cleanupPath,
-                            archiveDigest: expectedDigest,
-                            nonce: cleanupMarkerNonce,
-                        });
-                        if (markerDigest !== expectedMarker
-                            || archiveAbsent) {
-                            throw new FenceRejectedError(
-                                "legacy discovery marker binding is invalid",
-                                { investigationId },
-                            );
-                        }
-                        this.#assertRetentionPathReservation({
-                            relativePath: discoveredPath,
-                            investigationId,
-                            allowedOwnSources: [],
-                        });
-                        this.#db.prepare(`
-                            UPDATE investigation_delete_cleanup
-                            SET source_authority = 'verified_bundle',
-                                archive_relpath = ?,
-                                archive_absent = 0,
-                                cleanup_marker_digest = ?
-                            WHERE investigation_id = ?
-                        `).run(
-                            discoveredPath,
-                            markerDigest,
-                            investigationId,
-                        );
-                        this.#advanceLifecycleGeneration();
-                    } else if (archiveAbsent) {
-                        if (Number(pending.archive_absent) !== 1
-                            || pending.cleanup_state === "reserved") {
-                            this.#db.prepare(`
-                                UPDATE investigation_delete_cleanup
-                                SET archive_absent = 1,
-                                    cleanup_state = 'durability_pending'
-                                WHERE investigation_id = ?
-                            `).run(investigationId);
-                            this.#advanceLifecycleGeneration();
-                        }
-                    } else if (nextCleanupState !== null
-                        || archiveRemoved) {
-                        throw new FenceRejectedError(
-                            "legacy archive discovery must be resolved first",
-                            { investigationId },
-                        );
-                    }
-                    pending = this.#db.prepare(`
-                        SELECT *
-                        FROM investigation_delete_cleanup
-                        WHERE investigation_id = ?
-                    `).get(investigationId);
-                }
-                const changed = this.#advanceDeleteCleanupState({
-                    pending,
-                    nextCleanupState,
-                    archiveRemoved,
-                    investigationId,
-                    allowLegacyMissingSource:
-                        pending.source_authority
-                            === "legacy_preverified",
-                });
-                if (archiveRemoved) {
-                    this.#db.prepare(`
-                        DELETE FROM investigation_delete_cleanup
-                        WHERE investigation_id = ?
-                    `).run(investigationId);
-                    this.#advanceLifecycleGeneration();
-                    return Object.freeze({
-                        changed: true,
-                        cleanupPending: false,
-                        investigation:
-                            this.getInvestigation(investigationId),
-                    });
-                }
-                return Object.freeze({
-                    changed,
-                    cleanupPending: true,
-                    investigation: this.getInvestigation(investigationId),
-                });
+                throw new FenceRejectedError(
+                    "delete cleanup requires a current archived investigation",
+                    { investigationId },
+                );
             }
 
             requireString(operationToken, "operationToken", 256);
@@ -2239,13 +2039,9 @@ export class ResourceCatalogRepository {
                 archiveDigest: expectedDigest,
                 nonce: cleanupMarkerNonce,
             });
-            if ((pending === undefined
-                    && sourceAuthority !== "verified_bundle")
-                || (pending !== undefined
-                    && sourceAuthority !== pending.source_authority)
-                || markerDigest !== expectedMarker
-                || discoveredPath !== null
-                || archiveAbsent) {
+            if ((pending !== undefined
+                    && pending.source_authority !== "verified_bundle")
+                || markerDigest !== expectedMarker) {
                 throw new FenceRejectedError(
                     "pending delete cleanup binding is invalid",
                     { investigationId },
@@ -2253,7 +2049,7 @@ export class ResourceCatalogRepository {
             }
             const pendingMatches = pending !== undefined
                 && pending.authority_kind === "pending_delete"
-                && pending.source_authority === sourceAuthority
+                && pending.source_authority === "verified_bundle"
                 && pending.archive_relpath === archivePath
                 && pending.cleanup_relpath === cleanupPath
                 && pending.archive_digest === expectedDigest
@@ -2334,7 +2130,6 @@ export class ResourceCatalogRepository {
                 nextCleanupState,
                 archiveRemoved,
                 investigationId,
-                allowLegacyMissingSource: false,
             });
             if (!archiveRemoved) {
                 return Object.freeze({
@@ -2384,7 +2179,6 @@ export class ResourceCatalogRepository {
                 "DELETE FROM leases WHERE investigation_id = ?",
             ).run(investigationId);
             for (const table of [
-                "recovery_operations",
                 "storage_reconciliations",
                 "storage_usage",
                 "investigation_limits",
@@ -2621,100 +2415,6 @@ export class ResourceCatalogRepository {
         });
     }
 
-    recordRecoveryOperation({
-        lease,
-        investigationId,
-        state,
-        code,
-        supervisorGeneration = null,
-        runnerIncarnation = null,
-    } = {}) {
-        const credentials = this.#normalizeRecoveryDaemonCredentials(lease);
-        requireString(investigationId, "investigationId", 128);
-        if (!RECOVERY_OPERATION_STATES.has(state)) {
-            throw new InvalidArgumentError(
-                "recovery operation state is invalid",
-                { state },
-            );
-        }
-        const operationCode = requireString(code, "code", 128);
-        const hasSupervisorGeneration = supervisorGeneration !== null;
-        const hasRunnerIncarnation = runnerIncarnation !== null;
-        if (hasSupervisorGeneration !== hasRunnerIncarnation) {
-            throw new InvalidArgumentError(
-                "supervisorGeneration and runnerIncarnation must be provided together",
-            );
-        }
-        const normalizedGeneration = hasSupervisorGeneration
-            ? requireSafeInteger(
-                supervisorGeneration,
-                "supervisorGeneration",
-                { minimum: 1 },
-            )
-            : null;
-        const normalizedIncarnation = hasRunnerIncarnation
-            ? requireString(
-                runnerIncarnation,
-                "runnerIncarnation",
-                256,
-            )
-            : null;
-        return this.#tx(() => {
-            const nowMs = this.#timestamp();
-            this.#assertCurrentRecoveryDaemonInTransaction(
-                credentials,
-                nowMs,
-            );
-            this.#requireInvestigationInTransaction(investigationId);
-            this.#db.prepare(`
-                INSERT INTO recovery_operations(
-                    investigation_id, daemon_generation, daemon_incarnation,
-                    operation_state, operation_code, supervisor_generation,
-                    runner_incarnation, attempt_count, updated_at_ms)
-                VALUES(?, ?, ?, ?, ?, ?, ?, 1, ?)
-                ON CONFLICT(investigation_id) DO UPDATE SET
-                    daemon_generation = excluded.daemon_generation,
-                    daemon_incarnation = excluded.daemon_incarnation,
-                    operation_state = excluded.operation_state,
-                    operation_code = excluded.operation_code,
-                    supervisor_generation = excluded.supervisor_generation,
-                    runner_incarnation = excluded.runner_incarnation,
-                    attempt_count = recovery_operations.attempt_count + 1,
-                    updated_at_ms = excluded.updated_at_ms
-            `).run(
-                investigationId,
-                credentials.daemonGeneration,
-                credentials.daemonIncarnation,
-                state,
-                operationCode,
-                normalizedGeneration,
-                normalizedIncarnation,
-                nowMs,
-            );
-            return this.getRecoveryOperation(investigationId);
-        });
-    }
-
-    getRecoveryOperation(investigationId) {
-        requireString(investigationId, "investigationId", 128);
-        const row = this.#db.prepare(`
-            SELECT *
-            FROM recovery_operations
-            WHERE investigation_id = ?
-        `).get(investigationId);
-        return row === undefined
-            ? null
-            : this.#rowToRecoveryOperation(row);
-    }
-
-    listRecoveryOperations() {
-        return Object.freeze(this.#db.prepare(`
-            SELECT *
-            FROM recovery_operations
-            ORDER BY investigation_id
-        `).all().map((row) => this.#rowToRecoveryOperation(row)));
-    }
-
     #rowToInvestigation(row) {
         return Object.freeze({
             investigationId: row.investigation_id,
@@ -2870,40 +2570,18 @@ export class ResourceCatalogRepository {
                 { investigationId: row.investigation_id },
             );
         }
-        if (row.source_authority === "legacy_discovery") {
-            if (row.archive_relpath !== null
-                || row.cleanup_marker_digest !== null
-                || (Number(row.archive_absent) === 1
-                    && !["durability_pending", "durable"].includes(
-                        row.cleanup_state,
-                    ))) {
-                throw new SchemaIntegrityError(
-                    "legacy discovery cleanup state is inconsistent",
-                    { investigationId: row.investigation_id },
-                );
-            }
-        } else {
-            const expectedMarkerDigest = cleanupMarkerDigest({
-                investigationId: row.investigation_id,
-                archiveRelativePath: row.archive_relpath,
-                cleanupRelativePath: row.cleanup_relpath,
-                archiveDigest: row.archive_digest,
-                nonce: row.cleanup_marker_nonce,
-            });
-            if (row.archive_relpath === null
-                || Number(row.archive_absent) !== 0
-                || row.cleanup_marker_digest
-                    !== expectedMarkerDigest) {
-                throw new SchemaIntegrityError(
-                    "catalog cleanup marker binding is inconsistent",
-                    { investigationId: row.investigation_id },
-                );
-            }
-        }
-        if (row.authority_kind === "pending_delete"
-            && row.source_authority === "legacy_discovery") {
+        const expectedMarkerDigest = cleanupMarkerDigest({
+            investigationId: row.investigation_id,
+            archiveRelativePath: row.archive_relpath,
+            cleanupRelativePath: row.cleanup_relpath,
+            archiveDigest: row.archive_digest,
+            nonce: row.cleanup_marker_nonce,
+        });
+        if (row.archive_relpath === null
+            || Number(row.archive_absent) !== 0
+            || row.cleanup_marker_digest !== expectedMarkerDigest) {
             throw new SchemaIntegrityError(
-                "pending delete cleanup cannot require archive discovery",
+                "catalog cleanup marker binding is inconsistent",
                 { investigationId: row.investigation_id },
             );
         }
@@ -3935,34 +3613,6 @@ export class ResourceCatalogRepository {
             expiresAtMs: numberFromSql(
                 row.expires_at_ms,
                 "recoveryDaemon.expiresAtMs",
-            ),
-        });
-    }
-
-    #rowToRecoveryOperation(row) {
-        return Object.freeze({
-            investigationId: row.investigation_id,
-            daemonGeneration: numberFromSql(
-                row.daemon_generation,
-                "recoveryOperation.daemonGeneration",
-            ),
-            daemonIncarnation: row.daemon_incarnation,
-            state: row.operation_state,
-            code: row.operation_code,
-            supervisorGeneration: row.supervisor_generation === null
-                ? null
-                : numberFromSql(
-                    row.supervisor_generation,
-                    "recoveryOperation.supervisorGeneration",
-                ),
-            runnerIncarnation: row.runner_incarnation ?? null,
-            attemptCount: numberFromSql(
-                row.attempt_count,
-                "recoveryOperation.attemptCount",
-            ),
-            updatedAtMs: numberFromSql(
-                row.updated_at_ms,
-                "recoveryOperation.updatedAtMs",
             ),
         });
     }

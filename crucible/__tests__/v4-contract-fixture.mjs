@@ -190,7 +190,6 @@ const DEFAULT_CASES = Object.freeze({
     search: Object.freeze([["search-case", snapshot("3"), "accept"]]),
     confirmation: Object.freeze([["confirmation-case", snapshot("4"), "accept"]]),
     challenge: Object.freeze([["challenge-case", snapshot("5"), "reject"]]),
-    novelty: Object.freeze([["novelty-case", snapshot("6"), "accept"]]),
 });
 
 function roleIdentity(role, cases, executesCandidateCode = false) {
@@ -392,7 +391,6 @@ export function buildHarnessSuiteForAllowlist(
         "search",
         "confirmation",
         "challenge",
-        "novelty",
     ]) {
         const ids = roleCaseIds[role];
         roles[role] = roleSpec(role, ids);
@@ -643,91 +641,4 @@ export function makeV4ContractInput(overrides = {}) {
         ...base,
         ...overrides,
     };
-}
-
-export function upgradeLegacyContractInput(input) {
-    const topology = input.hypothesisTopology ?? "open_generative";
-    const candidatesPerRound = input.candidatesPerRound ?? 1;
-    const maxRounds = input.maxRounds ?? 1;
-    const ids = input.boundedCandidateIds
-        ?? Array.from(
-            { length: candidatesPerRound * maxRounds },
-            (_unused, index) => `candidate-${index}`,
-        );
-    const manifest = input.enumerandManifest
-        ?? fakeEnumerandManifest(topology, ids);
-    const legacyCalibration = Array.isArray(input.validationCases)
-        && input.validationCases.length >= 2
-        ? input.validationCases.map((item) => [
-            item.id,
-            item.artifactHash,
-            item.expectation,
-        ])
-        : DEFAULT_CASES.calibration;
-    const suite = input.harnessSuite ?? fakeHarnessSuiteV4({
-        includeVerifier: topology === "certified_impossibility",
-        verifierSandboxPolicyDigest:
-            input.verifierSandboxPolicyDigest ?? null,
-        cases: {
-            ...DEFAULT_CASES,
-            calibration: legacyCalibration,
-        },
-    });
-    const predicateThresholds = new Map();
-    const visitPredicate = (predicate) => {
-        if (predicate?.kind === "metric_compare") {
-            predicateThresholds.set(predicate.metric, predicate.value);
-        }
-        for (const child of predicate?.predicates ?? []) visitPredicate(child);
-        if (predicate?.predicate !== undefined) visitPredicate(predicate.predicate);
-    };
-    visitPredicate(input.acceptancePredicate);
-    const oldMetrics = Array.isArray(input.metrics) && input.metrics.length > 0
-        ? input.metrics
-        : [{ key: "score", direction: "max", epsilon: 0.01 }];
-    const registry = input.observableRegistry ?? oldMetrics.map((metric) => ({
-        key: metric.key,
-        kind: "numeric",
-        minimum: 0,
-        maximum: Math.max(
-            100,
-            Math.ceil(Math.abs(predicateThresholds.get(metric.key) ?? 0)),
-        ),
-    }));
-    const registryByKey = new Map(registry.map((item) => [item.key, item]));
-    const statisticalMetrics = oldMetrics.map((metric) => ({
-        key: metric.key,
-        minimum: registryByKey.get(metric.key)?.minimum ?? 0,
-        maximum: registryByKey.get(metric.key)?.maximum ?? 1,
-        estimand: `${metric.key} versus control`,
-        unit: metric.key,
-        direction: metric.direction,
-        acceptanceThreshold: predicateThresholds.get(metric.key)
-            ?? (metric.direction === "min" ? 0.2 : 0.8),
-        practicalEquivalenceDelta: Math.max(metric.epsilon ?? 0.01, 0.000001),
-        family: "primary",
-    }));
-    return makeV4ContractInput({
-        objective: input.objective,
-        acceptancePredicate: input.acceptancePredicate,
-        hypothesisTopology: topology,
-        criticality: input.criticality,
-        policyVersion: input.policyVersion,
-        workerModels: input.workerModels,
-        candidatesPerRound,
-        maxRounds,
-        searchPolicy: input.searchPolicy,
-        observableRegistry: registry,
-        hypothesisPolicy: input.hypothesisPolicy ?? fakeHypothesisPolicy(),
-        statisticalPolicy: input.statisticalPolicy ?? fakeStatisticalPolicy({
-                topology,
-                searchSlots: manifest?.entries.length
-                    ?? candidatesPerRound * maxRounds,
-                manifest,
-                metrics: statisticalMetrics,
-            }),
-        harnessSuite: suite,
-        harnessSuiteIdentity: computeHarnessSuiteV4Identity(suite),
-        ...(manifest === null ? {} : { enumerandManifest: manifest }),
-    });
 }

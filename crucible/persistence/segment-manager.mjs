@@ -24,33 +24,11 @@ import {
     SCHEMA_VERSION,
 } from "./schema.mjs";
 
-export const SEGMENT_CATALOG_TYPE = "crucible-event-segment-catalog";
-export const SEGMENT_CATALOG_VERSION = 1;
-export const SEGMENT_SCHEMA_VERSION = 1;
-export const DEFAULT_SEGMENT_EVENT_THRESHOLD = 50_000;
-export const DEFAULT_SEGMENT_BYTE_THRESHOLD = 256 * 1024 * 1024;
-
-export const SEGMENT_SEAL_STAGES = Object.freeze([
-    "after-prepare",
-    "after-segment-seal",
-    "after-segment-publish",
-    "after-manifest-publish",
-    "after-active-prune",
-    "after-active-commit",
-]);
-
-export const SEGMENT_MANAGER_INTEGRATION_NOTES = Object.freeze({
-    active:
-        "The caller-supplied repository SQLite file remains the sole writable active segment and stays in WAL/FULL mode. Sealed events.<index>.sqlite files are immutable read-only authorities.",
-    quiescence:
-        "Call rotateEventSegment only after the runtime has fenced concurrent effects and reached a scheduler quiescence point. The manager also takes SQLite BEGIN IMMEDIATE and rotates only after an event-count or stored-byte threshold is met.",
-    crashRecovery:
-        "Rotation publishes a durable prepare journal, seals and fsyncs the segment, CAS-publishes the canonical catalog, then prunes the sealed duplicate rows from active. Recovery chooses the old catalog or completes the published catalog; it never guesses.",
-    replay:
-        "Repository and domain-adapter reads merge the sealed chain with active by global investigation sequence. Hashes, terminal closure, evidence idempotency keys, and artifact event references remain authoritative across boundaries.",
-    bundles:
-        "Bundle export inventories the catalog and every sealed segment. Read-only open, result verification, and bundle import authenticate every segment file and the cross-segment anchors before replay.",
-});
+const SEGMENT_CATALOG_TYPE = "crucible-event-segment-catalog";
+const SEGMENT_CATALOG_VERSION = 1;
+const SEGMENT_SCHEMA_VERSION = 1;
+const DEFAULT_SEGMENT_EVENT_THRESHOLD = 50_000;
+const DEFAULT_SEGMENT_BYTE_THRESHOLD = 256 * 1024 * 1024;
 
 const UTF8 = new TextDecoder("utf-8", { fatal: true });
 const HEX64_RE = /^[0-9a-f]{64}$/u;
@@ -849,7 +827,7 @@ function stemForDatabase(file) {
     return requireSafeBasename(parsed.name || "events", "database stem");
 }
 
-export function segmentCatalogPathFor(databaseFile, explicit = undefined) {
+function segmentCatalogPathFor(databaseFile, explicit = undefined) {
     if (typeof explicit === "string" && explicit.length > 0) {
         return path.resolve(explicit);
     }
@@ -1161,18 +1139,6 @@ export class EventSegmentManager {
             manager.#loadCatalog({ allowMissing: false, forceVerify: true });
         }
         return manager;
-    }
-
-    get catalogFile() {
-        return this.#catalogFile;
-    }
-
-    get journalFile() {
-        return this.#journalFile;
-    }
-
-    get readOnly() {
-        return this.#readOnly;
     }
 
     configureThresholds({
@@ -1579,14 +1545,6 @@ export class EventSegmentManager {
             outcome: published ? "published" : "rolled_back",
             index: journal.descriptor.index,
         };
-    }
-
-    catalog({ verify = false } = {}) {
-        const loaded = this.#loadCatalog({
-            allowMissing: this.#readOnly,
-            forceVerify: verify,
-        });
-        return JSON.parse(canonicalize(loaded.catalog));
     }
 
     snapshot({ verify = true } = {}) {

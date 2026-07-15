@@ -42,7 +42,6 @@ function contract(metrics, { maxBlocks = 2 } = {}) {
 function candidate(id, intervals, {
     blockCount = 1,
     requiredPredictionState = "SUPPORTED",
-    contentCharacter = null,
 } = {}) {
     const claims = Object.entries(intervals).map(
         ([key, confidenceSequence]) => ({
@@ -97,18 +96,6 @@ function candidate(id, intervals, {
                 status: requiredPredictionState,
             }],
         },
-        novelty: contentCharacter === null
-            ? null
-            : {
-                content: {
-                    signature: tagged(
-                        "sha256:crucible-content-novelty-v1",
-                        contentCharacter,
-                    ),
-                },
-                structural: null,
-                behavioral: null,
-            },
     };
 }
 
@@ -304,17 +291,17 @@ describe("v4 candidate cohort relations", () => {
         });
     });
 
-    it("is invariant to candidate arrival permutations and carries prediction/novelty evidence", () => {
+    it("is invariant to candidate arrival permutations and carries prediction evidence", () => {
         const policy = contract([
             metric({ key: "score", priority: 0 }),
         ]);
         const candidates = [
             candidate("bravo", {
                 score: { lower: 0.8, upper: 0.81 },
-            }, { contentCharacter: "b" }),
+            }),
             candidate("alpha", {
                 score: { lower: 0.6, upper: 0.61 },
-            }, { contentCharacter: "a" }),
+            }),
         ];
         const forward = deriveCandidateCohortComparison({
             contract: policy,
@@ -332,11 +319,6 @@ describe("v4 candidate cohort relations", () => {
                 predictions: {
                     left: { requiredState: "SUPPORTED" },
                     right: { requiredState: "SUPPORTED" },
-                },
-                novelty: {
-                    sameContent: false,
-                    leftSignatures: [expect.stringMatching(/^sha256:/u)],
-                    rightSignatures: [expect.stringMatching(/^sha256:/u)],
                 },
             }],
         });

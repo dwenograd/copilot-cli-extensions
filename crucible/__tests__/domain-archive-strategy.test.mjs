@@ -2,8 +2,6 @@ import { describe, expect, it } from "vitest";
 import {
     DEFAULT_SEARCH_POLICY,
     ESCAPE_SEARCH_OPERATORS,
-    CANDIDATE_NOVELTY_VERSION,
-    LEGACY_SEARCH_STRATEGY_POLICY_VERSION,
     SEARCH_STRATEGY_POLICY_VERSION,
     adaptiveOperatorWeights,
     buildCandidateArchive,
@@ -11,22 +9,13 @@ import {
     compareCandidateEvidence,
     contractHash,
     createInvestigationContract,
-    contentNoveltySignature,
     hashCanonical,
     selectAdaptiveOperator,
-    structuralRoleIdentity,
 } from "../domain/index.mjs";
 import { makeV4ContractInput } from "./v4-contract-fixture.mjs";
 
 function artifactHash(character) {
     return `sha256:${character.repeat(64)}`;
-}
-
-function structuralHash(label) {
-    return hashCanonical(
-        { structure: label },
-        "sha256:crucible-novelty-structural-v1",
-    );
 }
 
 function policy(overrides = {}) {
@@ -77,28 +66,10 @@ function evidence({
     duplicateOf = null,
     mechanism = null,
     finding = null,
-    structuralSignature = null,
-    behavioralSignature = null,
     round = 1,
     slotIndex = 0,
     invalidated = false,
 }) {
-    const novelty = {
-        version: CANDIDATE_NOVELTY_VERSION,
-        content: {
-            snapshotHash: artifact,
-            signature: contentNoveltySignature(artifact),
-        },
-        structural: structuralSignature === null
-            ? null
-            : { structuralFingerprint: structuralSignature },
-        behavioral: behavioralSignature === null
-            ? null
-            : {
-                signature: behavioralSignature,
-                claims: [],
-            },
-    };
     return {
         evidenceId,
         committedSeq,
@@ -112,7 +83,6 @@ function evidence({
         metrics: outcomeClass === "invalid_metrics" ? {} : { score },
         receipt: { candidateArtifactHash: artifact },
         duplicateOf,
-        novelty,
         annotations: {
             mechanism,
             hypothesis: null,
@@ -125,62 +95,12 @@ function evidence({
 
 function aggregateFor(items, searchPolicy, contractOptions = {}) {
     const frozenContract = contract(searchPolicy, contractOptions);
-    const roleFingerprint = structuralRoleIdentity(frozenContract);
-    const normalizedItems = items.map((item) => {
-        const structuralToken =
-            item.novelty.structural?.structuralFingerprint ?? null;
-        const structuralFeatures = structuralToken === null
-            ? null
-            : {
-                structureCode: Number(BigInt(
-                    `0x${structuralToken.slice(-12)}`,
-                )),
-            };
-        return {
-            ...item,
-            novelty: {
-                ...item.novelty,
-                structural: structuralFeatures === null
-                    ? null
-                    : {
-                        version: "crucible-novelty-role-adapter-v1",
-                        roleFingerprint,
-                        structuralFingerprint: hashCanonical({
-                            version: "crucible-novelty-role-adapter-v1",
-                            roleFingerprint,
-                            observableSchemaHash:
-                                frozenContract.harnessSuite.roles.novelty
-                                    .observableSchemaHash,
-                            features: structuralFeatures,
-                        }, "sha256:crucible-novelty-structural-v1"),
-                        features: structuralFeatures,
-                        receiptHash: hashCanonical(
-                            { evidenceId: item.evidenceId, receipt: "novelty" },
-                            "sha256:crucible-measurement-receipt-v1",
-                        ),
-                        measurementRoot: hashCanonical(
-                            {
-                                evidenceId: item.evidenceId,
-                                measurement: "novelty",
-                            },
-                            "sha256:crucible-evidence-measurement-provenance-v1",
-                        ),
-                        subjectId: `novelty-${
-                            item.receipt.candidateArtifactHash
-                                .split(":")
-                                .at(-1)
-                                .slice(0, 48)
-                        }`,
-                    },
-            },
-        };
-    });
     return {
         contract: frozenContract,
         contractHash: contractHash(frozenContract),
-        evidenceOrder: normalizedItems.map((item) => item.evidenceId),
+        evidenceOrder: items.map((item) => item.evidenceId),
         evidence: Object.fromEntries(
-            normalizedItems.map((item) => [item.evidenceId, item]),
+            items.map((item) => [item.evidenceId, item]),
         ),
     };
 }
@@ -414,64 +334,6 @@ describe("Crucible deterministic archive and strategy", () => {
         expect(ESCAPE_SEARCH_OPERATORS).toContain(escape);
     });
 
-    it("does not treat a lone behavioral profile as a supported difference", () => {
-        const searchPolicy = policy();
-        const incumbent = evidence({
-            evidenceId: "behavior-incumbent",
-            committedSeq: 1,
-            score: 100,
-            outcomeClass: "accepted",
-            artifact: hashCanonical({ artifact: "behavior-incumbent" }),
-        });
-        const near = evidence({
-            evidenceId: "behavior-near",
-            committedSeq: 2,
-            score: 99,
-            outcomeClass: "near_miss",
-            artifact: hashCanonical({ artifact: "behavior-near" }),
-        });
-        const archive = {
-            accepted: [incumbent],
-            nearMisses: [near],
-            rejected: [],
-            inconclusive: [],
-            invalidMetrics: [],
-            noveltyNiches: {
-                content: [],
-                structural: [],
-                behavioral: [],
-            },
-            mechanismGroups: [],
-            lessonGroups: [],
-            duplicateIndex: {},
-            incumbent,
-        };
-        const oneProfile = {
-            ...archive,
-            noveltyNiches: {
-                ...archive.noveltyNiches,
-                behavioral: [{
-                    signature: hashCanonical(
-                        { behavior: "profile" },
-                        "sha256:crucible-behavioral-novelty-v1",
-                    ),
-                    representativeEvidenceId: incumbent.evidenceId,
-                    evidenceIds: [incumbent.evidenceId, near.evidenceId],
-                }],
-            },
-        };
-        const selection = {
-            searchPolicy,
-            contractHash: hashCanonical({ contract: "behavior-profile" }),
-            round: 2,
-            slotIndex: 0,
-        };
-        expect(adaptiveOperatorWeights(searchPolicy, oneProfile))
-            .toEqual(adaptiveOperatorWeights(searchPolicy, archive));
-        expect(selectAdaptiveOperator({ ...selection, archive: oneProfile }))
-            .toBe(selectAdaptiveOperator({ ...selection, archive }));
-    });
-
     it("uses versioned history-weight adaptation without overriding frozen weights", () => {
         const searchPolicy = policy();
         const incumbent = evidence({
@@ -510,21 +372,6 @@ describe("Crucible deterministic archive and strategy", () => {
         expect(refinementWeights.refinement)
             .toBeGreaterThan(baseWeights.refinement);
 
-        const {
-            version: _version,
-            ...legacySearchPolicy
-        } = searchPolicy;
-        expect(adaptiveOperatorWeights(
-            legacySearchPolicy,
-            archive,
-            "normal",
-            ["fresh"],
-        )).toEqual(adaptiveOperatorWeights(
-            legacySearchPolicy,
-            archive,
-            "normal",
-        ));
-
         const extremePolicy = policy({
             operatorWeights: {
                 fresh: 1_000_000,
@@ -560,10 +407,10 @@ describe("Crucible deterministic archive and strategy", () => {
         })).toThrow(/operator history/u);
     });
 
-    it("replays golden unversioned v1 commands and separates v2 authority", () => {
+    it("replays current versioned search commands deterministically", () => {
         function goldenContract(searchPolicy) {
             return createInvestigationContract(makeV4ContractInput({
-                objective: "golden legacy operator replay",
+                objective: "golden current operator replay",
                 candidatesPerRound: 1,
                 maxRounds: 64,
                 searchPolicy,
@@ -571,8 +418,8 @@ describe("Crucible deterministic archive and strategy", () => {
         }
         function goldenAggregate(frozenContract) {
             const parent = {
-                evidenceId: "legacy-parent",
-                observationId: "legacy-observation",
+                evidenceId: "current-parent",
+                observationId: "current-observation",
                 committedSeq: 1,
                 sourceKind: "harness",
                 purpose: "candidate",
@@ -586,7 +433,6 @@ describe("Crucible deterministic archive and strategy", () => {
                 metrics: { score: 75 },
                 receipt: { candidateArtifactHash: null },
                 duplicateOf: null,
-                novelty: null,
                 annotations: {
                     mechanism: null,
                     hypothesis: null,
@@ -601,12 +447,12 @@ describe("Crucible deterministic archive and strategy", () => {
                 evidenceOrder: [parent.evidenceId],
                 evidence: { [parent.evidenceId]: parent },
                 observations: {
-                    "legacy-observation": {
-                        commandId: "legacy-command",
+                    "current-observation": {
+                        commandId: "current-command",
                     },
                 },
                 commands: {
-                    "legacy-command": {
+                    "current-command": {
                         command: {
                             kind: "search_candidate",
                             operator: "fresh",
@@ -616,35 +462,12 @@ describe("Crucible deterministic archive and strategy", () => {
             };
         }
 
-        const {
-            version: _version,
-            ...legacySearchPolicy
-        } = policy();
-        const legacyContract = goldenContract(legacySearchPolicy);
-        const legacy = buildSearchCandidateCommand(
-            goldenAggregate(legacyContract),
-            { nextRound: 2, nextSlot: 0 },
-        );
-        expect(legacyContract.searchPolicy).not.toHaveProperty("version");
-        expect({
-            strategyPolicyVersion:
-                legacyContract.searchPolicy.version
-                ?? LEGACY_SEARCH_STRATEGY_POLICY_VERSION,
-            operator: legacy.operator,
-            seed: legacy.seed,
-            subjectIndex: legacy.replicationSchedule.subject.index,
-            scheduleHash: legacy.replicationSchedule.scheduleHash,
-        }).toEqual({
-            strategyPolicyVersion: LEGACY_SEARCH_STRATEGY_POLICY_VERSION,
-            operator: "fresh",
-            seed: 522677298,
-            subjectIndex: 3,
-            scheduleHash:
-                "sha256:crucible-replication-schedule-v1:48108a0c568034a54839dfe073918a601da79d7c5a21c8727de8f16f89a43fa4",
-        });
-
         const currentContract = goldenContract(policy());
         const current = buildSearchCandidateCommand(
+            goldenAggregate(currentContract),
+            { nextRound: 2, nextSlot: 0 },
+        );
+        const replayed = buildSearchCandidateCommand(
             goldenAggregate(currentContract),
             { nextRound: 2, nextSlot: 0 },
         );
@@ -652,15 +475,17 @@ describe("Crucible deterministic archive and strategy", () => {
             .toBe(SEARCH_STRATEGY_POLICY_VERSION);
         expect({
             operator: current.operator,
-            seed: current.seed,
             subjectIndex: current.replicationSchedule.subject.index,
-            scheduleHash: current.replicationSchedule.scheduleHash,
         }).toEqual({
             operator: "adversarial",
-            seed: 1122524115,
             subjectIndex: 3,
-            scheduleHash:
-                "sha256:crucible-replication-schedule-v1:f668285179a85cea5065571b1441da7b3f089510b57624a494ad7d1aef315cf1",
+        });
+        expect({
+            seed: current.seed,
+            scheduleHash: current.replicationSchedule.scheduleHash,
+        }).toEqual({
+            seed: replayed.seed,
+            scheduleHash: replayed.replicationSchedule.scheduleHash,
         });
     });
 
@@ -786,7 +611,7 @@ describe("Crucible deterministic archive and strategy", () => {
         expect(invalidOnlyWeights.adversarial).toBe(0);
     });
 
-    it("assigns crossover two distinct parents and prefers different structural signatures", () => {
+    it("assigns crossover two distinct content parents", () => {
         const crossoverPolicy = policy({
             operatorWeights: {
                 fresh: 1,
@@ -804,7 +629,6 @@ describe("Crucible deterministic archive and strategy", () => {
             outcomeClass: "accepted",
             artifact: hashCanonical({ artifact: "incumbent" }),
             mechanism: "mechanism-a",
-            structuralSignature: structuralHash("a"),
         });
         const near = evidence({
             evidenceId: "near",
@@ -813,7 +637,6 @@ describe("Crucible deterministic archive and strategy", () => {
             outcomeClass: "near_miss",
             artifact: hashCanonical({ artifact: "near" }),
             mechanism: "mechanism-b",
-            structuralSignature: structuralHash("b"),
         });
         const aggregate = aggregateFor([incumbent, near], crossoverPolicy);
         let command = null;
@@ -827,54 +650,6 @@ describe("Crucible deterministic archive and strategy", () => {
         expect(command.operator).toBe("crossover");
         expect(command.parentEvidenceIds).toEqual(["incumbent", "near"]);
         expect(new Set(command.parentEvidenceIds).size).toBe(2);
-    });
-
-    it("prefers two represented structural niches even when the incumbent has none", () => {
-        const crossoverPolicy = policy({
-            operatorWeights: {
-                fresh: 1,
-                refinement: 0,
-                crossover: 1_000_000,
-                diversification: 1,
-                adversarial: 0,
-                restart: 1,
-            },
-        });
-        const incumbent = evidence({
-            evidenceId: "incumbent-without-mechanism",
-            committedSeq: 1,
-            score: 100,
-            outcomeClass: "accepted",
-            artifact: hashCanonical({ artifact: "incumbent-without-mechanism" }),
-        });
-        const nearA = evidence({
-            evidenceId: "near-a",
-            committedSeq: 2,
-            score: 99,
-            outcomeClass: "near_miss",
-            artifact: hashCanonical({ artifact: "near-a" }),
-            mechanism: "mechanism-a",
-            structuralSignature: structuralHash("a"),
-        });
-        const nearB = evidence({
-            evidenceId: "near-b",
-            committedSeq: 3,
-            score: 98,
-            outcomeClass: "near_miss",
-            artifact: hashCanonical({ artifact: "near-b" }),
-            mechanism: "mechanism-b",
-            structuralSignature: structuralHash("b"),
-        });
-        const aggregate = aggregateFor([incumbent, nearA, nearB], crossoverPolicy);
-        let command = null;
-        for (let round = 2; round < 100 && command?.operator !== "crossover"; round += 1) {
-            command = buildSearchCandidateCommand(aggregate, {
-                nextRound: round,
-                nextSlot: 0,
-            });
-        }
-        expect(command.operator).toBe("crossover");
-        expect(command.parentEvidenceIds).toEqual(["near-a", "near-b"]);
     });
 
     it("falls back deterministically when crossover cannot receive two parents", () => {
@@ -934,7 +709,6 @@ describe("Crucible deterministic archive and strategy", () => {
             artifact: hashCanonical({ artifact: "parent-a" }),
             mechanism: "first model label",
             finding: "first explanation",
-            structuralSignature: structuralHash("a"),
         });
         const secondParent = evidence({
             evidenceId: "parent-b",
@@ -944,7 +718,6 @@ describe("Crucible deterministic archive and strategy", () => {
             artifact: hashCanonical({ artifact: "parent-b" }),
             mechanism: "second model label",
             finding: "second explanation",
-            structuralSignature: structuralHash("b"),
         });
         const baseline = aggregateFor(
             [firstParent, secondParent],
@@ -1010,7 +783,6 @@ describe("Crucible deterministic archive and strategy", () => {
                 score: 100,
                 outcomeClass: "accepted",
                 artifact: hashCanonical({ artifact: "model-order-a" }),
-                structuralSignature: structuralHash("model-order-a"),
             }),
             evidence({
                 evidenceId: "parent-b",
@@ -1018,7 +790,6 @@ describe("Crucible deterministic archive and strategy", () => {
                 score: 99,
                 outcomeClass: "near_miss",
                 artifact: hashCanonical({ artifact: "model-order-b" }),
-                structuralSignature: structuralHash("model-order-b"),
             }),
         ];
         const firstAggregate = aggregateFor(

@@ -11,12 +11,10 @@ export const ERROR_CODES = Object.freeze({
     DUPLICATE_ID: "DUPLICATE_ID",
     TERMINAL_STATE: "TERMINAL_STATE",
     UNAUTHORIZED_DECISION: "UNAUTHORIZED_DECISION",
-    EVIDENCE_NOT_FOUND: "EVIDENCE_NOT_FOUND",
     INVALID_EVIDENCE: "INVALID_EVIDENCE",
     NO_DECISION_EVENT: "NO_DECISION_EVENT",
     INVESTIGATION_NOT_OPEN: "INVESTIGATION_NOT_OPEN",
     DOMAIN_VERSION_RESTART_REQUIRED: "DOMAIN_VERSION_RESTART_REQUIRED",
-    RESTART_REQUIRED: "DOMAIN_VERSION_RESTART_REQUIRED",
 });
 
 export class DomainError extends Error {
@@ -58,11 +56,9 @@ export class DecisionError extends DomainError {
     }
 }
 
-export class RestartRequiredError extends DomainError {
+class RestartRequiredError extends DomainError {
     constructor(message, details = null) {
         super(ERROR_CODES.DOMAIN_VERSION_RESTART_REQUIRED, message, {
-            compatibility: "legacy_incompatible",
-            legacyIncompatible: true,
             restartRequired: true,
             requiredAction: "start_new_investigation",
             ...details,

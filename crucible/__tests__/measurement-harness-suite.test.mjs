@@ -47,9 +47,6 @@ const CASES = Object.freeze({
     challenge: Object.freeze([
         ["challenge-reject", snapshot("e"), "reject"],
     ]),
-    novelty: Object.freeze([
-        ["novelty-accept", snapshot("f"), "accept"],
-    ]),
 });
 
 function roleIdentity(role, cases = CASES[role] ?? []) {
@@ -143,9 +140,9 @@ function clone(value) {
 describe("HarnessSuiteV4 normalization and identity", () => {
     it("requires every primary role", () => {
         const suite = baseSuite();
-        delete suite.roles.novelty;
+        delete suite.roles.search;
         expect(() => normalizeHarnessSuiteV4(suite))
-            .toThrow(/roles\.novelty is required/u);
+            .toThrow(/roles\.search is required/u);
     });
 
     it("rejects held-out byte overlap with search/calibration manifests", () => {
@@ -181,8 +178,8 @@ describe("HarnessSuiteV4 normalization and identity", () => {
             .toBe(computeHarnessSuiteV4Identity(suite));
 
         const changed = clone(suite);
-        changed.roles.novelty.caseManifest[0].snapshotHash = snapshot("9");
-        changed.operatorCorpus.cases["novelty-accept"].snapshotHash =
+        changed.roles.challenge.caseManifest[0].snapshotHash = snapshot("9");
+        changed.operatorCorpus.cases["challenge-reject"].snapshotHash =
             snapshot("9");
         expect(computeHarnessSuiteV4Identity(changed))
             .not.toBe(computeHarnessSuiteV4Identity(suite));
@@ -497,7 +494,7 @@ describe("HarnessSuiteV4 parser/receipt binding", () => {
             metrics: { score: 7 },
             ...binding,
         }), { expectedBinding: binding });
-        const receipt = buildMeasurementReceipt(receiptInput(parsed));
+        const receipt = buildMeasurementReceipt(receiptInput(parsed, binding));
         expect(receipt.version).toBe(HARNESS_SUITE_RECEIPT_VERSION);
         expect(receipt).toMatchObject(binding);
         expect(projectDeterministicReceipt(receipt)).toMatchObject(binding);
@@ -507,7 +504,7 @@ describe("HarnessSuiteV4 parser/receipt binding", () => {
             subjectId: "candidate-99",
         }))).toThrow(/binding disagrees/u);
 
-        const wrongParser = receiptInput(parsed);
+        const wrongParser = receiptInput(parsed, binding);
         wrongParser.parserIdentity = {
             ...wrongParser.parserIdentity,
             sourceHash: tagged("wrong-parser-source"),

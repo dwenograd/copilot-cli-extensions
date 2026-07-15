@@ -1,5 +1,4 @@
 import { hashCanonical } from "./canonical.mjs";
-import { commandBudget } from "./contract.mjs";
 import {
     EVENT_TYPES,
     NON_RESULT_CODES,
@@ -51,18 +50,11 @@ function nextEvidenceId(aggregate) {
     return `evidence-${String(aggregate.evidenceOrder.length + 1).padStart(6, "0")}`;
 }
 
-function budgetIsExhausted(aggregate) {
-    const budget = commandBudget(aggregate.contract);
-    return budget !== null && aggregate.commandOrder.length >= budget;
-}
-
-function budgetRecommendation(aggregate, reason, details = null) {
-    const budget = commandBudget(aggregate.contract);
+function searchExhaustionRecommendation(aggregate, reason, details = null) {
     const payload = {
         code: NON_RESULT_CODES.BUDGET_EXHAUSTED_INCONCLUSIVE,
         reason,
         commandCount: aggregate.commandOrder.length,
-        commandBudget: budget,
         maxRounds: aggregate.contract.maxRounds,
         sourceStopRequestSeq: null,
         ...(details === null ? {} : { scientificState: details }),
@@ -115,7 +107,6 @@ function impossibilityNonResultRecommendation(aggregate, evidence) {
                 ? "The independent impossibility verifier could not close the frozen evidence."
                 : "The independent impossibility verifier produced an invalid result.",
         commandCount: aggregate.commandOrder.length,
-        commandBudget: commandBudget(aggregate.contract),
         maxRounds: aggregate.contract.maxRounds,
         sourceStopRequestSeq: null,
         certificateVerdict,
@@ -139,7 +130,6 @@ function impossibilityEvidenceIncompleteRecommendation(aggregate, verification) 
         reason:
             "The frozen calibration, control, search, or alpha-ledger evidence is incomplete; the independent verifier was not run.",
         commandCount: aggregate.commandOrder.length,
-        commandBudget: commandBudget(aggregate.contract),
         maxRounds: aggregate.contract.maxRounds,
         sourceStopRequestSeq: null,
         certificateVerdict: "inconclusive",
@@ -174,7 +164,6 @@ function scientificConfirmationFailureRecommendation(
         code: NON_RESULT_CODES.SCIENTIFIC_CONFIRMATION_FAILED,
         reason,
         commandCount: aggregate.commandOrder.length,
-        commandBudget: commandBudget(aggregate.contract),
         maxRounds: aggregate.contract.maxRounds,
         sourceStopRequestSeq: null,
         cohortStatus: cohort.status,
@@ -219,7 +208,6 @@ function scientificReadinessFailureRecommendation(
         code,
         reason,
         commandCount: aggregate.commandOrder.length,
-        commandBudget: commandBudget(aggregate.contract),
         maxRounds: aggregate.contract.maxRounds,
         sourceStopRequestSeq: null,
         cohortStatus: cohort?.status ?? null,
@@ -364,7 +352,6 @@ function independentVerificationRecommendation(aggregate, basis, readiness) {
         reason:
             "Search-space exhaustion is not authority for TARGET_UNREACHABLE; an independent impossibility verifier must supply trusted evidence.",
         commandCount: aggregate.commandOrder.length,
-        commandBudget: commandBudget(aggregate.contract),
         maxRounds: aggregate.contract.maxRounds,
         sourceStopRequestSeq: null,
         basis,
@@ -659,7 +646,6 @@ function validationInconclusiveRecommendation(aggregate) {
         reason:
             "The operator-signed calibration suite did not resolve every required role/case claim to its expected state within the frozen block limit.",
         commandCount: aggregate.commandOrder.length,
-        commandBudget: commandBudget(aggregate.contract),
         maxRounds: aggregate.contract.maxRounds,
         sourceStopRequestSeq: null,
         validationAttemptCount: attempts.length,
@@ -902,12 +888,6 @@ export function decideNext(aggregate) {
         if (nextValidationAttemptIndex(aggregate) === null) {
             return validationInconclusiveRecommendation(aggregate);
         }
-        if (budgetIsExhausted(aggregate)) {
-            return budgetRecommendation(
-                aggregate,
-                "Declared command budget was exhausted before current validation completed.",
-            );
-        }
         return reserveCommandRecommendation(aggregate);
     }
 
@@ -966,16 +946,6 @@ export function decideNext(aggregate) {
         const scientificCommand =
             nextScientificConfirmationCommand(aggregate);
         if (scientificCommand !== null) {
-            if (budgetIsExhausted(aggregate)) {
-                return scientificConfirmationFailureRecommendation(
-                    aggregate,
-                    frozenEvidence,
-                    frozenCohort,
-                    frozenConfirmation.discoveryClosure.basis,
-                    assessVerifiedResultReadiness(aggregate, frozenCohort),
-                    "The declared command budget was exhausted after discovery froze and before every confirmation/challenge role closed.",
-                );
-            }
             return reserveFrozenScientificCommand(
                 aggregate,
                 scientificCommand,
@@ -1004,48 +974,6 @@ export function decideNext(aggregate) {
             frozenConfirmation.discoveryClosure.basis,
             assessVerifiedResultReadiness(aggregate, frozenCohort),
             "The frozen confirmation protocol reached an impossible incomplete state.",
-        );
-    }
-
-    if (budgetIsExhausted(aggregate)) {
-        const basis = {
-            kind: "budget_exhausted_without_supported_cohort",
-            commandCount: aggregate.commandOrder.length,
-            commandBudget: commandBudget(aggregate.contract),
-        };
-        if (!supportedCohort) {
-            const predictionFailure = blockedPredictionRecommendation(
-                aggregate,
-                candidateCohort,
-                basis,
-            );
-            if (predictionFailure !== null) return predictionFailure;
-            if (candidateCohort?.tieResolution?.required === true) {
-                return unresolvedCohortRecommendation(
-                    aggregate,
-                    candidateCohort,
-                    basis,
-                );
-            }
-            return budgetRecommendation(
-                aggregate,
-                "Declared command budget was exhausted without a supported candidate cohort.",
-                candidateCohort,
-            );
-        }
-        return freezeScientificConfirmationRecommendation(
-            aggregate,
-            cohortEvidence,
-            candidateCohort,
-            {
-                kind: "budget_exhausted_with_supported_cohort",
-                commandCount: aggregate.commandOrder.length,
-                commandBudget: commandBudget(aggregate.contract),
-                cohortComparisonHash:
-                    candidateCohort.comparisonHash,
-                relationEvidenceHash:
-                    candidateCohort.relationEvidenceHash,
-            },
         );
     }
 
@@ -1099,7 +1027,7 @@ export function decideNext(aggregate) {
                     basis,
                 );
             }
-            return budgetRecommendation(
+            return searchExhaustionRecommendation(
                 aggregate,
                 "Frozen search rounds were exhausted without a supported candidate cohort.",
                 candidateCohort,

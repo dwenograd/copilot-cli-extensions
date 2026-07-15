@@ -440,26 +440,6 @@ export function normalizeReplicationSchedule(value) {
     return immutableCanonical({ ...core, scheduleHash });
 }
 
-export function assertReplicationScheduleMatches({
-    schedule,
-    contractHash,
-    statisticalPolicy,
-    subject,
-    arms = null,
-}) {
-    const normalized = normalizeReplicationSchedule(schedule);
-    const expected = deriveReplicationSchedule({
-        contractHash,
-        statisticalPolicy,
-        subject,
-        arms,
-    });
-    if (!canonicalEqual(normalized, expected)) {
-        fail("replication schedule does not match the frozen contract and subject");
-    }
-    return normalized;
-}
-
 export function assertReplicationSchedulePolicyBinding({
     schedule,
     contractHash,

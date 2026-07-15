@@ -537,24 +537,18 @@ export function deriveTerminalEvidenceClosure(
                 evidence.evidenceId,
             ))
         : [];
-    const scientificConclusion = decisiveKind === "winner"
-        && decisiveEvidenceItems.length === 1
-        ? deriveScientificConclusion(
-            aggregate,
-            decisiveEvidenceItems[0].evidenceId,
-        )
-        : decisiveKind === "candidate_cohort"
-            && candidateConclusions.length === 1
-            ? candidateConclusions[0]
-            : decisiveKind === "impossibility_certificate"
-                && coverageSummary !== null
-                && verifier !== null
-                ? unreachableConclusion(
-                    aggregate,
-                    coverageSummary,
-                    verifier,
-                )
-                : null;
+    const scientificConclusion = decisiveKind === "candidate_cohort"
+        && candidateConclusions.length === 1
+        ? candidateConclusions[0]
+        : decisiveKind === "impossibility_certificate"
+            && coverageSummary !== null
+            && verifier !== null
+            ? unreachableConclusion(
+                aggregate,
+                coverageSummary,
+                verifier,
+            )
+            : null;
     const core = {
         version: TERMINAL_EVIDENCE_CLOSURE_VERSION,
         authority: terminalAuthorityClosure(aggregate),

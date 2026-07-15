@@ -108,8 +108,6 @@ export const IMPOSSIBILITY_REQUEST_HASH_ALGORITHM =
     "sha256:crucible-impossibility-request-v2";
 export const IMPOSSIBILITY_PROPOSAL_HASH_ALGORITHM =
     "sha256:crucible-impossibility-certificate-proposal-v1";
-export const IMPOSSIBILITY_SEARCH_EVIDENCE_HASH_ALGORITHM =
-    "sha256:crucible-impossibility-search-evidence-v2";
 export const IMPOSSIBILITY_CALIBRATION_EVIDENCE_HASH_ALGORITHM =
     "sha256:crucible-impossibility-calibration-evidence-v1";
 export const IMPOSSIBILITY_CONTROL_EVIDENCE_HASH_ALGORITHM =
@@ -168,25 +166,11 @@ export const IMPOSSIBILITY_CHECKER_STATUSES = Object.freeze([
     "INCONCLUSIVE",
     "INVALID",
 ]);
-export const IMPOSSIBILITY_VERDICTS = Object.freeze([
-    "target_unreachable",
-    "not_proven",
-    "inconclusive",
-    "invalid",
-]);
 export const DEFAULT_IMPOSSIBILITY_POLICY = Object.freeze({
     trigger: "search_exhausted",
     requestVersion: IMPOSSIBILITY_REQUEST_VERSION,
     certificateVersion: IMPOSSIBILITY_CERTIFICATE_VERSION,
 });
-
-export const CANDIDATE_OUTCOME_CLASSES = Object.freeze([
-    "accepted",
-    "near_miss",
-    "rejected",
-    "inconclusive",
-    "invalid_metrics",
-]);
 
 export const VALIDATION_HARNESS_ROLES = Object.freeze([
     "calibration",
@@ -210,14 +194,8 @@ export const ESCAPE_SEARCH_OPERATORS = Object.freeze([
     "restart",
 ]);
 
-export const LEGACY_SEARCH_STRATEGY_POLICY_VERSION =
-    "crucible-search-strategy-v1";
 export const SEARCH_STRATEGY_POLICY_VERSION =
     "crucible-search-strategy-v2";
-export const SEARCH_STRATEGY_POLICY_VERSIONS = Object.freeze([
-    LEGACY_SEARCH_STRATEGY_POLICY_VERSION,
-    SEARCH_STRATEGY_POLICY_VERSION,
-]);
 
 export const DEFAULT_SEARCH_POLICY = Object.freeze({
     version: SEARCH_STRATEGY_POLICY_VERSION,
@@ -271,10 +249,8 @@ export const EVENT_TYPES = Object.freeze({
     COMMAND_DISPATCHED: "command_dispatched",
     COMMAND_OBSERVED: "command_observed",
     EVIDENCE_COMMITTED: "evidence_committed",
-    EVIDENCE_INVALIDATED: "evidence_invalidated",
     VALIDATION_COMPLETED: "validation_completed",
     SCIENTIFIC_CONFIRMATION_FROZEN: "scientific_confirmation_frozen",
-    SEARCH_STRATEGY_REVISED: "search_strategy_revised",
     STORAGE_BUDGET_EXHAUSTED: "storage_budget_exhausted",
     STOP_REQUESTED: "stop_requested",
     INVESTIGATION_PAUSED: "investigation_paused",
@@ -289,7 +265,6 @@ export const EVENT_VOCABULARY = Object.freeze(Object.values(EVENT_TYPES));
 export const EXTERNAL_EVENT_TYPES = Object.freeze([
     EVENT_TYPES.CAPABILITY_EPOCH_RECORDED,
     EVENT_TYPES.COMMAND_DISPATCHED,
-    EVENT_TYPES.EVIDENCE_INVALIDATED,
     EVENT_TYPES.STORAGE_BUDGET_EXHAUSTED,
     EVENT_TYPES.STOP_REQUESTED,
 ]);
@@ -298,48 +273,14 @@ export const KERNEL_DECISION_EVENT_TYPES = Object.freeze([
     EVENT_TYPES.COMMAND_RESERVED,
     EVENT_TYPES.VALIDATION_COMPLETED,
     EVENT_TYPES.SCIENTIFIC_CONFIRMATION_FROZEN,
-    EVENT_TYPES.SEARCH_STRATEGY_REVISED,
     EVENT_TYPES.INVESTIGATION_PAUSED,
     EVENT_TYPES.NON_RESULT_RECORDED,
     EVENT_TYPES.VERIFIED_RESULT,
     EVENT_TYPES.TARGET_UNREACHABLE,
 ]);
 
-export const KERNEL_CONTROL_EVENT_TYPES = Object.freeze([
-    EVENT_TYPES.INVESTIGATION_RESUMED,
-]);
-
-export const EVIDENCE_EVENT_TYPES = Object.freeze([
-    EVENT_TYPES.COMMAND_OBSERVED,
-    EVENT_TYPES.EVIDENCE_COMMITTED,
-    EVENT_TYPES.EVIDENCE_INVALIDATED,
-]);
-
-export const TERMINAL_EVENT_TYPES = Object.freeze([
-    EVENT_TYPES.VERIFIED_RESULT,
-    EVENT_TYPES.TARGET_UNREACHABLE,
-]);
-
-export const EVENT_CATEGORIES = Object.freeze({
-    observations: Object.freeze([
-        EVENT_TYPES.INVESTIGATION_OPENED,
-        EVENT_TYPES.CAPABILITY_EPOCH_RECORDED,
-        EVENT_TYPES.COMMAND_DISPATCHED,
-        EVENT_TYPES.COMMAND_OBSERVED,
-        EVENT_TYPES.STOP_REQUESTED,
-    ]),
-    evidence: EVIDENCE_EVENT_TYPES,
-    decisions: Object.freeze([
-        ...KERNEL_DECISION_EVENT_TYPES,
-        ...KERNEL_CONTROL_EVENT_TYPES,
-    ]),
-    terminalDecisions: TERMINAL_EVENT_TYPES,
-});
-
 export const SOURCE_KINDS = Object.freeze([
     "harness",
-    "model_review",
-    "operator_observation",
 ]);
 
 export const EVIDENCE_PURPOSES = Object.freeze([

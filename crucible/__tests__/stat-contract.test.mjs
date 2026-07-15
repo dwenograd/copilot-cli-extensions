@@ -2,7 +2,6 @@ import { describe, expect, it } from "vitest";
 
 import {
     DEFAULT_SEARCH_POLICY,
-    LEGACY_SEARCH_STRATEGY_POLICY_VERSION,
     SEARCH_STRATEGY_POLICY_VERSION,
     contractHash,
     createInvestigationContract,
@@ -23,27 +22,19 @@ function clone(value) {
 }
 
 describe("frozen statistical contract", () => {
-    it("versions new search authority while preserving unversioned v1 contracts", () => {
+    it("requires the current search authority version", () => {
         const current = createInvestigationContract(makeV4ContractInput());
         expect(current.searchPolicy.version)
             .toBe(SEARCH_STRATEGY_POLICY_VERSION);
 
-        const legacyInput = makeV4ContractInput();
+        const unversioned = makeV4ContractInput();
         const {
             version: _version,
-            ...legacySearchPolicy
-        } = legacyInput.searchPolicy;
-        legacyInput.searchPolicy = legacySearchPolicy;
-        const legacy = createInvestigationContract(legacyInput);
-        expect(legacy.searchPolicy).not.toHaveProperty("version");
-
-        const explicitLegacyInput = makeV4ContractInput();
-        explicitLegacyInput.searchPolicy.version =
-            LEGACY_SEARCH_STRATEGY_POLICY_VERSION;
-        expect(createInvestigationContract(explicitLegacyInput).searchPolicy)
-            .toMatchObject({
-                version: LEGACY_SEARCH_STRATEGY_POLICY_VERSION,
-            });
+            ...unversionedSearchPolicy
+        } = unversioned.searchPolicy;
+        unversioned.searchPolicy = unversionedSearchPolicy;
+        expect(() => createInvestigationContract(unversioned))
+            .toThrow(/searchPolicy.*canonical fields|version/u);
 
         const unknown = makeV4ContractInput();
         unknown.searchPolicy.version = "crucible-search-strategy-v999";
@@ -152,11 +143,6 @@ describe("frozen statistical contract", () => {
     });
 
     it("requires goal/topology roles, finite bounds, and the matching control", () => {
-        const missingRole = makeV4ContractInput();
-        delete missingRole.harnessSuite.roles.novelty;
-        expect(() => createInvestigationContract(missingRole))
-            .toThrow(/roles\.novelty is required|role "novelty" is required/u);
-
         const missingVerifier = makeV4ContractInput({
             hypothesisTopology: "certified_impossibility",
             harnessSuite: fakeHarnessSuiteV4({ includeVerifier: false }),

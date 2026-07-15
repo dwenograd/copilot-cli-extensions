@@ -209,7 +209,14 @@ class DuplicateKeyScanner {
     }
 }
 
-export function parseImpossibilityVerifierResult(raw, options = {}) {
+export function parseImpossibilityVerifierResult(
+    raw,
+    {
+        request,
+        requestHash,
+        expectedBinding,
+    } = {},
+) {
     const parsed = strictJson(raw);
     if (parsed === null
         || typeof parsed !== "object"
@@ -242,9 +249,9 @@ export function parseImpossibilityVerifierResult(raw, options = {}) {
             armId: null,
             parserVersion: VERIFIER_PARSER_VERSION,
         }, {
-            request: options.request ?? null,
-            requestHash: options.requestHash ?? null,
-            binding: options.expectedBinding ?? null,
+            request,
+            requestHash,
+            binding: expectedBinding,
         });
     } catch (error) {
         parseFailure(

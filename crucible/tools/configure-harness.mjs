@@ -59,9 +59,9 @@ import {
 import { hashCanonical } from "../domain/canonical.mjs";
 import { assertLocalDatabasePath, openArtifactStore } from "../persistence/index.mjs";
 
-export const CONFIGURE_SCHEMA_VERSION = 1;
+const CONFIGURE_SCHEMA_VERSION = 1;
 
-export const CONFIGURE_ERROR_CODES = Object.freeze({
+const CONFIGURE_ERROR_CODES = Object.freeze({
     USAGE: "CRUCIBLE_CONFIGURE_USAGE",
     CONFIG_NOT_FOUND: "CRUCIBLE_CONFIGURE_CONFIG_NOT_FOUND",
     CONFIG_TOO_LARGE: "CRUCIBLE_CONFIGURE_CONFIG_TOO_LARGE",
@@ -80,7 +80,7 @@ export const CONFIGURE_ERROR_CODES = Object.freeze({
     WRITE_FAILED: "CRUCIBLE_CONFIGURE_WRITE_FAILED",
 });
 
-export class ConfigureHarnessError extends Error {
+class ConfigureHarnessError extends Error {
     constructor(code, message, details = null) {
         super(message);
         this.name = "ConfigureHarnessError";
@@ -186,9 +186,8 @@ function rejectUnknownKeys(obj, allowed, field) {
     }
 }
 
-// Read + strict-parse a config file. Kept separate so tests can exercise the
-// malformed-input paths without a full run.
-export function loadConfigFile(configPath) {
+// Read and strict-parse a config file before any output is written.
+function loadConfigFile(configPath) {
     if (typeof configPath !== "string" || configPath.trim().length === 0) {
         fail(CONFIGURE_ERROR_CODES.USAGE, "--config <path> is required");
     }
@@ -665,7 +664,7 @@ function verifySourceDir(sourceDir, caseId, env) {
 // Resolve the output allowlist path: an explicit --allowlist wins, otherwise
 // the per-user default under %LOCALAPPDATA%. The path must be absolute and on
 // a trusted local filesystem.
-export function resolveOutputAllowlistPath(explicitPath, env) {
+function resolveOutputAllowlistPath(explicitPath, env) {
     let raw;
     if (typeof explicitPath === "string" && explicitPath.trim().length > 0) {
         raw = explicitPath;
@@ -693,7 +692,7 @@ export function resolveOutputAllowlistPath(explicitPath, env) {
     }
 }
 
-export function resolveOperatorCorpusStorePath(
+function resolveOperatorCorpusStorePath(
     explicitPath,
     allowlistPath,
     env,
@@ -727,7 +726,7 @@ export function resolveOperatorCorpusStorePath(
 // file is malformed rather than silently discarding operator entries.
 function loadExistingEntries(allowlistPath) {
     if (!fs.existsSync(allowlistPath)) {
-        return { existed: false, entries: {}, suites: {} };
+        return { entries: {}, suites: {} };
     }
     let loaded;
     try {
@@ -747,7 +746,7 @@ function loadExistingEntries(allowlistPath) {
     for (const id of loaded.listSuiteIds()) {
         suites[id] = loaded.getSuite(id);
     }
-    return { existed: true, entries, suites, loaded };
+    return { entries, suites, loaded };
 }
 
 // Convert a loader-normalized entry back into the strict on-disk entry shape,
@@ -887,7 +886,7 @@ function atomicWriteWithBackup(targetPath, contentString) {
         });
     }
     fsyncDirBestEffort(dir);
-    return { backupPath, existed };
+    return { backupPath };
 }
 
 // --- core -----------------------------------------------------------------
@@ -939,11 +938,17 @@ function trustedParserIdentity(role) {
  * Validation bytes remain in the durable operator corpus CAS created while
  * authoring the entries; this operation binds their immutable ids and labels.
  */
-export function configureHarnessSuite(options = {}) {
+function configureHarnessSuite(options = {}) {
     const env = options.env ?? process.env;
     const replace = options.replace === true;
     if (options.config !== undefined && options.configPath !== undefined) {
         fail(CONFIGURE_ERROR_CODES.USAGE, "pass either config or configPath, not both");
+    }
+    if (options.caseStorePath !== undefined) {
+        fail(
+            CONFIGURE_ERROR_CODES.USAGE,
+            "--case-store is not supported for suite configs",
+        );
     }
     const rawConfig = options.config !== undefined
         ? options.config
@@ -1414,7 +1419,7 @@ function sortedEntries(entries) {
 
 // --- CLI -------------------------------------------------------------------
 
-export function parseArgs(argv) {
+function parseArgs(argv) {
     const out = {
         config: undefined,
         allowlist: undefined,
@@ -1463,7 +1468,7 @@ Options:
   --replace           Allow replacing changed executable/corpus/suite identity.
   -h, --help          Show this help.`;
 
-export function main(argv = process.argv.slice(2), { env = process.env, stdout = process.stdout, stderr = process.stderr } = {}) {
+function main(argv = process.argv.slice(2), { env = process.env, stdout = process.stdout, stderr = process.stderr } = {}) {
     let args;
     try {
         args = parseArgs(argv);

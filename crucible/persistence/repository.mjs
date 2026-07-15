@@ -11,7 +11,7 @@
 //     event hash, at-most-one terminal event, compare-and-swap batch append.
 //   * Idempotent evidence ingestion with conflict detection.
 //   * Durable command lifecycle with fencing tokens / lease ownership.
-//   * Inline + external artifact metadata with a durability gate on external
+//   * External artifact metadata with a durability gate
 //     references (the filesystem CAS itself lives elsewhere).
 //   * Read-only query methods that never repair or mutate.
 //   * Structural integrity verification (no domain-policy recomputation).
@@ -46,7 +46,6 @@ import {
     inspectCanonicalJson,
     normalizeCreatedAt,
     parseCanonicalJson,
-    sha256Hex,
     GENESIS_PREV_HASH,
 } from "./canonical.mjs";
 import {
@@ -365,10 +364,6 @@ export class EventRepository {
         return this.#readOnly;
     }
 
-    get segmentCatalogFile() {
-        return this.#segments.catalogFile;
-    }
-
     configureWorkingSet(policy) {
         if (policy === null || typeof policy !== "object" || Array.isArray(policy)) {
             throw new InvalidArgumentError("working-set policy must be an object");
@@ -579,10 +574,6 @@ export class EventRepository {
         return sealedCount + Number(row.c);
     }
 
-    getSegmentCatalog({ verify = false } = {}) {
-        return this.#segments.catalog({ verify });
-    }
-
     getSegmentStorageSnapshot({ verify = true } = {}) {
         return this.#segments.snapshot({ verify });
     }
@@ -711,10 +702,6 @@ export class EventRepository {
             lastCheckpoint: this.#lastWalCheckpoint,
             lastCheckpointError: this.#lastWalCheckpointError,
         });
-    }
-
-    verifySegmentChain() {
-        return this.#segments.verify();
     }
 
     rotateEventSegment(options = {}) {
@@ -3237,11 +3224,10 @@ export class EventRepository {
                     this.#db.prepare(`
                         INSERT INTO artifacts(
                             artifact_id, investigation_id, storage, content_type,
-                            size_bytes, inline_blob, hash_algo, hash_value,
-                            durable, created_at)
+                            size_bytes, hash_algo, hash_value, durable, created_at)
                         VALUES(
-                            :id, :inv, 'external', :ct, :size, NULL, :algo,
-                            :hash, 1, :at)`).run({
+                            :id, :inv, 'external', :ct, :size, :algo, :hash,
+                            1, :at)`).run({
                         id: artifactId,
                         inv: investigationId,
                         ct: contentType,
@@ -3421,33 +3407,6 @@ export class EventRepository {
         });
     }
 
-    putInlineArtifact({ investigationId, artifactId, bytes, contentType = null } = {}) {
-        requireNonEmptyString(investigationId, "investigationId");
-        requireNonEmptyString(artifactId, "artifactId");
-        const buf = this.#coerceBytes(bytes);
-
-        return this.#tx(() => {
-            this.#requireInvestigation(investigationId);
-            const createdAt = this.#timestamp("artifact.createdAt");
-            try {
-                this.#db.prepare(`
-                    INSERT INTO artifacts(
-                        artifact_id, investigation_id, storage, content_type, size_bytes,
-                        inline_blob, hash_algo, hash_value, durable, created_at)
-                    VALUES(:id, :inv, 'inline', :ct, :size, :blob, NULL, NULL, 1, :at)`).run({
-                    id: artifactId, inv: investigationId, ct: contentType,
-                    size: buf.length, blob: buf, at: createdAt,
-                });
-            } catch (err) {
-                throw this.#translateArtifactInsert(err, artifactId);
-            }
-            return {
-                artifactId, investigationId, storage: "inline", contentType,
-                sizeBytes: buf.length, sha256: sha256Hex(buf), durable: true, createdAt,
-            };
-        });
-    }
-
     registerExternalArtifact({ investigationId, artifactId, algo, hash, sizeBytes = null, contentType = null } = {}) {
         requireNonEmptyString(investigationId, "investigationId");
         requireNonEmptyString(artifactId, "artifactId");
@@ -3461,8 +3420,8 @@ export class EventRepository {
                 this.#db.prepare(`
                     INSERT INTO artifacts(
                         artifact_id, investigation_id, storage, content_type, size_bytes,
-                        inline_blob, hash_algo, hash_value, durable, created_at)
-                    VALUES(:id, :inv, 'external', :ct, :size, NULL, :algo, :hash, 0, :at)`).run({
+                        hash_algo, hash_value, durable, created_at)
+                    VALUES(:id, :inv, 'external', :ct, :size, :algo, :hash, 0, :at)`).run({
                     id: artifactId, inv: investigationId, ct: contentType,
                     size: sizeBytes, algo, hash, at: createdAt,
                 });
@@ -3487,22 +3446,6 @@ export class EventRepository {
             }
             return this.getArtifact(artifactId);
         });
-    }
-
-    // Bind an artifact to the investigation (optionally to an event seq).
-    // External artifacts must be marked durable first; the repository refuses to
-    // reference a non-durable external artifact (the filesystem CAS that makes
-    // it durable is intentionally out of scope here).
-    referenceArtifact({ investigationId, artifactId, seq = null } = {}) {
-        requireNonEmptyString(investigationId, "investigationId");
-        requireNonEmptyString(artifactId, "artifactId");
-
-        return this.#tx(() => this.#referenceArtifactInTransaction({
-            investigationId,
-            artifactId,
-            seq,
-            createdAt: this.#timestamp("artifactReference.createdAt"),
-        }));
     }
 
     #normalizeArtifactIds(value, field) {
@@ -3641,21 +3584,6 @@ export class EventRepository {
         return row ? this.#rowToArtifactMeta(row) : null;
     }
 
-    getInlineArtifact(artifactId) {
-        requireNonEmptyString(artifactId, "artifactId");
-        const row = this.#db
-            .prepare("SELECT * FROM artifacts WHERE artifact_id = ?")
-            .get(artifactId);
-        if (!row) {
-            throw new NotFoundError(ERROR_CODES.ARTIFACT_NOT_FOUND, `unknown artifact '${artifactId}'`, { artifactId });
-        }
-        if (row.storage !== "inline") {
-            throw new InvalidArgumentError("artifact is not inline", { artifactId, storage: row.storage });
-        }
-        const bytes = Buffer.from(row.inline_blob);
-        return { ...this.#rowToArtifactMeta(row), bytes };
-    }
-
     listArtifactRefs(investigationId) {
         requireNonEmptyString(investigationId, "investigationId");
         return this.#db
@@ -3705,16 +3633,6 @@ export class EventRepository {
         };
     }
 
-    #coerceBytes(bytes) {
-        if (Buffer.isBuffer(bytes)) {
-            return bytes;
-        }
-        if (bytes instanceof Uint8Array) {
-            return Buffer.from(bytes);
-        }
-        throw new InvalidArgumentError("bytes must be a Buffer or Uint8Array", { type: typeof bytes });
-    }
-
     #translateArtifactInsert(err, artifactId) {
         if (isUniqueViolation(err)) {
             return new CruciblePersistenceError(
@@ -3727,44 +3645,6 @@ export class EventRepository {
             return new StorageError(`artifact insert failed: ${err.message}`, err);
         }
         return err;
-    }
-
-    // --- projection metadata ----------------------------------------------
-
-    getProjectionCheckpoint({ name, investigationId = "*" } = {}) {
-        requireNonEmptyString(name, "name");
-        const row = this.#db
-            .prepare("SELECT * FROM projection_metadata WHERE projection_name = ? AND investigation_id = ?")
-            .get(name, investigationId);
-        if (!row) {
-            return { projectionName: name, investigationId, lastAppliedSeq: 0, checkpoint: null, updatedAt: null };
-        }
-        return {
-            projectionName: row.projection_name,
-            investigationId: row.investigation_id,
-            lastAppliedSeq: Number(row.last_applied_seq),
-            checkpoint: row.checkpoint === null ? null : JSON.parse(row.checkpoint),
-            updatedAt: row.updated_at,
-        };
-    }
-
-    setProjectionCheckpoint({ name, investigationId = "*", lastAppliedSeq, checkpoint = null } = {}) {
-        requireNonEmptyString(name, "name");
-        if (!Number.isInteger(lastAppliedSeq) || lastAppliedSeq < 0) {
-            throw new InvalidArgumentError("lastAppliedSeq must be a non-negative integer", { lastAppliedSeq });
-        }
-        const checkpointJson = checkpoint === null ? null : canonicalize(checkpoint);
-        return this.#tx(() => {
-            const updatedAt = this.#timestamp("projection.updatedAt");
-            this.#db.prepare(`
-                INSERT INTO projection_metadata(projection_name, investigation_id, last_applied_seq, checkpoint, updated_at)
-                VALUES(:name, :inv, :seq, :cp, :at)
-                ON CONFLICT(projection_name, investigation_id)
-                DO UPDATE SET last_applied_seq = :seq, checkpoint = :cp, updated_at = :at`).run({
-                name, inv: investigationId, seq: lastAppliedSeq, cp: checkpointJson, at: updatedAt,
-            });
-            return this.getProjectionCheckpoint({ name, investigationId });
-        });
     }
 
     // --- integrity verification (read-only) --------------------------------
@@ -3913,26 +3793,16 @@ export class EventRepository {
                     detail: `artifact '${ref.artifact_id}' belongs to a different investigation`,
                 });
             }
-            if (art.storage === "external" && art.durable !== 1) {
+            if (art.storage !== "external") {
+                violations.push({
+                    code: ERROR_CODES.INTEGRITY_VIOLATION,
+                    detail: `artifact '${ref.artifact_id}' has unsupported storage '${art.storage}'`,
+                });
+            } else if (art.durable !== 1) {
                 violations.push({
                     code: ERROR_CODES.ARTIFACT_NOT_DURABLE,
                     detail: `referenced external artifact '${ref.artifact_id}' is not durable`,
                 });
-            }
-            if (art.storage === "inline" && art.inline_blob === null) {
-                violations.push({
-                    code: ERROR_CODES.INTEGRITY_VIOLATION,
-                    detail: `inline artifact '${ref.artifact_id}' has no blob`,
-                });
-            } else if (art.storage === "inline") {
-                const bytes = Buffer.from(art.inline_blob);
-                if (!Number.isSafeInteger(Number(art.size_bytes))
-                    || Number(art.size_bytes) !== bytes.length) {
-                    violations.push({
-                        code: ERROR_CODES.INTEGRITY_VIOLATION,
-                        detail: `inline artifact '${ref.artifact_id}' size metadata does not match its blob`,
-                    });
-                }
             }
             if (ref.seq !== null) {
                 const ev = this.getEvent(investigationId, Number(ref.seq));

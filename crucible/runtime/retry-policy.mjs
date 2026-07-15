@@ -24,7 +24,6 @@ import {
     requireString,
 } from "./utils.mjs";
 
-export const SDK_RETRY_POLICY_VERSION = 1;
 export const SDK_RETRY_BUDGET_VERSION = 1;
 export const SDK_SUBMISSION_COMMIT_VERSION = 1;
 export const SDK_OPERATIONAL_EVIDENCE_VERSION = 1;
@@ -135,19 +134,6 @@ export const SDK_RETRY_DISABLED_POLICY = Object.freeze({
     maxDelayMs: 0,
     maxCumulativeDelayMs: 0,
     jitterBps: 0,
-});
-
-export const SDK_RETRY_INTEGRATION_NOTES = Object.freeze({
-    policy:
-        "Normalize and freeze one retry budget before the first SDK effect. Retrying requires a finite absolute deadline; never extend attempts, delay, or cost after admission.",
-    identity:
-        "Pass the proposal-slot, domain command, and logical-effect ids from the frozen runner command. They remain identical across every recreated SDK session.",
-    submission:
-        "Inject a fenced durable submission journal. commit() must durably CAS the first valid tool payload before returning; recover() must run before any model call after restart.",
-    quarantine:
-        "Persist late, duplicate, conflicting, and sendAndWait-ambiguous responses as operational evidence. They never replace or recommit the first sealed payload.",
-    accounting:
-        "Reserve conservative model-cost units per admitted attempt. Reconcile monotonically to max(prior charge, all reserved attempt cost, summed SDK-reported cost); missing SDK usage never lowers the charge.",
 });
 
 function nonNegativeInteger(value, field, maximum = Number.MAX_SAFE_INTEGER) {
@@ -291,8 +277,6 @@ export function normalizeSdkOperationIdentity(input) {
         ),
     });
 }
-
-export const createSdkOperationIdentity = normalizeSdkOperationIdentity;
 
 export function createSdkRetryBudget({
     policy: policyInput = DEFAULT_SDK_RETRY_POLICY,
@@ -924,39 +908,6 @@ export function normalizeSdkSubmissionJournal(input) {
     });
 }
 
-export function createInMemorySdkSubmissionJournal() {
-    const records = new Map();
-    const quarantines = [];
-    const evidence = [];
-    return {
-        durable: false,
-        async recover({ operationIdentity }) {
-            const identity = normalizeSdkOperationIdentity(operationIdentity);
-            return records.get(identity.operationHash) ?? null;
-        },
-        async commit(record) {
-            const existing = records.get(record.operationHash);
-            if (existing !== undefined) {
-                return { status: "existing", record: existing };
-            }
-            records.set(record.operationHash, record);
-            return { status: "committed", record };
-        },
-        async quarantine(record) {
-            quarantines.push(record);
-        },
-        async recordEvidence(record) {
-            evidence.push(record);
-        },
-        snapshot() {
-            return {
-                records: new Map(records),
-                quarantines: [...quarantines],
-                evidence: [...evidence],
-            };
-        },
-    };
-}
 
 function createSubmissionCommitRecord({
     operationIdentity,

@@ -14,11 +14,10 @@ import {
     ESCAPE_SEARCH_OPERATORS,
     GOAL_MODES,
     HYPOTHESIS_TOPOLOGIES,
-    LEGACY_SEARCH_STRATEGY_POLICY_VERSION,
     MISSINGNESS_MODES,
     SEARCH_POLICY_LIMITS,
     SEARCH_OPERATORS,
-    SEARCH_STRATEGY_POLICY_VERSIONS,
+    SEARCH_STRATEGY_POLICY_VERSION,
     STATISTICAL_POLICY_HASH_ALGORITHM,
     STATISTICAL_METRIC_DIRECTIONS,
     STATISTICAL_POLICY_VERSION,
@@ -65,76 +64,7 @@ const FORBIDDEN_IDENTIFIERS = new Set([
     "constructor",
     "prototype",
 ]);
-const HARNESS_IDENTITY_KEYS = Object.freeze([
-    "allowedEnvHash",
-    "allowlistFileHash",
-    "allowlistVersion",
-    "argvTemplateHash",
-    "dependencyHashes",
-    "executesCandidateCode",
-    "executableHash",
-    "harnessEntryHash",
-    "harnessId",
-    "parserSourceHash",
-    "parserVersion",
-    "parserVersionHash",
-    "sandbox",
-    "version",
-]);
-const HARNESS_DEPENDENCY_KEYS = Object.freeze(["path", "role", "sha256"]);
-const HARNESS_SANDBOX_KEYS = Object.freeze([
-    "policyDigest",
-    "policyIdentity",
-    "required",
-]);
-const HARNESS_SANDBOX_IDENTITY_KEYS = Object.freeze([
-    "filesystem",
-    "helperBinaryHash",
-    "helperSourceHash",
-    "job",
-    "launcherBinaryHash",
-    "launcherId",
-    "launcherScriptHash",
-    "network",
-    "policyId",
-    "primitive",
-    "providerId",
-    "providerVersion",
-    "securityContext",
-]);
-const HARNESS_SANDBOX_SECURITY_CONTEXT_KEYS = Object.freeze([
-    "appContainer",
-    "capabilities",
-    "loopbackExemptionRejected",
-    "lowIntegrity",
-]);
-const HARNESS_SANDBOX_NETWORK_KEYS = Object.freeze([
-    "enforcement",
-    "mode",
-]);
-const HARNESS_SANDBOX_FILESYSTEM_KEYS = Object.freeze([
-    "aclJournalRestored",
-    "exactLaunchClosure",
-    "hostWriteDenied",
-    "immutableCandidate",
-    "outputTemp",
-    "stagedHarness",
-]);
-const HARNESS_SANDBOX_JOB_KEYS = Object.freeze([
-    "activeProcessLimit",
-    "cpuRatePercent",
-    "cpuTimeMs",
-    "descendantsContained",
-    "jobMemoryBytes",
-    "killOnJobClose",
-    "processMemoryBytes",
-    "terminationGraceMs",
-    "uiRestrictions",
-    "wallTimeMs",
-]);
-const SANDBOX_POLICY_IDENTITY_HASH_ALGORITHM =
-    "sha256:crucible-measurement-sandbox-policy-identity-v1";
-const LEGACY_SEARCH_POLICY_KEYS = Object.freeze([
+const SEARCH_POLICY_KEYS = Object.freeze([
     "archiveCaps",
     "dedupPolicy",
     "mandatoryEscapeRounds",
@@ -143,9 +73,6 @@ const LEGACY_SEARCH_POLICY_KEYS = Object.freeze([
     "plateauMinImprovement",
     "plateauWindow",
     "promptCaps",
-]);
-const VERSIONED_SEARCH_POLICY_KEYS = Object.freeze([
-    ...LEGACY_SEARCH_POLICY_KEYS,
     "version",
 ]);
 const ARCHIVE_CAP_KEYS = Object.freeze([
@@ -410,326 +337,6 @@ function requireTaggedSha256(value, field) {
         });
     }
     return value;
-}
-
-function normalizeHarnessDependencies(value) {
-        if (!Array.isArray(value) || value.length > 64) {
-            throw new ContractError("harnessIdentity.dependencyHashes must be an array of at most 64 items");
-        }
-        const paths = new Set();
-        return value.map((dependency, index) => {
-            const field = `harnessIdentity.dependencyHashes[${index}]`;
-            requireExactObjectKeys(dependency, field, HARNESS_DEPENDENCY_KEYS);
-            const dependencyPath = requireNonEmptyString(dependency.path, `${field}.path`, 32767);
-            const pathKey = process.platform === "win32"
-                ? dependencyPath.toLowerCase()
-                : dependencyPath;
-            if (paths.has(pathKey)) {
-                throw new ContractError("harnessIdentity.dependencyHashes paths must be unique", {
-                    path: dependencyPath,
-                });
-            }
-            paths.add(pathKey);
-            return {
-                path: dependencyPath,
-                role: requireNonEmptyString(dependency.role, `${field}.role`, 64),
-                sha256: requireTaggedSha256(dependency.sha256, `${field}.sha256`),
-            };
-        });
-}
-
-function normalizeHarnessSandbox(value, executesCandidateCode) {
-        requireExactObjectKeys(value, "harnessIdentity.sandbox", HARNESS_SANDBOX_KEYS);
-        if (typeof value.required !== "boolean") {
-            throw new ContractError("harnessIdentity.sandbox.required must be boolean");
-        }
-        if (value.required !== executesCandidateCode) {
-            throw new ContractError(
-                "harnessIdentity.sandbox.required must match executesCandidateCode",
-            );
-        }
-        if (!value.required) {
-            if (value.policyIdentity !== null || value.policyDigest !== null) {
-                throw new ContractError(
-                    "A non-executing harness must freeze a null sandbox policy identity/digest",
-                );
-            }
-            return {
-                required: false,
-                policyIdentity: null,
-                policyDigest: null,
-            };
-        }
-        requireExactObjectKeys(
-            value.policyIdentity,
-            "harnessIdentity.sandbox.policyIdentity",
-            HARNESS_SANDBOX_IDENTITY_KEYS,
-        );
-        requireExactObjectKeys(
-            value.policyIdentity.securityContext,
-            "harnessIdentity.sandbox.policyIdentity.securityContext",
-            HARNESS_SANDBOX_SECURITY_CONTEXT_KEYS,
-        );
-        requireExactObjectKeys(
-            value.policyIdentity.network,
-            "harnessIdentity.sandbox.policyIdentity.network",
-            HARNESS_SANDBOX_NETWORK_KEYS,
-        );
-        requireExactObjectKeys(
-            value.policyIdentity.filesystem,
-            "harnessIdentity.sandbox.policyIdentity.filesystem",
-            HARNESS_SANDBOX_FILESYSTEM_KEYS,
-        );
-        requireExactObjectKeys(
-            value.policyIdentity.job,
-            "harnessIdentity.sandbox.policyIdentity.job",
-            HARNESS_SANDBOX_JOB_KEYS,
-        );
-        const requireBoolean = (input, field) => {
-            if (typeof input !== "boolean") {
-                throw new ContractError(`${field} must be boolean`);
-            }
-            return input;
-        };
-        const capabilities = value.policyIdentity.securityContext.capabilities;
-        if (!Array.isArray(capabilities)
-            || capabilities.length > 64
-            || capabilities.some((capability) =>
-                typeof capability !== "string"
-                || capability.length === 0
-                || capability.length > 256)) {
-            throw new ContractError(
-                "harnessIdentity.sandbox.policyIdentity.securityContext.capabilities must be a bounded string array",
-            );
-        }
-        const policyIdentity = {
-            primitive: requireNonEmptyString(
-                value.policyIdentity.primitive,
-                "harnessIdentity.sandbox.policyIdentity.primitive",
-                128,
-            ),
-            providerId: requireIdentifier(
-                value.policyIdentity.providerId,
-                "harnessIdentity.sandbox.policyIdentity.providerId",
-            ),
-            providerVersion: requireIdentifier(
-                value.policyIdentity.providerVersion,
-                "harnessIdentity.sandbox.policyIdentity.providerVersion",
-            ),
-            policyId: requireIdentifier(
-                value.policyIdentity.policyId,
-                "harnessIdentity.sandbox.policyIdentity.policyId",
-            ),
-            helperSourceHash: requireTaggedSha256(
-                value.policyIdentity.helperSourceHash,
-                "harnessIdentity.sandbox.policyIdentity.helperSourceHash",
-            ),
-            helperBinaryHash: requireTaggedSha256(
-                value.policyIdentity.helperBinaryHash,
-                "harnessIdentity.sandbox.policyIdentity.helperBinaryHash",
-            ),
-            launcherId: requireIdentifier(
-                value.policyIdentity.launcherId,
-                "harnessIdentity.sandbox.policyIdentity.launcherId",
-            ),
-            launcherBinaryHash: requireTaggedSha256(
-                value.policyIdentity.launcherBinaryHash,
-                "harnessIdentity.sandbox.policyIdentity.launcherBinaryHash",
-            ),
-            launcherScriptHash: requireTaggedSha256(
-                value.policyIdentity.launcherScriptHash,
-                "harnessIdentity.sandbox.policyIdentity.launcherScriptHash",
-            ),
-            securityContext: {
-                appContainer: requireBoolean(
-                    value.policyIdentity.securityContext.appContainer,
-                    "harnessIdentity.sandbox.policyIdentity.securityContext.appContainer",
-                ),
-                lowIntegrity: requireBoolean(
-                    value.policyIdentity.securityContext.lowIntegrity,
-                    "harnessIdentity.sandbox.policyIdentity.securityContext.lowIntegrity",
-                ),
-                capabilities: [...capabilities],
-                loopbackExemptionRejected: requireBoolean(
-                    value.policyIdentity.securityContext.loopbackExemptionRejected,
-                    "harnessIdentity.sandbox.policyIdentity.securityContext.loopbackExemptionRejected",
-                ),
-            },
-            network: {
-                mode: requireNonEmptyString(
-                    value.policyIdentity.network.mode,
-                    "harnessIdentity.sandbox.policyIdentity.network.mode",
-                    128,
-                ),
-                enforcement: requireNonEmptyString(
-                    value.policyIdentity.network.enforcement,
-                    "harnessIdentity.sandbox.policyIdentity.network.enforcement",
-                    1024,
-                ),
-            },
-            filesystem: {
-                stagedHarness: requireNonEmptyString(
-                    value.policyIdentity.filesystem.stagedHarness,
-                    "harnessIdentity.sandbox.policyIdentity.filesystem.stagedHarness",
-                    128,
-                ),
-                immutableCandidate: requireNonEmptyString(
-                    value.policyIdentity.filesystem.immutableCandidate,
-                    "harnessIdentity.sandbox.policyIdentity.filesystem.immutableCandidate",
-                    128,
-                ),
-                outputTemp: requireNonEmptyString(
-                    value.policyIdentity.filesystem.outputTemp,
-                    "harnessIdentity.sandbox.policyIdentity.filesystem.outputTemp",
-                    128,
-                ),
-                aclJournalRestored: requireBoolean(
-                    value.policyIdentity.filesystem.aclJournalRestored,
-                    "harnessIdentity.sandbox.policyIdentity.filesystem.aclJournalRestored",
-                ),
-                exactLaunchClosure: requireBoolean(
-                    value.policyIdentity.filesystem.exactLaunchClosure,
-                    "harnessIdentity.sandbox.policyIdentity.filesystem.exactLaunchClosure",
-                ),
-                hostWriteDenied: requireBoolean(
-                    value.policyIdentity.filesystem.hostWriteDenied,
-                    "harnessIdentity.sandbox.policyIdentity.filesystem.hostWriteDenied",
-                ),
-            },
-            job: {
-                killOnJobClose: requireBoolean(
-                    value.policyIdentity.job.killOnJobClose,
-                    "harnessIdentity.sandbox.policyIdentity.job.killOnJobClose",
-                ),
-                descendantsContained: requireBoolean(
-                    value.policyIdentity.job.descendantsContained,
-                    "harnessIdentity.sandbox.policyIdentity.job.descendantsContained",
-                ),
-                uiRestrictions: requireBoolean(
-                    value.policyIdentity.job.uiRestrictions,
-                    "harnessIdentity.sandbox.policyIdentity.job.uiRestrictions",
-                ),
-                activeProcessLimit: requirePositiveSafeInteger(
-                    value.policyIdentity.job.activeProcessLimit,
-                    "harnessIdentity.sandbox.policyIdentity.job.activeProcessLimit",
-                ),
-                processMemoryBytes: requirePositiveSafeInteger(
-                    value.policyIdentity.job.processMemoryBytes,
-                    "harnessIdentity.sandbox.policyIdentity.job.processMemoryBytes",
-                ),
-                jobMemoryBytes: requirePositiveSafeInteger(
-                    value.policyIdentity.job.jobMemoryBytes,
-                    "harnessIdentity.sandbox.policyIdentity.job.jobMemoryBytes",
-                ),
-                cpuRatePercent: requirePositiveSafeInteger(
-                    value.policyIdentity.job.cpuRatePercent,
-                    "harnessIdentity.sandbox.policyIdentity.job.cpuRatePercent",
-                ),
-                cpuTimeMs: requirePositiveSafeInteger(
-                    value.policyIdentity.job.cpuTimeMs,
-                    "harnessIdentity.sandbox.policyIdentity.job.cpuTimeMs",
-                ),
-                wallTimeMs: requirePositiveSafeInteger(
-                    value.policyIdentity.job.wallTimeMs,
-                    "harnessIdentity.sandbox.policyIdentity.job.wallTimeMs",
-                ),
-                terminationGraceMs: requirePositiveSafeInteger(
-                    value.policyIdentity.job.terminationGraceMs,
-                    "harnessIdentity.sandbox.policyIdentity.job.terminationGraceMs",
-                ),
-            },
-        };
-        if (policyIdentity.job.cpuRatePercent > 100) {
-            throw new ContractError(
-                "harnessIdentity.sandbox.policyIdentity.job.cpuRatePercent must be <= 100",
-            );
-        }
-        if (policyIdentity.job.jobMemoryBytes
-            < policyIdentity.job.processMemoryBytes) {
-            throw new ContractError(
-                "harnessIdentity.sandbox.policyIdentity.job.jobMemoryBytes must be >= processMemoryBytes",
-            );
-        }
-        const policyDigest = requireTaggedSha256(
-            value.policyDigest,
-            "harnessIdentity.sandbox.policyDigest",
-        );
-        const expectedDigest = hashCanonical(
-            policyIdentity,
-            SANDBOX_POLICY_IDENTITY_HASH_ALGORITHM,
-        );
-        if (policyDigest !== expectedDigest) {
-            throw new ContractError(
-                "harnessIdentity.sandbox.policyDigest must match the canonical policy identity",
-                { expected: expectedDigest, actual: policyDigest },
-            );
-        }
-        return {
-            required: true,
-            policyIdentity,
-            policyDigest,
-        };
-}
-
-function normalizeHarnessIdentity(value, harnessId, parserVersion) {
-        requireExactObjectKeys(value, "harnessIdentity", HARNESS_IDENTITY_KEYS);
-        if (value.version !== 1) {
-            throw new ContractError("harnessIdentity.version must be 1");
-        }
-        if (value.allowlistVersion !== 1) {
-            throw new ContractError("harnessIdentity.allowlistVersion must be 1");
-        }
-        const frozenHarnessId = requireIdentifier(value.harnessId, "harnessIdentity.harnessId");
-        if (frozenHarnessId !== harnessId) {
-            throw new ContractError("harnessIdentity.harnessId must match harnessId");
-        }
-        const frozenParserVersion = requireIdentifier(
-            value.parserVersion,
-            "harnessIdentity.parserVersion",
-        );
-        if (frozenParserVersion !== parserVersion) {
-            throw new ContractError("harnessIdentity.parserVersion must match parserVersion");
-        }
-        if (typeof value.executesCandidateCode !== "boolean") {
-            throw new ContractError("harnessIdentity.executesCandidateCode must be boolean");
-        }
-        return {
-            version: 1,
-            harnessId: frozenHarnessId,
-            allowlistVersion: 1,
-            allowlistFileHash: requireTaggedSha256(
-                value.allowlistFileHash,
-                "harnessIdentity.allowlistFileHash",
-            ),
-            harnessEntryHash: requireTaggedSha256(
-                value.harnessEntryHash,
-                "harnessIdentity.harnessEntryHash",
-            ),
-            executableHash: requireTaggedSha256(
-                value.executableHash,
-                "harnessIdentity.executableHash",
-            ),
-            dependencyHashes: normalizeHarnessDependencies(value.dependencyHashes),
-            argvTemplateHash: requireTaggedSha256(
-                value.argvTemplateHash,
-                "harnessIdentity.argvTemplateHash",
-            ),
-            allowedEnvHash: requireTaggedSha256(
-                value.allowedEnvHash,
-                "harnessIdentity.allowedEnvHash",
-            ),
-            parserVersion: frozenParserVersion,
-            parserVersionHash: requireTaggedSha256(
-                value.parserVersionHash,
-                "harnessIdentity.parserVersionHash",
-            ),
-            parserSourceHash: requireTaggedSha256(
-                value.parserSourceHash,
-                "harnessIdentity.parserSourceHash",
-            ),
-            executesCandidateCode: value.executesCandidateCode,
-            sandbox: normalizeHarnessSandbox(value.sandbox, value.executesCandidateCode),
-        };
 }
 
 function normalizePath(path, field) {
@@ -1006,222 +613,6 @@ function normalizePredicate(predicate) {
     return normalized;
 }
 
-function valueAtPath(root, path) {
-    let current = root;
-    for (const segment of path) {
-        if (current === null
-            || typeof current !== "object"
-            || !Object.hasOwn(current, segment)) {
-            return { found: false, value: null };
-        }
-        current = current[segment];
-    }
-    return { found: true, value: current };
-}
-
-function compareNumbers(actual, operator, expected) {
-    if (typeof actual !== "number" || !Number.isFinite(actual)) {
-        return false;
-    }
-    switch (operator) {
-        case "<": return actual < expected;
-        case "<=": return actual <= expected;
-        case "==": return actual === expected;
-        case ">=": return actual >= expected;
-        case ">": return actual > expected;
-        default: return false;
-    }
-}
-
-function evaluatePredicate(predicate, result) {
-    switch (predicate.kind) {
-        case "harness_pass":
-            return result?.pass === true;
-        case "constant":
-            return predicate.value;
-        case "field_equals": {
-            const actual = valueAtPath(result, predicate.path);
-            return actual.found && canonicalEqual(actual.value, predicate.value);
-        }
-        case "number_compare": {
-            const actual = valueAtPath(result, predicate.path);
-            return actual.found && compareNumbers(actual.value, predicate.operator, predicate.value);
-        }
-        case "metric_compare":
-            return compareNumbers(result?.metrics?.[predicate.metric], predicate.operator, predicate.value);
-        case "all":
-            return predicate.predicates.every((child) => evaluatePredicate(child, result));
-        case "any":
-            return predicate.predicates.some((child) => evaluatePredicate(child, result));
-        case "not":
-            return !evaluatePredicate(predicate.predicate, result);
-        default:
-            return false;
-    }
-}
-
-function numericFailureDistance(actual, operator, expected) {
-    if (typeof actual !== "number" || !Number.isFinite(actual)) {
-        return null;
-    }
-    let gap;
-    switch (operator) {
-        case "<":
-            gap = actual < expected ? 0 : actual - expected + Number.EPSILON;
-            break;
-        case "<=":
-            gap = actual <= expected ? 0 : actual - expected;
-            break;
-        case "==":
-            gap = Math.abs(actual - expected);
-            break;
-        case ">=":
-            gap = actual >= expected ? 0 : expected - actual;
-            break;
-        case ">":
-            gap = actual > expected ? 0 : expected - actual + Number.EPSILON;
-            break;
-        default:
-            return null;
-    }
-    return gap / Math.max(1, Math.abs(expected));
-}
-
-function assessPredicate(predicate, result) {
-    switch (predicate.kind) {
-        case "harness_pass":
-            return {
-                satisfied: result?.pass === true,
-                near: false,
-                distance: result?.pass === true ? 0 : null,
-                failedLeaves: result?.pass === true ? 0 : 1,
-                leafCount: 1,
-                booleanGateFailure: result?.pass !== true,
-            };
-        case "constant":
-            return {
-                satisfied: predicate.value,
-                near: false,
-                distance: predicate.value ? 0 : null,
-                failedLeaves: predicate.value ? 0 : 1,
-                leafCount: 1,
-                booleanGateFailure: false,
-            };
-        case "field_equals": {
-            const actual = valueAtPath(result, predicate.path);
-            const satisfied = actual.found && canonicalEqual(actual.value, predicate.value);
-            return {
-                satisfied,
-                near: false,
-                distance: satisfied ? 0 : null,
-                failedLeaves: satisfied ? 0 : 1,
-                leafCount: 1,
-                booleanGateFailure: false,
-            };
-        }
-        case "number_compare": {
-            const actual = valueAtPath(result, predicate.path);
-            const satisfied = actual.found
-                && compareNumbers(actual.value, predicate.operator, predicate.value);
-            const distance = actual.found
-                ? numericFailureDistance(actual.value, predicate.operator, predicate.value)
-                : null;
-            return {
-                satisfied,
-                near: !satisfied && distance !== null && distance <= 0.1,
-                distance,
-                failedLeaves: satisfied ? 0 : 1,
-                leafCount: 1,
-                booleanGateFailure: false,
-            };
-        }
-        case "metric_compare": {
-            const actual = result?.metrics?.[predicate.metric];
-            const satisfied = compareNumbers(actual, predicate.operator, predicate.value);
-            const distance = numericFailureDistance(actual, predicate.operator, predicate.value);
-            return {
-                satisfied,
-                near: !satisfied && distance !== null && distance <= 0.1,
-                distance,
-                failedLeaves: satisfied ? 0 : 1,
-                leafCount: 1,
-                booleanGateFailure: false,
-            };
-        }
-        case "all": {
-            const children = predicate.predicates.map((child) => assessPredicate(child, result));
-            const failed = children.filter((child) => !child.satisfied);
-            const booleanGateOnly = failed.length === 1
-                && failed[0].booleanGateFailure
-                && children.length > 1;
-            return {
-                satisfied: failed.length === 0,
-                near: failed.length === 1 && (failed[0].near || booleanGateOnly),
-                distance: failed.length === 0
-                    ? 0
-                    : failed.length === 1
-                        ? failed[0].distance
-                        : null,
-                failedLeaves: children.reduce((sum, child) => sum + child.failedLeaves, 0),
-                leafCount: children.reduce((sum, child) => sum + child.leafCount, 0),
-                booleanGateFailure: false,
-            };
-        }
-        case "any": {
-            const children = predicate.predicates.map((child) => assessPredicate(child, result));
-            const satisfied = children.some((child) => child.satisfied);
-            const nearChildren = children.filter((child) => child.near);
-            const distances = nearChildren
-                .map((child) => child.distance)
-                .filter((distance) => distance !== null);
-            return {
-                satisfied,
-                near: !satisfied && nearChildren.length > 0,
-                distance: distances.length > 0 ? Math.min(...distances) : null,
-                failedLeaves: satisfied
-                    ? 0
-                    : Math.min(...children.map((child) => child.failedLeaves)),
-                leafCount: children.reduce((sum, child) => sum + child.leafCount, 0),
-                booleanGateFailure: false,
-            };
-        }
-        case "not": {
-            const child = assessPredicate(predicate.predicate, result);
-            return {
-                satisfied: !child.satisfied,
-                near: false,
-                distance: !child.satisfied ? 0 : null,
-                failedLeaves: !child.satisfied ? 0 : 1,
-                leafCount: child.leafCount,
-                booleanGateFailure: false,
-            };
-        }
-        default:
-            return {
-                satisfied: false,
-                near: false,
-                distance: null,
-                failedLeaves: 1,
-                leafCount: 1,
-                booleanGateFailure: false,
-            };
-    }
-}
-
-function normalizeDeclaredLimits(limits) {
-    if (limits === null || typeof limits !== "object" || Array.isArray(limits)) {
-        throw new ContractError("declaredLimits must be an object");
-    }
-    const normalized = immutableCanonical(limits);
-    for (const field of ["maxCommands", "commandBudget", "maxEvidence", "maxSearchRevisions"]) {
-        if (Object.hasOwn(normalized, field)
-            && (!Number.isSafeInteger(normalized[field]) || normalized[field] < 1)) {
-            throw new ContractError(`declaredLimits.${field} must be a positive safe integer`);
-        }
-    }
-    return normalized;
-}
-
 function normalizeValidationCases(cases) {
     if (!Array.isArray(cases)
         || cases.length < 2
@@ -1331,24 +722,15 @@ function normalizeImpossibilityPolicy(input, topology) {
 }
 
 export function createSearchPolicy(input) {
-    const versioned = input !== null
-        && typeof input === "object"
-        && !Array.isArray(input)
-        && Object.hasOwn(input, "version");
     requireExactObjectKeys(
         input,
         "searchPolicy",
-        versioned
-            ? VERSIONED_SEARCH_POLICY_KEYS
-            : LEGACY_SEARCH_POLICY_KEYS,
+        SEARCH_POLICY_KEYS,
     );
-    const version = versioned
-        ? input.version
-        : LEGACY_SEARCH_STRATEGY_POLICY_VERSION;
-    if (!SEARCH_STRATEGY_POLICY_VERSIONS.includes(version)) {
+    if (input.version !== SEARCH_STRATEGY_POLICY_VERSION) {
         throw new ContractError("searchPolicy.version is unsupported", {
-            expected: SEARCH_STRATEGY_POLICY_VERSIONS,
-            actual: typeof version === "string" ? version : null,
+            expected: SEARCH_STRATEGY_POLICY_VERSION,
+            actual: typeof input.version === "string" ? input.version : null,
         });
     }
 
@@ -1458,7 +840,7 @@ export function createSearchPolicy(input) {
     }
 
     return immutableCanonical({
-        ...(versioned ? { version } : {}),
+        version: SEARCH_STRATEGY_POLICY_VERSION,
         plateauWindow,
         minRoundsBeforePlateau,
         plateauMinImprovement,
@@ -1469,12 +851,6 @@ export function createSearchPolicy(input) {
         dedupPolicy: "mark",
     });
 }
-
-export function defaultSearchPolicy() {
-    return createSearchPolicy(DEFAULT_SEARCH_POLICY);
-}
-
-export const normalizeSearchPolicy = createSearchPolicy;
 
 function requireNonNegativeSafeInteger(value, field, maximum = Number.MAX_SAFE_INTEGER) {
     if (!Number.isSafeInteger(value) || value < 0 || value > maximum) {
@@ -1570,7 +946,6 @@ export function requiredHarnessRoles(goalMode, topology) {
         "search",
         "confirmation",
         "challenge",
-        "novelty",
         ...(topology === "certified_impossibility"
             ? ["impossibility_verifier"]
             : []),
@@ -1608,7 +983,6 @@ function normalizeHarnessSuiteContract(value, identity, goalMode, topology) {
             "search",
             "confirmation",
             "challenge",
-            "novelty",
         ].map((role) => suite.roles[role].parser.version),
     );
     if (primaryParserVersions.size !== 1) {
@@ -2063,11 +1437,10 @@ export function createStatisticalPolicy(input, context = {}) {
     requireObjectKeys(
         input,
         "statisticalPolicy",
-        STATISTICAL_POLICY_KEYS.filter((key) => key !== "version"),
-        ["version"],
+        STATISTICAL_POLICY_KEYS,
+        [],
     );
-    if (input.version !== undefined
-        && input.version !== STATISTICAL_POLICY_VERSION) {
+    if (input.version !== STATISTICAL_POLICY_VERSION) {
         throw new ContractError("statisticalPolicy.version is unsupported", {
             expected: STATISTICAL_POLICY_VERSION,
             actual: input.version,
@@ -2152,15 +1525,6 @@ export function createStatisticalPolicy(input, context = {}) {
         evaluationBudget,
         resourceBudget,
     });
-}
-
-export const normalizeStatisticalPolicy = createStatisticalPolicy;
-
-export function statisticalPolicyHash(policy, context = {}) {
-    return hashCanonical(
-        createStatisticalPolicy(policy, context),
-        STATISTICAL_POLICY_HASH_ALGORITHM,
-    );
 }
 
 function normalizeEnumerandContract(
@@ -2440,43 +1804,6 @@ export function createInvestigationContract(input) {
     return immutableCanonical(contract);
 }
 
-export function acceptanceSatisfied(acceptancePredicate, harnessResult) {
-    const normalized = normalizePredicate(acceptancePredicate);
-    return evaluatePredicate(normalized, harnessResult);
-}
-
-export function assessAcceptancePredicate(acceptancePredicate, harnessResult) {
-    return immutableCanonical(assessPredicate(
-        normalizePredicate(acceptancePredicate),
-        harnessResult,
-    ));
-}
-
-export function candidateMetricValues(metrics, harnessResult) {
-    const values = {};
-    for (const metric of metrics) {
-        const value = harnessResult?.metrics?.[metric.key];
-        if (typeof value === "number" && Number.isFinite(value)) {
-            values[metric.key] = value;
-        }
-    }
-    return immutableCanonical(values);
-}
-
-export function candidateMetricsRankable(metrics, metricValues) {
-    return metrics.every((metric) =>
-        typeof metricValues?.[metric.key] === "number"
-        && Number.isFinite(metricValues[metric.key]));
-}
-
-export const availableCandidateMetricValues = candidateMetricValues;
-
 export function contractHash(contract) {
     return hashCanonical(contract, CONTRACT_HASH_ALGORITHM);
-}
-
-export function commandBudget(contract) {
-    return contract.declaredLimits.maxCommands
-        ?? contract.declaredLimits.commandBudget
-        ?? null;
 }

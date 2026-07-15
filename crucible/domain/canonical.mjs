@@ -1,7 +1,6 @@
 import { createHash } from "node:crypto";
 import { CanonicalizationError } from "./errors.mjs";
 
-export const CANONICAL_JSON_VERSION = "crucible-canonical-json-v1";
 export const CANONICAL_HASH_ALGORITHM = "sha256:crucible-canonical-json-v1";
 export const EVENT_HASH_ALGORITHM = "sha256:crucible-event-v4";
 export const CONTRACT_HASH_ALGORITHM = "sha256:crucible-contract-v4";

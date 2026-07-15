@@ -35,11 +35,10 @@ import { SchemaValidationError } from "./errors.mjs";
 // Re-exported so the schema module's public surface includes the error its
 // parser throws (callers/tests import it from here, the single source).
 export { SchemaValidationError };
-export { DEFAULT_SEARCH_POLICY };
 
-export const MAX_OBJECTIVE_CHARACTERS = CONTRACT_LIMITS.objectiveCharacters;
-export const MAX_OBJECTIVE_BYTES = CONTRACT_LIMITS.objectiveBytes;
-export const MAX_ACCEPTANCE_PREDICATE_BYTES =
+const MAX_OBJECTIVE_CHARACTERS = CONTRACT_LIMITS.objectiveCharacters;
+const MAX_OBJECTIVE_BYTES = CONTRACT_LIMITS.objectiveBytes;
+const MAX_ACCEPTANCE_PREDICATE_BYTES =
     CONTRACT_LIMITS.acceptancePredicateBytes;
 
 const IDENTIFIER_PATTERN = "^(?!.*\\.\\.)[A-Za-z0-9][A-Za-z0-9._@-]{0,127}$";
@@ -76,7 +75,7 @@ function commonOptions(base, { description } = {}) {
     return description === undefined ? base : { ...base, description };
 }
 
-export function string({
+function string({
     description,
     minLength = 1,
     maxLength = 4096,
@@ -124,7 +123,7 @@ export function string({
     });
 }
 
-export function identifier({ description, optional = false } = {}) {
+function identifier({ description, optional = false } = {}) {
     return makeField({
         jsonSchema: commonOptions(
             { type: "string", minLength: 1, maxLength: 128, pattern: IDENTIFIER_PATTERN },
@@ -140,7 +139,7 @@ export function identifier({ description, optional = false } = {}) {
     });
 }
 
-export function lowerIdentifier({ description, optional = false } = {}) {
+function lowerIdentifier({ description, optional = false } = {}) {
     return makeField({
         jsonSchema: commonOptions(
             { type: "string", minLength: 1, maxLength: 128, pattern: LOWER_IDENTIFIER_PATTERN },
@@ -156,7 +155,7 @@ export function lowerIdentifier({ description, optional = false } = {}) {
     });
 }
 
-export function enumField(values, {
+function enumField(values, {
     description,
     optional = false,
     default: defaultValue,
@@ -176,7 +175,7 @@ export function enumField(values, {
     });
 }
 
-export function integer({
+function integer({
     description,
     minimum,
     maximum,
@@ -211,7 +210,7 @@ export function integer({
     });
 }
 
-export function number({
+function number({
     description,
     minimum,
     maximum,
@@ -246,7 +245,7 @@ export function number({
     });
 }
 
-export function boolean({ description, optional = false, default: defaultValue } = {}) {
+function boolean({ description, optional = false, default: defaultValue } = {}) {
     return makeField({
         jsonSchema: commonOptions({ type: "boolean" }, { description }),
         optional,
@@ -261,7 +260,7 @@ export function boolean({ description, optional = false, default: defaultValue }
     });
 }
 
-export function array(item, {
+function array(item, {
     description,
     minItems,
     maxItems,
@@ -323,7 +322,7 @@ export function array(item, {
 // asserts "an object" and the parser only guards against non-objects and
 // prototype pollution. The single source of truth for the nested shape stays
 // in the domain, not duplicated here.
-export function rawObject({
+function rawObject({
     description,
     optional = false,
     maxBytes = Number.MAX_SAFE_INTEGER,
@@ -354,7 +353,7 @@ export function rawObject({
 
 // Compose a set of named field descriptors into an object descriptor that
 // yields BOTH a strict Copilot JSON Schema and a runtime parser.
-export function object(fields, {
+function object(fields, {
     description,
     optional = false,
     default: defaultValue,
@@ -416,7 +415,7 @@ export function object(fields, {
 
 // A tool spec is the single source for one Copilot tool: name + description +
 // derived JSON Schema (`parameters`) + derived `parse`.
-export function defineTool({ name, description, args }) {
+function defineTool({ name, description, args }) {
     return Object.freeze({
         name,
         description,
@@ -630,14 +629,6 @@ function jsonValueField({ description, arrayOnly = false } = {}) {
             }
             return structuredClone(value);
         },
-    });
-}
-
-function taggedHashField({ description } = {}) {
-    return string({
-        description,
-        maxLength: 256,
-        pattern: "^sha256:[a-z0-9][a-z0-9._-]*:[a-f0-9]{64}$",
     });
 }
 
@@ -1186,12 +1177,26 @@ const crucibleStartArgs = discriminatedObjectUnion({
         "Exactly one form is accepted: an operator-preapproved experiment_id, or an investigation_id reattach with only an optional later deadline/reset policy.",
 });
 
-export const crucibleStartSpec = defineTool({
+const baseCrucibleStartSpec = defineTool({
     name: "crucible_start",
     description:
         "Start a new persistent Crucible investigation from an existing operator-preapproved experiment_id, or reattach/resume one by investigation_id using its persisted contract/config/snapshots. Models cannot author acceptance, topology, enumerands, hypotheses, or statistics through this tool. All admission checks complete before durable mutation. This is NOT a result — poll crucible_status and only crucible_result may emit a terminal decision.",
     args: crucibleStartArgs,
 });
+const normalizedCrucibleStartArgs = new WeakSet();
+
+export const crucibleStartSpec = Object.freeze({
+    ...baseCrucibleStartSpec,
+    parse(rawArgs) {
+        const parsed = Object.freeze(baseCrucibleStartSpec.parse(rawArgs));
+        normalizedCrucibleStartArgs.add(parsed);
+        return parsed;
+    },
+});
+
+export function isNormalizedCrucibleStartArgs(value) {
+    return normalizedCrucibleStartArgs.has(value);
+}
 
 export const crucibleStatusSpec = defineTool({
     name: "crucible_status",
@@ -1291,7 +1296,7 @@ export const crucibleStopSpec = defineTool({
 export const crucibleResultSpec = defineTool({
     name: "crucible_result",
     description:
-        "The ONLY tool that may emit a terminal Crucible result. Replays and verifies compatible v4 state, artifact integrity, and frozen scientific readiness/confirmation closure; legacy, synthetic, search-only, or scientifically incomplete terminals return is_result:false with no winner/evidence/hash payload.",
+        "The ONLY tool that may emit a terminal Crucible result. Replays and verifies current v4 state, artifact integrity, and frozen scientific readiness/confirmation closure; synthetic, search-only, or scientifically incomplete terminals return is_result:false with no winner/evidence/hash payload.",
     args: object({ investigation_id: investigationIdField }),
 });
 

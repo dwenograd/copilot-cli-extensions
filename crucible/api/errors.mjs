@@ -14,15 +14,12 @@ export const API_ERROR_CODES = Object.freeze({
     INVESTIGATION_NOT_FOUND: "CRUCIBLE_API_INVESTIGATION_NOT_FOUND",
     CONTRACT_CONFLICT: "CRUCIBLE_API_CONTRACT_CONFLICT",
     HARNESS_NOT_ALLOWLISTED: "CRUCIBLE_API_HARNESS_NOT_ALLOWLISTED",
-    VALIDATION_CASE_PATH: "CRUCIBLE_API_VALIDATION_CASE_PATH",
-    INVESTIGATION_NOT_OPEN: "CRUCIBLE_API_INVESTIGATION_NOT_OPEN",
     PREFLIGHT_FAILED: "CRUCIBLE_API_PREFLIGHT_FAILED",
     HARNESS_CONFIGURATION_INVALID: "CRUCIBLE_API_HARNESS_CONFIGURATION_INVALID",
     SANDBOX_UNAVAILABLE: "CRUCIBLE_API_SANDBOX_UNAVAILABLE",
     START_FAILED: "CRUCIBLE_API_START_FAILED",
     INVESTIGATION_NOT_RESUMABLE: "CRUCIBLE_API_INVESTIGATION_NOT_RESUMABLE",
     OPERATIONAL_RESET_REQUIRED: "CRUCIBLE_API_OPERATIONAL_RESET_REQUIRED",
-    LEGACY_INCOMPATIBLE: "CRUCIBLE_API_LEGACY_INCOMPATIBLE",
     EXPERIMENT_REGISTRY_INVALID: "CRUCIBLE_API_EXPERIMENT_REGISTRY_INVALID",
     EXPERIMENT_NOT_FOUND: "CRUCIBLE_API_EXPERIMENT_NOT_FOUND",
     EXPERIMENT_AUTHORITY_MISMATCH:
@@ -74,13 +71,6 @@ export class HarnessNotAllowlistedError extends CrucibleApiError {
     }
 }
 
-export class ValidationCasePathError extends CrucibleApiError {
-    constructor(message, details = null) {
-        super(API_ERROR_CODES.VALIDATION_CASE_PATH, message, details);
-        this.name = "ValidationCasePathError";
-    }
-}
-
 export class StartPreflightError extends CrucibleApiError {
     constructor(message, details = null, options = {}) {
         super(API_ERROR_CODES.PREFLIGHT_FAILED, message, details, options);
@@ -120,19 +110,6 @@ export class OperationalResetRequiredError extends CrucibleApiError {
     constructor(message, details = null) {
         super(API_ERROR_CODES.OPERATIONAL_RESET_REQUIRED, message, details);
         this.name = "OperationalResetRequiredError";
-    }
-}
-
-export class LegacyIncompatibleApiError extends CrucibleApiError {
-    constructor(message, details = null) {
-        super(API_ERROR_CODES.LEGACY_INCOMPATIBLE, message, {
-            compatibility: "legacy_incompatible",
-            legacyIncompatible: true,
-            restartRequired: true,
-            requiredAction: "start_new_investigation",
-            ...details,
-        });
-        this.name = "LegacyIncompatibleApiError";
     }
 }
 

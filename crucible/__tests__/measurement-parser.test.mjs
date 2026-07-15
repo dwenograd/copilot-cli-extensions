@@ -16,17 +16,29 @@ function parseError(raw) {
     throw new Error("expected parseHarnessResult to throw");
 }
 
+const CURRENT_BINDING = Object.freeze({
+    role: "calibration",
+    phase: "calibration",
+    replicateIndex: 0,
+    blockIndex: 0,
+    armIndex: 0,
+    armId: "control",
+    deterministicSeed: "seed-calibration-0",
+    subjectId: "control",
+    environmentIdentity:
+        `sha256:crucible-harness-environment-v4:${"a".repeat(64)}`,
+    suiteIdentity:
+        `sha256:crucible-harness-suite-v4:${"b".repeat(64)}`,
+});
+
 describe("parseHarnessResult", () => {
     it("normalizes and deeply freezes a complete result", () => {
-        const certificate =
-            `sha256:crucible-impossibility-v1:${"a".repeat(64)}`;
         const result = parseHarnessResult(JSON.stringify({
             pass: false,
             metrics: { latencyMs: 42.5, throughput: 1000, exact: 0 },
             observables: { category: "good", converged: true, ratio: 0.5 },
             validationCases: { "case-a": true, "case-b": false },
-            searchSpaceExhausted: true,
-            impossibilityCertificateHash: certificate,
+            ...CURRENT_BINDING,
         }));
 
         expect(result).toEqual({
@@ -34,18 +46,7 @@ describe("parseHarnessResult", () => {
             metrics: { exact: 0, latencyMs: 42.5, throughput: 1000 },
             observables: { category: "good", converged: true, ratio: 0.5 },
             validationCases: { "case-a": true, "case-b": false },
-            searchSpaceExhausted: true,
-            impossibilityCertificateHash: certificate,
-            role: null,
-            phase: null,
-            replicateIndex: null,
-            blockIndex: null,
-            armIndex: null,
-            armId: null,
-            deterministicSeed: null,
-            subjectId: null,
-            environmentIdentity: null,
-            suiteIdentity: null,
+            ...CURRENT_BINDING,
             parserVersion: PARSER_VERSION,
         });
         expect(Object.isFrozen(result)).toBe(true);
@@ -64,24 +65,18 @@ describe("parseHarnessResult", () => {
     });
 
     it("accepts the minimal result with surrounding whitespace", () => {
-        const result = parseHarnessResult(' \n{"pass":true}\r\n\t');
+        const result = parseHarnessResult(
+            ` \n${JSON.stringify({
+                pass: true,
+                ...CURRENT_BINDING,
+            })}\r\n\t`,
+        );
         expect(result).toEqual({
             pass: true,
             metrics: null,
             observables: null,
             validationCases: null,
-            searchSpaceExhausted: null,
-            impossibilityCertificateHash: null,
-            role: null,
-            phase: null,
-            replicateIndex: null,
-            blockIndex: null,
-            armIndex: null,
-            armId: null,
-            deterministicSeed: null,
-            subjectId: null,
-            environmentIdentity: null,
-            suiteIdentity: null,
+            ...CURRENT_BINDING,
             parserVersion: PARSER_VERSION,
         });
     });

@@ -8,14 +8,12 @@ import {
     NON_RESULT_CODES,
     OBSERVATION_STREAM_HASH_ALGORITHM,
     assessTargetUnreachableReadiness,
-    assessVerifiedResultReadiness,
     canonicalJson,
     computeEventHash,
     constructEvidenceCommittedEvent,
     constructHarnessObservedEvent,
     constructInvestigationResumedEvent,
     constructKernelDecisionEvent,
-    constructModelObservedEvent,
     createEvidenceProvenance,
     createExternalEvent,
     createInitialAggregate,
@@ -909,86 +907,6 @@ function forgeEvent(event, payload, { rehash = true } = {}) {
     return forged;
 }
 
-function requiredPredictionContext(score) {
-    const observableRegistry = [{
-        key: "score",
-        kind: "numeric",
-        minimum: 0,
-        maximum: 1,
-    }];
-    const hypothesisPolicy = {
-        required: true,
-        maxPredictions: 1,
-        allowedKinds: ["threshold"],
-        allowRequiredForResult: true,
-    };
-    const rawHypotheses = {
-        predictions: [{
-            id: "required-score-threshold",
-            kind: "threshold",
-            observable: "score",
-            operator: ">=",
-            value: 1,
-            refutation: {
-                kind: "threshold",
-                operator: "<",
-                value: 1,
-            },
-            requiredForResult: true,
-        }],
-    };
-    const control = artifactHash("f");
-    const context = validateInvestigation(openInvestigation({
-        hypothesisTopology: "finite_enumerable",
-        observableRegistry,
-        hypothesisPolicy,
-        enumerandManifest: {
-            topology: "finite_enumerable",
-            entries: [{
-                id: "candidate-r000001-s000",
-                ordinal: 0,
-                artifactSnapshotHash: artifactHash("e"),
-                hypotheses: rawHypotheses,
-            }],
-            control: {
-                kind: "reference",
-                referenceHash: control,
-            },
-        },
-        statisticalPolicy: fastStatisticalPolicy({
-            topology: "finite_enumerable",
-            searchSlots: 1,
-            minBlocks: 1,
-            maxBlocks: 8,
-            maximum: 1,
-            control: { kind: "snapshot", identity: control },
-        }),
-    }));
-    const committed = commitCandidate(context, {
-        label: `prediction-${String(score).replace(".", "-")}`,
-        score,
-        blockCount: 8,
-        annotations: {
-            hypotheses:
-                decideNext(context.aggregate).command.hypotheses,
-        },
-    });
-    return { context, committed };
-}
-
-const REQUIRED_PREDICTION_CASES = [
-    {
-        ...requiredPredictionContext(1),
-        state: "UNRESOLVED",
-        code: NON_RESULT_CODES.SCIENTIFIC_PREDICTION_UNRESOLVED,
-    },
-    {
-        ...requiredPredictionContext(0),
-        state: "REFUTED",
-        code: NON_RESULT_CODES.SCIENTIFIC_PREDICTION_REFUTED,
-    },
-];
-
 describe("Crucible v4 fast domain kernel", () => {
     it("opens and replays deterministically with signed authority", () => {
         const context = openInvestigation();
@@ -1096,17 +1014,6 @@ describe("Crucible v4 fast domain kernel", () => {
         const context = validateInvestigation(openInvestigation());
         const reserved =
             reserveAndDispatch(context, "search_candidate");
-        const modelEvent = constructModelObservedEvent(context.aggregate, {
-            commandId: reserved.commandId,
-            observationId: "model-candidate",
-            purpose: "candidate",
-            data: { pass: true },
-        });
-        expect(() => reduceEvent(context.aggregate, modelEvent))
-            .toThrow(expect.objectContaining({
-                code: ERROR_CODES.INVALID_EVIDENCE,
-            }));
-
         const built = candidateObservation(context, reserved, {
             label: "authoritative",
             pass: false,
@@ -1128,38 +1035,6 @@ describe("Crucible v4 fast domain kernel", () => {
         })).toThrow(expect.objectContaining({
             code: ERROR_CODES.DUPLICATE_ID,
         }));
-    });
-
-    it("reopens an invalidated search slot", () => {
-        const context = validateInvestigation(openInvestigation());
-        const first = commitCandidate(context, {
-            label: "invalidate",
-            score: 50,
-        });
-        append(context, createExternalEvent(
-            context.aggregate,
-            EVENT_TYPES.EVIDENCE_INVALIDATED,
-            {
-                evidenceId: first.evidence.evidenceId,
-                reason: "receipt integrity failed",
-            },
-        ));
-
-        expect(searchProgress(context.aggregate)).toMatchObject({
-            nextRound: 1,
-            nextSlot: 0,
-            completedRounds: 0,
-            roundsExhausted: false,
-        });
-        expect(decideNext(context.aggregate)).toMatchObject({
-            kind: "COMMAND",
-            command: {
-                kind: "search_candidate",
-                round: 1,
-                slotIndex: 0,
-                replacementOrdinal: 1,
-            },
-        });
     });
 
     it("lets a persisted stop barrier preempt an active command", () => {
@@ -1249,36 +1124,6 @@ describe("Crucible v4 fast domain kernel", () => {
                 code: ERROR_CODES.TERMINAL_STATE,
             }));
 
-    });
-
-    it("blocks scientific readiness for unresolved and refuted required predictions", () => {
-        for (const {
-            context,
-            committed,
-            state,
-            code,
-        } of REQUIRED_PREDICTION_CASES) {
-            expect(committed.evidence.predictionEvaluation.requiredState)
-                .toBe(state);
-            expect(assessVerifiedResultReadiness(
-                context.aggregate,
-                committed.evidence,
-            ))
-                .toMatchObject({
-                    ready: false,
-                    requiredPredictionState: state,
-                    missing: expect.arrayContaining([
-                        "trusted_required_prediction_evaluations",
-                    ]),
-                });
-            expect(decideNext(context.aggregate)).toMatchObject({
-                kind: "NON_RESULT",
-                code,
-                readiness: {
-                    requiredPredictionState: state,
-                },
-            });
-        }
     });
 
     it("cannot terminalize discovery evidence before confirmation", () => {

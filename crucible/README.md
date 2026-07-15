@@ -1,5 +1,8 @@
 # Crucible
 
+See [WORKFLOW.md](WORKFLOW.md) for the source-audited end-to-end flowchart,
+component map, removed abandoned code, and remaining live limitations.
+
 Crucible runs persistent, evidence-judged experiments.
 
 You define and sign the experiment: objective, candidates, measurements,

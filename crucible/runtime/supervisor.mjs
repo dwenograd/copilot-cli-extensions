@@ -692,7 +692,7 @@ function inspectExistingLock(lockPath) {
         parsed = JSON.parse(raw.toString("utf8"));
         valid = validateLockDocument(parsed, lockPath);
     } catch {
-        // Malformed/partial legacy lock: recovery is based on mtime + heartbeat.
+        // Malformed or partially published lock: recover from mtime and heartbeat.
     }
     return {
         rawHash: sha256Hex(raw),
@@ -3398,80 +3398,4 @@ export function readSupervisorStatus(stateDir, investigationId) {
         return null;
     }
     return status;
-}
-
-export function terminateExactSupervisor({
-    lockPath,
-    statusPath,
-    stopRequestPath,
-    expectedNonce,
-    expectedGeneration,
-    signal = "SIGTERM",
-    processApi = process,
-    clock = defaultClock(),
-    staleAfterMs = 30_000,
-} = {}) {
-    const lock = Object.freeze({
-        ...validateLockDocument(readJsonFile(lockPath, "supervisor lock"), lockPath),
-        lockPath,
-    });
-    if (expectedNonce !== undefined && lock.nonce !== expectedNonce) {
-        throw new SupervisorLockError(
-            RUNTIME_ERROR_CODES.LOCK_HELD,
-            "Supervisor nonce changed; refusing to terminate an unverified PID",
-            { lockPath },
-        );
-    }
-    if (expectedGeneration !== undefined
-        && lock.supervisorGeneration !== expectedGeneration) {
-        throw new SupervisorLockError(
-            RUNTIME_ERROR_CODES.LOCK_HELD,
-            "Supervisor generation changed; refusing to terminate an unverified PID",
-            { lockPath, expectedGeneration, actualGeneration: lock.supervisorGeneration },
-        );
-    }
-    const status = readStatusForOwnership(statusPath, lock);
-    if (!hasFreshMatchingHeartbeat(
-        lock,
-        status,
-        clock.now(),
-        staleAfterMs,
-        (pid) => isExactPidAlive(pid, processApi),
-    )) {
-        throw new SupervisorLockError(
-            RUNTIME_ERROR_CODES.LOCK_HELD,
-            "Supervisor heartbeat is stale or does not match the lock nonce; refusing PID-based termination",
-            {
-                lockPath,
-                statusPath,
-                pid: lock.pid,
-                nonce: lock.nonce,
-                supervisorGeneration: lock.supervisorGeneration,
-            },
-        );
-    }
-    if (typeof stopRequestPath !== "string" || !path.isAbsolute(stopRequestPath)) {
-        throw new RuntimeConfigError("stopRequestPath must be an absolute path");
-    }
-    const ownedStopRequestPath = ownerScopedPath(stopRequestPath, lock);
-    assertSupervisorOwnership(lock, "supervisor stop request write");
-    atomicWriteJson(ownedStopRequestPath, {
-        version: 2,
-        pid: lock.pid,
-        nonce: lock.nonce,
-        supervisorGeneration: lock.supervisorGeneration,
-        signal,
-        requestedAt: clock.isoNow(),
-    }, {
-        token: `stop:${lock.supervisorGeneration}:${lock.nonce}`,
-    });
-    assertSupervisorOwnership(lock, "supervisor stop request verification");
-    return {
-        action: "stop_requested",
-        pid: lock.pid,
-        nonce: lock.nonce,
-        supervisorGeneration: lock.supervisorGeneration,
-        signal,
-        stopRequestPath: ownedStopRequestPath,
-    };
 }

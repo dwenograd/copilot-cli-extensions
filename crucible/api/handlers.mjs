@@ -18,7 +18,6 @@ import fs from "node:fs";
 import path from "node:path";
 
 import {
-    DOMAIN_VERSION,
     SEARCH_OPERATORS,
     assessPersistedTerminalReadiness,
     buildCandidateArchive,
@@ -31,7 +30,6 @@ import {
 import {
     openArtifactStore,
     openArtifactStoreReadOnly,
-    openRepository,
     openRepositoryReadOnly,
     createWorkingSetController,
     publicWorkingSetTelemetry,
@@ -49,7 +47,6 @@ import {
     probeWindowsSandboxAvailability,
 } from "../measurement/index.mjs";
 import {
-    RUNTIME_ERROR_CODES,
     createDomainRepositoryAdapter,
     ensureSupervisor,
     isExactPidAlive,
@@ -110,7 +107,7 @@ const TERMINAL_DECISIONS = Object.freeze(["VERIFIED_RESULT", "TARGET_UNREACHABLE
 
 // --- production runtime wiring ---------------------------------------------
 
-export function makeDefaultDeps(env = process.env, log = () => {}) {
+function makeDefaultDeps(env = process.env, log = () => {}) {
     return {
         env,
         log,
@@ -121,7 +118,6 @@ export function makeDefaultDeps(env = process.env, log = () => {}) {
         pathExists: fs.existsSync,
         reverifyExperimentRegistryFile,
         probeSandboxAvailability: probeWindowsSandboxAvailability,
-        openRepository,
         openRepositoryReadOnly,
         openArtifactStore,
         openArtifactStoreReadOnly,
@@ -244,13 +240,10 @@ function openInvestigationForRead(
         }
         return {
             aggregate: replay.aggregate,
-            repositoryHead:
+            repositoryHeadEventHash:
                 typeof repository.getHead === "function"
-                    ? repository.getHead(investigationId)
-                    : {
-                        seq: replay.aggregate.lastSeq,
-                        eventHash: replay.aggregate.lastEventHash,
-                    },
+                    ? repository.getHead(investigationId)?.eventHash
+                    : replay.aggregate.lastEventHash,
             updatedAtMs:
                 replay.aggregate.lastSeq > 0
                 && typeof repository.getEvent === "function"
@@ -263,7 +256,6 @@ function openInvestigationForRead(
                     : null,
             operationalNonResult,
             quiescentStop,
-            artifactClosureReport: replay.artifactClosureReport ?? null,
             storageTelemetry,
         };
     } finally {
@@ -293,7 +285,7 @@ function summarizeSupervisorAction(result) {
     };
 }
 
-export function startInvestigation(args, deps) {
+function startInvestigation(args, deps) {
     const apply = (plan) => {
         const cleanupBeforeFailure = (error) => {
             try {
@@ -531,38 +523,6 @@ function scientificBlockedPayload(investigationId, assessment) {
     };
 }
 
-function legacyIncompatiblePayload(investigationId, details = {}) {
-    return {
-        is_result: false,
-        banner: NON_RESULT_BANNER,
-        investigation_id: investigationId,
-        compatibility: "legacy_incompatible",
-        legacy_incompatible: true,
-        restart_required: true,
-        required_action: "start_new_investigation",
-        expected_domain_version:
-            details.expectedDomainVersion ?? DOMAIN_VERSION,
-        actual_domain_version: details.actualDomainVersion ?? null,
-        contract_domain_version: details.contractDomainVersion ?? null,
-        event_count: details.eventCount ?? null,
-        read_only: true,
-        archiveable: false,
-        integrity_blocked: false,
-        terminal_available: false,
-        non_result: true,
-        non_result_code: "LEGACY_INCOMPATIBLE",
-        reason:
-            "Persisted state belongs to an incompatible legacy Crucible domain. "
-            + "It may be inventoried read-only, but it cannot resume, archive, append, or emit a newly computed result.",
-        message: NON_RESULT_BANNER,
-    };
-}
-
-function isLegacyIncompatibleError(error) {
-    return error?.code === RUNTIME_ERROR_CODES.LEGACY_INCOMPATIBLE
-        || error?.details?.compatibility === "legacy_incompatible";
-}
-
 function readInvestigationOrIntegrityBlock(
     deps,
     investigationId,
@@ -576,7 +536,6 @@ function readInvestigationOrIntegrityBlock(
     try {
         return {
             blocked: null,
-            legacy: null,
             read: openInvestigationForRead(
                 deps,
                 investigationId,
@@ -590,22 +549,11 @@ function readInvestigationOrIntegrityBlock(
         };
     } catch (error) {
         if (error instanceof InvestigationNotFoundError) throw error;
-        if (isLegacyIncompatibleError(error)) {
-            return {
-                blocked: null,
-                legacy: legacyIncompatiblePayload(
-                    investigationId,
-                    error?.details ?? {},
-                ),
-                read: null,
-            };
-        }
         deps.log?.(
             `[crucible] integrity verification blocked read for ${investigationId}: ${error?.message ?? String(error)}`,
         );
         return {
             blocked: integrityBlockedPayload(investigationId),
-            legacy: null,
             read: null,
         };
     }
@@ -634,17 +582,6 @@ function probeActiveCatalogEntry(entry, stateRoot, deps) {
             deps,
         });
     }
-    if (verifiedRead.legacy !== null) {
-        return activeCatalogSummary({
-            entry,
-            stateRoot,
-            read: null,
-            integrityStatus: "blocked",
-            domainVersion:
-                verifiedRead.legacy.actual_domain_version ?? null,
-            deps,
-        });
-    }
     return activeCatalogSummary({
         entry,
         stateRoot,
@@ -665,7 +602,6 @@ export function statusInvestigation(args, deps) {
     const target = resolveLifecycleTarget({
         deps,
         investigationId,
-        verifyArchive: false,
     });
     if (target.state === "tombstoned") {
         return statusTombstonePayload(target);
@@ -711,16 +647,6 @@ export function statusInvestigation(args, deps) {
             paused: false,
             status: "integrity_blocked",
             note: "Integrity verification failed; status cannot expose or trust a terminal decision.",
-        };
-    }
-    if (verifiedRead.legacy !== null) {
-        return {
-            ...verifiedRead.legacy,
-            lifecycle_state: lifecycleState,
-            paused: false,
-            status: "legacy_incompatible",
-            note:
-                "Legacy state is read-only and restart-required; start a new v4 investigation.",
         };
     }
     const {
@@ -810,13 +736,6 @@ function pauseInvestigation(args, deps) {
             investigationId,
         });
     }
-    if (typeof deps.openRepository === "function") {
-        const migrationRepository = deps.openRepository({
-            file: paths.eventsDbPath,
-            env: deps.env,
-        });
-        migrationRepository.close();
-    }
     const verifiedRead = readInvestigationOrIntegrityBlock(
         deps,
         investigationId,
@@ -837,22 +756,6 @@ function pauseInvestigation(args, deps) {
             appended: false,
             paused: false,
             status: "integrity_blocked",
-            already_terminal: false,
-        };
-    }
-    if (verifiedRead.legacy !== null) {
-        return {
-            ...verifiedRead.legacy,
-            stop_state: "legacy_incompatible",
-            pause_requested: false,
-            pause_in_flight: false,
-            pause_persisted: false,
-            quiescent: false,
-            resumable: false,
-            intervention_required: false,
-            appended: false,
-            paused: false,
-            status: "legacy_incompatible",
             already_terminal: false,
         };
     }
@@ -1030,11 +933,6 @@ export function stopInvestigation(args, deps) {
                         "active investigation integrity verification failed before archive",
                     );
                 }
-                if (verifiedRead.legacy !== null) {
-                    throw new Error(
-                        "legacy investigation cannot enter the v4 archive lifecycle",
-                    );
-                }
                 return verifiedRead.read;
             },
         });
@@ -1068,7 +966,6 @@ export function resultInvestigation(args, deps) {
     const target = resolveLifecycleTarget({
         deps,
         investigationId,
-        verifyArchive: false,
     });
     if (target.state === "tombstoned") {
         return {
@@ -1104,13 +1001,6 @@ export function resultInvestigation(args, deps) {
     );
     if (verifiedRead.blocked !== null) {
         return verifiedRead.blocked;
-    }
-    if (verifiedRead.legacy !== null) {
-        return {
-            ...verifiedRead.legacy,
-            status: "legacy_incompatible",
-            paused: false,
-        };
     }
     const { aggregate, operationalNonResult } = verifiedRead.read;
     const terminal = aggregate.terminal;
@@ -1262,7 +1152,6 @@ export function runToolBoundary(spec, handler, rawArgs, deps) {
         deps.log?.(
             `[crucible] ${spec.name} failed (${code ?? "ERROR"}): ${error?.message ?? String(error)}`,
         );
-        const compatibility = error?.details?.compatibility;
         const terminalAvailableForStart =
             spec.name === "crucible_start"
             && code === API_ERROR_CODES.INVESTIGATION_NOT_RESUMABLE
@@ -1287,19 +1176,6 @@ export function runToolBoundary(spec, handler, rawArgs, deps) {
             tool: spec.name,
             ...(terminalAvailableForStart
                 ? { terminal_available: verifiedTerminalAvailable }
-                : {}),
-            ...(compatibility === "legacy_incompatible"
-                ? {
-                    compatibility,
-                    legacy_incompatible: true,
-                    restart_required: true,
-                    required_action: "start_new_investigation",
-                    expected_domain_version:
-                        error?.details?.expectedDomainVersion ?? DOMAIN_VERSION,
-                    actual_domain_version:
-                        error?.details?.actualDomainVersion ?? null,
-                    terminal_available: false,
-                }
                 : {}),
         });
     };

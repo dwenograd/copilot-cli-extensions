@@ -25,7 +25,6 @@ import {
     EVENT_VOCABULARY,
     EXTERNAL_EVENT_TYPES,
     IMPOSSIBILITY_CERTIFICATE_VERSION,
-    NON_RESULT_CODES,
     SOURCE_KINDS,
 } from "./constants.mjs";
 import { decideNext } from "./decision.mjs";
@@ -53,10 +52,6 @@ import {
     normalizeReplicationSchedule,
     replicationBlockPlan,
 } from "./replication.mjs";
-import {
-    createNoveltyMeasurementBinding,
-    normalizeNoveltyRoleAttempt,
-} from "../measurement/novelty-role.mjs";
 import { createInitialAggregate } from "./state.mjs";
 import {
     bindEventImpossibilityExecution,
@@ -166,7 +161,7 @@ function makeEnvelope(aggregate, type, payload) {
     });
 }
 
-export function normalizeCapabilityEpochPayload(payload) {
+function normalizeCapabilityEpochPayload(payload) {
     const input = requirePlainObject(payload, "payload");
     const epochId = normalizeEventIdentifier(
         requireOwnField(input, "epochId", "epochId"),
@@ -186,7 +181,7 @@ export function normalizeCapabilityEpochPayload(payload) {
     });
 }
 
-export function normalizeCommandDispatchedPayload(payload) {
+function normalizeCommandDispatchedPayload(payload) {
     const input = requirePlainObject(payload, "payload");
     const capabilityEpochId = Object.hasOwn(input, "capabilityEpochId")
         ? input.capabilityEpochId
@@ -505,13 +500,7 @@ function normalizeHarnessReceipt(value, purpose, { command = null, contract = nu
             (measurement) =>
                 measurement.role === role && measurement.phase === phase,
         );
-        const noveltyMeasurements = purpose === "candidate"
-            ? provenance.measurements.filter(
-            (measurement) => measurement.role === "novelty",
-        )
-            : [];
-        if (roleMeasurements.length + noveltyMeasurements.length
-            !== provenance.measurements.length) {
+        if (roleMeasurements.length !== provenance.measurements.length) {
             throw new TransitionError(
                 ERROR_CODES.INVALID_EVENT,
                 `${purpose} receipt contains an unsupported measurement role`,
@@ -551,9 +540,7 @@ function normalizeHarnessReceipt(value, purpose, { command = null, contract = nu
         }
         if (candidateSnapshots.length !== blockCount
             || candidateSnapshots.some((hash) => hash !== candidateArtifactHash)
-            || new Set(controlSnapshots).size > 1
-            || noveltyMeasurements.some((measurement) =>
-                measurement.snapshot.snapshotHash !== candidateArtifactHash)) {
+            || new Set(controlSnapshots).size > 1) {
             throw new TransitionError(
                 ERROR_CODES.INVALID_EVENT,
                 `${purpose} candidate/control snapshot closures are not stable across measurements`,
@@ -696,24 +683,19 @@ function normalizeImpossibilityData(value, command) {
 function normalizeCandidateRawData(
     value,
     command,
-    {
-        contract = null,
-        candidateArtifactHash = null,
-        purpose = "candidate",
-    } = {},
+    purpose = "candidate",
 ) {
     const input = requirePlainObject(value, "data");
-    const allowNovelty = purpose === "candidate";
-    const expectedKeys = allowNovelty && input.version === 2
-        ? ["novelty", "series", "version"]
-        : ["series", "version"];
-    if (!canonicalEqual(Object.keys(input).sort(), expectedKeys)) {
+    if (!canonicalEqual(
+        Object.keys(input).sort(),
+        ["series", "version"],
+    )) {
         throw new TransitionError(
             ERROR_CODES.INVALID_EVENT,
             `${purpose} data must contain only raw complete measurement series`,
         );
     }
-    if ((input.version !== 1 && (!allowNovelty || input.version !== 2))
+    if (input.version !== 1
         || !Array.isArray(input.series)
         || input.series.length !== 1) {
         throw new TransitionError(
@@ -750,34 +732,7 @@ function normalizeCandidateRawData(
             `${purpose} raw complete blocks do not satisfy the frozen schedule`,
         );
     }
-    if (input.version === 1) {
-        return immutableCanonical({ version: 1, series: [normalized] });
-    }
-    let novelty = null;
-    if (input.novelty !== null) {
-        try {
-            novelty = normalizeNoveltyRoleAttempt(input.novelty, {
-                expectedBinding: createNoveltyMeasurementBinding({
-                    contract,
-                    candidateArtifactHash,
-                }),
-                environmentIdentity:
-                    contract?.harnessSuite?.environmentIdentity,
-                suiteIdentity: contract?.harnessSuiteIdentity,
-            });
-        } catch (error) {
-            throw new TransitionError(
-                ERROR_CODES.INVALID_EVENT,
-                `candidate novelty attempt is invalid: ${error.message}`,
-                error.details ?? null,
-            );
-        }
-    }
-    return immutableCanonical({
-        version: 2,
-        series: [normalized],
-        novelty,
-    });
+    return immutableCanonical({ version: 1, series: [normalized] });
 }
 
 function normalizeValidationRawData(value, command, contract) {
@@ -866,10 +821,6 @@ function assertRawObservationReceiptBindings(receipt, data, purpose) {
     );
     const observations = data.series.flatMap((series) =>
         series.completeBlocks.flatMap((block) => block.observations));
-    if (purpose === "candidate" && data.novelty !== null
-        && data.novelty !== undefined) {
-        observations.push(data.novelty);
-    }
     if (bySubject.size !== measurements.length
         || observations.length !== measurements.length
         || observations.some((observation) => {
@@ -895,9 +846,8 @@ export function normalizeCommandObservedPayload(payload, aggregate = null, optio
     if (!EVIDENCE_PURPOSES.includes(purpose)) {
         throw new TransitionError(ERROR_CODES.INVALID_EVENT, "purpose is not supported");
     }
-    const harnessCandidate = sourceKind === "harness" && purpose === "candidate";
-    const harnessReplicated = sourceKind === "harness"
-        && replicatedCandidatePurpose(purpose);
+    const harnessCandidate = purpose === "candidate";
+    const harnessReplicated = replicatedCandidatePurpose(purpose);
     const commandId = normalizeEventIdentifier(
         requireOwnField(input, "commandId", "commandId"),
         "commandId",
@@ -949,12 +899,14 @@ export function normalizeCommandObservedPayload(payload, aggregate = null, optio
             });
         })()
         : null;
-    const receipt = sourceKind === "harness"
-        ? normalizeHarnessReceipt(requireOwnField(input, "receipt", "receipt"), purpose, {
+    const receipt = normalizeHarnessReceipt(
+        requireOwnField(input, "receipt", "receipt"),
+        purpose,
+        {
             command,
             contract: aggregate?.contract ?? null,
-        })
-        : null;
+        },
+    );
     const round = Object.hasOwn(input, "round") ? input.round : undefined;
     const slotIndex = Object.hasOwn(input, "slotIndex") ? input.slotIndex : undefined;
     const candidateId = Object.hasOwn(input, "candidateId")
@@ -972,12 +924,7 @@ export function normalizeCommandObservedPayload(payload, aggregate = null, optio
             ? normalizeCandidateRawData(
                 requireOwnField(input, "data", "data"),
                 command,
-                {
-                    contract: aggregate?.contract ?? null,
-                    candidateArtifactHash:
-                        receipt?.candidateArtifactHash ?? null,
-                    purpose,
-                },
+                purpose,
             )
             : purpose === "validation"
                 ? normalizeValidationRawData(
@@ -994,18 +941,14 @@ export function normalizeCommandObservedPayload(payload, aggregate = null, optio
         observationId,
         sourceKind,
         purpose,
-        harnessId: sourceKind === "harness"
-            ? normalizeEventIdentifier(
-                requireOwnField(input, "harnessId", "harnessId"),
-                "harnessId",
-            )
-            : null,
-        parserVersion: sourceKind === "harness"
-            ? normalizeEventIdentifier(
-                requireOwnField(input, "parserVersion", "parserVersion"),
-                "parserVersion",
-            )
-            : null,
+        harnessId: normalizeEventIdentifier(
+            requireOwnField(input, "harnessId", "harnessId"),
+            "harnessId",
+        ),
+        parserVersion: normalizeEventIdentifier(
+            requireOwnField(input, "parserVersion", "parserVersion"),
+            "parserVersion",
+        ),
         receipt,
         ...(purpose === "impossibility"
             ? { verifierExecution: verifiedExecution.reference }
@@ -1066,18 +1009,7 @@ function requireAlgorithmHash(value, field) {
     return value;
 }
 
-export function normalizeEvidenceInvalidatedPayload(payload) {
-    const input = requirePlainObject(payload, "payload");
-    return immutableCanonical({
-        evidenceId: normalizeEventIdentifier(
-            requireOwnField(input, "evidenceId", "evidenceId"),
-            "evidenceId",
-        ),
-        reason: requireString(requireOwnField(input, "reason", "reason"), "reason"),
-    });
-}
-
-export function normalizeStopRequestedPayload(payload) {
+function normalizeStopRequestedPayload(payload) {
     const input = requirePlainObject(payload, "payload");
     return immutableCanonical({
         requestId: normalizeEventIdentifier(
@@ -1090,7 +1022,7 @@ export function normalizeStopRequestedPayload(payload) {
     });
 }
 
-export function normalizeStorageBudgetExhaustedPayload(payload) {
+function normalizeStorageBudgetExhaustedPayload(payload) {
     const input = requirePlainObject(payload, "payload");
     const expectedKeys = [
         "globalBytes",
@@ -1123,8 +1055,6 @@ export function normalizeExternalEventPayload(type, payload, aggregate = null, o
             return normalizeCommandDispatchedPayload(payload);
         case EVENT_TYPES.COMMAND_OBSERVED:
             return normalizeCommandObservedPayload(payload, aggregate, options);
-        case EVENT_TYPES.EVIDENCE_INVALIDATED:
-            return normalizeEvidenceInvalidatedPayload(payload);
         case EVENT_TYPES.STORAGE_BUDGET_EXHAUSTED:
             return normalizeStorageBudgetExhaustedPayload(payload);
         case EVENT_TYPES.STOP_REQUESTED:
@@ -1238,30 +1168,6 @@ export function constructInvestigationResumedEvent(aggregate) {
     });
 }
 
-export function constructStorageBudgetNonResultEvent(aggregate) {
-    if (aggregate?.storageBudgetExhaustion === null
-        || aggregate?.storageBudgetExhaustion === undefined) {
-        throw new TransitionError(
-            ERROR_CODES.ILLEGAL_TRANSITION,
-            "Storage-budget non-result requires a persisted exhaustion signal",
-        );
-    }
-    const recommendation = decideNext(aggregate);
-    if (recommendation.code
-        !== NON_RESULT_CODES.STORAGE_BUDGET_INCONCLUSIVE
-        || recommendation.event?.type !== EVENT_TYPES.NON_RESULT_RECORDED) {
-        throw new TransitionError(
-            ERROR_CODES.UNAUTHORIZED_DECISION,
-            "Storage-budget signal is not the current deterministic decision",
-        );
-    }
-    return makeEnvelope(
-        aggregate,
-        recommendation.event.type,
-        recommendation.event.payload,
-    );
-}
-
 export function createExternalEvent(aggregate, type, payload, options = {}) {
     if (aggregate.terminal !== null) {
         throw new TransitionError(
@@ -1312,32 +1218,6 @@ export function constructHarnessObservedEvent(aggregate, payload, options = {}) 
             options.verifierExecutionCapability,
         )
         : event;
-}
-
-export function constructModelObservedEvent(aggregate, payload, options = {}) {
-    if (aggregate.terminal !== null) {
-        throw new TransitionError(
-            ERROR_CODES.TERMINAL_STATE,
-            "Terminal investigations reject subsequent events",
-        );
-    }
-    const reserved = aggregate.commands?.[payload?.commandId]?.command ?? null;
-    return makeEnvelope(
-        aggregate,
-        EVENT_TYPES.COMMAND_OBSERVED,
-        normalizeCommandObservedPayload({
-            ...payload,
-            sourceKind: "model_review",
-            harnessId: null,
-            parserVersion: null,
-            receipt: null,
-        }, aggregate, {
-            ...options,
-            observableRegistry: aggregate.contract.observableRegistry,
-            hypothesisPolicy: aggregate.contract.hypothesisPolicy,
-            assignedParentEvidenceIds: reserved?.parentEvidenceIds ?? [],
-        }),
-    );
 }
 
 export function constructEvidenceCommittedEvent(aggregate, input) {

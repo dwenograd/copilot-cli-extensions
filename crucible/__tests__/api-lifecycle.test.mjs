@@ -537,31 +537,8 @@ class LifecycleBroker {
     }
 
     commitDelete(input) {
-        const legacy = this.entry.lifecycleState === "tombstoned";
-        if (!legacy
-            && this.operation?.operationToken !== input.operationToken) {
+        if (this.operation?.operationToken !== input.operationToken) {
             throw new Error("delete fence lost");
-        }
-        if (legacy
-            && this.entry.deleteCleanup?.sourceAuthority
-                === "legacy_discovery") {
-            if (input.discoveredArchiveRelativePath !== undefined) {
-                this.entry.deleteCleanup = {
-                    ...this.entry.deleteCleanup,
-                    sourceAuthority: "verified_bundle",
-                    archiveRelativePath:
-                        input.discoveredArchiveRelativePath,
-                    cleanupMarkerDigest:
-                        input.cleanupMarkerDigest,
-                };
-            } else if (input.archiveAbsent === true) {
-                this.entry.deleteCleanup = {
-                    ...this.entry.deleteCleanup,
-                    archiveAbsent: true,
-                    cleanupState: "durability_pending",
-                };
-            }
-            return { changed: true, investigation: this.entry };
         }
         if (this.entry.deleteCleanup === null) {
             this.entry = {
@@ -569,8 +546,7 @@ class LifecycleBroker {
                 deleteCleanup: {
                     investigationId: this.investigationId,
                     authorityKind: "pending_delete",
-                    sourceAuthority:
-                        input.sourceAuthority ?? "verified_bundle",
+                    sourceAuthority: "verified_bundle",
                     cleanupState: "reserved",
                     archiveRelativePath:
                         this.entry.archive.relativePath,
@@ -620,10 +596,6 @@ class LifecycleBroker {
                 cleanupPending: true,
                 investigation: this.entry,
             };
-        }
-        if (legacy) {
-            this.entry = { ...this.entry, deleteCleanup: null };
-            return { changed: true, investigation: this.entry };
         }
         const cleanup = this.entry.deleteCleanup;
         this.operation = null;
@@ -1422,191 +1394,6 @@ describe("delete and tombstone lifecycle", () => {
             archive_removed: true,
         });
         expect(control.fsyncCalls).toBe(2);
-    });
-
-    it("discovers one verified custom v4 archive and rejects ambiguity", () => {
-        const stateRoot = makeRoot("legacy-custom-discovery");
-        const broker = new LifecycleBroker("delete-investigation");
-        const entry = tombstoneEntry(broker.investigationId);
-        const cleanupPath = cleanupRelativePath(
-            broker.investigationId,
-            DIGEST,
-        );
-        entry.deleteCleanup = {
-            investigationId: broker.investigationId,
-            authorityKind: "legacy_tombstone",
-            sourceAuthority: "legacy_discovery",
-            cleanupState: "reserved",
-            archiveRelativePath: null,
-            cleanupRelativePath: cleanupPath,
-            archiveAbsent: false,
-            archiveDigest: DIGEST,
-            cleanupMarkerNonce: "f".repeat(64),
-            cleanupMarkerDigest: null,
-            tombstoneRelativePath:
-                entry.tombstone.relativePath,
-            tombstoneDigest: entry.tombstone.digest,
-            signingKeyFingerprint:
-                entry.tombstone.signingKeyFingerprint,
-            signature: entry.tombstone.signature,
-            tombstoneSizeBytes: entry.tombstone.sizeBytes,
-            deletedAtMs: entry.tombstone.deletedAtMs,
-            preparedAtMs: entry.tombstone.deletedAtMs,
-        };
-        broker.entry = entry;
-        const first = path.join(
-            stateRoot,
-            ".retention",
-            "archives",
-            "custom-v4-one",
-        );
-        const second = path.join(
-            stateRoot,
-            ".retention",
-            "archives",
-            "custom-v4-two",
-        );
-        for (const directory of [first, second]) {
-            fs.mkdirSync(directory, { recursive: true });
-            fs.writeFileSync(path.join(directory, "bundle"), "archive");
-        }
-        const tombstonePath = path.join(
-            stateRoot,
-            ...entry.tombstone.relativePath.split("/"),
-        );
-        fs.mkdirSync(path.dirname(tombstonePath), { recursive: true });
-        fs.writeFileSync(tombstonePath, "tombstone");
-        const control = {
-            faultPoint: null,
-            fsyncFailures: 0,
-            tombstone: {
-                file: tombstonePath,
-                digest: entry.tombstone.digest,
-                signingKeyFingerprint:
-                    entry.tombstone.signingKeyFingerprint,
-                signature: entry.tombstone.signature,
-                sizeBytes: entry.tombstone.sizeBytes,
-                payload: {
-                    investigationId: broker.investigationId,
-                    createdAtMs: entry.registeredAtMs,
-                    deletedAt: new Date(
-                        entry.tombstone.deletedAtMs,
-                    ).toISOString(),
-                    domainVersion:
-                        entry.tombstone.domainVersion,
-                    archiveDigest: DIGEST,
-                    domainHead: entry.tombstone.domainHead,
-                },
-                verified: true,
-            },
-            verifyByPath: new Map([
-                [first, {
-                    digest: DIGEST,
-                    investigationId: broker.investigationId,
-                    domainVersion: 4,
-                    domainHead: HEAD,
-                    authenticated: true,
-                    verified: true,
-                }],
-                [second, {
-                    digest: DIGEST,
-                    investigationId: broker.investigationId,
-                    domainVersion: 4,
-                    domainHead: HEAD,
-                    authenticated: true,
-                    verified: true,
-                }],
-            ]),
-        };
-        const deps = deleteDeps({ stateRoot, broker, control });
-        expect(() => deleteInvestigation({
-            operation: "delete",
-            investigation_id: broker.investigationId,
-            expected_archive_digest: DIGEST,
-        }, deps)).toThrow(/discovery is ambiguous/u);
-        fs.rmSync(second, { recursive: true, force: true });
-        expect(deleteInvestigation({
-            operation: "delete",
-            investigation_id: broker.investigationId,
-            expected_archive_digest: DIGEST,
-        }, deps)).toMatchObject({
-            lifecycle_state: "tombstoned",
-            archive_removed: true,
-        });
-        expect(broker.entry.deleteCleanup).toBeNull();
-    });
-
-    it("resumes a migrated v5 partial tree without bundle re-verification", () => {
-        const stateRoot = makeRoot("v5-partial-tree");
-        const broker = new LifecycleBroker("delete-investigation");
-        const archiveRelativePath =
-            ".retention/archives/custom-v5-partial";
-        const cleanupPath = cleanupRelativePath(
-            broker.investigationId,
-            DIGEST,
-        );
-        const nonce = "f".repeat(64);
-        broker.entry = archiveEntry(broker.investigationId, {
-            archive: {
-                ...archiveEntry(broker.investigationId).archive,
-                relativePath: archiveRelativePath,
-            },
-            deleteCleanup: {
-                investigationId: broker.investigationId,
-                authorityKind: "pending_delete",
-                sourceAuthority: "legacy_preverified",
-                cleanupState: "reserved",
-                archiveRelativePath,
-                cleanupRelativePath: cleanupPath,
-                archiveAbsent: false,
-                archiveDigest: DIGEST,
-                cleanupMarkerNonce: nonce,
-                cleanupMarkerDigest: markerDigest({
-                    investigationId: broker.investigationId,
-                    archiveRelativePath,
-                    cleanupRelativePath: cleanupPath,
-                    archiveDigest: DIGEST,
-                    nonce,
-                }),
-                tombstoneRelativePath:
-                    `.retention/tombstones/${broker.investigationId}.json`,
-                tombstoneDigest: `sha256:${"c".repeat(64)}`,
-                signingKeyFingerprint:
-                    `sha256:crucible-tombstone-signing-key-v1:${
-                        "d".repeat(64)
-                    }`,
-                signature: "signed-tombstone",
-                tombstoneSizeBytes: 16,
-                deletedAtMs:
-                    Date.parse("2026-07-14T00:00:00.000Z"),
-                preparedAtMs: 1_000,
-            },
-        });
-        const archiveDir = path.join(
-            stateRoot,
-            ...archiveRelativePath.split("/"),
-        );
-        fs.mkdirSync(archiveDir, { recursive: true });
-        fs.writeFileSync(
-            path.join(archiveDir, "partial-fragment"),
-            "partial",
-        );
-        const control = {
-            faultPoint: null,
-            fsyncFailures: 0,
-            verificationError:
-                new Error("partial tree must not be reverified"),
-            tombstone: null,
-        };
-        expect(deleteInvestigation({
-            operation: "delete",
-            investigation_id: broker.investigationId,
-            expected_archive_digest: DIGEST,
-        }, deleteDeps({ stateRoot, broker, control }))).toMatchObject({
-            lifecycle_state: "tombstoned",
-            archive_removed: true,
-        });
-        expect(control.verificationCalls ?? 0).toBe(0);
     });
 
     it("cleans an unpublished tombstone after delete failure", () => {

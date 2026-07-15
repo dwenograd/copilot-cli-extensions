@@ -33,7 +33,6 @@ export const HARNESS_SUITE_V4_REQUIRED_ROLES = Object.freeze([
     "search",
     "confirmation",
     "challenge",
-    "novelty",
 ]);
 export const HARNESS_SUITE_V4_OPTIONAL_ROLES = Object.freeze([
     "impossibility_verifier",
@@ -45,7 +44,6 @@ export const HARNESS_SUITE_V4_ROLES = Object.freeze([
 export const HARNESS_SUITE_V4_HIDDEN_CASE_ROLES = Object.freeze([
     "confirmation",
     "challenge",
-    "novelty",
     "impossibility_verifier",
 ]);
 export const HARNESS_SUITE_V4_VERIFIER_MODES = Object.freeze([
@@ -738,15 +736,13 @@ function assertHeldOutDisjointness(roles) {
         }
     }
     if (identities.challenge !== undefined) {
-        for (const other of ["confirmation", "novelty"]) {
-            if (identities[other] !== undefined) {
-                assertDisjoint(
-                    "roles.challenge",
-                    identities.challenge,
-                    `roles.${other}`,
-                    identities[other],
-                );
-            }
+        if (identities.confirmation !== undefined) {
+            assertDisjoint(
+                "roles.challenge",
+                identities.challenge,
+                "roles.confirmation",
+                identities.confirmation,
+            );
         }
     }
 }
@@ -944,32 +940,6 @@ export function computeHarnessSuiteV4Identity(value) {
         normalizeHarnessSuiteV4(value),
         HARNESS_SUITE_V4_IDENTITY_ALGORITHM,
     );
-}
-
-export const identifyHarnessSuiteV4 = computeHarnessSuiteV4Identity;
-export const harnessSuiteV4Identity = computeHarnessSuiteV4Identity;
-
-export function validateHarnessSuiteV4(value, options = {}) {
-    const normalized = normalizeHarnessSuiteV4(value);
-    if (options.expectedIdentity !== undefined
-        && options.expectedIdentity !== null) {
-        const expected = requireTaggedHash(
-            options.expectedIdentity,
-            "expectedIdentity",
-            HARNESS_SUITE_V4_IDENTITY_ALGORITHM,
-        );
-        const actual = hashCanonical(
-            normalized,
-            HARNESS_SUITE_V4_IDENTITY_ALGORITHM,
-        );
-        if (actual !== expected) {
-            fail("HarnessSuiteV4 identity does not match expectedIdentity", {
-                expected,
-                actual,
-            });
-        }
-    }
-    return normalized;
 }
 
 export function validateHarnessSuiteV4CaseClaims(

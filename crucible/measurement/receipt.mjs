@@ -34,11 +34,9 @@
 //
 // Physical staged-file identities and timing are intentionally per-run.
 // Callers that need a strict input/output determinism check should project the
-// receipt through RECEIPT_DETERMINISM_KEYS before hashing.
+// receipt through HARNESS_SUITE_RECEIPT_DETERMINISM_KEYS before hashing.
 
 import {
-    CANONICAL_HASH_ALGORITHM,
-    canonicalJson,
     hashCanonical,
     immutableCanonical,
 } from "../domain/canonical.mjs";
@@ -47,7 +45,6 @@ import { normalizeHarnessResultBinding } from "./parser.mjs";
 export const RECEIPT_HASH_ALGORITHM = "sha256:crucible-measurement-receipt-v1";
 export const ARGV_HASH_ALGORITHM = "sha256:crucible-measurement-argv-v1";
 export const ENV_HASH_ALGORITHM = "sha256:crucible-measurement-env-v1";
-export const RECEIPT_VERSION = 6;
 export const HARNESS_SUITE_RECEIPT_VERSION = 8;
 
 const MEASUREMENT_BINDING_KEYS = Object.freeze([
@@ -69,7 +66,7 @@ const TAGGED_SHA256 =
 // Keys within the receipt that are input-derived (deterministic given the
 // same inputs). Timing fields are excluded so callers can prove determinism
 // across two runs that happened to take different wall-clock durations.
-export const RECEIPT_DETERMINISM_KEYS = Object.freeze([
+export const HARNESS_SUITE_RECEIPT_DETERMINISM_KEYS = Object.freeze([
     "version",
     "harnessId",
     "allowlistFileHash",
@@ -97,9 +94,6 @@ export const RECEIPT_DETERMINISM_KEYS = Object.freeze([
     "runnerEpochId",
     "exit",
     "parsed",
-]);
-export const HARNESS_SUITE_RECEIPT_DETERMINISM_KEYS = Object.freeze([
-    ...RECEIPT_DETERMINISM_KEYS,
     ...MEASUREMENT_BINDING_KEYS,
 ]);
 
@@ -121,10 +115,7 @@ export function hashReceipt(receipt) {
 // external verifiers who want to compare two runs modulo timing).
 export function projectDeterministicReceipt(receipt) {
     const out = {};
-    const keys = receipt?.version === HARNESS_SUITE_RECEIPT_VERSION
-        ? HARNESS_SUITE_RECEIPT_DETERMINISM_KEYS
-        : RECEIPT_DETERMINISM_KEYS;
-    for (const key of keys) {
+    for (const key of HARNESS_SUITE_RECEIPT_DETERMINISM_KEYS) {
         if (Object.hasOwn(receipt, key)) {
             out[key] = receipt[key];
         }
@@ -230,23 +221,20 @@ function bindingEqual(left, right) {
 }
 
 function normalizeReceiptBinding(input) {
-    const candidates = [
-        pickMeasurementBinding(input.measurementBinding),
-        pickMeasurementBinding(input),
-        pickMeasurementBinding(input.parsed),
-    ].filter((value) => value !== null)
-        .map((value) => normalizeHarnessResultBinding(value, {
-            field: "measurement receipt binding",
-            required: true,
-        }));
-    if (candidates.length === 0) return null;
-    const binding = candidates[0];
-    for (const candidate of candidates.slice(1)) {
-        if (!bindingEqual(binding, candidate)) {
-            throw new TypeError(
-                "measurement receipt binding disagrees with the parsed harness result",
-            );
-        }
+    const binding = normalizeHarnessResultBinding(input.measurementBinding, {
+        field: "measurement receipt binding",
+    });
+    const parsedBinding = pickMeasurementBinding(input.parsed);
+    if (parsedBinding !== null
+        && !bindingEqual(
+            binding,
+            normalizeHarnessResultBinding(parsedBinding, {
+                field: "parsed measurement receipt binding",
+            }),
+        )) {
+        throw new TypeError(
+            "measurement receipt binding disagrees with the parsed harness result",
+        );
     }
     return binding;
 }
@@ -264,9 +252,7 @@ export function buildMeasurementReceipt(input) {
         input.parserVersion,
     );
     const receipt = {
-        version: measurementBinding === null
-            ? RECEIPT_VERSION
-            : HARNESS_SUITE_RECEIPT_VERSION,
+        version: HARNESS_SUITE_RECEIPT_VERSION,
         harnessId: input.harnessId,
         allowlistFileHash: input.allowlistFileHash,
         harnessEntryHash: input.harnessEntryHash,
@@ -328,20 +314,16 @@ export function buildMeasurementReceipt(input) {
                 capabilityLaunchUsed: input.sandbox.capabilityLaunchUsed,
                 permittedStagedRoots: [...input.sandbox.permittedStagedRoots],
             },
-        ...(measurementBinding === null
-            ? {}
-            : {
-                role: measurementBinding.role,
-                phase: measurementBinding.phase,
-                replicateIndex: measurementBinding.replicateIndex,
-                blockIndex: measurementBinding.blockIndex,
-                armIndex: measurementBinding.armIndex,
-                armId: measurementBinding.armId,
-                deterministicSeed: measurementBinding.deterministicSeed,
-                subjectId: measurementBinding.subjectId,
-                environmentIdentity: measurementBinding.environmentIdentity,
-                suiteIdentity: measurementBinding.suiteIdentity,
-            }),
+        role: measurementBinding.role,
+        phase: measurementBinding.phase,
+        replicateIndex: measurementBinding.replicateIndex,
+        blockIndex: measurementBinding.blockIndex,
+        armIndex: measurementBinding.armIndex,
+        armId: measurementBinding.armId,
+        deterministicSeed: measurementBinding.deterministicSeed,
+        subjectId: measurementBinding.subjectId,
+        environmentIdentity: measurementBinding.environmentIdentity,
+        suiteIdentity: measurementBinding.suiteIdentity,
         attemptId: input.attemptId,
         runnerEpochId: input.runnerEpochId,
         startedAt: input.startedAt,
@@ -356,14 +338,3 @@ export function buildMeasurementReceipt(input) {
     };
     return immutableCanonical(receipt);
 }
-
-// Convenience: canonical-JSON serialisation with a stable per-domain tag.
-export function canonicalizeReceipt(receipt) {
-    // Use the domain's own canonical hash tag for the outer serialisation
-    // check when needed. Kept separate from receipt-hash: the receipt hash
-    // is what identifies THIS receipt across runs; the canonical form is
-    // the bytes-on-the-wire representation.
-    return canonicalJson(receipt);
-}
-
-export { CANONICAL_HASH_ALGORITHM };

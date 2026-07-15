@@ -29,7 +29,6 @@
 
 import fs from "node:fs";
 import path from "node:path";
-import { pathToFileURL } from "node:url";
 
 import { canonicalJson, immutableCanonical } from "../domain/canonical.mjs";
 import {
@@ -66,7 +65,6 @@ import {
     parseHarnessResult,
 } from "./parser.mjs";
 import {
-    VERIFIER_PARSER_MAX_INPUT_BYTES,
     VERIFIER_PARSER_VERSION,
     parseImpossibilityVerifierResult,
 } from "./verifier-parser.mjs";
@@ -163,7 +161,6 @@ function substituteArgv(template, substitutions) {
 }
 
 function bindingArgv(binding) {
-    if (binding === null) return [];
     return [
         `--crucible-role=${binding.role}`,
         `--crucible-phase=${binding.phase}`,
@@ -851,21 +848,34 @@ async function runOnce({
     const snapshot = validateCandidateSnapshot(runInput.candidateSnapshot);
     const attemptId = validateIdentifier(runInput.attemptId, "attemptId");
     const runnerEpochId = validateIdentifier(runInput.runnerEpochId, "runnerEpochId");
-    const measurementBinding = runInput.measurementBinding === undefined
-        || runInput.measurementBinding === null
-        ? null
-        : normalizeHarnessResultBinding(runInput.measurementBinding, {
+    const measurementBinding = normalizeHarnessResultBinding(
+        runInput.measurementBinding,
+        {
             field: "run().measurementBinding",
-            required: true,
-        });
-    const verifierParser = measurementBinding?.role === "impossibility_verifier";
+        },
+    );
+    const verifierParser = measurementBinding.role === "impossibility_verifier";
+    const resultParserContext = verifierParser
+        ? runInput.resultParserContext
+        : null;
+    if (verifierParser
+        && (resultParserContext === null
+            || typeof resultParserContext !== "object"
+            || Array.isArray(resultParserContext)
+            || resultParserContext.request === null
+            || typeof resultParserContext.request !== "object"
+            || Array.isArray(resultParserContext.request)
+            || typeof resultParserContext.requestHash !== "string"
+            || !HASH_TAG.test(resultParserContext.requestHash))) {
+        throw new MeasurementError(
+            MEASUREMENT_ERROR_CODES.INVALID_ARGUMENT,
+            "impossibility verifier runs require resultParserContext",
+        );
+    }
     const parserVersion = verifierParser
         ? VERIFIER_PARSER_VERSION
         : PARSER_VERSION;
     const parserIdentity = trustedParserIdentity(parserVersion);
-    const parserMaximumBytes = verifierParser
-        ? VERIFIER_PARSER_MAX_INPUT_BYTES
-        : PARSER_MAX_INPUT_BYTES;
     const deadlineMs = normalizeDeadline(runInput.deadlineMs);
     const signal = normalizeAbortSignal(runInput.signal);
     const budgetLimits = byteLedger.snapshot(attemptId).limits;
@@ -915,16 +925,16 @@ async function runOnce({
         const concreteArgv = substituteArgv(entry.argvTemplate, {
             candidatePath: stagedSnapshot.path,
             attemptId,
-            role: measurementBinding?.role ?? "none",
-            phase: measurementBinding?.phase ?? "none",
-            replicateIndex: String(measurementBinding?.replicateIndex ?? 0),
-            blockIndex: String(measurementBinding?.blockIndex ?? 0),
-            armIndex: String(measurementBinding?.armIndex ?? 0),
-            armId: measurementBinding?.armId ?? "none",
-            deterministicSeed: measurementBinding?.deterministicSeed ?? "none",
-            subjectId: measurementBinding?.subjectId ?? "none",
-            environmentIdentity: measurementBinding?.environmentIdentity ?? "none",
-            suiteIdentity: measurementBinding?.suiteIdentity ?? "none",
+            role: measurementBinding.role,
+            phase: measurementBinding.phase,
+            replicateIndex: String(measurementBinding.replicateIndex),
+            blockIndex: String(measurementBinding.blockIndex),
+            armIndex: String(measurementBinding.armIndex),
+            armId: measurementBinding.armId,
+            deterministicSeed: measurementBinding.deterministicSeed,
+            subjectId: measurementBinding.subjectId,
+            environmentIdentity: measurementBinding.environmentIdentity,
+            suiteIdentity: measurementBinding.suiteIdentity,
         });
         const spawnExecutable = stagedRun.executable.path;
         const spawnArgv = [
@@ -950,21 +960,19 @@ async function runOnce({
         env.CANDIDATE_SNAPSHOT_PATH = stagedSnapshot.path;
         env.CRUCIBLE_ATTEMPT_ID = attemptId;
         env.CRUCIBLE_RUNNER_EPOCH_ID = runnerEpochId;
-        if (measurementBinding !== null) {
-            env.CRUCIBLE_ROLE = measurementBinding.role;
-            env.CRUCIBLE_PHASE = measurementBinding.phase;
-            env.CRUCIBLE_REPLICATE_INDEX =
-                String(measurementBinding.replicateIndex);
-            env.CRUCIBLE_BLOCK_INDEX = String(measurementBinding.blockIndex);
-            env.CRUCIBLE_ARM_INDEX = String(measurementBinding.armIndex);
-            env.CRUCIBLE_ARM_ID = measurementBinding.armId;
-            env.CRUCIBLE_DETERMINISTIC_SEED =
-                measurementBinding.deterministicSeed;
-            env.CRUCIBLE_SUBJECT_ID = measurementBinding.subjectId;
-            env.CRUCIBLE_ENVIRONMENT_IDENTITY =
-                measurementBinding.environmentIdentity;
-            env.CRUCIBLE_SUITE_IDENTITY = measurementBinding.suiteIdentity;
-        }
+        env.CRUCIBLE_ROLE = measurementBinding.role;
+        env.CRUCIBLE_PHASE = measurementBinding.phase;
+        env.CRUCIBLE_REPLICATE_INDEX =
+            String(measurementBinding.replicateIndex);
+        env.CRUCIBLE_BLOCK_INDEX = String(measurementBinding.blockIndex);
+        env.CRUCIBLE_ARM_INDEX = String(measurementBinding.armIndex);
+        env.CRUCIBLE_ARM_ID = measurementBinding.armId;
+        env.CRUCIBLE_DETERMINISTIC_SEED =
+            measurementBinding.deterministicSeed;
+        env.CRUCIBLE_SUBJECT_ID = measurementBinding.subjectId;
+        env.CRUCIBLE_ENVIRONMENT_IDENTITY =
+            measurementBinding.environmentIdentity;
+        env.CRUCIBLE_SUITE_IDENTITY = measurementBinding.suiteIdentity;
 
         const argvHash = hashArgv(spawnArgv);
         const envHash = hashEnv(env);
@@ -1196,9 +1204,6 @@ async function runOnce({
                 runnerEpochId,
                 harnessId: entry.id,
                 pid: child.pid,
-                launchPath: capability === null
-                    ? "host-process-adapter"
-                    : "sandbox-capability",
             }));
         } catch (error) {
             capture.terminate("fault-after-harness-launch");
@@ -1339,9 +1344,6 @@ async function runOnce({
                 stdoutHash,
                 stderrHash,
                 outputCapture,
-                launchPath: capability === null
-                    ? "host-process-adapter"
-                    : "sandbox-capability",
             }));
             capturedOutputPublished = true;
         };
@@ -1419,37 +1421,19 @@ async function runOnce({
 
         // Parse result. The parser is strict — anything wrong throws
         // ResultParseError which the caller sees directly.
-        if (stdoutBytes.length > parserMaximumBytes) {
-            const receipt = buildReceiptFor(null, false);
-            await publishCapturedOutput();
-            throw new MeasurementError(
-                MEASUREMENT_ERROR_CODES.PARSE_OVERSIZED,
-                `harness result exceeds parser maximum of ${parserMaximumBytes} bytes`,
-                { bytes: stdoutBytes.length, receipt, outputCapture },
-            );
-        }
         const rawStdoutText = stdoutBytes.toString("utf8");
         let parsed;
         try {
             if (verifierParser) {
                 parsed = parseImpossibilityVerifierResult(rawStdoutText, {
                     expectedBinding: measurementBinding,
-                    ...(runInput.resultParserContext ?? {}),
+                    request: resultParserContext.request,
+                    requestHash: resultParserContext.requestHash,
                 });
             } else {
-                parsed = parseHarnessResult(rawStdoutText);
-            }
-            if (!verifierParser && measurementBinding !== null) {
-                if (parsed.role !== null) {
-                    parsed = parseHarnessResult(rawStdoutText, {
-                        expectedBinding: measurementBinding,
-                    });
-                } else {
-                    parsed = immutableCanonical({
-                        ...parsed,
-                        ...measurementBinding,
-                    });
-                }
+                parsed = parseHarnessResult(rawStdoutText, {
+                    expectedBinding: measurementBinding,
+                });
             }
         } catch (error) {
             const receipt = buildReceiptFor(null, false);
@@ -1744,10 +1728,4 @@ function captureChild(
         });
     });
     return Object.freeze({ outcome, closed, terminate });
-}
-
-// Small convenience for tests / callers that need a file:// URL from an
-// absolute path (harnesses sometimes want a URL-form snapshot pointer).
-export function toFileUrl(absPath) {
-    return pathToFileURL(absPath).href;
 }
