@@ -7,7 +7,7 @@ records domain decisions.
 
 The scientific kernel is paired with a durable operational lifecycle: active
 investigations, immutable verified archives, signed tombstones, leases, recovery
-ownership, and interrupted cleanup all live in a versioned global catalog. The
+ownership, and interrupted cleanup all live in a durable global catalog. The
 runner can recover after process death without trusting PID alone, reconcile
 accepted work whose SDK usage report was interrupted, and resume filesystem
 transitions from persisted state instead of inferring intent from leftover
@@ -24,10 +24,10 @@ The four public tools intentionally separate authority:
 - `crucible_result` is the only surface that can emit a terminal decision, and
   only after replay, scientific closure, and artifact verification succeed.
 
-Names such as `HarnessSuiteV4`, `crucible-statistical-policy-v4`, bundle format
-version 4, and the `v4_unreachable` basis are persisted protocol identifiers.
-They are documented literally where required for compatibility, but they are
-not a Crucible product version or release name.
+Some literal configuration values, hash domains, and command names contain
+revision suffixes because they are persisted protocol identifiers. They are
+shown only where an operator must provide or recognize the exact string; they
+do not name separate Crucible products or releases.
 
 A worker session always exposes `crucible_submit_candidate`. It conditionally
 also exposes `crucible_read_parent_artifact` when parent snapshots are assigned.
@@ -204,7 +204,6 @@ The strict operator config (not a `crucible_start` argument) contains:
   candidates_per_round: integer,
   max_rounds: integer,
   search_policy?: {
-    version?: "crucible-search-strategy-v1" | "crucible-search-strategy-v2",
     plateauWindow?: integer,
     minRoundsBeforePlateau?: integer,
     plateauMinImprovement?: number,
@@ -312,8 +311,8 @@ crucible_status({
 Both forms are read-only and never results. `get` resolves active state,
 verified archives, and signed tombstones through the global catalog. A
 scientifically ready terminal still returns only
-`{is_result:false, investigation_id, terminal_available:true}`. A legacy,
-synthetic, search-only, or scientifically incomplete terminal reports
+``{is_result:false, investigation_id, terminal_available:true}`. A structurally
+incompatible, synthetic, search-only, or scientifically incomplete terminal reports
 `terminal_available:false` and exposes no decision, candidate, evidence, or
 hash payload.
 
@@ -340,7 +339,7 @@ Status is read-only and never starts or restarts a supervisor.
 
 `list` is ordered by investigation id and uses a filter-bound opaque cursor. It
 exposes only investigation id, lifecycle state, created/updated timestamps,
-domain version, terminal availability, integrity status, and retained size.
+persisted schema identity, terminal availability, integrity status, and retained size.
 It never returns decisions, candidates, cohorts, evidence, or statistics.
 
 Catalog reads are generation-consistent: one status/list operation reads one
@@ -359,8 +358,8 @@ waiting for lease expiry; Task Scheduler also uses `IgnoreNew`, so stale or
 duplicate invocations cannot both act.
 
 Each cycle discovers investigations from the verified catalog and considers
-only active investigations using the current event-domain schema. Terminal,
-paused, archived, tombstoned, legacy, domain-non-result, and
+only active investigations using the supported persisted schema. Terminal,
+paused, archived, tombstoned, structurally incompatible, domain-non-result, and
 operational-non-result state is skipped. Before a missing supervisor can launch,
 discovery verifies:
 
@@ -384,7 +383,7 @@ deduplication.
 
 Runner ownership is not represented by PID alone. At spawn, the supervisor
 captures a durable process identity containing the executable, complete command
-line, a versioned command-identity hash, and an OS process-start identity. If
+line, a hash-bound command identity, and an OS process-start identity. If
 that identity cannot be captured, the child is terminated and never adopted.
 Drain, escalation, Job Object termination, and post-termination checks all
 re-read and compare the identity; PID reuse therefore cannot authorize killing
@@ -397,7 +396,7 @@ Copilot credentials, or network credentials. Task arguments contain only local
 paths, the state root, timing, and public SHA-256 identities—never tokens or
 secrets.
 
-The v2 task action is not a direct `node daemon.mjs` launch. Crucible builds a
+The scheduled action is not a direct `node daemon.mjs` launch. Crucible builds a
 pinned launch manifest for the launcher host, Node executable, daemon entry
 point, and production Crucible ESM closure, then embeds it in a self-verifying
 PowerShell action. Installation verifies the launcher, Node, and daemon bytes,
@@ -508,7 +507,7 @@ recreation or recovery of the deterministic investigation id.
 Every signed contract includes `workingSetPolicy`. It freezes per-effect and
 per-investigation disk ceilings, terminal/non-result reserve, WAL
 checkpoint/segment thresholds, orphan grace, maintenance cadence, and
-diagnostic retention. Resource-broker config v2 adds the global
+diagnostic retention. The resource broker adds the global
 `storage_bytes` admission lane, so external effects reserve worst-case growth
 before writing and reconcile observed growth afterward.
 
@@ -887,42 +886,42 @@ an optional `impossibility_verifier`:
       "harnessId": "mesh-calibration",
       "observableSchema": { "pass": "boolean", "metrics": ["error"] },
       "caseIds": ["cal-good", "cal-bad"],
-      "deterministicSeed": "calibration-seed-v1",
+      "deterministicSeed": "calibration-seed",
       "sandboxIdentity": { "required": false, "policyDigest": null }
     },
     "search": {
       "harnessId": "mesh-search",
       "observableSchema": { "pass": "boolean", "metrics": ["error"] },
       "caseIds": ["search-a"],
-      "deterministicSeed": "search-seed-v1",
+      "deterministicSeed": "search-seed",
       "sandboxIdentity": { "required": false, "policyDigest": null }
     },
     "confirmation": {
       "harnessId": "mesh-confirmation",
       "observableSchema": { "pass": "boolean", "metrics": ["error"] },
       "caseIds": ["held-out-a"],
-      "deterministicSeed": "confirmation-seed-v1",
+      "deterministicSeed": "confirmation-seed",
       "sandboxIdentity": { "required": false, "policyDigest": null }
     },
     "challenge": {
       "harnessId": "mesh-challenge",
       "observableSchema": { "pass": "boolean", "metrics": ["error"] },
       "caseIds": ["challenge-a"],
-      "deterministicSeed": "challenge-seed-v1",
+      "deterministicSeed": "challenge-seed",
       "sandboxIdentity": { "required": false, "policyDigest": null }
     },
     "novelty": {
       "harnessId": "mesh-novelty",
       "observableSchema": { "pass": "boolean", "metrics": ["error"] },
       "caseIds": ["novelty-a"],
-      "deterministicSeed": "novelty-seed-v1",
+      "deterministicSeed": "novelty-seed",
       "sandboxIdentity": { "required": false, "policyDigest": null }
     },
     "impossibility_verifier": {
       "harnessId": "mesh-independent-verifier",
       "observableSchema": { "status": "verifier-status" },
       "caseIds": [],
-      "deterministicSeed": "impossibility-verifier-seed-v1",
+      "deterministicSeed": "impossibility-verifier-seed",
       "sandboxIdentity": {
         "required": true,
         "policyDigest": "sha256:crucible-measurement-sandbox-policy-identity-v1:<64hex>"
@@ -977,14 +976,14 @@ The harness must emit exactly one JSON object followed only by whitespace.
   "blockIndex": 2,
   "armIndex": 0,
   "armId": "candidate",
-  "deterministicSeed": "confirmation-seed-v1",
+  "deterministicSeed": "confirmation-seed",
   "subjectId": "candidate-17",
   "environmentIdentity": "sha256:crucible-harness-environment-v4:<64hex>",
   "suiteIdentity": "sha256:crucible-harness-suite-v4:<64hex>"
 }
 ```
 
-The legacy five result fields remain supported. For suite-bound runs, Crucible
+The older five result fields remain supported. For suite-bound runs, Crucible
 passes the ten execution-binding fields shown above in concrete argv and env and
 repeats them verbatim in the receipt. If a harness echoes binding fields in its
 JSON, the parser requires an exact match to the trusted binding; otherwise the
@@ -995,7 +994,7 @@ confirmation, or challenge roles with `phase:"calibration"`. The independent
 impossibility verifier uses its own strict parser, requires deterministic
 seed/block/subject binding, and forbids replicate/arm ordinals. `validationCases` is
 calibration-phase-only once a role binding is present, while
-legacy `searchSpaceExhausted` and `impossibilityCertificateHash` fields have no
+older `searchSpaceExhausted` and `impossibilityCertificateHash` fields have no
 verifier authority.
 Unknown top-level fields, duplicate JSON keys, non-finite metrics, trailing
 content, and output overflow are rejected. Metrics named by acceptance claims
@@ -1041,18 +1040,15 @@ process-tree termination alone are not represented as a sandbox.
 
 ## Search and termination
 
-The event-domain schema is internally versioned, and its version participates in
-investigation identity. Older event history is not migrated in place. These
-identifiers are persistence/compatibility boundaries, not product release names.
+The persisted event-domain schema participates in investigation identity.
+Structurally incompatible event history is not migrated in place.
 
-Search policy is separately versioned. An omitted version and
-`crucible-search-strategy-v1` retain the original frozen operator weighting and
-shared search-lane authority for historical investigations.
-`crucible-search-strategy-v2` is the current default. It deterministically
-adapts operator weights from completed history: an untried adversarial step is
-strongly favored, then refinement is strongly favored after adversarial work
-completes. Because the adaptation reads persisted aggregate history, replay
-selects the same operator.
+Newly configured search policy deterministically adapts operator weights from
+completed history: an untried adversarial step is strongly favored, then
+refinement is strongly favored after adversarial work completes. Because the
+adaptation reads persisted aggregate history, replay selects the same operator.
+Previously persisted policy remains authoritative for its own investigation;
+Crucible does not reinterpret historical search decisions under newer rules.
 
 Each slot freezes round, slot, candidate id, model, operator, parent evidence,
 prompt refs, replacement ordinal, and deterministic seed. Invalidated candidate
@@ -1102,8 +1098,8 @@ the same slot spends a new lane; it cannot reuse the replaced candidate's
 significance authority. Before result material is derived, scientific replay
 reconstructs evidence order, replacement ordinals, lane assignment, and
 slot/candidate binding. Substitution, lane reuse, or reordered authority fails
-closed. Historical v1 investigations retain their original shared-lane rules
-rather than being reinterpreted under v2.
+closed. Previously persisted investigations retain their original lane rules
+rather than being reinterpreted under the current policy.
 
 Every sealed typed prediction is translated into a frozen statistical claim
 and evaluated independently from candidate acceptance over replay-derived
@@ -1202,8 +1198,7 @@ but remain read-only. They cannot resume, archive, append events, or emit a new
 terminal result. This prevents compatibility code from manufacturing current
 domain authority for an older or structurally incomplete history.
 
-Persistence bundle format version 4 is self-contained and internally
-hash-verifiable.
+The persistence bundle is self-contained and internally hash-verifiable.
 It includes the event database, every referenced raw receipt/output/snapshot/
 schedule/composite object, and a cache-only scientific replay digest. Export and
 import both replay the bundled event database and reject any mismatch between that
