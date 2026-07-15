@@ -1,6 +1,6 @@
 # Copilot CLI Extensions Workspace
 
-Eight interrelated Copilot CLI extensions for autonomous investigation, multi-model orchestration, zero-trust source auditing, and MCP-connection resilience:
+Seven interrelated Copilot CLI extensions for multi-model orchestration, zero-trust source auditing, and MCP-connection resilience:
 
 | Extension | What it does |
 |---|---|
@@ -9,7 +9,6 @@ Eight interrelated Copilot CLI extensions for autonomous investigation, multi-mo
 | **triple-plan** | 3 planning agents in parallel → merged plan with consensus + alternatives + contested decisions |
 | **debate** | 2 debaters arguing opposing positions + 1 independent judge |
 | **duck-council** | 6 role-specialized rubber-ducks (security/stability/perf/maintainer/skeptic/user) with optional judge synthesis |
-| **crucible** | Evidence-judged investigation runner with a persistent cataloged lifecycle, immutable verified archives, crash-safe runner/accounting recovery, replay-verified science, and authenticated Windows Task Scheduler recovery. Exposes exactly `crucible_start`, `crucible_status`, `crucible_stop`, and `crucible_result`. |
 | **zerotrust-sourcecheck** | 32-role multi-model security council against a GitHub URL OR an on-disk local directory. API-direct URL wrappers do not intentionally create source files, although returned text can still be retained by Copilot CLI/session logging. Local-source mode reads an existing tree via `view`/`grep`/`glob`. Build-mode wrappers provide pinned clone/install/build operations. |
 | **mcp-autoreload** | On a recognized MCP transport failure, invokes the SDK's global MCP reload, polls the owning server, and asks the agent to retry or escalates. Exposes `mcp_reload_now`. (Hook-based utility; no automated tests.) |
 
@@ -39,7 +38,7 @@ npm install
 # Restart Copilot CLI (or run `extensions_reload` from inside it).
 ```
 
-After restart, the orchestrator/audit tools plus Crucible's four-tool lifecycle become invokable in any session.
+After restart, the orchestrator and audit tools become invokable in any session.
 
 > **Already have a `~/.copilot/extensions/` directory?** Back it up first; the clone needs to write into an empty path. Existing extensions can be moved alongside (the workspace's `_shared/` is namespaced under `_shared/`, and each extension lives in its own subdirectory).
 
@@ -72,15 +71,6 @@ extensions/
 ├── triple-plan/                # same structure
 ├── debate/                     # same structure
 ├── duck-council/               # same structure (+ AGENTS.md no-`git diff` reminder)
-├── crucible/                    # autonomous event-sourced investigation runner
-│   ├── extension.mjs           # four-tool thin SDK adapter
-│   ├── api/                    # single-source schemas + start/status/stop/result handlers
-│   ├── domain/                 # pure reducer, decisions, contracts, evidence ranking
-│   ├── persistence/            # event log, CAS/bundles, global lifecycle catalog
-│   ├── measurement/            # allowlisted/staged harness execution boundary
-│   ├── runtime/                # restricted workers, runner/supervisor, recovery
-│   ├── tools/                  # experiment/harness and recovery-task operator CLIs
-│   └── __tests__/              # domain, persistence, measurement, runtime, API tests
 ├── mcp-autoreload/
 │   ├── extension.mjs           # standalone MCP recovery hook + mcp_reload_now tool
 │   └── README.md
@@ -110,7 +100,7 @@ parse (zod schema) → check budget → scrub each free-text field
                                   → buildInstructionPacket (compose meta-blocks + protocol)
 ```
 
-Each orchestrator stage can short-circuit with a clear error before the next runs. Crucible, zerotrust-sourcecheck, and mcp-autoreload have purpose-built pipelines described in their own READMEs.
+Each orchestrator stage can short-circuit with a clear error before the next runs. `zerotrust-sourcecheck` and `mcp-autoreload` have purpose-built pipelines described in their own READMEs.
 
 ## Hardening features
 
@@ -139,14 +129,8 @@ npm install   # one-time
 npm test
 ```
 
-`npm test` runs `vitest` for the orchestrators and `_shared/`, Crucible's
-curated 55-second-capped suite, then `node --test` for
-`zerotrust-sourcecheck/`.
-
-Use `npm run test:crucible` for Crucible. The `unit`, `changed`, and `release`
-commands are aliases for the same curated suite, and every path has the same
-55-second hard limit. Crucible no longer has separate long-running release,
-science, integration, hard-kill, Task Scheduler, or native conformance suites.
+`npm test` runs `vitest` for the orchestrators and `_shared/`, then
+`node --test` for `zerotrust-sourcecheck/`.
 
 If you change a packet wording deliberately in any orchestrator extension,
 regenerate vitest snapshots once with `npm run test:update`. That update command

@@ -3,19 +3,15 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Eight Copilot CLI extensions: five multi-model orchestrators; Crucible, an autonomous evidence-judged investigation runner; zerotrust-sourcecheck, a 32-role source security council with hardened runtime wrappers; and mcp-autoreload for stale MCP recovery.",
+  "description": "Seven Copilot CLI extensions: five multi-model orchestrators; zerotrust-sourcecheck, a 32-role source security council with hardened runtime wrappers; and mcp-autoreload for stale MCP recovery.",
   "license": "MIT",
   "repository": {
     "type": "git",
     "url": "https://github.com/dwenograd/copilot-cli-extensions"
   },
   "scripts": {
-    "test": "npm run test:vitest && npm run test:crucible && node --test \"zerotrust-sourcecheck/__tests__/*.test.mjs\"",
+    "test": "npm run test:vitest && node --test \"zerotrust-sourcecheck/__tests__/*.test.mjs\"",
     "test:vitest": "vitest run _shared/__tests__ triple-duck/__tests__ triple-plan/__tests__ triple-review/__tests__ debate/__tests__ duck-council/__tests__",
-    "test:crucible": "node crucible/scripts/run-tests.mjs",
-    "test:crucible:unit": "node crucible/scripts/run-tests.mjs",
-    "test:crucible:changed": "node crucible/scripts/run-related-tests.mjs",
-    "test:crucible:release": "node crucible/scripts/run-tests.mjs",
     "test:release": "npm test",
     "test:zerotrust": "node --test \"zerotrust-sourcecheck/__tests__/*.test.mjs\"",
     "test:watch": "vitest _shared/__tests__ triple-duck/__tests__ triple-plan/__tests__ triple-review/__tests__ debate/__tests__ duck-council/__tests__",
