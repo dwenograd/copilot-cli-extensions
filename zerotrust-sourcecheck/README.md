@@ -1,7 +1,7 @@
 # zerotrust-sourcecheck
 
 Copilot CLI extension that audits a GitHub URL (or an already-on-disk
-directory) for source-level malware indicators. API-direct wrappers do
+directory) for source-level malicious behavior. API-direct wrappers do
 not intentionally create source files, but returned tool text can still
 be retained in Copilot CLI session logs or oversized-tool-output storage.
 Build modes clone a pinned commit under a contained directory and run
@@ -21,19 +21,19 @@ dependency-CVE scanner.
 | Tool | Purpose |
 |---|---|
 | `zerotrust_sourcecheck` | Main entry point. Returns an instruction packet the orchestrator follows. |
-| `zerotrust_safe_list_tree` | GitHub-API tree listing at a pinned SHA (API-direct mode). |
-| `zerotrust_safe_fetch_file` | GitHub-API source fetch returned through the tool result; no source file is intentionally created by the wrapper. |
+| `zerotrust_safe_list_tree` | Resolves and binds the commit/release identity, enumerates the pinned Git tree, merges subtree pages, and records mandatory acquisition coverage. |
+| `zerotrust_safe_fetch_file` | Fetches one enumerated blob at the pinned SHA, classifies its actual bytes, fully scans text returned within the cap, indexes normalized facts, and records mandatory or advisory coverage; no source file is intentionally created. |
 | `zerotrust_safe_list_source` | Enumerates only the active local root or recorded build clone without following symlinks/reparse points; returns metadata, not source text. |
 | `zerotrust_safe_index_source_file` | Indexes one enumerated local/build file with exact containment, classification, hashes, and bounded normalized facts; never returns source text. |
 | `zerotrust_safe_list_analysis_facts` | Pages exact audit-bound indexed fact references (path, line range, identity, excerpt hash) without source text or excerpts. |
-| `zerotrust_record_council_candidates` | Validates and records one structured role batch with exact indexed evidence, then gates `prepared → scanned`. |
+| `zerotrust_record_council_candidates` | Validates and records structured role batches with exact indexed evidence; its finalize action enforces council coverage and gates `prepared → scanned`. |
 | `zerotrust_trace_behavior_graph` | Audit-bound merge and bounded trace of deterministic plugin seeds plus finalized council graph fragments; returns source-text-free chains and validation conflicts. |
 | `zerotrust_record_validation` | Paged audit-bound static validation: prepares required candidates, records independent confirm/refute decisions, records a separate adjudication, and advances `traced → validated` only when complete and untruncated. |
 | `zerotrust_safe_list_release_assets` | Lists assets only for the active audit's already-bound numeric release ID/tag/source SHA and records bounded coverage. |
 | `zerotrust_safe_fetch_release_asset` | Downloads one previously discovered numeric asset ID to the canonical quarantine, verifies byte counts, hashes it, and records coverage (100 MB hard maximum). |
 | `zerotrust_cache_list` | Lists strictly revalidated metadata-cache entries for the exact active source namespace; absence is normal. |
 | `zerotrust_cache_load` | Loads exact-source metadata or unchanged blob/content records from a prior source SHA, with exact plugin-version compatibility. |
-| `zerotrust_cache_store` | Atomically stores only normalized, bounded derived index/plugin metadata in the canonical versioned cache. |
+| `zerotrust_cache_store` | Atomically stores normalized, bounded index/plugin metadata and eligible structured finding/validation metadata in the canonical versioned cache. |
 | `zerotrust_cache_cleanup` | Removes only the active source entry or active source namespace; accepts no raw path. |
 | `zerotrust_safe_clone` | Hardened git clone (no submodules / hooks / LFS smudge / symlinks). Build modes only. |
 | `zerotrust_safe_install` | `npm`, `npm-install`, `yarn`, `pnpm`, `pip`, `cargo`, or `dotnet` dependency operation with hardcoded flags. Build modes only. |
@@ -75,6 +75,32 @@ deterministic mode the workspace default. All other modes are opt-in
 Council modes retain the fixed **32-role discovery backbone**. Optional extra
 roles are additive; they do not replace the required roster or its
 mandatory/category/90% completion gates.
+
+### Council architecture
+
+The council remains the primary semantic discovery layer:
+
+- The default roster contains 32 roles across seven attack-surface categories.
+  Four roles are mandatory: `install-build-hook`,
+  `compiler-toolchain-codegen`, `prompt-injection-in-source`, and
+  `enterprise-impact`.
+- All discovery roles run in bounded parallel batches. A valid council requires
+  every mandatory role, at least one successful role in every category, at
+  least 90% of the complete roster, and one successfully recorded batch from
+  every role counted as successful. The deterministic baseline must also
+  complete.
+- Each role is still given broad latitude to discover malicious behavior in its
+  assigned domain. In v5, roles submit bounded structured candidates and
+  connected graph fragments; they do not author durable report prose. Empty
+  candidate batches are valid when the role records non-empty coverage.
+- After trace and independent validation, seven category sub-judges organize
+  the already-recorded evidence without changing canonical identities, states,
+  dedupe groups, or scores. The meta-judge emits only a bounded JSON cross-check
+  of the trusted decision snapshot. It cannot invent findings, recompute the
+  verdict, or write `REPORT.md`.
+- The council supplies the discovery ceiling; deterministic acquisition,
+  indexing, plugins, and baseline checks supply the floor. Neither replaces the
+  other.
 
 The logical pipeline is:
 
@@ -136,8 +162,9 @@ read source. The API-direct audit pipeline:
    unfetched, and council-sample-only blobs keep quantitative
    `requiredAcquisitionComplete:false`.
 3. The deterministic checklist + all 32 discovery roles reason about the
-   returned content. Council-role samples are advisory and never satisfy the
-   parent's mandatory acquisition ledger.
+   returned content. Roles submit source-text-free candidate batches whose
+   evidence must resolve to the audit index. Council-role fetches are advisory
+   samples and never satisfy the parent's mandatory acquisition ledger.
 4. Candidate graphs are traced without execution. Every critical/high candidate
    (plus lower severities selected by `validation_min_severity`) receives
    independent static confirm and refute decisions followed by a separate
@@ -186,9 +213,13 @@ re-fetching from GitHub, use **local-path mode**:
 ```
 
 This activates `audit_local_source_council` (or pass
-`mode="audit_local_source"` for the non-council variant). The 32-role
-council runs against the local tree via `view`/`grep`/`glob` — no
-clone, no GitHub API calls, no SHA pinning.
+`mode="audit_local_source"` for the non-council variant). The wrapper first
+enumerates and indexes the exact local root without executing it or returning
+source text. The 32-role council then uses the audit-bound normalized facts and
+may use `view`/`grep`/`glob` for deeper inspection under the prompt-level path
+rule. There is no new clone, no GitHub source fetch, and no Git commit pin;
+identity is instead bound to the exact local root plus current indexed content
+hashes.
 
 ### Safety boundary for local mode
 
@@ -196,10 +227,12 @@ clone, no GitHub API calls, no SHA pinning.
   active `local_path`. Callers cannot redirect the root; traversal, symlinks,
   junctions, and other reparse points are refused or skipped, repository code is
   never executed, and only bounded normalized facts/hashes are retained.
-- Council roles may use `view`/`grep`/`glob` for deeper review under a separate
-  prompt-level path rule. Built-in tools are not intercepted by a runtime hook,
-  but role output cannot enter the trusted ledger unless its evidence exactly
-  matches the wrapper-owned index identity, line range, and excerpt hash.
+- Council roles begin from `zerotrust_safe_list_analysis_facts` and may use
+  `zerotrust_safe_index_source_file`, `view`, `grep`, and `glob` for deeper
+  review under a separate prompt-level path rule. Built-in tools are not
+  intercepted by a runtime hook, but role output cannot enter the trusted
+  ledger unless its evidence exactly matches the wrapper-owned index identity,
+  line range, and excerpt hash.
 - `local_path` itself is validated: must be absolute, must exist, must
   be a directory, no `..` segments, no UNC / `\\?\` prefix, no
   credential-store paths (`.ssh`, `.aws`, `.docker`, `.kube`,
@@ -216,8 +249,9 @@ their packet. API-direct `verify_release` can create quarantine files but does
 not apply this source-edit flow. In a v5 council flow, remediation starts only
 from a validated, source-text-free candidate that identifies graph edges,
 evidence locations/hashes, risk codes, and static verification criteria. No
-stored diff or source text enters the ledger. Per HIGH/CRITICAL source finding,
-the agent walks you through three choices:
+stored diff or source text enters the ledger. For each validated active
+HIGH/CRITICAL source finding that is eligible for remediation, the agent
+walks you through three choices:
 
 - **defang** — surgical edit (specific files + lines, in diff form).
   Agent calls `view` first to show you the proposed change, waits for
@@ -243,9 +277,11 @@ the "missed a second copy of the same payload elsewhere" risk).
 
 ## What it's for
 
-The "clean source / infected binary" attack class — and its inverse,
-source poisoning via supply-chain compromise — are the two big GitHub
-threats this extension targets. Common patterns it actively looks for:
+Source poisoning via supply-chain compromise is the primary threat this
+extension targets. Release mode also checks whether published artifacts are
+consistently bound to the audited tag/SHA and surfaces hashes, signatures, and
+provenance mismatches. It does **not** decompile binaries or prove that a
+published binary is malware-free. Common source patterns it actively looks for:
 
 - **Install / build hooks** that fetch + execute remote scripts
   (`postinstall`, `build.rs`, MSBuild `BeforeTargets`, etc.)
@@ -499,10 +535,10 @@ call it in the audit epilogue.
 |---|---|---|
 | `metadata_only` | GH API recon only, no clone. NOT a security audit. | (explicit) |
 | `audit_source` | Recon + static audit via GH API (no clone) + verdict. | repo / commit / tree / pull URLs when `ZEROTRUST_DETERMINISTIC_ONLY=1` is set |
-| `audit_source_council` | `audit_source` plus all 32 discovery roles, bounded graph tracing, independent confirm/refute/adjudication, and meta-judge synthesis. | **Default** for repo / commit / tree / pull URLs |
-| `audit_local_source` | Same as `audit_source` but against an already-on-disk path. | (explicit; `local_path=...`) |
-| `audit_local_source_council` | Council audit against an on-disk path. | **Default when `local_path` is supplied** |
-| `verify_release` | Release-artifact provenance: signed tag, attestations, Authenticode, `workflow_run` cross-check. | `/releases/...` URLs |
+| `audit_source_council` | `audit_source` plus all 32 discovery roles, bounded graph tracing, independent confirm/refute/adjudication, category organization, and a structured meta-judge cross-check. | **Default** for repo / commit / tree / pull URLs |
+| `audit_local_source` | Deterministic audit of an exact wrapper-indexed on-disk path; no new clone or GitHub source fetch. | (explicit; `local_path=...`) |
+| `audit_local_source_council` | The local deterministic audit plus the complete 32-role council and v5 trace/validation pipeline. | **Default when `local_path` is supplied** |
+| `verify_release` | Full API-direct source audit plus bound release-asset enumeration/hashing and provenance checks: signed tag, attestations, Authenticode, and `workflow_run` cross-check. No build. | `/releases/...` URLs |
 | `audit_and_safe_build` | `audit_source` + shared install/build wrappers. Install lifecycle scripts stay suppressed; build-time repo code may execute. Requires `i_understand_build_executes_code`. | (explicit) |
 | `audit_and_full_build` | Same wrappers as safe-build; additionally requires `unsafe` for admission/warning posture and reserves a future distinction. | (explicit) |
 | `audit_and_safe_build_council` | Council audit + shared install/build wrappers. The build wrapper refuses to proceed until a passing council outcome is recorded, unless the explicit wrapper override is supplied. | (explicit) |
@@ -519,6 +555,9 @@ build command itself is arbitrary repo-controlled code. Full mode currently
 reserves a future distinction only; it is not a less-restricted installer.
 
 ### Council-build overrides are orthogonal
+
+These are arguments to `zerotrust_safe_build`, not to the main
+`zerotrust_sourcecheck` activation call:
 
 - `proceed_on_council_failure:true` bypasses only the incomplete-council gate.
 - `council_build_override:true` bypasses only the severity gate.
@@ -605,7 +644,9 @@ zerotrust_sourcecheck({
   roles?: object,                                 // council modes only
   extra_roles?: object[],                         // council modes only
   judge?: string,                                 // council modes only
-  max_premium_calls?: number,                     // council modes only
+  max_premium_calls?: number,                     // council modes only; default 200
+  validation_min_severity?: "high" | "medium" |   // council modes only; default high
+                            "low" | "info",
 })
 ```
 
@@ -883,11 +924,9 @@ zerotrust-sourcecheck/
   packet.mjs              ← stable packet assembly surface
   packet/                 ← prepare / acquisition / scan / trace / validate / finalize renderers
   modes.mjs               ← mode enum + per-mode policy helpers
-  analysis/validation.mjs ← static validator/adjudication contracts + bounded validation state
-  analysis/cache.mjs      ← strict metadata-cache schema, canonical JSON, identity/path derivation
-  analysis/reportLedger.mjs ← source-text-free FINDINGS.json serialization + shared Markdown rendering
-  council/                ← discovery-role and validation/adjudication prompt templates
-  safeWrappers/           ← clone / install / build / report / cache / validation / cleanup / sweep / fetch / list-tree
+  analysis/               ← index, facts, plugins, graph, validation, scoring, remediation, cache, report ledger
+  council/                ← 32-role roster plus discovery, validation, adjudication, and judge prompt contracts
+  safeWrappers/           ← source/release acquisition, ledgers, trace/validation, cache, build, report, and lifecycle tools
   __corpus__/             ← regression corpus harness (see its own README)
   __tests__/              ← node:test in-process suite
   AGENTS.md               ← agent design notes (read before modifying sub-agent prompts)
@@ -928,7 +967,8 @@ contributions right now are:
   silently falling back — see [Model availability](#model-availability))
 
 Before modifying sub-agent prompt templates (`council/promptTemplate.mjs`,
-`packet.mjs` Section 5 preambles, role manifests), read
+`council/validationPromptTemplate.mjs`, `packet/scan.mjs`,
+`packet/local.mjs`, or the role manifest), read
 [`AGENTS.md`](./AGENTS.md) — there are non-obvious constraints around
 file-write prevention, `Set-Location`, and the `git diff` hung-shell
 pattern that the rest of the workspace also enforces.
