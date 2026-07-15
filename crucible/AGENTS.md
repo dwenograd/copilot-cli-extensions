@@ -9,6 +9,7 @@ Implementation work must use the smallest relevant test tier.
 2. Run `npm run test:crucible:unit` for domain/schema/parser changes.
 3. Run `npm run test:crucible:changed` when the affected tests are unclear.
 4. The parent/orchestrator runs `npm run test:crucible` once at a phase gate.
+   It uses the same curated fast suite and has a hard 55-second process timeout.
 5. Release-only matrices, real SDK integration, and Windows conformance run only
    at explicit release gates.
 
@@ -22,7 +23,7 @@ run, then rerun the affected tier once.
 
 ## Runtime budget
 
-- Targeted/unit loop: under 30 seconds.
+- Targeted/unit loop: under 30 seconds; hard process ceiling 55 seconds.
 - Changed-file unit loop: hard timeout of 120 seconds.
 - Ownership resolution covers every current Crucible source module, test fixture,
   PowerShell helper, Vitest config, and release test. Unknown inputs fail closed;

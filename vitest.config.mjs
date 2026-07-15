@@ -7,9 +7,9 @@
 // Excluding it avoids duplicate/incorrect discovery under a different runner.
 // mcp-autoreload currently has no automated test files.
 //
-// `npm test` (in package.json) runs vitest first, then explicitly
-// invokes `node --test "zerotrust-sourcecheck/__tests__/*.test.mjs"`
-// so both test runners are invoked by the workspace command.
+// Direct targeted Crucible commands use this config. The workspace iteration
+// command uses vitest.workspace-fast.config.mjs and invokes Crucible's curated
+// suite separately.
 // This config does not enable passWithNoTests. Only the snapshot-maintenance
 // script `npm run test:update` passes `--passWithNoTests`.
 

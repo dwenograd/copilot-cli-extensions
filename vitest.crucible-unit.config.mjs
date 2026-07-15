@@ -27,7 +27,6 @@ export default defineConfig({
             "crucible/__tests__/runtime-prediction-feedback.test.mjs",
             "crucible/__tests__/runtime-sdk-availability.test.mjs",
             "crucible/__tests__/release-plumbing.test.mjs",
-            "crucible/__tests__/tools-recovery-task.test.mjs",
             "crucible/__tests__/api-schema.test.mjs",
             "crucible/__tests__/api-lifecycle.test.mjs",
             "crucible/__tests__/api-handlers.test.mjs",

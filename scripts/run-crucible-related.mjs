@@ -19,6 +19,7 @@ const TOP_LEVEL_INPUTS = new Set([
     "vitest.crucible-unattended.config.mjs",
     "vitest.crucible-unit.config.mjs",
     "vitest.windows-conformance.config.mjs",
+    "vitest.workspace-fast.config.mjs",
 ]);
 
 function target(file, tier = "unit", pattern = null) {
@@ -459,14 +460,6 @@ const RULES = [
         ],
     },
     {
-        pattern: /^crucible\/scripts\/run-v3-science-benchmark\.mjs$/u,
-        targets: [
-            target(
-                "science-fixtures/benchmark-runner.characterizes_v3.test.mjs",
-            ),
-        ],
-    },
-    {
         pattern: /^crucible\/scripts\/run-v4-science-benchmark\.mjs$/u,
         targets: [
             target("science-fixtures/v4-science-gate.test.mjs", "science"),
@@ -475,6 +468,11 @@ const RULES = [
     {
         pattern:
             /^scripts\/run-crucible-related\.mjs$/u,
+        targets: [target("release-plumbing.test.mjs")],
+    },
+    {
+        pattern:
+            /^scripts\/run-crucible-fast\.mjs$/u,
         targets: [target("release-plumbing.test.mjs")],
     },
     {
@@ -643,7 +641,7 @@ const FIXTURE_RULES = [
     },
     {
         pattern:
-            /^crucible\/__tests__\/science-fixtures\/(?:baseline\.v3\.json|(?:fixtures|oracle|v3-adapter|v3-domain-harness|v4-adapter|v4-verifier-fixture)\.mjs)$/u,
+            /^crucible\/__tests__\/science-fixtures\/(?:(?:fixtures|oracle|v4-adapter|v4-verifier-fixture)\.mjs)$/u,
         releaseTargets: [
             target("science-fixtures/v4-science-gate.test.mjs", "science"),
             target(

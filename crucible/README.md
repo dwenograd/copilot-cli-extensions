@@ -1226,7 +1226,13 @@ npm run test:crucible:changed
 ```
 
 `test:crucible:unit` covers pure domain/schema/parser behavior and is intended
-for the inner edit loop. `test:crucible:changed` maps every current Crucible
+for the inner edit loop. `test:crucible` runs that same curated fast suite.
+Both commands are terminated at 55 seconds, making one minute a hard iteration
+ceiling rather than a target. Task Scheduler behavior and other host-state,
+hard-kill, multiprocess, credentialed, and native cases are excluded from the
+normal loop and remain in explicit release gates.
+
+`test:crucible:changed` maps every current Crucible
 source module, PowerShell helper, fixture, config, and test to narrow owners.
 Unknown inputs fail closed rather than falling back to an unrelated unit tier.
 Unit mappings abort after 120 seconds; reaching that limit means the next run

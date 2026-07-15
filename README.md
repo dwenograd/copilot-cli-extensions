@@ -100,6 +100,7 @@ extensions/
 ├── package.json                # workspace root (vitest + zod for the orchestrators; zerotrust uses node:test)
 ├── scripts/                    # Crucible ownership, integration, unattended, conformance runners
 ├── vitest.config.mjs           # safe developer-suite configuration
+├── vitest.workspace-fast.config.mjs # orchestrator/_shared workspace loop
 ├── vitest.crucible-*.config.mjs # unit, release, science, unattended, integration configs
 ├── vitest.windows-conformance.config.mjs # native Windows boundary config
 └── .gitignore
@@ -143,8 +144,9 @@ npm install   # one-time
 npm test
 ```
 
-`npm test` runs the safe developer suites: `vitest` for the orchestrators,
-Crucible, and `_shared/`, then `node --test` for `zerotrust-sourcecheck/`.
+`npm test` runs `vitest` for the orchestrators and `_shared/`, Crucible's
+curated 55-second-capped suite, then `node --test` for
+`zerotrust-sourcecheck/`.
 Native Windows containment, real SDK/CLI smoke, and Crucible's release-only
 hard-kill/multiprocess/long-process matrices are deliberately excluded.
 
@@ -157,6 +159,8 @@ explicit `npm run test:crucible:release` gate is four layers: safe Crucible
 tests, release-safe matrices, the science gate, and the unattended wrapper
 (authenticated SDK plus Windows containment, Task Scheduler recovery, and leak
 conformance). `npm run test:release` adds the rest of the workspace suites.
+The normal `test:crucible` command is the curated unit/component loop and is
+terminated at 55 seconds; slow host-state and recovery coverage is release-only.
 
 `npm run test:crucible:changed` maps current Crucible source, PowerShell,
 fixtures, configs, and tests to narrow owners and fails closed when no owner
