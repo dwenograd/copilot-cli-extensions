@@ -1,7 +1,6 @@
 # Crucible
 
-See [WORKFLOW.md](WORKFLOW.md) for the source-audited end-to-end flowchart,
-component map, removed abandoned code, and remaining live limitations.
+![Crucible source workflow](crucible-workflow.png)
 
 Crucible runs persistent, evidence-judged experiments.
 
