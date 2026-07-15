@@ -10,6 +10,7 @@ import {
     clearRecordedOutcome,
     getCacheBinding,
 } from "./state.mjs";
+import { failure, success } from "./result.mjs";
 
 /**
  * Tool signature:
@@ -106,18 +107,4 @@ export async function closeAuditHandler(args, invocation, dependencies = {}) {
         artifactsAbandoned: abandoning && blockingArtifacts.length > 0,
         ...(blockingArtifacts.length > 0 ? { abandonedArtifacts: blockingArtifacts } : {}),
     });
-}
-
-function success(data) {
-    return {
-        textResultForLlm: JSON.stringify({ ok: true, ...data }, null, 2),
-        resultType: "success",
-    };
-}
-
-function failure(message, data = {}) {
-    return {
-        textResultForLlm: JSON.stringify({ ok: false, error: message, ...data }, null, 2),
-        resultType: "failure",
-    };
 }

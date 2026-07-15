@@ -6,6 +6,7 @@ import {
 } from "../enforcement.mjs";
 import { FACT_KINDS } from "../analysis/extractFacts.mjs";
 import { DEFAULT_BUILD_ROOT } from "./defaults.mjs";
+import { failure, success } from "./result.mjs";
 
 const READABLE_STAGES = new Set([
     "prepared",
@@ -83,20 +84,6 @@ export async function safeListAnalysisFactsHandler(args, invocation) {
     } catch (err) {
         return failure(`safe_list_analysis_facts refused: ${err.message}`);
     }
-}
-
-function success(data) {
-    return {
-        textResultForLlm: JSON.stringify({ ok: true, ...data }, null, 2),
-        resultType: "success",
-    };
-}
-
-function failure(message, data = {}) {
-    return {
-        textResultForLlm: JSON.stringify({ ok: false, error: message, ...data }, null, 2),
-        resultType: "failure",
-    };
 }
 
 export const __internals = Object.freeze({

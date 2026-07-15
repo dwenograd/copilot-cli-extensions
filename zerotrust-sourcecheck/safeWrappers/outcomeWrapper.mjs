@@ -13,6 +13,7 @@ import {
 } from "../enforcement.mjs";
 import { modeUsesApiDirect } from "../modes.mjs";
 import { buildCoverageSnapshot } from "./coverageAccounting.mjs";
+import { failure, success as resultSuccess } from "./result.mjs";
 
 const VERDICTS = new Set([
     "critical",
@@ -22,6 +23,7 @@ const VERDICTS = new Set([
     "no red flags found",
     "incomplete",
 ]);
+const success = (data) => resultSuccess({ recorded: true, ...data });
 
 export async function recordOutcomeHandler(args, invocation) {
     args = args || {};
@@ -141,20 +143,6 @@ export async function recordOutcomeHandler(args, invocation) {
         sessionId: sessionId.slice(0, 12),
         ...(acquisitionCoverage ? { acquisitionCoverage } : {}),
     });
-}
-
-function success(data) {
-    return {
-        textResultForLlm: JSON.stringify({ ok: true, recorded: true, ...data }, null, 2),
-        resultType: "success",
-    };
-}
-
-function failure(message, data = {}) {
-    return {
-        textResultForLlm: JSON.stringify({ ok: false, error: message, ...data }, null, 2),
-        resultType: "failure",
-    };
 }
 
 export const __internals = {

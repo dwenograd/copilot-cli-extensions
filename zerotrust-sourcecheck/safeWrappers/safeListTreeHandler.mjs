@@ -26,6 +26,7 @@ import {
 } from "../enforcement.mjs";
 import { recordIndexEnumeration } from "../analysis/indexState.mjs";
 import { DEFAULT_BUILD_ROOT } from "./defaults.mjs";
+import { failure, success } from "./result.mjs";
 import {
     annotateTreeEntry,
     buildCoverageSnapshot,
@@ -535,20 +536,6 @@ function renderEnumerationResult({
         analysisStageState,
         analysisPlugins,
         behaviorGraph,
-    };
-}
-
-function success(data) {
-    return {
-        textResultForLlm: JSON.stringify({ ok: true, ...data }, null, 2),
-        resultType: "success",
-    };
-}
-
-function failure(message, data = {}) {
-    return {
-        textResultForLlm: JSON.stringify({ ok: false, error: message, ...data }, null, 2),
-        resultType: "failure",
     };
 }
 

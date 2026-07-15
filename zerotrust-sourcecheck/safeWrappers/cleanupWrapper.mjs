@@ -24,6 +24,7 @@ import { modeIsBuild } from "../modes.mjs";
 import { ARTIFACT_NAME_RE } from "../urlParser.mjs";
 
 import { DEFAULT_BUILD_ROOT } from "./defaults.mjs";
+import { failure, success } from "./result.mjs";
 
 const CLONE_NAME_RE = ARTIFACT_NAME_RE;
 
@@ -185,20 +186,6 @@ export async function cleanupAuditHandler(args, invocation, dependencies = {}) {
                 .filter((path) => existsSync(path)),
         metadataCachePreserved: true,
     });
-}
-
-function success(data) {
-    return {
-        textResultForLlm: JSON.stringify({ ok: true, ...data }, null, 2),
-        resultType: "success",
-    };
-}
-
-function failure(message, data = {}) {
-    return {
-        textResultForLlm: JSON.stringify({ ok: false, error: message, ...data }, null, 2),
-        resultType: "failure",
-    };
 }
 
 export const __internals = {

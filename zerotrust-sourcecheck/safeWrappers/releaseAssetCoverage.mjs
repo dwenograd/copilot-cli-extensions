@@ -268,7 +268,6 @@ function normalizeAsset(asset) {
         name: name.slice(0, 256),
         nameTruncated: name.length > 256,
         contentType: contentType.slice(0, 128),
-        contentTypeTruncated: contentType.length > 128,
         sizeBytes: asset.sizeBytes,
         digest: digest ? digest.slice(0, 128) : null,
     };

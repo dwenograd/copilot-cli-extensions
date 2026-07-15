@@ -144,10 +144,6 @@ function validationAdjudications(validationSnapshot, auditId) {
     ]));
 }
 
-function evidenceKey(value) {
-    return canonicalJson(value);
-}
-
 function aliasRecord(finding, chains, adjudication) {
     const chainIds = unique(chains.map((chain) => chain.id));
     const completeChainIds = unique(chains
@@ -371,5 +367,4 @@ export const __internals = Object.freeze({
     chainDescriptor,
     normalizedMaliciousBehaviorSignature,
     associatedChains,
-    evidenceKey,
 });

@@ -6,6 +6,7 @@ import nodePath from "node:path";
 import { getTrustedAuditContext } from "../enforcement.mjs";
 import { buildQuarantinePath } from "../urlParser.mjs";
 import { DEFAULT_BUILD_ROOT } from "./defaults.mjs";
+import { failure, success } from "./result.mjs";
 
 function safeRemove(p) {
     if (!existsSync(p)) return { existed: false, removed: false };
@@ -105,20 +106,6 @@ export async function cleanupQuarantineHandler(args, invocation, dependencies = 
         quarantine: result,
         auditStillActive: true,
     });
-}
-
-function success(data) {
-    return {
-        textResultForLlm: JSON.stringify({ ok: true, ...data }, null, 2),
-        resultType: "success",
-    };
-}
-
-function failure(message, data = {}) {
-    return {
-        textResultForLlm: JSON.stringify({ ok: false, error: message, ...data }, null, 2),
-        resultType: "failure",
-    };
 }
 
 export const __internals = {

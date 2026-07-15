@@ -7,6 +7,7 @@ import {
 } from "../enforcement.mjs";
 import { DEFAULT_BUILD_ROOT } from "./defaults.mjs";
 import { resolveTrustedProgram } from "./programResolver.mjs";
+import { failure, success } from "./result.mjs";
 import {
     buildReleaseAssetCoverageSnapshot,
     createReleaseAssetCoverageState,
@@ -223,20 +224,6 @@ function normalizePositiveId(value) {
     if (Number.isSafeInteger(value) && value > 0) return String(value);
     if (typeof value === "string" && /^[1-9][0-9]{0,19}$/.test(value)) return value;
     return null;
-}
-
-function success(data) {
-    return {
-        textResultForLlm: JSON.stringify({ ok: true, ...data }, null, 2),
-        resultType: "success",
-    };
-}
-
-function failure(message, data = {}) {
-    return {
-        textResultForLlm: JSON.stringify({ ok: false, error: message, ...data }, null, 2),
-        resultType: "failure",
-    };
 }
 
 export const __internals = {

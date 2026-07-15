@@ -168,6 +168,13 @@ describe("Section 9b — load-bearing safety invariants present verbatim", () =>
             assert.match(out, /\*\*keep as-is\*\*/);
         });
 
+        test(`(${label}) offers the decision flow at every severity`, () => {
+            const out = findRemediationBlock(invocation);
+            assert.match(out, /regardless of impact severity/);
+            assert.match(out, /Do NOT collapse MEDIUM\/LOW\/INFO findings/);
+            assert.doesNotMatch(out, /review at your leisure/);
+        });
+
         test(`(${label}) contains "NEVER auto-apply" invariant`, () => {
             const out = findRemediationBlock(invocation);
             assert.match(out, /NEVER auto-apply/);

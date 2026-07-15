@@ -21,7 +21,7 @@
 //   { ok: false, error: <reason> }
 
 import nodePath from "node:path";
-import { existsSync, lstatSync, statSync } from "node:fs";
+import { lstatSync, statSync } from "node:fs";
 
 const MAX_LEN = 2048;
 

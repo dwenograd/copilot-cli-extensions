@@ -29,7 +29,6 @@ import {
     parseCacheEnvelope,
     selectReusableCache,
     serializeCacheEnvelope,
-    validateCachePayload,
 } from "../analysis/cache.mjs";
 import {
     getAnalysisIndexState,
@@ -39,6 +38,7 @@ import {
 } from "../enforcement.mjs";
 import { validateAuditId } from "../analysis/schemas.mjs";
 import { DEFAULT_BUILD_ROOT, resolveCacheRoot } from "./defaults.mjs";
+import { failure, success } from "./result.mjs";
 import {
     clearCacheBinding,
     recordCacheBinding,
@@ -708,20 +708,6 @@ export async function cacheCleanupHandler(args, invocation) {
     } catch (error) {
         return failure(error?.message || String(error));
     }
-}
-
-function success(data) {
-    return {
-        textResultForLlm: JSON.stringify({ ok: true, ...data }, null, 2),
-        resultType: "success",
-    };
-}
-
-function failure(message, data = {}) {
-    return {
-        textResultForLlm: JSON.stringify({ ok: false, error: message, ...data }, null, 2),
-        resultType: "failure",
-    };
 }
 
 export const __internals = Object.freeze({

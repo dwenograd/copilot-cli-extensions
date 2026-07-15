@@ -252,10 +252,6 @@ export function buildArtifactIdentityName(owner, repo, resolvedSha) {
     return `${ARTIFACT_ID_PREFIX}${digest}`;
 }
 
-export function isCanonicalArtifactName(name) {
-    return typeof name === "string" && ARTIFACT_NAME_RE.test(name);
-}
-
 function containedJoin(buildRoot, ...subSegments) {
     if (!buildRoot || typeof buildRoot !== "string") {
         throw new Error("buildRoot must be a non-empty string");

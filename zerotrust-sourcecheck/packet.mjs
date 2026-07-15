@@ -29,82 +29,16 @@ export {
     validateFindingContract,
 } from "./packet/shared.mjs";
 
-export function buildInstructionPacket({
-    mode,
-    target,
-    parsed,
-    refOverride,
-    focusWrapped,
-    injectionPreamble,
-    injectionWarnings,
-    subAgentInstruction,
-    nonce,
-    scrubNote,
-    privateRepoAck,
-    buildExecAck,
-    unsafeAck,
-    buildRoot,
-    expectedClonePath,
-    expectedReportPath,
-    expectedQuarantinePath,
-    placeholderSha,
-    auditId,
-    analysisStageState,
-    councilManifest,
-    councilJudgeModel,
-    councilSubJudgeModel,
-    maxPremiumCalls,
-    validationMinSeverity,
-}) {
+export function buildInstructionPacket(args) {
+    const { target } = args;
     if (target && target.kind === "local") {
         return buildLocalSourcePacket({
-            mode,
-            auditId,
+            ...args,
             localPath: target.localPath,
-            focusWrapped,
-            injectionPreamble,
-            injectionWarnings,
-            subAgentInstruction,
-            nonce,
-            scrubNote,
-            buildRoot,
-            expectedReportPath,
-            councilManifest,
-            councilJudgeModel,
-            councilSubJudgeModel,
-            maxPremiumCalls,
-            validationMinSeverity,
         });
     }
 
-    const context = createUrlPacketContext({
-        mode,
-        target,
-        parsed,
-        refOverride,
-        focusWrapped,
-        injectionPreamble,
-        injectionWarnings,
-        subAgentInstruction,
-        nonce,
-        scrubNote,
-        privateRepoAck,
-        buildExecAck,
-        unsafeAck,
-        buildRoot,
-        expectedClonePath,
-        expectedReportPath,
-        expectedQuarantinePath,
-        placeholderSha,
-        auditId,
-        analysisStageState,
-        councilManifest,
-        councilJudgeModel,
-        councilSubJudgeModel,
-        maxPremiumCalls,
-        validationMinSeverity,
-    });
-
+    const context = createUrlPacketContext(args);
     return renderPrepareStage(context)
         + renderAcquisitionStage(context)
         + renderScanCouncilStage(context)

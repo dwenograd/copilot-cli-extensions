@@ -111,9 +111,11 @@ commands. Install lifecycle scripts are suppressed, but the build itself may
 execute repository-controlled npm scripts, `build.rs`, MSBuild targets, or
 equivalent code.
 
-Both "safe" and "full" build modes currently use the same installer and builder.
-Full mode is not more isolated; it adds an explicit `unsafe` acknowledgement and
-reserves a future policy distinction.
+Both "safe" and "full" build modes currently use the same install/build wrappers.
+Install lifecycle scripts remain suppressed in both. Full mode is not more
+isolated; its explicit `unsafe` acknowledgement changes admission/warning
+posture only and reserves a future distinction. It does not select a
+less-restricted installer.
 
 Build modes require:
 
@@ -166,6 +168,25 @@ Overall verdicts are:
 
 `no red flags found` means the completed audit found no supported malicious
 behavior. It is not proof that the project is safe or bug-free.
+
+## Remediation choices
+
+Local-source and build audits offer an operator decision for every active,
+non-refuted finding, regardless of severity. Findings are handled one at a time:
+
+- **defang** — show one bounded diff for the trusted remediation candidate,
+  wait for explicit approval, back up the original file, then apply one edit;
+- **delete project** — remove only the exact path pinned by the audit, after a
+  second path confirmation;
+- **keep as-is** — retain the finding with the operator's written rationale.
+
+A finding can be recorded as `defanged` only when static verification permits a
+fix claim and the approved edit completed. Guidance-only unresolved findings may
+be investigated, deleted, or kept, but cannot be claimed as successfully
+defanged. After remediation, run a fresh audit to verify the resulting tree.
+
+API-direct, release-verification, and metadata-only modes do not offer source
+edits because they do not own a pinned editable source tree.
 
 ## Cleanup
 

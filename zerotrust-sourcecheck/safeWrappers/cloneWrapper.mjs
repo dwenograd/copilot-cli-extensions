@@ -26,6 +26,7 @@ import { modeNeedsClone } from "../modes.mjs";
 import { resolveTrustedProgram } from "./programResolver.mjs";
 
 import { DEFAULT_BUILD_ROOT } from "./defaults.mjs";
+import { failure, success } from "./result.mjs";
 
 // Cross-platform "discard hooks" path. On Windows, `NUL` is the magic
 // null device. On POSIX, `/dev/null` is. Using the wrong one means git
@@ -375,20 +376,6 @@ export async function safeCloneHandler(args, invocation) {
         boundContext,
         ...(purgeSummary ? { autoPurge: purgeSummary } : {}),
     });
-}
-
-function success(data) {
-    return {
-        textResultForLlm: JSON.stringify({ ok: true, ...data }, null, 2),
-        resultType: "success",
-    };
-}
-
-function failure(message) {
-    return {
-        textResultForLlm: JSON.stringify({ ok: false, error: message }, null, 2),
-        resultType: "failure",
-    };
 }
 
 export const __internals = {

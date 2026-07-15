@@ -15,6 +15,7 @@ import { modeIsBuild } from "../modes.mjs";
 import { resolveTrustedProgram } from "./programResolver.mjs";
 
 import { DEFAULT_BUILD_ROOT } from "./defaults.mjs";
+import { failure, success } from "./result.mjs";
 
 const ECOSYSTEMS = {
     npm: {
@@ -330,20 +331,6 @@ export async function safeInstallHandler(args, invocation) {
         stdout: stdout.slice(-4000),
         stderr: stderr.slice(-2000),
     });
-}
-
-function success(data) {
-    return {
-        textResultForLlm: JSON.stringify({ ok: true, ...data }, null, 2),
-        resultType: "success",
-    };
-}
-
-function failure(message) {
-    return {
-        textResultForLlm: JSON.stringify({ ok: false, error: message }, null, 2),
-        resultType: "failure",
-    };
 }
 
 export const __internals = {

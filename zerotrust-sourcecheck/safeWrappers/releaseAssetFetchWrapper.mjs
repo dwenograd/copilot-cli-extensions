@@ -18,6 +18,7 @@ import { buildQuarantinePath } from "../urlParser.mjs";
 import { __internals as apiClientInternals } from "./apiClient.mjs";
 import { DEFAULT_BUILD_ROOT } from "./defaults.mjs";
 import { resolveTrustedProgram } from "./programResolver.mjs";
+import { failure, success } from "./result.mjs";
 import {
     buildReleaseAssetCoverageSnapshot,
     createReleaseAssetCoverageState,
@@ -312,20 +313,6 @@ function pathsEqual(left, right) {
     const a = nodePath.resolve(left);
     const b = nodePath.resolve(right);
     return process.platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b;
-}
-
-function success(data) {
-    return {
-        textResultForLlm: JSON.stringify({ ok: true, ...data }, null, 2),
-        resultType: "success",
-    };
-}
-
-function failure(message, data = {}) {
-    return {
-        textResultForLlm: JSON.stringify({ ok: false, error: message, ...data }, null, 2),
-        resultType: "failure",
-    };
 }
 
 export const __internals = {

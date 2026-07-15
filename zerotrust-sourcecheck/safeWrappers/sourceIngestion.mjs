@@ -27,6 +27,7 @@ import {
 } from "../analysis/indexState.mjs";
 import { __internals as apiClientInternals } from "./apiClient.mjs";
 import { DEFAULT_BUILD_ROOT } from "./defaults.mjs";
+import { failure, success } from "./result.mjs";
 
 const MAX_OUTPUT_ENTRIES = 1_000;
 const MAX_ENUMERATED_DIRECTORIES = 50_000;
@@ -497,20 +498,6 @@ export async function safeIndexSourceFileHandler(args, invocation) {
         analysisPlugins: preparation?.analysisPlugins || ctx.analysisPlugins,
         behaviorGraph: preparation?.behaviorGraph || ctx.behaviorGraph,
     });
-}
-
-function success(data) {
-    return {
-        textResultForLlm: JSON.stringify({ ok: true, ...data }, null, 2),
-        resultType: "success",
-    };
-}
-
-function failure(message, data = {}) {
-    return {
-        textResultForLlm: JSON.stringify({ ok: false, error: message, ...data }, null, 2),
-        resultType: "failure",
-    };
 }
 
 export const __internals = Object.freeze({

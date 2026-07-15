@@ -34,6 +34,7 @@ import nodePath from "node:path";
 import { getTrustedAuditContext } from "../enforcement.mjs";
 
 import { DEFAULT_BUILD_ROOT } from "./defaults.mjs";
+import { failure, success } from "./result.mjs";
 
 // Top-level filenames that are LEGITIMATE in build_root or its parent.
 // Lowercased for case-insensitive matching. Anything not in this set
@@ -228,20 +229,6 @@ export async function sweepAuditScratchHandler(args, invocation, dependencies = 
         errors,
         auditStillActive: ctx.hasActiveAudit,
     });
-}
-
-function success(data) {
-    return {
-        textResultForLlm: JSON.stringify({ ok: true, ...data }, null, 2),
-        resultType: "success",
-    };
-}
-
-function failure(message, data = {}) {
-    return {
-        textResultForLlm: JSON.stringify({ ok: false, error: message, ...data }, null, 2),
-        resultType: "failure",
-    };
 }
 
 // Test seam: exposes the file-allowlist + helper for unit tests.

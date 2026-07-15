@@ -27,6 +27,7 @@ import {
 import { modeIsBuild, modeUsesCouncil } from "../modes.mjs";
 import { getTrustedAuditContext } from "../enforcement.mjs";
 import { resolveTrustedProgram } from "./programResolver.mjs";
+import { failure, success } from "./result.mjs";
 
 import { DEFAULT_BUILD_ROOT } from "./defaults.mjs";
 
@@ -296,20 +297,6 @@ export async function safeBuildHandler(args, invocation) {
         ...(gateOpenReason ? { councilGate: gateOpenReason } : {}),
         ...(advisoryNote ? { advisoryNote } : {}),
     });
-}
-
-function success(data) {
-    return {
-        textResultForLlm: JSON.stringify({ ok: true, ...data }, null, 2),
-        resultType: "success",
-    };
-}
-
-function failure(message) {
-    return {
-        textResultForLlm: JSON.stringify({ ok: false, error: message }, null, 2),
-        resultType: "failure",
-    };
 }
 
 export const __internals = {

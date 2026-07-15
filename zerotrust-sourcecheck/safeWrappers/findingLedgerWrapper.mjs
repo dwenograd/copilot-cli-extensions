@@ -32,6 +32,7 @@ import {
     getCouncilLedgerSnapshot,
     mutateCouncilLedgerState,
 } from "./state.mjs";
+import { failure, success } from "./result.mjs";
 
 export const COUNCIL_INGESTION_LIMITS = Object.freeze({
     serializedBytes: 128 * 1024,
@@ -79,20 +80,6 @@ const EFFECT_NODE_KINDS = new Set([
     "propagation",
     "transform",
 ]);
-
-function failure(message, data = {}) {
-    return {
-        textResultForLlm: JSON.stringify({ ok: false, error: message, ...data }, null, 2),
-        resultType: "failure",
-    };
-}
-
-function success(data) {
-    return {
-        textResultForLlm: JSON.stringify({ ok: true, ...data }, null, 2),
-        resultType: "success",
-    };
-}
 
 function isPlainObject(value) {
     if (!value || typeof value !== "object" || Array.isArray(value)) return false;

@@ -41,10 +41,6 @@ const MANIFEST_BASENAMES = new Set([
     "devcontainer.json",
 ]);
 
-function cloneFrozen(value) {
-    return Object.freeze(structuredClone(value));
-}
-
 function normalizeLabel(value) {
     return String(value || "")
         .normalize("NFKC")
@@ -401,5 +397,4 @@ export const __internals = Object.freeze({
     isManifestPath,
     evidenceFor,
     sourceIdentityFor,
-    cloneFrozen,
 });

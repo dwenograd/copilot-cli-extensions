@@ -26,6 +26,7 @@ import { extractFactsFromText } from "../analysis/extractFacts.mjs";
 import { listIndexedFacts, recordIndexedFile } from "../analysis/indexState.mjs";
 
 import { DEFAULT_BUILD_ROOT } from "./defaults.mjs";
+import { failure, success } from "./result.mjs";
 import {
     buildCoverageSnapshot,
     COVERAGE_SCOPES,
@@ -273,18 +274,4 @@ export async function safeFetchFileHandler(args, invocation) {
         analysisPlugins,
         behaviorGraph,
     });
-}
-
-function success(data) {
-    return {
-        textResultForLlm: JSON.stringify({ ok: true, ...data }, null, 2),
-        resultType: "success",
-    };
-}
-
-function failure(message, data = {}) {
-    return {
-        textResultForLlm: JSON.stringify({ ok: false, error: message, ...data }, null, 2),
-        resultType: "failure",
-    };
 }

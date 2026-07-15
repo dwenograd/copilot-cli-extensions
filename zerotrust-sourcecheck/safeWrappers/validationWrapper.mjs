@@ -5,6 +5,7 @@ import {
     prepareAnalysisValidation,
     submitAnalysisValidationDecision,
 } from "../enforcement.mjs";
+import { failure, success } from "./result.mjs";
 
 export const VALIDATION_WRAPPER_LIMITS = Object.freeze({
     serializedBytes: 64 * 1024,
@@ -38,20 +39,6 @@ function exactFields(value, allowed, label) {
     for (const key of ["action", "schemaVersion", "audit_id"]) {
         if (!Object.hasOwn(value, key)) throw new TypeError(`${label}.${key} is required`);
     }
-}
-
-function success(data) {
-    return {
-        textResultForLlm: JSON.stringify({ ok: true, ...data }, null, 2),
-        resultType: "success",
-    };
-}
-
-function failure(message, data = {}) {
-    return {
-        textResultForLlm: JSON.stringify({ ok: false, error: message, ...data }, null, 2),
-        resultType: "failure",
-    };
 }
 
 export async function recordValidationHandler(args, invocation) {

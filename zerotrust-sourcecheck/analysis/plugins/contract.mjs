@@ -1,7 +1,6 @@
 import { createHash } from "node:crypto";
 
 import {
-    ANALYSIS_SCHEMA_VERSION,
     validateIdentifier,
     validatePluginOutput,
 } from "../schemas.mjs";

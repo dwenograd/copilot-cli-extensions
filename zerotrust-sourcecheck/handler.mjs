@@ -49,7 +49,6 @@ import {
     BUILD_MODE_TAXONOMY_NOTE,
     VALID_MODES_SET,
     COUNCIL_MODES_SET,
-    isValidMode,
     modeUsesCouncil,
     modeIsBuild,
     modeIsFullBuild,

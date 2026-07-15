@@ -136,16 +136,6 @@ export class BehaviorGraph {
         };
     }
 
-    getNode(id) {
-        const node = this.#nodes.get(id);
-        return node ? clone(node) : null;
-    }
-
-    getEdge(id) {
-        const edge = this.#edges.get(id);
-        return edge ? clone(edge) : null;
-    }
-
     toDocument() {
         return validateBehaviorGraphDocument({
             schemaVersion: ANALYSIS_SCHEMA_VERSION,

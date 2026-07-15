@@ -364,20 +364,6 @@ export function listTreeBySha(owner, repo, treeSha, {
 }
 
 /**
- * Back-compatible root-tree listing helper. `sha` remains the commit SHA;
- * `rootTreeSha` is the distinct Git tree identity used for subtree traversal.
- */
-export function listTree(owner, repo, sha, options = {}) {
-    const commit = getCommitIdentity(owner, repo, sha, options);
-    const tree = listTreeBySha(owner, repo, commit.rootTreeSha, options);
-    return {
-        sha: commit.commitSha,
-        rootTreeSha: commit.rootTreeSha,
-        ...tree,
-    };
-}
-
-/**
  * Fetch a single file's contents at the given SHA. See header for return shapes.
  *
  * Classification is based on the fetched bytes, never the filename suffix.

@@ -37,6 +37,7 @@ import { modeUsesApiDirect, modeUsesCouncil } from "../modes.mjs";
 import { DEFAULT_BUILD_ROOT } from "./defaults.mjs";
 import { buildCoverageSnapshot } from "./coverageAccounting.mjs";
 import { buildReleaseAssetCoverageSnapshot } from "./releaseAssetCoverage.mjs";
+import { failure, success } from "./result.mjs";
 import {
     councilOutcomeMatchesAudit,
     getCacheBinding,
@@ -1042,20 +1043,6 @@ function coverageResult(acquisitionCoverage, releaseAssetCoverage) {
     return {
         ...(acquisitionCoverage ? { acquisitionCoverage } : {}),
         ...(releaseAssetCoverage ? { releaseAssetCoverage } : {}),
-    };
-}
-
-function success(data) {
-    return {
-        textResultForLlm: JSON.stringify({ ok: true, ...data }, null, 2),
-        resultType: "success",
-    };
-}
-
-function failure(message, data = {}) {
-    return {
-        textResultForLlm: JSON.stringify({ ok: false, error: message, ...data }, null, 2),
-        resultType: "failure",
     };
 }
 

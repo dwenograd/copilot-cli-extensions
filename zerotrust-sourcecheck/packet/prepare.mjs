@@ -9,7 +9,6 @@ export function createUrlPacketContext(args) {
         injectionWarnings, scrubNote, privateRepoAck, placeholderSha,
     } = args;
     const { owner, repo, kind, canonicalUrl } = parsed;
-    const effectiveRef = refOverride || parsed.ref || "HEAD";
     const refDisplay = parsed.ref
         ? `\`${parsed.ref}\` (from URL${refOverride ? `, overridden by ref param to \`${refOverride}\`` : ""})`
         : refOverride
@@ -89,7 +88,6 @@ Stop only after the close call succeeds.
         repo,
         kind,
         canonicalUrl,
-        effectiveRef,
         refDisplay,
         warningsBlock,
         focusBlock,

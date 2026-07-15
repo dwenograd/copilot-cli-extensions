@@ -220,7 +220,7 @@ export function scoreInvisibleUnicode(text, { filePath = "" } = {}) {
 // Shared lifecycle/remediation prose used by URL and local packets.
 
 /**
- * Section-9 remediation block: per HIGH/CRITICAL finding, walk the user
+ * Section-9 remediation block: per active non-refuted finding, walk the user
  * through defang / delete-project / keep-as-is. Rendered into:
  *   - the local-source packet (always)
  *   - the URL-driven packet IF the mode wrote source to disk (build modes)
@@ -268,13 +268,13 @@ not create, append, edit, or otherwise write REPORT.md directly.`}
 ${ledgerFlow}
 
 If ${remediationSource
-        ? "\`validationFinal.decisionSnapshot.canonicalFindings\` contains any active finding whose impact severity is HIGH or CRITICAL"
-        : "the report draft contains ANY finding at severity HIGH or CRITICAL"},
+        ? "\`validationFinal.decisionSnapshot.canonicalFindings\` contains any active non-refuted finding at any impact severity"
+        : "the report draft contains ANY active finding at any severity"},
 walk the user through this decision flow **per finding**. Do NOT batch
 findings; prompt for one at a time. Preserve one-finding approval and
 one-finding/one-approval sequencing throughout.
 
-For each HIGH/CRITICAL finding:
+For each active non-refuted finding, regardless of impact severity:
 
 1. **Present exactly one finding.** ${remediationSource
         ? `Use its canonical ID, impact severity, state, evidence references/hashes,
@@ -355,20 +355,19 @@ use \`action: "investigate"\` with \`alternate-path-remains\`,
 Do not record model-authored rationales or claim that an unverified edit fixed a
 finding.` : ""}
 
-3. Findings at MEDIUM/LOW/INFO severity are summarised in a single
-   "review at your leisure" ${remediationSource
-        ? "deterministic finalizer summary; do not add model prose or synthetic operator decisions"
-        : "block in the in-memory report draft"} — do NOT
-   individually prompt for them. ${remediationSource ? `Retain their structured
-   candidates only as source-text-free future guidance; do not auto-apply them.`
-        : ""}
+3. Do NOT collapse MEDIUM/LOW/INFO findings into a summary or defer their
+   decision solely because of severity. Severity affects prioritization, not
+   operator choice eligibility. Present each active non-refuted finding through
+   the same one-finding decision flow. Unresolved guidance-only findings still
+   cannot receive a confident defang because they have no trusted fix-claim
+   candidate.
 
-4. After all HIGH/CRITICAL decisions are made, ${remediationSource
+4. After all active finding decisions are made, ${remediationSource
        ? `retain only one structured record per decided canonical finding.
    Do not add a free-form aggregate summary or backup-file names; the finalizer
    derives action counts deterministically from \`operatorDecisions\`.`
        : `append this final summary to \`reportMarkdown\`:
-   "Of N high-severity findings: defanged X, kept Y, deleted project Z."
+   "Of N active findings: defanged X, kept Y, deleted project Z."
    List any \`.zerotrust-backup-<utc-ts>\` files written. If \`delete
    project\` was chosen, note that the audit pinned path is now gone and
    the report will be finalized outside it.`}

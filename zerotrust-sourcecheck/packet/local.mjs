@@ -259,7 +259,7 @@ There is no clone directory to delete. No quarantine. No backup files
 
 ## Section 10 — Final user-facing summary
 
-After Section 9b is complete (or skipped if no HIGH/CRITICAL findings),
+After Section 9b is complete (or skipped if there are no active non-refuted findings),
 run the sandbox sweep and lifecycle close below:
 
 ${renderSweepAndCloseBlock({ buildRoot })}

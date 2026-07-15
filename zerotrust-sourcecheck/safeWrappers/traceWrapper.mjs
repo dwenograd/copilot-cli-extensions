@@ -2,20 +2,7 @@ import {
     getActiveAudit,
     traceAnalysisGraph,
 } from "../enforcement.mjs";
-
-function success(data) {
-    return {
-        textResultForLlm: JSON.stringify({ ok: true, ...data }, null, 2),
-        resultType: "success",
-    };
-}
-
-function failure(message, data = {}) {
-    return {
-        textResultForLlm: JSON.stringify({ ok: false, error: message, ...data }, null, 2),
-        resultType: "failure",
-    };
-}
+import { failure, success } from "./result.mjs";
 
 export async function traceBehaviorGraphHandler(args, invocation) {
     args = args || {};
