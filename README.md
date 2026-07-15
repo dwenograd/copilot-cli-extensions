@@ -9,7 +9,7 @@ Eight interrelated Copilot CLI extensions for autonomous investigation, multi-mo
 | **triple-plan** | 3 planning agents in parallel → merged plan with consensus + alternatives + contested decisions |
 | **debate** | 2 debaters arguing opposing positions + 1 independent judge |
 | **duck-council** | 6 role-specialized rubber-ducks (security/stability/perf/maintainer/skeptic/user) with optional judge synthesis |
-| **crucible** | Domain-v4 evidence-judged investigation runner with persistent active/archive/tombstone lifecycle, verified bundles, and catalog recovery. Exposes exactly `crucible_start`, `crucible_status`, `crucible_stop`, and `crucible_result`. |
+| **crucible** | Evidence-judged investigation runner with a persistent cataloged lifecycle, immutable verified archives, crash-safe runner/accounting recovery, replay-verified science, and authenticated Windows Task Scheduler recovery. Exposes exactly `crucible_start`, `crucible_status`, `crucible_stop`, and `crucible_result`. |
 | **zerotrust-sourcecheck** | 32-role multi-model security council against a GitHub URL OR an on-disk local directory. API-direct URL wrappers do not intentionally create source files, although returned text can still be retained by Copilot CLI/session logging. Local-source mode reads an existing tree via `view`/`grep`/`glob`. Build-mode wrappers provide pinned clone/install/build operations. |
 | **mcp-autoreload** | On a recognized MCP transport failure, invokes the SDK's global MCP reload, polls the owning server, and asks the agent to retry or escalates. Exposes `mcp_reload_now`. (Hook-based utility; no automated tests.) |
 
@@ -76,10 +76,10 @@ extensions/
 │   ├── extension.mjs           # four-tool thin SDK adapter
 │   ├── api/                    # single-source schemas + start/status/stop/result handlers
 │   ├── domain/                 # pure reducer, decisions, contracts, evidence ranking
-│   ├── persistence/            # SQLite event log + immutable artifact store/bundles
+│   ├── persistence/            # event log, CAS/bundles, global lifecycle catalog
 │   ├── measurement/            # allowlisted/staged harness execution boundary
-│   ├── runtime/                # restricted SDK workers + runner + supervisor
-│   ├── tools/                  # operator CLI for authoring harness allowlists
+│   ├── runtime/                # restricted workers, runner/supervisor, recovery
+│   ├── tools/                  # experiment/harness and recovery-task operator CLIs
 │   └── __tests__/              # domain, persistence, measurement, runtime, API tests
 ├── mcp-autoreload/
 │   ├── extension.mjs           # standalone MCP recovery hook + mcp_reload_now tool
@@ -98,9 +98,9 @@ extensions/
 │   ├── __tests__/              # node:test in-process suite
 │   └── AGENTS.md               # agent-design notes (sub-agent file-write rule, etc.)
 ├── package.json                # workspace root (vitest + zod for the orchestrators; zerotrust uses node:test)
-├── scripts/                    # explicit Crucible integration/conformance launchers
+├── scripts/                    # Crucible ownership, integration, unattended, conformance runners
 ├── vitest.config.mjs           # safe developer-suite configuration
-├── vitest.crucible-*.config.mjs # release-safe and real-integration configurations
+├── vitest.crucible-*.config.mjs # unit, release, science, unattended, integration configs
 ├── vitest.windows-conformance.config.mjs # native Windows boundary config
 └── .gitignore
 ```
@@ -154,7 +154,7 @@ real integration gate is `npm run test:crucible:integration`; it requires
 absolute `COPILOT_SDK_PATH` and `COPILOT_CLI_PATH` values plus an authenticated
 Copilot CLI, and fails rather than skipping when they are unavailable. The
 explicit `npm run test:crucible:release` gate is four layers: safe Crucible
-tests, release-safe matrices, the v4 science gate, and the unattended wrapper
+tests, release-safe matrices, the science gate, and the unattended wrapper
 (authenticated SDK plus Windows containment, Task Scheduler recovery, and leak
 conformance). `npm run test:release` adds the rest of the workspace suites.
 

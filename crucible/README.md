@@ -1,9 +1,33 @@
 # Crucible
 
-Crucible is a persistent, local, evidence-judged investigation runner. The
-current event domain is **v4**. Model workers propose bounded candidate file
-sets against a frozen statistical contract; an operator-selected
-`HarnessSuiteV4` measures them; the kernel alone records domain decisions.
+Crucible is a persistent, local, evidence-judged investigation runner. Model
+workers propose bounded candidate file sets against a frozen statistical
+contract; an operator-selected `HarnessSuiteV4` measures them; the kernel alone
+records domain decisions.
+
+The scientific kernel is paired with a durable operational lifecycle: active
+investigations, immutable verified archives, signed tombstones, leases, recovery
+ownership, and interrupted cleanup all live in a versioned global catalog. The
+runner can recover after process death without trusting PID alone, reconcile
+accepted work whose SDK usage report was interrupted, and resume filesystem
+transitions from persisted state instead of inferring intent from leftover
+directories.
+
+The four public tools intentionally separate authority:
+
+- `crucible_start` admits a signed experiment or reattaches an existing active
+  investigation;
+- `crucible_status` inventories active, archived, and tombstoned state but can
+  never emit a scientific result;
+- `crucible_stop` pauses, archives, or deletes through fenced, durable lifecycle
+  transitions; and
+- `crucible_result` is the only surface that can emit a terminal decision, and
+  only after replay, scientific closure, and artifact verification succeed.
+
+Names such as `HarnessSuiteV4`, `crucible-statistical-policy-v4`, bundle format
+version 4, and the `v4_unreachable` basis are persisted protocol identifiers.
+They are documented literally where required for compatibility, but they are
+not a Crucible product version or release name.
 
 A worker session always exposes `crucible_submit_candidate`. It conditionally
 also exposes `crucible_read_parent_artifact` when parent snapshots are assigned.
@@ -27,19 +51,23 @@ the selected harness; they are not a substitute for reviewing the harness.
 crucible/
   extension.mjs             four-tool SDK adapter
   api/                      schemas, environment resolution, preflight, handlers
-  domain/                   v4 contract, reducer, strategy, archive, decisions
-  persistence/              SQLite event repository, CAS, audit bundles
+  domain/                   contract, reducer, strategy, archive, decisions
+  persistence/              event repository, CAS, bundles, resource catalog
   measurement/              allowlist, parser, executor, Windows containment
-  runtime/                  worker pool, measurement scheduler, runner, supervisor
-  tools/configure-harness.mjs
+  runtime/                  workers, scheduler, runner, supervisor, recovery
+  tools/                    harness/experiment and recovery-task operator CLIs
   __tests__/
 
 ../scripts/
   run-crucible-integration.mjs
+  run-crucible-related.mjs
+  run-crucible-unattended-release.mjs
   run-crucible-windows-conformance.mjs
 
 ../vitest.config.mjs
 ../vitest.crucible-release.config.mjs
+../vitest.crucible-science.config.mjs
+../vitest.crucible-unattended.config.mjs
 ../vitest.crucible-integration.config.mjs
 ../vitest.windows-conformance.config.mjs
 ```
@@ -176,6 +204,7 @@ The strict operator config (not a `crucible_start` argument) contains:
   candidates_per_round: integer,
   max_rounds: integer,
   search_policy?: {
+    version?: "crucible-search-strategy-v1" | "crucible-search-strategy-v2",
     plateauWindow?: integer,
     minRoundsBeforePlateau?: integer,
     plateauMinImprovement?: number,
@@ -314,19 +343,26 @@ exposes only investigation id, lifecycle state, created/updated timestamps,
 domain version, terminal availability, integrity status, and retained size.
 It never returns decisions, candidates, cohorts, evidence, or statistics.
 
-### Reboot recovery daemon
+Catalog reads are generation-consistent: one status/list operation reads one
+lifecycle generation and does not combine rows from opposite sides of a
+concurrent archive, delete, or lease transition. Archived investigation
+databases are opened through SQLite immutable mode, so verifying status or a
+result cannot create a WAL or modify the retained artifact.
+
+### Unattended recovery daemon
 
 `runtime/recovery-daemon-cli.mjs` provides same-user unattended recovery without
 making status a liveness trigger. One daemon generation/incarnation holds the
 state-root singleton lease in `resource-catalog.sqlite`. Exact PID/start-time
-identity permits immediate takeover after reboot without waiting for lease
-expiry; Task Scheduler also uses `IgnoreNew`, so stale or duplicate invocations
-cannot both act.
+identity permits immediate takeover after process loss or a new logon without
+waiting for lease expiry; Task Scheduler also uses `IgnoreNew`, so stale or
+duplicate invocations cannot both act.
 
-Each cycle discovers investigations from the verified catalog and considers only
-active v4 runs. Terminal, paused, archived, tombstoned, legacy, domain
-non-result, and operational-non-result state is skipped. Before a missing
-supervisor can launch, discovery verifies:
+Each cycle discovers investigations from the verified catalog and considers
+only active investigations using the current event-domain schema. Terminal,
+paused, archived, tombstoned, legacy, domain-non-result, and
+operational-non-result state is skipped. Before a missing supervisor can launch,
+discovery verifies:
 
 - the event database, sealed-segment catalog/hash chain, replay, and every
   referenced inline/external artifact;
@@ -346,12 +382,30 @@ Supervisor startup still owns per-investigation generation allocation, runner
 incarnation issuance, stale process/resource reconciliation, and logical-effect
 deduplication.
 
+Runner ownership is not represented by PID alone. At spawn, the supervisor
+captures a durable process identity containing the executable, complete command
+line, a versioned command-identity hash, and an OS process-start identity. If
+that identity cannot be captured, the child is terminated and never adopted.
+Drain, escalation, Job Object termination, and post-termination checks all
+re-read and compare the identity; PID reuse therefore cannot authorize killing
+an unrelated process.
+
 Windows installation uses a hidden current-user logon task with
 `InteractiveToken`, least privilege, restart-on-failure, and no stored password.
 Logon is intentional: startup/S4U would not guarantee the user's profile,
 Copilot credentials, or network credentials. Task arguments contain only local
 paths, the state root, timing, and public SHA-256 identities—never tokens or
 secrets.
+
+The v2 task action is not a direct `node daemon.mjs` launch. Crucible builds a
+pinned launch manifest for the launcher host, Node executable, daemon entry
+point, and production Crucible ESM closure, then embeds it in a self-verifying
+PowerShell action. Installation verifies the launcher, Node, and daemon bytes,
+requires exactly one action and one trigger, and canonical-compares the
+installed principal, SID/user identity, trigger, arguments, working directory,
+battery behavior, and action fingerprint. Uninstall refuses a nonmatching task,
+stops a matching running task within a bound, and verifies that registration is
+gone.
 
 ```powershell
 # 1. Inspect exact paths/hashes and deterministic task identity.
@@ -383,9 +437,15 @@ node .\crucible\tools\uninstall-recovery-task.mjs `
 Installation requires an existing verified state-root catalog, the same Node
 runtime frozen into active investigations, configured experiment public-key
 trust, and same-user noninteractive Copilot authentication. Upgrades remove the
-old exact action before installing new hashes. The optional test-owned Windows
-round trip runs only when
-`CRUCIBLE_RUN_TASK_SCHEDULER_CONFORMANCE=1` at a conformance gate.
+old exact action before installing new hashes. The task permits execution on
+battery and does not stop on a battery transition; those settings are part of
+the exact verified definition.
+
+The launch manifest's boundary is explicit. It pins and holds open the launcher
+host, Node executable, and production Crucible ESM set. It does not attest Node
+built-ins, Windows loader dependencies, or separately authenticated
+per-investigation runtime inputs. The Windows conformance gate tests
+process/logon-task recovery only; it does not reboot or power-cycle the host.
 
 ### `crucible_stop`
 
@@ -432,13 +492,20 @@ then removes active state. All retention paths remain under the local state-root
 `.retention` directory.
 
 `delete` accepts only a verified archived catalog entry and its exact digest.
-It has no force-live mode. The archive and resource-catalog rows are removed,
-while a canonical Ed25519-signed durable tombstone remains and permanently
-blocks recreation or recovery of that deterministic investigation id.
+It has no force-live mode. Deletion is a cataloged recovery state machine:
+`reserved -> marked -> moved -> durability_pending -> durable`. Crucible
+persists the cleanup path, ownership marker nonce/digest, source authority,
+archive-discovery state, and durability progress; verifies containment and
+symlink/canonical-path behavior; reserves retention paths against concurrent
+operations; and fsyncs the relevant directories before completion. A crash at
+any stage resumes from the recorded transition instead of guessing from the
+filesystem. The archive and active catalog state are removed only through that
+flow, while a canonical Ed25519-signed durable tombstone permanently blocks
+recreation or recovery of the deterministic investigation id.
 
 ### Active working-set bounds
 
-Every signed v4 contract includes `workingSetPolicy`. It freezes per-effect and
+Every signed contract includes `workingSetPolicy`. It freezes per-effect and
 per-investigation disk ceilings, terminal/non-result reserve, WAL
 checkpoint/segment thresholds, orphan grace, maintenance cadence, and
 diagnostic retention. Resource-broker config v2 adds the global
@@ -581,6 +648,14 @@ renews leases, reconciles SDK usage, and releases observed usage after cleanup.
 SDK proposals use a durable first-valid-submission journal with stable logical
 ids, frozen retry/deadline/cost policy, and quarantine for late, duplicate, or
 ambiguous responses.
+
+SDK accounting is independently crash-recoverable. The runner persists
+hash-verified `runtime:sdk_accounting_state` records bound to the current lease,
+fencing token, and nonce. If a worker submission is already sealed when usage
+reporting fails, Crucible preserves the scientific submission and records
+`usage_reconciliation_pending` or `usage_reconciliation_failed` operational
+evidence. Reattach/recovery can reconcile the usage without rerunning accepted
+work, losing accounted units, or charging the same work twice.
 
 The persisted supervisor config contains runtime configuration for the
 supervisor process:
@@ -964,10 +1039,20 @@ harness/runner processes still use kill-on-close Job ownership and bounded
 cleanup. Working-directory isolation, filtered environment, timeouts, and
 process-tree termination alone are not represented as a sandbox.
 
-## Domain-v4 search and termination
+## Search and termination
 
-Domain v4 is a hard cutover: the domain version participates in investigation
-identity, and older-version event history is not migrated in place.
+The event-domain schema is internally versioned, and its version participates in
+investigation identity. Older event history is not migrated in place. These
+identifiers are persistence/compatibility boundaries, not product release names.
+
+Search policy is separately versioned. An omitted version and
+`crucible-search-strategy-v1` retain the original frozen operator weighting and
+shared search-lane authority for historical investigations.
+`crucible-search-strategy-v2` is the current default. It deterministically
+adapts operator weights from completed history: an untried adversarial step is
+strongly favored, then refinement is strongly favored after adversarial work
+completes. Because the adaptation reads persisted aggregate history, replay
+selects the same operator.
 
 Each slot freezes round, slot, candidate id, model, operator, parent evidence,
 prompt refs, replacement ordinal, and deterministic seed. Invalidated candidate
@@ -1010,6 +1095,15 @@ preregistered-block plan and become a scientific non-result when those blocks
 are exhausted. Finite/bounded exhaustion alone ends as
 `INDEPENDENT_VERIFICATION_REQUIRED`; only qualifying evidence from the pinned
 independent impossibility-verifier role may support `TARGET_UNREACHABLE`.
+
+Search evaluations also receive collision-free preregistered alpha lanes keyed
+by round, slot, and replacement ordinal. Invalidating a candidate and filling
+the same slot spends a new lane; it cannot reuse the replaced candidate's
+significance authority. Before result material is derived, scientific replay
+reconstructs evidence order, replacement ordinals, lane assignment, and
+slot/candidate binding. Substitution, lane reuse, or reordered authority fails
+closed. Historical v1 investigations retain their original shared-lane rules
+rather than being reinterpreted under v2.
 
 Every sealed typed prediction is translated into a frozen statistical claim
 and evaluated independently from candidate acceptance over replay-derived
@@ -1103,10 +1197,16 @@ rechecks the frozen scientific readiness policy. Persisted
 search-only or synthetic terminals remain non-results with all
 candidate/evidence/hash fields redacted.
 
-Persistence bundle version 4 is self-contained and internally hash-verifiable.
+Legacy-incompatible investigations may be inventoried through catalog discovery
+but remain read-only. They cannot resume, archive, append events, or emit a new
+terminal result. This prevents compatibility code from manufacturing current
+domain authority for an older or structurally incomplete history.
+
+Persistence bundle format version 4 is self-contained and internally
+hash-verifiable.
 It includes the event database, every referenced raw receipt/output/snapshot/
 schedule/composite object, and a cache-only scientific replay digest. Export and
-import both replay the bundled v4 database and reject any mismatch between that
+import both replay the bundled event database and reject any mismatch between that
 digest and the raw schedule/policy/block history. They also canonical-compare
 schedule/composite objects and each raw parsed observation against its
 content-addressed receipt before publication or import. Impossibility bundles
@@ -1138,10 +1238,16 @@ Unit mappings abort after 120 seconds; reaching that limit means the next run
 should target explicit test files.
 An explicit release phase gate may resolve release ownership with
 `npm run test:crucible:changed -- --release <source-or-release-test>`.
-The v4 scientific acceptance gate is
+The scientific acceptance gate is
 `npm run test:crucible:science`; it runs the dedicated falsification/runner
 matrix and emits the deterministic benchmark metrics. The machine-readable
 benchmark alone is `npm run benchmark:crucible:v4-science`.
+
+The benchmark checks null false-positive control, known-effect power,
+environment fail-closed behavior, predicate disagreement,
+prediction/conclusion consistency, novelty, cohorts, overfitting,
+impossibility, and optimization. It is an executable acceptance gate for the
+scientific contract, not a performance-only benchmark.
 
 The complete safe suite runs once at a phase gate. Hard-kill, multiprocess,
 credentialed SDK, and native AppContainer tests remain release-gate work and
@@ -1164,7 +1270,7 @@ Crucible release validation has four layers:
 remaining workspace suites. Native containment and real authenticated SDK/CLI
 coverage are intentionally not part of the default developer command.
 
-`npm run test:crucible:unattended-release` is the v4 unattended lifecycle gate
+`npm run test:crucible:unattended-release` is the unattended lifecycle gate
 and the fourth release layer.
 It runs only runtime/persistence/API/Task Scheduler coverage, the authenticated
 SDK/CLI smoke, and Windows conformance; it does not run science benchmarks or
@@ -1185,3 +1291,10 @@ delayed user-environment propagation.
 The test keeps its state root and cleanup manifest until exact uninstall is
 confirmed; test-finally and unattended-runner cleanup both retry interrupted
 removals.
+
+The unattended wrapper also snapshots test-owned state roots/CAS, processes,
+scheduled tasks, AppContainer profiles, registry state, and the authenticated
+task environment before and after execution. Production processes are not
+classified as test-owned by name alone. Child-process causes and cleanup
+failures remain visible, so a green gate means the tested host resources were
+returned to their pre-run state rather than merely that Vitest exited zero.
