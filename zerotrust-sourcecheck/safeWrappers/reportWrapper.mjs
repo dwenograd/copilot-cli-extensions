@@ -15,21 +15,29 @@ import nodePath from "node:path";
 
 import {
     advanceAnalysisStage,
+    finalizeAssuranceReportState,
     getAcquisitionCoverageState,
     getAnalysisTraceSnapshot,
     getReleaseAssetCoverageState,
     getTreeEnumerationState,
     getTrustedAuditContext,
+    getAssuranceState,
     listAnalysisFacts,
+    markReportFinalizationStageComplete,
     recordReportFinalization,
 } from "../enforcement.mjs";
 import {
+    ASSURANCE_REPORT_FLOW,
+    assertAssuranceMarkdownFindingsConsistency,
     buildFindingsArtifact,
-    buildLegacyFindingsArtifact,
+    buildCompatibilityFindingsArtifact,
     buildTrustedDecisionSnapshot,
+    buildAssuranceFindingsArtifact,
     assertMarkdownFindingsConsistency,
     renderFindingsMarkdown,
+    renderAssuranceFindingsMarkdown,
     serializeFindingsArtifact,
+    serializeAssuranceFindingsArtifact,
 } from "../analysis/index.mjs";
 import { buildReportPath } from "../urlParser.mjs";
 import { modeUsesApiDirect, modeUsesCouncil } from "../modes.mjs";
@@ -39,10 +47,8 @@ import { buildCoverageSnapshot } from "./coverageAccounting.mjs";
 import { buildReleaseAssetCoverageSnapshot } from "./releaseAssetCoverage.mjs";
 import { failure, success } from "./result.mjs";
 import {
-    councilOutcomeMatchesAudit,
     getCacheBinding,
     getCouncilLedgerSnapshot,
-    getRecordedOutcome,
 } from "./state.mjs";
 
 const MAX_REPORT_BYTES = 1024 * 1024;
@@ -84,7 +90,31 @@ export async function finalizeReportHandler(args, invocation, dependencies = {})
         }
     }
 
-    const contractError = validateFinalizerArgumentKeys(args, ctx.mode);
+    let assuranceState;
+    try {
+        const getState = dependencies.getAssuranceState || getAssuranceState;
+        assuranceState = getState(sessionId, { auditId: ctx.auditId });
+    } catch (error) {
+        return failure(`finalize_report refused: assurance state validation failed: ${error.message}`);
+    }
+    const recordedFlow = ctx.reportFinalization?.flow || null;
+    const assuranceStage = assuranceState?.stageState?.current || "acquired";
+    const assuranceReady = ["validated", "finalized"].includes(assuranceStage);
+    const assuranceStarted = assuranceStage !== "acquired"
+        || assuranceState?.analysisSnapshot !== null
+        || assuranceState?.supplyChainGraph !== null;
+    if (!recordedFlow && assuranceStarted && !assuranceReady) {
+        return failure(
+            `finalize_report refused: current assurance analysis is not validated (current: ${assuranceStage})`,
+        );
+    }
+    const flowKind = recordedFlow === ASSURANCE_REPORT_FLOW
+        ? "assurance": recordedFlow === "trusted-ledger"
+            ? "baseline": recordedFlow === "compatibility-report"
+                ? "compatibility": assuranceReady
+                    ? "assurance": modeUsesCouncil(ctx.mode)
+                        ? "baseline": "compatibility";
+    const contractError = validateFinalizerArgumentKeys(args, flowKind);
     if (contractError) return failure(contractError);
 
     if (ctx.reportFinalization) {
@@ -100,11 +130,9 @@ export async function finalizeReportHandler(args, invocation, dependencies = {})
     const coverageState = getAcquisitionCoverageState(sessionId);
     const treeState = getTreeEnumerationState(sessionId);
     const acquisitionCoverage = (modeUsesApiDirect(ctx.mode) || coverageState || treeState)
-        ? buildCoverageSnapshot(coverageState, treeState)
-        : null;
+        ? buildCoverageSnapshot(coverageState, treeState): null;
     const releaseAssetCoverage = ctx.mode === "verify_release"
-        ? buildReleaseAssetCoverageSnapshot(getReleaseAssetCoverageState(sessionId))
-        : null;
+        ? buildReleaseAssetCoverageSnapshot(getReleaseAssetCoverageState(sessionId)): null;
     let cacheBinding = null;
     try {
         cacheBinding = getCacheBinding(sessionId, { auditId: ctx.auditId });
@@ -113,8 +141,16 @@ export async function finalizeReportHandler(args, invocation, dependencies = {})
     }
 
     let artifacts;
-    let recordedOutcome = null;
-    if (modeUsesCouncil(ctx.mode)) {
+    if (flowKind === "assurance") {
+        const built = buildAssuranceArtifacts({
+            args,
+            ctx,
+            reportIdentity,
+            assuranceState,
+        });
+        if (!built.ok) return failure(built.error, built.data);
+        artifacts = built.artifacts;
+    } else if (flowKind === "baseline") {
         const built = buildCouncilArtifacts({
             args,
             ctx,
@@ -126,9 +162,8 @@ export async function finalizeReportHandler(args, invocation, dependencies = {})
         });
         if (!built.ok) return failure(built.error, built.data);
         artifacts = built.artifacts;
-        recordedOutcome = built.recordedOutcome;
     } else {
-        const built = buildLegacyArtifacts({
+        const built = buildCompatibilityArtifacts({
             args,
             ctx,
             reportIdentity,
@@ -158,7 +193,7 @@ export async function finalizeReportHandler(args, invocation, dependencies = {})
     const preExisting = [reportPath, findingsPath].filter((path) => io.exists(path));
     if (preExisting.length > 0) {
         return failure(
-            "finalize_report refused: a canonical report artifact already exists without a finalization record; refusing to overwrite or adopt unrecorded files",
+            "finalize_report refused: a canonical report artifact already exists without a finalization record; refusing to overwrite or accept unrecorded files",
             { preExisting },
         );
     }
@@ -187,6 +222,7 @@ export async function finalizeReportHandler(args, invocation, dependencies = {})
         reportIdentity,
         flow: artifacts.flow,
         ledgerDecisionId: artifacts.ledgerDecisionId,
+        trustedOutcome: artifacts.trustedOutcome,
     });
     if (!recorded) {
         const rollback = rollbackCanonicalPair([reportPath, findingsPath], io);
@@ -196,28 +232,35 @@ export async function finalizeReportHandler(args, invocation, dependencies = {})
         );
     }
 
-    let analysisStageAfter = ctx.analysisStageState?.current || null;
-    if (artifacts.flow === "v5-ledger" && analysisStageAfter === "validated") {
-        try {
-            analysisStageAfter = advanceAnalysisStage(sessionId, {
-                auditId: ctx.auditId,
-                from: "validated",
-                to: "finalized",
-            }).current;
-        } catch (error) {
-            return failure(
-                `finalize_report durably recorded the pair but could not advance validated to finalized: ${error.message}. Retry the same finalizer call; it will not rewrite either artifact.`,
-                pairResult({
-                    reportPath,
-                    findingsPath,
-                    reportIdentity,
-                    creation,
-                    artifacts,
-                    alreadyFinalized: true,
-                    analysisStageAfter,
-                }),
-            );
-        }
+    let analysisStageAfter;
+    try {
+        analysisStageAfter = finalizeRecordedAnalysisStage({
+            artifacts,
+            ctx,
+            sessionId,
+            dependencies,
+        });
+    } catch (error) {
+        return failure(
+            `finalize_report durably recorded the pair but could not complete the finalized stage: ${error.message}. Retry the same finalizer call; it will not rewrite either artifact.`,
+            pairResult({
+                reportPath,
+                findingsPath,
+                reportIdentity,
+                creation,
+                artifacts,
+                alreadyFinalized: true,
+                analysisStageAfter: null,
+            }),
+        );
+    }
+    const completedRecord = markReportFinalizationStageComplete(sessionId, {
+        auditId: ctx.auditId,
+    });
+    if (!completedRecord) {
+        return failure(
+            "finalize_report durably recorded the pair and stage but could not seal the finalized report record; retry the same finalizer call",
+        );
     }
 
     return success({
@@ -231,20 +274,20 @@ export async function finalizeReportHandler(args, invocation, dependencies = {})
             analysisStageAfter,
         }),
         ...coverageResult(acquisitionCoverage, releaseAssetCoverage),
-        ...(recordedOutcome ? { recordedOutcome: renderRecordedOutcome(recordedOutcome) } : {}),
+        ...(completedRecord.trustedOutcome
+            ? { recordedOutcome: renderRecordedOutcome(completedRecord.trustedOutcome) }: {}),
     });
 }
 
-function validateFinalizerArgumentKeys(args, mode) {
-    const allowed = modeUsesCouncil(mode)
+function validateFinalizerArgumentKeys(args, flowKind) {
+    const allowed = flowKind === "assurance" || flowKind === "baseline"
         ? new Set([
             "owner",
             "repo",
             "resolved_sha",
             "build_root",
             "operator_decisions",
-        ])
-        : new Set([
+        ]): new Set([
             "owner",
             "repo",
             "resolved_sha",
@@ -253,9 +296,65 @@ function validateFinalizerArgumentKeys(args, mode) {
         ]);
     const unexpected = Object.keys(args).filter((key) => !allowed.has(key));
     if (unexpected.length === 0) return null;
-    return modeUsesCouncil(mode)
-        ? `v5 council finalization accepts only structured operator_decisions; model-authored report prose is refused. Refused fields: ${unexpected.join(", ")}`
-        : `legacy finalization does not accept arguments: ${unexpected.join(", ")}`;
+    return flowKind === "assurance"
+        ? `assurance finalization derives verdict, counts, completeness, assurance, and prose from validated state; only structured operator_decisions are accepted. Refused fields: ${unexpected.join(", ")}`: flowKind === "baseline"
+            ? `baseline council finalization accepts only structured operator_decisions; model-authored report prose and caller-authored outcome fields are refused. Refused fields: ${unexpected.join(", ")}`: `compatibility finalization does not accept arguments: ${unexpected.join(", ")}`;
+}
+
+function buildAssuranceArtifacts({
+    args,
+    ctx,
+    reportIdentity,
+    assuranceState,
+}) {
+    if (!assuranceState || !["validated", "finalized"].includes(assuranceState.stageState?.current)) {
+        return {
+            ok: false,
+            error:
+                "finalize_report refused: assurance finalization requires validated assurance state",
+        };
+    }
+    try {
+        const document = buildAssuranceFindingsArtifact({
+            context: ctx,
+            reportIdentity,
+            assuranceState,
+            operatorDecisions: args.operator_decisions || [],
+        });
+        const findingsJson = serializeAssuranceFindingsArtifact(document);
+        const findingsSha256 = sha256(findingsJson);
+        const markdown = renderAssuranceFindingsMarkdown({
+            document,
+            findingsSha256,
+        });
+        assertAssuranceMarkdownFindingsConsistency(markdown, document);
+        return {
+            ok: true,
+            artifacts: {
+                flow: ASSURANCE_REPORT_FLOW,
+                ledgerDecisionId: document.verdict.outcomeId,
+                trustedOutcome: {
+                    schemaVersion: 6,
+                    outcomeId: document.verdict.outcomeId,
+                    verdict: document.verdict.value,
+                    severityCounts: document.verdict.severityCounts,
+                    complete: true,
+                    assurance: {
+                        level: document.assurance.assuranceLevel,
+                        complete: document.assurance.complete,
+                    },
+                },
+                document,
+                findingsJson,
+                markdown,
+            },
+        };
+    } catch (error) {
+        return {
+            ok: false,
+            error: `finalize_report refused: assurance deterministic rendering failed: ${error.message}`,
+        };
+    }
 }
 
 function resolveReportIdentity(ctx, args) {
@@ -365,7 +464,7 @@ function buildCouncilArtifacts({
         return {
             ok: false,
             error:
-                `v5 council finalization accepts only structured operator_decisions; model-authored report prose is refused. Refused fields: ${unexpected.join(", ")}`,
+                `baseline council finalization accepts only structured operator_decisions; model-authored report prose is refused. Refused fields: ${unexpected.join(", ")}`,
         };
     }
     const ledgerSnapshot = getCouncilLedgerSnapshot(sessionId, { auditId: ctx.auditId });
@@ -373,7 +472,7 @@ function buildCouncilArtifacts({
         return {
             ok: false,
             error:
-                "finalize_report refused: v5 council finalization requires the active audit's trusted finding ledger",
+                "finalize_report refused: baseline council finalization requires the active audit's trusted finding ledger",
         };
     }
     const stageState = ctx.analysisStageState;
@@ -419,8 +518,7 @@ function buildCouncilArtifacts({
             code: "required-acquisition-incomplete",
             blockers: acquisitionCoverage.blockers,
             ...(acquisitionCoverage.details
-                ? { details: acquisitionCoverage.details }
-                : {}),
+                ? { details: acquisitionCoverage.details }: {}),
         });
     }
     if (releaseAssetCoverage?.requiredReleaseAssetAcquisitionComplete === false) {
@@ -428,8 +526,7 @@ function buildCouncilArtifacts({
             code: "required-release-asset-acquisition-incomplete",
             blockers: releaseAssetCoverage.blockers,
             ...(releaseAssetCoverage.details
-                ? { details: releaseAssetCoverage.details }
-                : {}),
+                ? { details: releaseAssetCoverage.details }: {}),
         });
     }
     const trustedVerdict = !!ledgerSnapshot.decisionSnapshot
@@ -439,43 +536,7 @@ function buildCouncilArtifacts({
         && acquisitionCoverage?.requiredAcquisitionComplete !== false
         && releaseAssetCoverage?.requiredReleaseAssetAcquisitionComplete !== false;
     const verdict = trustedVerdict
-        ? decisionSnapshot.overallVerdictEligibility.recommendedVerdict
-        : "incomplete";
-
-    const recordedOutcome = getRecordedOutcome(sessionId);
-    const activeIdentity = {
-        auditId: ctx.auditId,
-        owner: ctx.owner || null,
-        repo: ctx.repo || null,
-        resolvedSha: ctx.resolvedSha || null,
-    };
-    if (!councilOutcomeMatchesAudit(recordedOutcome, activeIdentity)) {
-        return {
-            ok: false,
-            error:
-                "finalize_report refused: council mode requires an identity-matching zerotrust_record_council_outcome result for the current immutable audit before finalization",
-        };
-    }
-    const expectedOutcome = {
-        verdict,
-        criticalCount: decisionSnapshot.severityCounts.active.critical,
-        highCount: decisionSnapshot.severityCounts.active.high,
-        complete: trustedVerdict,
-    };
-    if (recordedOutcome.verdict !== expectedOutcome.verdict
-        || recordedOutcome.criticalCount !== expectedOutcome.criticalCount
-        || recordedOutcome.highCount !== expectedOutcome.highCount
-        || recordedOutcome.complete !== expectedOutcome.complete) {
-        return {
-            ok: false,
-            error:
-                "finalize_report refused: recorded council outcome conflicts with the trusted ledger decision",
-            data: {
-                recordedOutcome: renderRecordedOutcome(recordedOutcome),
-                expectedOutcome,
-            },
-        };
-    }
+        ? decisionSnapshot.overallVerdictEligibility.recommendedVerdict: "incomplete";
 
     let document;
     let findingsJson;
@@ -524,10 +585,18 @@ function buildCouncilArtifacts({
     }
     return {
         ok: true,
-        recordedOutcome,
         artifacts: {
-            flow: "v5-ledger",
+            flow: "trusted-ledger",
             ledgerDecisionId: decisionSnapshot.decisionId,
+            trustedOutcome: {
+                schemaVersion: 5,
+                outcomeId: decisionSnapshot.decisionId,
+                verdict,
+                severityCounts:
+                    structuredClone(decisionSnapshot.severityCounts.active),
+                complete: trustedVerdict,
+                assurance: null,
+            },
             document,
             findingsJson,
             markdown,
@@ -581,7 +650,7 @@ function decisionCoverage(ctx, ledgerSnapshot, traceSnapshot) {
     };
 }
 
-function buildLegacyArtifacts({
+function buildCompatibilityArtifacts({
     args,
     ctx,
     reportIdentity,
@@ -600,11 +669,11 @@ function buildLegacyArtifacts({
     if (unexpected.length > 0) {
         return {
             ok: false,
-            error: `legacy finalization does not accept arguments: ${unexpected.join(", ")}`,
+            error: `compatibility finalization does not accept arguments: ${unexpected.join(", ")}`,
         };
     }
     if (typeof args.markdown_body !== "string") {
-        return { ok: false, error: "markdown_body is required for legacy finalization" };
+        return { ok: false, error: "markdown_body is required for compatibility finalization" };
     }
     const inputBytes = Buffer.byteLength(args.markdown_body, "utf8");
     if (inputBytes > MAX_REPORT_BYTES) {
@@ -644,20 +713,19 @@ function buildLegacyArtifacts({
     if (declarations.length > 1) {
         return {
             ok: false,
-            error: "legacy report must not contain multiple verdict declarations",
+            error: "compatibility report must not contain multiple verdict declarations",
             data: { declaredVerdicts: declarations },
         };
     }
     const verdict = declarations[0]
-        || (ctx.mode === "metadata_only" ? "reconnaissance only" : "incomplete");
+        || (ctx.mode === "metadata_only" ? "reconnaissance only": "incomplete");
     const blockers = [];
     if (acquisitionCoverage?.requiredAcquisitionComplete === false) {
         blockers.push({
             code: "required-acquisition-incomplete",
             blockers: acquisitionCoverage.blockers,
             ...(acquisitionCoverage.details
-                ? { details: acquisitionCoverage.details }
-                : {}),
+                ? { details: acquisitionCoverage.details }: {}),
         });
     }
     if (releaseAssetCoverage?.requiredReleaseAssetAcquisitionComplete === false) {
@@ -665,14 +733,13 @@ function buildLegacyArtifacts({
             code: "required-release-asset-acquisition-incomplete",
             blockers: releaseAssetCoverage.blockers,
             ...(releaseAssetCoverage.details
-                ? { details: releaseAssetCoverage.details }
-                : {}),
+                ? { details: releaseAssetCoverage.details }: {}),
         });
     }
     let document;
     let findingsJson;
     try {
-        document = buildLegacyFindingsArtifact({
+        document = buildCompatibilityFindingsArtifact({
             context: ctx,
             reportIdentity,
             stageState: ctx.analysisStageState,
@@ -686,11 +753,11 @@ function buildLegacyArtifacts({
     } catch (error) {
         return {
             ok: false,
-            error: `legacy FINDINGS.json assembly failed: ${error.message}`,
+            error: `compatibility FINDINGS.json assembly failed: ${error.message}`,
         };
     }
     const findingsSha256 = sha256(findingsJson);
-    const markdown = appendLegacyArtifactBinding(
+    const markdown = appendCompatibilityArtifactBinding(
         appendTrustedCoverageSnapshots(
             args.markdown_body,
             acquisitionCoverage,
@@ -702,8 +769,9 @@ function buildLegacyArtifacts({
     return {
         ok: true,
         artifacts: {
-            flow: "legacy-v4",
+            flow: "compatibility-report",
             ledgerDecisionId: null,
+            trustedOutcome: null,
             document,
             findingsJson,
             markdown,
@@ -764,19 +832,29 @@ function returnRecordedPair({
             },
         );
     }
-    let analysisStageAfter = ctx.analysisStageState?.current || null;
-    if (record.flow === "v5-ledger" && analysisStageAfter === "validated") {
-        try {
-            analysisStageAfter = advanceAnalysisStage(sessionId, {
-                auditId: ctx.auditId,
-                from: "validated",
-                to: "finalized",
-            }).current;
-        } catch (error) {
-            return failure(
-                `finalize_report verified the recorded pair but could not advance validated to finalized: ${error.message}`,
-            );
-        }
+    let analysisStageAfter;
+    try {
+        analysisStageAfter = finalizeRecordedAnalysisStage({
+            artifacts: {
+                flow: record.flow,
+                trustedOutcome: record.trustedOutcome,
+            },
+            ctx,
+            sessionId,
+            dependencies,
+        });
+    } catch (error) {
+        return failure(
+            `finalize_report verified the recorded pair but could not complete the finalized stage: ${error.message}`,
+        );
+    }
+    const completedRecord = markReportFinalizationStageComplete(sessionId, {
+        auditId: ctx.auditId,
+    });
+    if (!completedRecord) {
+        return failure(
+            "finalize_report verified the recorded pair but could not seal the finalized report record",
+        );
     }
     return success({
         reportPath: record.reportPath,
@@ -788,6 +866,14 @@ function returnRecordedPair({
         reportIdentity: record.reportIdentity,
         flow: record.flow,
         ledgerDecisionId: record.ledgerDecisionId,
+        ...(completedRecord.trustedOutcome
+            ? {
+                verdict: completedRecord.trustedOutcome.verdict,
+                trustedVerdict: true,
+                recordedOutcome: renderRecordedOutcome(
+                    completedRecord.trustedOutcome,
+                ),
+            }: {}),
         analysisStageAfter,
         alreadyFinalized: true,
     });
@@ -886,7 +972,7 @@ function createArtifactPair({
 
 function readArtifactIdentity(path, io) {
     const bytes = io.read(path);
-    const buffer = Buffer.isBuffer(bytes) ? bytes : Buffer.from(String(bytes), "utf8");
+    const buffer = Buffer.isBuffer(bytes) ? bytes: Buffer.from(String(bytes), "utf8");
     return {
         bytes: buffer.byteLength,
         sha256: createHash("sha256").update(buffer).digest("hex"),
@@ -914,6 +1000,11 @@ function pairResult({
         ledgerDecisionId: artifacts.ledgerDecisionId,
         verdict: artifacts.document.verdict.value,
         trustedVerdict: artifacts.document.verdict.trusted,
+        ...(artifacts.document.assurance
+            ? {
+                assuranceLevel: artifacts.document.assurance.assuranceLevel,
+                assuranceBasis: artifacts.document.assurance.basis,
+            }: {}),
         analysisStageAfter,
         alreadyFinalized,
     };
@@ -944,8 +1035,7 @@ function pathsEqual(left, right) {
     const a = nodePath.resolve(left);
     const b = nodePath.resolve(right);
     return process.platform === "win32"
-        ? a.toLowerCase() === b.toLowerCase()
-        : a === b;
+        ? a.toLowerCase() === b.toLowerCase(): a === b;
 }
 
 function appendTrustedCoverageSnapshot(markdown, acquisitionCoverage) {
@@ -967,13 +1057,13 @@ function appendTrustedCoverageSnapshots(markdown, acquisitionCoverage, releaseAs
     return `${body}\n`;
 }
 
-function appendLegacyArtifactBinding(markdown, document, findingsSha256) {
+function appendCompatibilityArtifactBinding(markdown, document, findingsSha256) {
     const body = String(markdown).replace(/\s+$/u, "");
     return `${body}\n\n## Trusted dual-artifact binding\n\n`
-        + "- **Flow:** legacy-v4 compatibility\n"
+        + "- **Flow:** compatibility-report\n"
         + `- **FINDINGS.json SHA-256:** ${findingsSha256}\n`
         + `- **Findings document ID:** ${document.documentId}\n`
-        + `- **Legacy declared verdict:** ${document.verdict.value}\n`;
+        + `- **Declared compatibility verdict:** ${document.verdict.value}\n`;
 }
 
 function escapeHtml(value) {
@@ -1027,12 +1117,47 @@ function extractDeclaredCouncilCompletionStates(markdown) {
 
 function renderRecordedOutcome(outcome) {
     return {
-        auditId: outcome.auditId,
+        schemaVersion: outcome.schemaVersion,
+        outcomeId: outcome.outcomeId,
         verdict: outcome.verdict,
-        criticalCount: outcome.criticalCount,
-        highCount: outcome.highCount,
+        severityCounts: structuredClone(outcome.severityCounts),
         complete: outcome.complete,
+        assurance: outcome.assurance
+            ? structuredClone(outcome.assurance): null,
+        trusted: outcome.trusted === true,
     };
+}
+
+function finalizeRecordedAnalysisStage({
+    artifacts,
+    ctx,
+    sessionId,
+    dependencies,
+}) {
+    if (artifacts.flow === ASSURANCE_REPORT_FLOW) {
+        const finalizeAssuranceState =
+            dependencies.finalizeAssuranceState || finalizeAssuranceReportState;
+        return finalizeAssuranceState(sessionId, { auditId: ctx.auditId })
+            .stageState.current;
+    }
+    if (artifacts.flow === "trusted-ledger") {
+        const current = getTrustedAuditContext({
+            sessionId,
+            args: {},
+            defaultBuildRoot: DEFAULT_BUILD_ROOT,
+        }).analysisStageState?.current;
+        if (current === "finalized") return current;
+        if (artifacts.trustedOutcome?.complete !== true) return current || null;
+        if (current !== "validated") {
+            throw new Error(`baseline analysis stage is ${current || "missing"}`);
+        }
+        return advanceAnalysisStage(sessionId, {
+            auditId: ctx.auditId,
+            from: "validated",
+            to: "finalized",
+        }).current;
+    }
+    return ctx.analysisStageState?.current || null;
 }
 
 function sha256(value) {
@@ -1041,8 +1166,8 @@ function sha256(value) {
 
 function coverageResult(acquisitionCoverage, releaseAssetCoverage) {
     return {
-        ...(acquisitionCoverage ? { acquisitionCoverage } : {}),
-        ...(releaseAssetCoverage ? { releaseAssetCoverage } : {}),
+        ...(acquisitionCoverage ? { acquisitionCoverage }: {}),
+        ...(releaseAssetCoverage ? { releaseAssetCoverage }: {}),
     };
 }
 
@@ -1052,7 +1177,8 @@ export const __internals = {
     appendTrustedCoverageSnapshot,
     appendTrustedCoverageSnapshots,
     buildCouncilArtifacts,
-    buildLegacyArtifacts,
+    buildAssuranceArtifacts,
+    buildCompatibilityArtifacts,
     buildLocalReportPath,
     createArtifactPair,
     decisionCoverage,

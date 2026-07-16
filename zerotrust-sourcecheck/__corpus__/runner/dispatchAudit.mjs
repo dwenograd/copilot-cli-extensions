@@ -47,13 +47,13 @@ export async function dispatchAudit({
     // extension handler in-process, which is easier to unit-test but does not
     // exercise the real operator workflow. For Wave 1 this file picks Option 1.
     // TODO: validate this live subprocess command against real audits before
-    // relying on non-dry corpus runs as a promotion gate.
+    // relying on non-dry corpus runs as a quality gate.
     const prompt = [
         "Run zerotrust_sourcecheck for this corpus fixture.",
         `URL: ${url}`,
         `mode: ${mode}`,
-        buildRoot ? `build_root: ${buildRoot}` : null,
-        sessionId ? `session_id: ${sessionId}` : null,
+        buildRoot ? `build_root: ${buildRoot}`: null,
+        sessionId ? `session_id: ${sessionId}`: null,
         "Use API-direct source inspection only. Do not install, build, or execute repository code.",
         "Return the final REPORT.md and FINDINGS.json paths.",
     ].filter(Boolean).join("\n");
@@ -77,9 +77,9 @@ export async function dispatchAudit({
     const stdoutText = Buffer.concat(stdout).toString("utf-8");
     const stderrText = Buffer.concat(stderr).toString("utf-8");
     const reportPath = findReportPath(stdoutText)
-        || (outDir ? nodePath.join(outDir, `${mode}-REPORT.md`) : null);
+        || (outDir ? nodePath.join(outDir, `${mode}-REPORT.md`): null);
     const findingsPath = findFindingsPath(stdoutText)
-        || (reportPath ? siblingArtifactPath(reportPath, "FINDINGS.json") : null);
+        || (reportPath ? siblingArtifactPath(reportPath, "FINDINGS.json"): null);
 
     return {
         ok: exitCode === 0,
@@ -127,8 +127,7 @@ function findArtifactPath(text, basename, jsonField) {
 function siblingArtifactPath(path, basename) {
     const value = String(path || "");
     const implementation = /^[A-Za-z]:[\\/]/u.test(value) || value.startsWith("\\\\")
-        ? nodePath.win32
-        : nodePath.posix;
+        ? nodePath.win32: nodePath.posix;
     return implementation.join(implementation.dirname(value), basename);
 }
 

@@ -31,7 +31,7 @@ const LEGACY_FULL_SHA_CLONE_NAME_RE = /^[A-Za-z0-9._-]+-[A-Za-z0-9._-]+-[0-9a-f]
 const LEGACY_CLONE_NAME_RE = /^[A-Za-z0-9._-]+-[A-Za-z0-9._-]+-[0-9a-f]{7}$/;
 
 export function getPurgeHours(env) {
-    const e = env || (typeof process !== "undefined" ? process.env : {}) || {};
+    const e = env || (typeof process !== "undefined" ? process.env: {}) || {};
     const raw = e.ZEROTRUST_AUTO_PURGE_HOURS;
     if (raw === undefined || raw === null || raw === "") return DEFAULT_PURGE_HOURS;
     const n = Number(raw);

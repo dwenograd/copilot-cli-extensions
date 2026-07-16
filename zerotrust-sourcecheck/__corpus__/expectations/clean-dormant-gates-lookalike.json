@@ -1,0 +1,24 @@
+{
+  "schema": "zerotrust-evaluation-expectation",
+  "schema_version": 1,
+  "slug": "clean-dormant-gates-lookalike",
+  "kind": "benign-lookalike",
+  "source": {"type": "local", "path": "fixtures/clean-dormant-gates-lookalike"},
+  "dimensions": {
+    "evasion_classes": ["environment-time-and-state-gated-activation"],
+    "artifact_classes": ["source-text"],
+    "languages": ["rust"],
+    "size": "small"
+  },
+  "expected": {
+    "stage": {"required": ["acquired", "prepared", "scanned", "traced", "validated", "finalized"], "final": "finalized"},
+    "activation_facts": {"required": ["manual-preview", "environment-selector", "time-selector", "platform-selector"], "minimum": 4},
+    "plugin_facts": {"required": ["rust", "display-choice"], "minimum": 2},
+    "counts": {"candidate": 1, "validated": 0, "refuted": 1, "unresolved": 0},
+    "chains": {"required": ["behavior-chain"], "complete_required": [], "forbidden": []},
+    "scores": {"severity": {"min": "low", "max": "low"}, "confidence": {"min": "medium", "max": "medium"}, "project_fit": {"min": "unlikely", "max": "unlikely"}},
+    "tags": {"required": ["benign-lookalike", "environment-gate", "time-gate", "platform-gate"], "forbidden": ["execute-effect"]},
+    "acceptable_blockers": [],
+    "failure_stage": null
+  }
+}

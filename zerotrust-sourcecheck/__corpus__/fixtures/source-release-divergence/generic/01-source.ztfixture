@@ -1,0 +1,5 @@
+marker.fact("activation-surface","publish-trigger","generic");
+marker.fact("artifact-shape","source-artifact","release-asset");
+marker.node("release-start","trigger","publish-trigger","activation,publish");
+marker.node("release-source","provenance","source-artifact","source-artifact,provenance");
+marker.edge("release-start-source","reads-from","release-start","release-source","provenance");

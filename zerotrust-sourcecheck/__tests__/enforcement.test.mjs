@@ -16,11 +16,9 @@ import {
 } from "../enforcement.mjs";
 
 const BUILD_ROOT = process.platform === "win32"
-    ? "C:\\test\\zerotrust-sourcecheck"
-    : "/tmp/zerotrust-sourcecheck";
+    ? "C:\\test\\zerotrust-sourcecheck": "/tmp/zerotrust-sourcecheck";
 const CLONE_PATH = process.platform === "win32"
-    ? "C:\\test\\zerotrust-sourcecheck\\octocat-hello-abc1234"
-    : "/tmp/zerotrust-sourcecheck/octocat-hello-abc1234";
+    ? "C:\\test\\zerotrust-sourcecheck\\octocat-hello-abc1234": "/tmp/zerotrust-sourcecheck/octocat-hello-abc1234";
 
 const SESSION = "test-session-1";
 
@@ -63,9 +61,9 @@ test("expired audit is auto-cleared on read", () => {
     assert.equal(getActiveAudit(SESSION), null);
 });
 
-// ---------- v3 Step 0.3: mode-dependent TTL ----------
+// ---------- current Step 0.3: mode-dependent TTL ----------
 
-test("v3: ttlForMode returns generous values per mode (audit_source 60min, council 90min, build_council 180min)", () => {
+test("current: ttlForMode returns generous values per mode (audit_source 60min, council 90min, build_council 180min)", () => {
     assert.equal(__internals.ttlForMode("audit_source"), 60 * 60 * 1000);
     assert.equal(__internals.ttlForMode("audit_source_council"), 90 * 60 * 1000);
     assert.equal(__internals.ttlForMode("audit_and_safe_build"), 120 * 60 * 1000);
@@ -76,13 +74,13 @@ test("v3: ttlForMode returns generous values per mode (audit_source 60min, counc
     assert.equal(__internals.ttlForMode("verify_release"), 30 * 60 * 1000);
 });
 
-test("v3: ttlForMode falls back to a generous default for unknown modes (no silent 30-min regression)", () => {
+test("current: ttlForMode falls back to a generous default for unknown modes (no silent 30-min regression)", () => {
     assert.equal(__internals.ttlForMode("future-mode-not-in-table"), __internals.AUDIT_TTL_MS_DEFAULT);
     assert.ok(__internals.AUDIT_TTL_MS_DEFAULT >= 60 * 60 * 1000,
-        "default TTL must be at least 60 minutes to avoid the v2 silent-expiry regression");
+        "default TTL must be at least 60 minutes to avoid the previous silent-expiry regression");
 });
 
-test("v3: activateAudit picks per-mode TTL (council mode gets >= 90 min)", () => {
+test("current: activateAudit picks per-mode TTL (council mode gets >= 90 min)", () => {
     activateAudit({
         sessionId: SESSION,
         buildPath: BUILD_ROOT,
@@ -96,7 +94,7 @@ test("v3: activateAudit picks per-mode TTL (council mode gets >= 90 min)", () =>
     assert.ok(remainingMs <= 91 * 60 * 1000, `council TTL too long: ${remainingMs}ms`);
 });
 
-test("v3: consumeExpiryNotice surfaces the silent-expiry event so it isn't invisible", () => {
+test("current: consumeExpiryNotice surfaces the silent-expiry event so it isn't invisible", () => {
     activateAudit({
         sessionId: SESSION,
         buildPath: BUILD_ROOT,
@@ -115,7 +113,7 @@ test("v3: consumeExpiryNotice surfaces the silent-expiry event so it isn't invis
     assert.equal(consumeExpiryNotice(SESSION), null);
 });
 
-test("v3: consumeExpiryNotice returns null when nothing expired", () => {
+test("current: consumeExpiryNotice returns null when nothing expired", () => {
     assert.equal(consumeExpiryNotice("never-existed-session"), null);
 });
 
@@ -134,7 +132,7 @@ test("denies bare `git clone <url>` without destination", () => {
 
 test("denies clone to a path outside build_root", () => {
     activateAudit({ sessionId: SESSION, buildPath: BUILD_ROOT, mode: "audit_and_safe_build", expectedClonePath: CLONE_PATH });
-    const outside = process.platform === "win32" ? "C:\\temp\\evil" : "/tmp/evil";
+    const outside = process.platform === "win32" ? "C:\\temp\\evil": "/tmp/evil";
     const r = inspectToolCall({
         sessionId: SESSION,
         toolName: "powershell",
@@ -147,8 +145,7 @@ test("denies clone to a path outside build_root", () => {
 test("denies clone to a sibling under build_root that isn't the planned path", () => {
     activateAudit({ sessionId: SESSION, buildPath: BUILD_ROOT, mode: "audit_and_safe_build", expectedClonePath: CLONE_PATH });
     const sibling = process.platform === "win32"
-        ? "C:\\test\\zerotrust-sourcecheck\\unrelated-other"
-        : "/tmp/zerotrust-sourcecheck/unrelated-other";
+        ? "C:\\test\\zerotrust-sourcecheck\\unrelated-other": "/tmp/zerotrust-sourcecheck/unrelated-other";
     const r = inspectToolCall({
         sessionId: SESSION,
         toolName: "powershell",
@@ -158,7 +155,7 @@ test("denies clone to a sibling under build_root that isn't the planned path", (
     assert.match(r.reason, /planned/i);
 });
 
-test("allows clone to the planned path with hardening flags", () => {
+test("allows clone to the planned path with security flags", () => {
     activateAudit({ sessionId: SESSION, buildPath: BUILD_ROOT, mode: "audit_and_safe_build", expectedClonePath: CLONE_PATH });
     const r = inspectToolCall({
         sessionId: SESSION,
@@ -263,8 +260,7 @@ test("denies `gradle build` even in safe-build mode (no safe-mode flag)", () => 
 test("denies Start-Process of a binary under build_root", () => {
     activateAudit({ sessionId: SESSION, buildPath: BUILD_ROOT, mode: "audit_and_safe_build", expectedClonePath: CLONE_PATH });
     const targetExe = process.platform === "win32"
-        ? `${CLONE_PATH}\\dist\\app.exe`
-        : `${CLONE_PATH}/dist/app.exe`;
+        ? `${CLONE_PATH}\\dist\\app.exe`: `${CLONE_PATH}/dist/app.exe`;
     const r = inspectToolCall({
         sessionId: SESSION,
         toolName: "powershell",
@@ -276,8 +272,7 @@ test("denies Start-Process of a binary under build_root", () => {
 test("denies direct .exe invocation under build_root", () => {
     activateAudit({ sessionId: SESSION, buildPath: BUILD_ROOT, mode: "audit_and_safe_build", expectedClonePath: CLONE_PATH });
     const targetExe = process.platform === "win32"
-        ? `${CLONE_PATH}\\dist\\app.exe`
-        : `${CLONE_PATH}/dist/app.exe`;
+        ? `${CLONE_PATH}\\dist\\app.exe`: `${CLONE_PATH}/dist/app.exe`;
     const r = inspectToolCall({
         sessionId: SESSION,
         toolName: "powershell",
@@ -289,8 +284,7 @@ test("denies direct .exe invocation under build_root", () => {
 test("denies Mount-DiskImage of an .iso under build_root", () => {
     activateAudit({ sessionId: SESSION, buildPath: BUILD_ROOT, mode: "verify_release", expectedClonePath: CLONE_PATH });
     const targetIso = process.platform === "win32"
-        ? `C:\\test\\zerotrust-sourcecheck\\_quarantine\\octocat-hello-abc1234\\foo.bin`
-        : `/tmp/zerotrust-sourcecheck/_quarantine/octocat-hello-abc1234/foo.bin`;
+        ? `C:\\test\\zerotrust-sourcecheck\\_quarantine\\octocat-hello-abc1234\\foo.bin`: `/tmp/zerotrust-sourcecheck/_quarantine/octocat-hello-abc1234/foo.bin`;
     const r = inspectToolCall({
         sessionId: SESSION,
         toolName: "powershell",
@@ -330,15 +324,14 @@ test("preToolUseHook returns undefined when no opinion", () => {
     assert.equal(out, undefined);
 });
 
-// ---------- v4-r2 round-14: GUI-launch + disk-download enforcement ----------
+// ---------- security rationale: GUI-launch + disk-download enforcement ----------
 // Regression for the user-visible "Notepad opened itself on agent_scratch.txt"
 // and "command-line windows briefly flashed" bugs. Sub-agents called
 // `Invoke-Item <file>` (Notepad pop-up) and `iwr -OutFile <file>` (downloaded
 // source bytes to disk leaving scratch files) during an API-direct audit.
 
 const TARGET_TXT = process.platform === "win32"
-    ? "C:\\test\\agent_scratch.txt"
-    : "/tmp/agent_scratch.txt";
+    ? "C:\\test\\agent_scratch.txt": "/tmp/agent_scratch.txt";
 
 test("denies Invoke-Item against a file outside build_root (Notepad pop-up bug)", () => {
     activateAudit({ sessionId: SESSION, buildPath: BUILD_ROOT, mode: "audit_source_council", expectedClonePath: CLONE_PATH });
@@ -519,9 +512,9 @@ test("does NOT deny `start` substring inside other tokens (false-positive guard)
     assert.notEqual(r.decision, "deny");
 });
 
-// ---------- v4-r2 round-15: regex-bypass fixes from triple-review ----------
+// ---------- security rationale: regex-bypass fixes from triple-review ----------
 
-test("round-15: denies `ii .` (open current dir in Explorer)", () => {
+test("denies `ii .` (open current dir in Explorer)", () => {
     activateAudit({ sessionId: SESSION, buildPath: BUILD_ROOT, mode: "audit_source", expectedClonePath: CLONE_PATH });
     const r = inspectToolCall({
         sessionId: SESSION,
@@ -532,7 +525,7 @@ test("round-15: denies `ii .` (open current dir in Explorer)", () => {
     assert.match(r.reason, /ii|Invoke-Item/i);
 });
 
-test("round-15: denies `ii ..` and `ii $path` (variable target)", () => {
+test("denies `ii ..` and `ii $path` (variable target)", () => {
     activateAudit({ sessionId: SESSION, buildPath: BUILD_ROOT, mode: "audit_source", expectedClonePath: CLONE_PATH });
     for (const cmd of [`ii ..`, `ii $somepath`, `ii foo`]) {
         const r = inspectToolCall({
@@ -544,7 +537,7 @@ test("round-15: denies `ii ..` and `ii $path` (variable target)", () => {
     }
 });
 
-test("round-15: denies `code .` (open current dir in VS Code)", () => {
+test("denies `code .` (open current dir in VS Code)", () => {
     activateAudit({ sessionId: SESSION, buildPath: BUILD_ROOT, mode: "audit_source", expectedClonePath: CLONE_PATH });
     const r = inspectToolCall({
         sessionId: SESSION,
@@ -555,7 +548,7 @@ test("round-15: denies `code .` (open current dir in VS Code)", () => {
     assert.match(r.reason, /VS Code/i);
 });
 
-test("round-15: denies `code ..` and `code somefile.txt`", () => {
+test("denies `code ..` and `code somefile.txt`", () => {
     activateAudit({ sessionId: SESSION, buildPath: BUILD_ROOT, mode: "audit_source", expectedClonePath: CLONE_PATH });
     for (const cmd of [`code ..`, `code somefile.txt`]) {
         const r = inspectToolCall({
@@ -567,7 +560,7 @@ test("round-15: denies `code ..` and `code somefile.txt`", () => {
     }
 });
 
-test("round-15: ALLOWS `code -v` / `code --version` (flag-only, no target)", () => {
+test("ALLOWS `code -v` / `code --version` (flag-only, no target)", () => {
     activateAudit({ sessionId: SESSION, buildPath: BUILD_ROOT, mode: "audit_source", expectedClonePath: CLONE_PATH });
     for (const cmd of [`code -v`, `code --version`, `code --help`]) {
         const r = inspectToolCall({
@@ -579,7 +572,7 @@ test("round-15: ALLOWS `code -v` / `code --version` (flag-only, no target)", () 
     }
 });
 
-test("round-15: denies `start .` and `start /B foo`", () => {
+test("denies `start .` and `start /B foo`", () => {
     activateAudit({ sessionId: SESSION, buildPath: BUILD_ROOT, mode: "audit_source", expectedClonePath: CLONE_PATH });
     for (const cmd of [`start .`, `start ..`, `start /B foo.exe`, `start "title" foo.txt`]) {
         const r = inspectToolCall({
@@ -591,7 +584,7 @@ test("round-15: denies `start .` and `start /B foo`", () => {
     }
 });
 
-test("round-15: `Start-Process` still caught by its own pattern (not the new bare-start pattern)", () => {
+test("`Start-Process` still caught by its own pattern (not the new bare-start pattern)", () => {
     activateAudit({ sessionId: SESSION, buildPath: BUILD_ROOT, mode: "audit_source", expectedClonePath: CLONE_PATH });
     const r = inspectToolCall({
         sessionId: SESSION,
@@ -601,7 +594,7 @@ test("round-15: `Start-Process` still caught by its own pattern (not the new bar
     assert.equal(r.decision, "deny");
 });
 
-test("round-15: denies `iwr URL | Out-File file` (pipe to disk-write sink)", () => {
+test("denies `iwr URL | Out-File file` (pipe to disk-write sink)", () => {
     activateAudit({ sessionId: SESSION, buildPath: BUILD_ROOT, mode: "audit_source", expectedClonePath: CLONE_PATH });
     const r = inspectToolCall({
         sessionId: SESSION,
@@ -612,7 +605,7 @@ test("round-15: denies `iwr URL | Out-File file` (pipe to disk-write sink)", () 
     assert.match(r.reason, /Out-File|Set-Content|Tee-Object|disk-writing/i);
 });
 
-test("round-15: denies `curl URL | Set-Content file` (pipe form)", () => {
+test("denies `curl URL | Set-Content file` (pipe form)", () => {
     activateAudit({ sessionId: SESSION, buildPath: BUILD_ROOT, mode: "audit_source", expectedClonePath: CLONE_PATH });
     const r = inspectToolCall({
         sessionId: SESSION,
@@ -622,7 +615,7 @@ test("round-15: denies `curl URL | Set-Content file` (pipe form)", () => {
     assert.equal(r.decision, "deny");
 });
 
-test("round-15: denies `gh api ... | Out-File file` (pipe form)", () => {
+test("denies `gh api ... | Out-File file` (pipe form)", () => {
     activateAudit({ sessionId: SESSION, buildPath: BUILD_ROOT, mode: "audit_source", expectedClonePath: CLONE_PATH });
     const r = inspectToolCall({
         sessionId: SESSION,
@@ -632,7 +625,7 @@ test("round-15: denies `gh api ... | Out-File file` (pipe form)", () => {
     assert.equal(r.decision, "deny");
 });
 
-test("round-15: ALLOWS legitimate `Out-File` for report writing (no download upstream)", () => {
+test("ALLOWS legitimate `Out-File` for report writing (no download upstream)", () => {
     activateAudit({ sessionId: SESSION, buildPath: BUILD_ROOT, mode: "audit_source", expectedClonePath: CLONE_PATH });
     // The orchestrator writing REPORT.md via Out-File is legitimate.
     // Only the <download> | Out-File COMBINATION is denied.

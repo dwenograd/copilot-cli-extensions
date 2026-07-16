@@ -11,7 +11,7 @@
 // Callers receive an absolute, normalised path string. Wrappers that
 // perform destructive ops should still validate that an agent-supplied
 // `args.build_root` matches DEFAULT_BUILD_ROOT (or an active audit
-// anchor) before touching it — see the round-17 defence-in-depth
+// anchor) before touching it — see the security rationale defence-in-depth
 // checks in sweepWrapper.mjs / reportWrapper.mjs.
 
 import os from "node:os";

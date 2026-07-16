@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 
 import {
-    ANALYSIS_SCHEMA_VERSION,
+    ANALYSIS_SCHEMA_REVISION,
     CONFIDENCE_LEVELS,
     LIMITS,
     MALICIOUS_PROJECT_FIT_LEVELS,
@@ -117,12 +117,11 @@ function normalizedMaliciousBehaviorSignature(finding, chains) {
         effect: Object.freeze({
             action: behavior.action,
             target: behavior.target,
-            ...(behavior.persistence ? { persistence: behavior.persistence } : {}),
-            ...(behavior.propagation ? { propagation: behavior.propagation } : {}),
+            ...(behavior.persistence ? { persistence: behavior.persistence }: {}),
+            ...(behavior.propagation ? { propagation: behavior.propagation }: {}),
         }),
         graphNeighborhood: Object.freeze(neighborhoods.length > 0
-            ? neighborhoods
-            : [{
+            ? neighborhoods: [{
                 status: "unmapped",
                 pattern: "unmapped",
                 stepKinds: [],
@@ -169,8 +168,7 @@ function aliasRecord(finding, chains, adjudication) {
 function strongestSeverity(findings) {
     return findings.reduce((strongest, finding) =>
         SEVERITY_RANK[finding.severity] > SEVERITY_RANK[strongest]
-            ? finding.severity
-            : strongest, "info");
+            ? finding.severity: strongest, "info");
 }
 
 function canonicalGroup(group, limits) {
@@ -206,7 +204,7 @@ function canonicalGroup(group, limits) {
         edgeIds: edgeIdsUnbounded.length > limits.edgeIdsPerFinding,
     });
     return Object.freeze({
-        canonicalId: `ztcanon-v5-${digest("zerotrust-canonical-finding-v5", {
+        canonicalId: `ztcanon-${digest("zerotrust-canonical-finding", {
             auditId: group.auditId,
             signature: group.signature,
             stateClass: group.stateClass,
@@ -246,9 +244,8 @@ function canonicalGroup(group, limits) {
 
 function groupPriority(group) {
     const severity = SEVERITY_RANK[group.strongestObservedSeverity];
-    const active = group.stateClass === "refuted" ? 0 : 1;
-    const state = group.stateClass === "validated" ? 2
-        : group.stateClass === "unresolved" ? 1 : 0;
+    const active = group.stateClass === "refuted" ? 0: 1;
+    const state = group.stateClass === "validated" ? 2: group.stateClass === "unresolved" ? 1: 0;
     return { active, severity, state };
 }
 
@@ -334,7 +331,7 @@ export function dedupeFindings({
         canonicalDetails: itemTruncated,
         blockers: blockersTruncated,
     });
-    const inputFingerprint = digest("zerotrust-dedupe-input-v5", {
+    const inputFingerprint = digest("zerotrust-dedupe-input", {
         auditId: normalizedAuditId,
         findings: normalizedFindings,
         traceInputFingerprint: traceSnapshot?.inputFingerprint || null,
@@ -343,7 +340,7 @@ export function dedupeFindings({
     });
 
     return Object.freeze(structuredClone({
-        schemaVersion: ANALYSIS_SCHEMA_VERSION,
+        schemaVersion: ANALYSIS_SCHEMA_REVISION,
         auditId: normalizedAuditId,
         inputFingerprint,
         coverageComplete: !Object.values(truncation).some(Boolean),

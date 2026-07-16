@@ -1,0 +1,3 @@
+marker.node("generate-effect","sink","execution-effect","execute-effect");
+marker.edge("generate-output-effect","enables","generate-output","generate-effect","execute-effect");
+marker.finding("generated-hook-chain","validated","high","high","strong","execute","generated-code","build-output","generated-code,build-hook,cross-language,execute-effect");

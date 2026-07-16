@@ -1,18 +1,16 @@
 // __tests__/avSafetyScan.test.mjs
 //
-// AV-safety scan: assert that v3-changed files do not contain any of the
-// v2-incident-trigger byte sequences that previously caused Microsoft
-// Defender alerts during the v2 build.
+// AV-safety scan: assert that covered files do not contain byte sequences that
+// previously caused Microsoft Defender alerts.
 //
-// Background — two distinct v2 files tripped Defender:
+// Background — two distinct files tripped Defender:
 //   1. A fixture file containing a JS eval-of-base64 token plus a
 //      Tags-block-style UTF-8 byte triple → Trojan:JS/GlassWorm.A!MTB
 //   2. A role-prompt file densely enumerating PowerShell offensive
 //      cmdlet names → Trojan:PowerShell/PsAttack.R
 //
-// The v3 AV-safety gate is: no v3-changed file contains a known
-// v2-incident-trigger substring. This test enforces that gate on every
-// v3-CHANGED file (modes.mjs + future safeWrappers/ + tagDictionary/).
+// The AV-safety gate is that no covered file contains a known incident-trigger
+// substring.
 //
 // Pre-existing files (packet.mjs prose, README.md deferred-items table,
 // council/ role prompts, all __tests__) are explicitly OUT-OF-SCOPE here
@@ -33,7 +31,7 @@ import { fileURLToPath } from "node:url";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const EXT_ROOT = join(__dirname, "..");
 
-// ---------- v2-incident-trigger substrings ----------
+// ---------- Incident-trigger substrings ----------
 //
 // Each entry is { label, bytes }. `bytes` is a Buffer constructed from
 // concatenated string fragments (or, for the UTF-8 byte triple, raw hex
@@ -64,7 +62,7 @@ const TRIGGERS = [
         bytes: Buffer.from("ev" + "al" + "(at" + "ob(", "utf-8"),
     },
     {
-        // Three-byte UTF-8 prefix used by the v2 GlassWorm fixture
+        // Three-byte UTF-8 prefix used by the historical GlassWorm fixture
         // (Tags-block-style invisible-character sequence). Expressed as
         // raw hex byte literals so the actual byte sequence does not
         // appear as raw characters in this source file.
@@ -88,9 +86,8 @@ const TRIGGERS = [
     },
 ];
 
-// ---------- Allowlist of v3-changed files to scan ----------
+// ---------- Allowlist of files to scan ----------
 //
-// Per Wave 0 Step 0.5 spec, scan only files added/modified by v3 work.
 // Pre-existing files are explicitly out-of-scope to avoid false positives
 // on prose that has been on disk for days without triggering AV.
 //
@@ -103,39 +100,62 @@ const TRIGGERS = [
 //   - everything (.mjs / .md, recursive) under __corpus__/runner/
 //   - __tests__/corpusRunner.test.mjs
 //   - __tests__/buildCouncil.test.mjs
-//   - __tests__/defaultPromotion.test.mjs
 //
 // Skip-list (documentation; the allowlist makes this redundant but the
 // test stays intentionally narrow):
 //   - packet.mjs, README.md (pre-existing prose with deferred-items text)
 //   - handler.mjs, enforcement.mjs, extension.mjs, urlParser.mjs
 //   - council/ (pre-existing role prompts)
-//   - other __tests__/ files (some pre-existing tests reference v2 prose)
+//   - other __tests__/ files
 //   - node_modules/, build/, dist/ (vendor / build output)
 const ALLOWED_ROOT_FILES = ["modes.mjs"];
 const ALLOWED_FILES = [
     ["__tests__", "corpusRunner.test.mjs"],
     ["__tests__", "buildCouncil.test.mjs"],
-    ["__tests__", "defaultPromotion.test.mjs"],
     ["__tests__", "cleanupAndPurge.test.mjs"],
-    ["__tests__", "v31Hardening.test.mjs"],
+    ["__tests__", "wrapper-security-boundaries.test.mjs"],
     ["__tests__", "apiDirect.test.mjs"],
-    ["__tests__", "v4r1Hardening.test.mjs"],
-    ["__tests__", "v4r2Hardening.test.mjs"],
-    ["__tests__", "v4r2r2Hardening.test.mjs"],
-    ["__tests__", "v4r2r3Hardening.test.mjs"],
-    ["__tests__", "v4r2r4Hardening.test.mjs"],
-    ["__tests__", "v4r2r5Hardening.test.mjs"],
-    ["__tests__", "v4r2r6Hardening.test.mjs"],
-    ["__tests__", "v4r2r7Hardening.test.mjs"],
-    ["__tests__", "v4r2r8Hardening.test.mjs"],
-    ["__tests__", "v4r2r9Hardening.test.mjs"],
-    ["__tests__", "v4r2r10Hardening.test.mjs"],
-    ["__tests__", "v4r2r11Hardening.test.mjs"],
+    ["__tests__", "api-direct-binary-boundaries.test.mjs"],
+    ["__tests__", "command-coverage-boundaries.test.mjs"],
+    ["__tests__", "clone-argument-validation.test.mjs"],
+    ["__tests__", "command-normalization.test.mjs"],
+    ["__tests__", "installer-command-bypasses.test.mjs"],
+    ["__tests__", "install-synthesis-sha-binding.test.mjs"],
+    ["__tests__", "chained-install-fetch-fallback.test.mjs"],
+    ["__tests__", "synthesis-detection-clone-flags.test.mjs"],
+    ["__tests__", "clone-invocation-validation.test.mjs"],
+    ["__tests__", "powershell-escape-sha-binding.test.mjs"],
+    ["__tests__", "trusted-git-interpolation.test.mjs"],
+    ["__tests__", "unicode-escape-ref-binding.test.mjs"],
+    ["__tests__", "analysis-index.test.mjs"],
+    ["__tests__", "behavior-graph.test.mjs"],
+    ["__tests__", "analysis-contracts.test.mjs"],
+    ["__tests__", "dedupe-scoring.test.mjs"],
+    ["__tests__", "finalization-state-separation.test.mjs"],
+    ["__tests__", "metadata-cache.test.mjs"],
+    ["__tests__", "plugin-framework.test.mjs"],
+    ["__tests__", "remediation-engine.test.mjs"],
+    ["__tests__", "lifecycle-stage-state.test.mjs"],
+    ["__tests__", "static-validation.test.mjs"],
+    ["__tests__", "assurance.test.mjs"],
+    ["__tests__", "dependency-inventory.test.mjs"],
+    ["__tests__", "derived-artifacts.test.mjs"],
+    ["__tests__", "assurance-enforcement-state.test.mjs"],
+    ["__tests__", "evasive-graph-validation.test.mjs"],
+    ["__tests__", "assurance-foundations.test.mjs"],
+    ["__tests__", "language-scanners.test.mjs"],
+    ["__tests__", "workflow-state-separation.test.mjs"],
+    ["__tests__", "object-inventory.test.mjs"],
+    ["__tests__", "prompt-resilience.test.mjs"],
+    ["__tests__", "red-team.test.mjs"],
+    ["__tests__", "semantic-coverage.test.mjs"],
+    ["__tests__", "supply-chain-graph.test.mjs"],
+    ["__tests__", "verdict-build-gate.test.mjs"],
     ["analysis", "plugins", "runner.mjs"],
     ["analysis", "reportLedger.mjs"],
     ["__corpus__", "README.md"],
-    ["__corpus__", "promotion-gate.v1.json"],
+    ["__corpus__", "quality-gate.json"],
+    ["__tests__", "corpusEvasive.test.mjs"],
 ];
 const ALLOWED_DIRS = [
     ["safeWrappers"],
@@ -202,11 +222,11 @@ function collectScanTargets() {
 
 // ---------- Tests ----------
 
-test("v3-changed files contain none of the v2 AV-incident triggers", () => {
+test("covered files contain none of the AV incident triggers", () => {
     const targets = collectScanTargets();
     assert.ok(
         targets.length >= 1,
-        `expected at least one v3-changed file to scan; got ${targets.length}. ` +
+        `expected at least one covered file to scan; got ${targets.length}. ` +
             `Allowlist: root=${ALLOWED_ROOT_FILES.join(",")}, files=${ALLOWED_FILES.map((p) => p.join(sep)).join(",")}, dirs=${ALLOWED_DIRS.map((p) => p.join(sep)).join(",")}`,
     );
 
@@ -226,7 +246,7 @@ test("v3-changed files contain none of the v2 AV-incident triggers", () => {
     assert.deepEqual(
         violations,
         [],
-        `AV-safety scan failed — found ${violations.length} v2-incident-trigger occurrence(s) in v3 files:\n` +
+        `AV-safety scan failed — found ${violations.length} incident-trigger occurrence(s):\n` +
             violations
                 .map((v) => `  - ${v.file}: contains ${JSON.stringify(v.trigger)}`)
                 .join("\n") +
@@ -236,7 +256,7 @@ test("v3-changed files contain none of the v2 AV-incident triggers", () => {
     );
 });
 
-test("AV-safety scan covers modes.mjs (canonical v3 file) when present", () => {
+test("AV-safety scan covers modes.mjs when present", () => {
     // Sanity: if modes.mjs exists (it does — shipped in Wave 0 Step 0.4)
     // it MUST be among the scan targets. Guards against accidental
     // allowlist regression that would silently scan zero files and let
@@ -251,7 +271,7 @@ test("AV-safety scan covers modes.mjs (canonical v3 file) when present", () => {
     }
 });
 
-test("AV-safety scan covers v3 test additions", () => {
+test("AV-safety scan covers corpus test additions", () => {
     const targets = collectScanTargets();
     assert.ok(
         targets.includes(join(EXT_ROOT, "__corpus__", "runner", "tagDictionary.mjs")),
@@ -261,13 +281,12 @@ test("AV-safety scan covers v3 test additions", () => {
         targets.includes(join(EXT_ROOT, "__tests__", "corpusRunner.test.mjs")),
         "expected corpusRunner.test.mjs to be included in scan targets",
     );
-    assert.ok(
-        targets.includes(join(EXT_ROOT, "__tests__", "defaultPromotion.test.mjs")),
-        "expected defaultPromotion.test.mjs to be included in scan targets",
-    );
+    assert.ok(targets.includes(
+        join(EXT_ROOT, "__corpus__", "quality-gate.json"),
+    ));
 });
 
-test("AV-safety scan covers v3.1 hardening files (cleanup wrapper + auto-purge)", () => {
+test("AV-safety scan covers security files", () => {
     const targets = collectScanTargets();
     assert.ok(
         targets.includes(join(EXT_ROOT, "safeWrappers", "cleanupWrapper.mjs")),
@@ -283,15 +302,14 @@ test("AV-safety scan covers v3.1 hardening files (cleanup wrapper + auto-purge)"
     );
     assert.ok(
         targets.includes(join(EXT_ROOT, "safeWrappers", "apiClient.mjs")),
-        "expected safeWrappers/apiClient.mjs (v4) to be in scan targets",
+        "expected safeWrappers/apiClient.mjs to be in scan targets",
     );
     assert.ok(
         targets.includes(join(EXT_ROOT, "safeWrappers", "safeListTreeHandler.mjs")),
-        "expected safeWrappers/safeListTreeHandler.mjs (v4) to be in scan targets",
+        "expected safeWrappers/safeListTreeHandler.mjs to be in scan targets",
     );
     assert.ok(
         targets.includes(join(EXT_ROOT, "safeWrappers", "safeFetchHandler.mjs")),
-        "expected safeWrappers/safeFetchHandler.mjs (v4) to be in scan targets",
+        "expected safeWrappers/safeFetchHandler.mjs to be in scan targets",
     );
 });
-

@@ -103,7 +103,7 @@ describe("local_path handler — argument validation", () => {
         const r = runHandler({
             local_path: validDir,
             i_understand_local_path_reads_my_disk: true,
-            ref: "v1.0",
+            ref: "baseline.0",
         });
         assert.equal(r.resultType, "failure");
         assert.match(r.textResultForLlm, /ref is not valid in local_path mode/);
@@ -172,19 +172,19 @@ describe("local_path handler — success paths", () => {
         assert.match(r.textResultForLlm, /CONTAINMENT \(load-bearing\)/);
     });
 
-    test("packet contains the Section 9b remediation flow", () => {
+    test("packet contains the current remediation flow", () => {
         const r = runHandler({
             local_path: validDir,
             i_understand_local_path_reads_my_disk: true,
             mode: "audit_local_source_council",
         });
         assert.equal(r.resultType, "success");
-        assert.match(r.textResultForLlm, /Section 9b — Remediation/);
+        assert.match(r.textResultForLlm, /Step E — Remediation decisions before finalization/);
         assert.match(r.textResultForLlm, /defang/);
-        assert.match(r.textResultForLlm, /delete project/);
-        assert.match(r.textResultForLlm, /keep as-is/);
-        assert.match(r.textResultForLlm, /NEVER auto-apply/);
-        assert.match(r.textResultForLlm, /NEVER batch/);
+        assert.match(r.textResultForLlm, /delete-project/);
+        assert.match(r.textResultForLlm, /keep-as-is/);
+        assert.match(r.textResultForLlm, /Never auto-apply/i);
+        assert.match(r.textResultForLlm, /one finding at a time/i);
         assert.match(r.textResultForLlm, /\.zerotrust-backup-/);
     });
 
@@ -215,10 +215,10 @@ describe("local_path handler — success paths", () => {
         });
         assert.equal(r.resultType, "success");
         const resolved = nodePath.resolve(validDir);
-        // The Section 9b prose names the pinned path as the only delete target.
+        // The remediation prose names the pinned path as the only delete target.
         assert.ok(
             r.textResultForLlm.includes(`pinned path for this audit is **exactly** \`${resolved}\``),
-            "Section 9b must pin the delete path to the resolved localPath",
+            "remediation must pin the delete path to the resolved localPath",
         );
     });
 });

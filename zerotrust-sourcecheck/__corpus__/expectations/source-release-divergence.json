@@ -1,0 +1,25 @@
+{
+  "schema": "zerotrust-evaluation-expectation",
+  "schema_version": 1,
+  "slug": "source-release-divergence",
+  "kind": "synthetic-incomplete",
+  "source": {"type": "local", "path": "fixtures/source-release-divergence"},
+  "dimensions": {
+    "evasion_classes": ["release-source-and-artifact-divergence"],
+    "artifact_classes": ["release-asset"],
+    "languages": ["generic"],
+    "size": "small",
+    "known_coverage_blockers": true
+  },
+  "expected": {
+    "stage": {"required": ["acquired"], "final": "acquired"},
+    "activation_facts": {"required": ["publish-trigger"], "minimum": 1},
+    "plugin_facts": {"required": ["release-transform", "release-divergence", "release-source-divergence"], "minimum": 3},
+    "counts": {"candidate": 1, "validated": 1, "refuted": 0, "unresolved": 0},
+    "chains": {"required": ["behavior-chain"], "complete_required": ["behavior-chain"], "forbidden": []},
+    "scores": {"severity": {"min": "high", "max": "high"}, "confidence": {"min": "high", "max": "high"}, "project_fit": {"min": "strong", "max": "strong"}},
+    "tags": {"required": ["source-release-divergence", "release-asset", "provenance"], "forbidden": ["benign"]},
+    "acceptable_blockers": ["release-source-divergence"],
+    "failure_stage": "prepare"
+  }
+}

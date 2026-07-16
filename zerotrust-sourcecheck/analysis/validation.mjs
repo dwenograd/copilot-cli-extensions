@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 
 import {
-    ANALYSIS_SCHEMA_VERSION,
+    ANALYSIS_SCHEMA_REVISION,
     CONFIDENCE_LEVELS,
     LIMITS,
     MALICIOUS_PROJECT_FIT_LEVELS,
@@ -158,9 +158,9 @@ function stripNode(node) {
         kind: node.kind,
         producer: node.producer,
         evidence: node.evidence,
-        ...(node.sourceIdentity ? { sourceIdentity: node.sourceIdentity } : {}),
-        ...(node.behaviorSignature ? { behaviorSignature: node.behaviorSignature } : {}),
-        ...(node.tags ? { tags: node.tags } : {}),
+        ...(node.sourceIdentity ? { sourceIdentity: node.sourceIdentity }: {}),
+        ...(node.behaviorSignature ? { behaviorSignature: node.behaviorSignature }: {}),
+        ...(node.tags ? { tags: node.tags }: {}),
     };
 }
 
@@ -172,7 +172,7 @@ function stripEdge(edge) {
         to: edge.to,
         producer: edge.producer,
         evidence: edge.evidence,
-        ...(edge.tags ? { tags: edge.tags } : {}),
+        ...(edge.tags ? { tags: edge.tags }: {}),
     };
 }
 
@@ -321,7 +321,7 @@ export function buildValidationPlan({
         }));
     }
 
-    const inputFingerprint = digest("zerotrust-validation-input-v5", {
+    const inputFingerprint = digest("zerotrust-validation-input-baseline", {
         auditId: normalizedAuditId,
         minSeverity: normalizedMinSeverity,
         traceInputFingerprint: traceSnapshot.inputFingerprint,
@@ -329,7 +329,7 @@ export function buildValidationPlan({
         contexts: validationContexts,
     });
     return Object.freeze({
-        schemaVersion: ANALYSIS_SCHEMA_VERSION,
+        schemaVersion: ANALYSIS_SCHEMA_REVISION,
         auditId: normalizedAuditId,
         minSeverity: normalizedMinSeverity,
         inputFingerprint,
@@ -341,8 +341,8 @@ export function buildValidationPlan({
 }
 
 export function createValidationState(plan) {
-    if (!plan || plan.schemaVersion !== ANALYSIS_SCHEMA_VERSION) {
-        throw new TypeError("validation state requires a version-5 validation plan");
+    if (!plan || plan.schemaVersion !== ANALYSIS_SCHEMA_REVISION) {
+        throw new TypeError("validation state requires a baseline analysis validation plan");
     }
     const auditId = validateAuditId(plan.auditId);
     const contexts = new Map(plan.contexts.map((context) => [
@@ -350,7 +350,7 @@ export function createValidationState(plan) {
         context,
     ]));
     return {
-        schemaVersion: ANALYSIS_SCHEMA_VERSION,
+        schemaVersion: ANALYSIS_SCHEMA_REVISION,
         auditId,
         minSeverity: normalizeValidationMinSeverity(plan.minSeverity),
         inputFingerprint: plan.inputFingerprint,
@@ -377,7 +377,7 @@ export function buildValidationSnapshot(state) {
         && adjudications === required
         && !Object.values(state.truncation || {}).some(Boolean);
     return Object.freeze(structuredClone({
-        schemaVersion: ANALYSIS_SCHEMA_VERSION,
+        schemaVersion: ANALYSIS_SCHEMA_REVISION,
         auditId: state.auditId,
         minSeverity: state.minSeverity,
         inputFingerprint: state.inputFingerprint,
@@ -420,8 +420,7 @@ export function pageValidationContexts(state, {
         contexts,
         cursor,
         nextCursor: cursor + limit < state.requiredFindingIds.length
-            ? cursor + limit
-            : null,
+            ? cursor + limit: null,
         total: state.requiredFindingIds.length,
     }));
 }
@@ -505,8 +504,8 @@ export function validateStaticDecisionSubmission(input, {
         "checks",
     ], "validation decision");
     if (input.action !== "submit") throw new TypeError("action must be submit");
-    if (input.schemaVersion !== ANALYSIS_SCHEMA_VERSION) {
-        throw new TypeError(`schemaVersion must equal ${ANALYSIS_SCHEMA_VERSION}`);
+    if (input.schemaVersion !== ANALYSIS_SCHEMA_REVISION) {
+        throw new TypeError(`schemaVersion must equal ${ANALYSIS_SCHEMA_REVISION}`);
     }
     const auditId = validateAuditId(input.audit_id);
     if (auditId !== context.finding.auditId) {
@@ -525,8 +524,7 @@ export function validateStaticDecisionSubmission(input, {
         "decision_type",
     );
     const conclusions = decisionType === "confirm"
-        ? ["confirmed", "not-confirmed", "unresolved"]
-        : ["refuted", "not-refuted", "unresolved"];
+        ? ["confirmed", "not-confirmed", "unresolved"]: ["refuted", "not-refuted", "unresolved"];
     const conclusion = enumValue(input.conclusion, conclusions, "conclusion");
     const allowedChainIds = context.chains.map((chain) => chain.id);
     const chainIds = validateReferenceSubset(input.chain_ids, allowedChainIds, "chain_ids");
@@ -545,8 +543,7 @@ export function validateStaticDecisionSubmission(input, {
         throw new Error("validation decisions require at least one existing evidence reference");
     }
     const checks = decisionType === "confirm"
-        ? validateConfirmChecks(input.checks)
-        : validateRefuteChecks(input.checks);
+        ? validateConfirmChecks(input.checks): validateRefuteChecks(input.checks);
 
     if (decisionType === "confirm" && conclusion === "confirmed") {
         if (!checks.activationReachable || !checks.effectReachable
@@ -590,7 +587,7 @@ export function validateStaticDecisionSubmission(input, {
     }
 
     return Object.freeze({
-        schemaVersion: ANALYSIS_SCHEMA_VERSION,
+        schemaVersion: ANALYSIS_SCHEMA_REVISION,
         auditId,
         findingId: context.finding.id,
         validatorId,
@@ -608,7 +605,7 @@ export function validateStaticDecisionSubmission(input, {
 
 export function storeStaticDecision(state, decision) {
     const key = `${decision.findingId}:${decision.decisionType}`;
-    const decisionDigest = digest("zerotrust-static-validation-decision-v5", decision);
+    const decisionDigest = digest("zerotrust-static-validation-decision-baseline", decision);
     const existing = state.decisions.get(key);
     if (existing) {
         if (existing.digest !== decisionDigest) {
@@ -657,8 +654,8 @@ export function validateAdjudicationSubmission(input, {
         "evidence",
     ], "validation adjudication");
     if (input.action !== "adjudicate") throw new TypeError("action must be adjudicate");
-    if (input.schemaVersion !== ANALYSIS_SCHEMA_VERSION) {
-        throw new TypeError(`schemaVersion must equal ${ANALYSIS_SCHEMA_VERSION}`);
+    if (input.schemaVersion !== ANALYSIS_SCHEMA_REVISION) {
+        throw new TypeError(`schemaVersion must equal ${ANALYSIS_SCHEMA_REVISION}`);
     }
     const auditId = validateAuditId(input.audit_id);
     if (auditId !== context.finding.auditId || input.finding_id !== context.finding.id) {
@@ -744,7 +741,7 @@ export function validateAdjudicationSubmission(input, {
     }
 
     return Object.freeze({
-        schemaVersion: ANALYSIS_SCHEMA_VERSION,
+        schemaVersion: ANALYSIS_SCHEMA_REVISION,
         auditId,
         findingId: context.finding.id,
         adjudicatorId,
@@ -763,7 +760,7 @@ export function validateAdjudicationSubmission(input, {
 
 export function storeAdjudication(state, adjudication) {
     const adjudicationDigest = digest(
-        "zerotrust-validation-adjudication-v5",
+        "zerotrust-validation-adjudication-baseline",
         adjudication,
     );
     const existing = state.adjudications.get(adjudication.findingId);
@@ -791,7 +788,7 @@ export function finalizeValidationState(state) {
         throw new Error("validation truncation prevents finalization");
     }
     const finalization = Object.freeze({
-        digest: digest("zerotrust-validation-finalization-v5", {
+        digest: digest("zerotrust-validation-finalization-baseline", {
             auditId: state.auditId,
             inputFingerprint: state.inputFingerprint,
             decisions: snapshot.decisions,

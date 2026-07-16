@@ -22,11 +22,9 @@ export default defineRulePlugin({
         fact,
         key: `cargo:${fact.path}:${fact.kind}:${fact.name}`,
         activationLabel: basename(fact.path) === "build.rs"
-            ? "Cargo build.rs execution surface"
-            : `Cargo build registration: ${fact.name}`,
+            ? "Cargo build.rs execution surface": `Cargo build registration: ${fact.name}`,
         targetLabel: fact.value
-            ? `Cargo build target: ${fact.value}`
-            : "Cargo build-time capability",
+            ? `Cargo build target: ${fact.value}`: "Cargo build-time capability",
         edgeKind: "invokes",
         tags: ["cargo", "rust", "build-script"],
     }),

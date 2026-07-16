@@ -1,0 +1,9 @@
+marker.fact("activation-surface","package-lifecycle","generic");
+marker.fact("inventory-object","nested-archive","archive");
+marker.node("archive-start","activation","package-lifecycle","activation,package-lifecycle");
+marker.node("archive-object","dependency","nested-archive","archive,dependency");
+marker.node("archive-effect","sink","runtime-load","runtime-load");
+marker.edge("archive-start-object","depends-on","archive-start","archive-object","archive");
+marker.edge("archive-object-effect","flows-to","archive-object","archive-effect","runtime-load");
+marker.finding("archive-chain","validated","high","high","likely","load","nested-archive","runtime-effect","archive,nested-artifact,runtime-load");
+marker.blocker("prepare","inventory-archive-unsupported");

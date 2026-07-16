@@ -192,7 +192,7 @@ describe("slugForPath", () => {
 
     test("preserves allowed chars (letters, digits, dot, underscore, hyphen)", () => {
         assert.equal(slugForPath("C:\\AI\\foo.bar.baz"), "foo.bar.baz");
-        assert.equal(slugForPath("C:\\AI\\my_project-v2"), "my_project-v2");
+        assert.equal(slugForPath("C:\\AI\\my_project-previous"), "my_project-previous");
     });
 
     test("truncates to 60 chars", () => {

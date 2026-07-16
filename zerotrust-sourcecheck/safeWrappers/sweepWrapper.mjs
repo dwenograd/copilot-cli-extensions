@@ -6,7 +6,7 @@
 // disk via PowerShell (`Out-File`, `Set-Content`, `iwr -OutFile`, etc.).
 //
 // The `preToolUseHook` policy in enforcement.mjs would deny most of those
-// calls if it were wired in — but as of v4-r3 we do NOT register
+// calls if it were wired in, but the extension does not register
 // `onPreToolUse` (the elevated "register hooks" permission isn't worth
 // paying for a hook the runtime ignores anyway; see README's "Honest
 // disclosure" section and extension.mjs top-of-file comment for the full
@@ -74,7 +74,7 @@ const ALLOWED_TOP_LEVEL_FILES = new Set([
 
 function isAllowedFilename(name) {
     if (ALLOWED_TOP_LEVEL_FILES.has(name.toLowerCase())) return true;
-    // Round-15: Section 9b creates `<original>.zerotrust-backup-<utc-ts>`
+    // Remediation creates `<original>.zerotrust-backup-<utc-ts>`
     // files as part of the defang flow. If <original> happens to live at
     // the top level of build_root or its parent (rare but possible — e.g.
     // local-source audit pointed at a flat directory of source files),
@@ -82,7 +82,7 @@ function isAllowedFilename(name) {
     // so the audit's safety net isn't undone by its own cleanup step.
     // The convention is documented in packet.mjs:74.
     //
-    // Round-16 fix: the original `[A-Za-z0-9_:.-]+$` included `.` inside
+    // security fix: the original `[A-Za-z0-9_:.-]+$` included `.` inside
     // the character class, allowing files like
     // `evil.zerotrust-backup-DROP.exe` to bypass the sweep — the inner
     // class would consume `DROP.exe` all the way to end-of-string.
@@ -141,7 +141,7 @@ export async function sweepAuditScratchHandler(args, invocation, dependencies = 
     });
     if (!ctx.ok) return failure(ctx.error);
 
-    // Round-17 defense-in-depth: sweep is destructive (rmSync per file).
+    // security rationale defense-in-depth: sweep is destructive (rmSync per file).
     // getTrustedAuditContext's strict mismatch check is gated on a truthy
     // sessionId for backward compat with non-destructive callers; but a
     // destructive caller MUST refuse an agent-supplied build_root that
@@ -224,8 +224,8 @@ export async function sweepAuditScratchHandler(args, invocation, dependencies = 
         dryRun,
         foundCount: found.length,
         found,
-        removedCount: dryRun ? 0 : removed.length,
-        removed: dryRun ? null : removed,
+        removedCount: dryRun ? 0: removed.length,
+        removed: dryRun ? null: removed,
         errors,
         auditStillActive: ctx.hasActiveAudit,
     });

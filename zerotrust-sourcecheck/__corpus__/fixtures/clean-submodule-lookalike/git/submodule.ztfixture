@@ -1,0 +1,8 @@
+marker.fact("activation-surface","package-lifecycle","git");
+marker.fact("inventory-object","pinned-submodule","submodule");
+marker.node("pinned-start","activation","package-lifecycle","activation,benign");
+marker.node("pinned-object","dependency","pinned-submodule","benign,submodule");
+marker.node("pinned-effect","sink","local-library-load","benign,local-output");
+marker.edge("pinned-start-object","depends-on","pinned-start","pinned-object","benign");
+marker.edge("pinned-object-effect","flows-to","pinned-object","pinned-effect","benign");
+marker.finding("pinned-submodule-lookalike","refuted","low","medium","unlikely","load","pinned-submodule","local-output","benign,benign-lookalike,submodule");

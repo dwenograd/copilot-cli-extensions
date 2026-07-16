@@ -11,8 +11,8 @@
 //   - Avoids needing to bundle an HTTP client; execFileSync is simpler.
 //
 // Trust model:
-//   - All `gh` invocations go through resolveTrustedProgram (round-11
-//     hardening) so a repo-planted `gh.cmd` cannot shadow-execute.
+//   - All `gh` invocations go through resolveTrustedProgram so a
+//     repo-planted `gh.cmd` cannot shadow-execute.
 //   - File contents are returned through the tool result. This module performs
 //     no source-file write, but host/runtime output retention is out of scope.
 //   - There is a per-fetch byte cap (configurable). Above the cap, the
@@ -21,6 +21,14 @@
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 
+import {
+    GIT_TREE_MODES,
+    classifyGitTreeEntry,
+    computeGitBlobSha1,
+    parseGitLfsPointer,
+    parseGitSymlinkTarget,
+    verifyGitBlobSha1,
+} from "../analysis/objectInventory.mjs";
 import { resolveTrustedProgram } from "./programResolver.mjs";
 
 // Per-fetch caps:
@@ -33,12 +41,12 @@ import { resolveTrustedProgram } from "./programResolver.mjs";
 //     enough to confirm file type (PE "MZ", ELF "\x7fELF", ZIP "PK\x03\x04",
 //     etc.) without returning the full binary.
 //
-// v4.1 hardening: BINARY content is NEVER returned in full (no `base64`
+// Binary content is never returned in full (no `base64`
 // field). The agent gets size + sha256 + magic-byte preview only. This
 // closes the spill-via-runtime-temp-file attack: a 552KB malware .exe
 // previously would have returned ~750KB of base64 in the JSON response,
 // which the Copilot CLI runtime spills to %LOCALAPPDATA%\Temp\copilot-
-// tool-output-*.txt, where Defender then sees it. With this hardening,
+// tool-output-*.txt, where Defender then sees it. With this security,
 // the response for that .exe is ~400 bytes — way under any spill threshold.
 export const DEFAULT_MAX_FILE_BYTES = 5 * 1024 * 1024; // 5 MB
 export const DEFAULT_TEXT_INLINE_BYTES = 256 * 1024;   // 256 KB
@@ -100,8 +108,8 @@ function runGh(args) {
             maxBuffer: 32 * 1024 * 1024, // 32 MB
         });
     } catch (err) {
-        const stderr = err.stderr ? String(err.stderr) : "";
-        throw new Error(`gh ${args[0]} failed: ${err.message}${stderr ? `\nstderr: ${stderr.slice(-500)}` : ""}`);
+        const stderr = err.stderr ? String(err.stderr): "";
+        throw new Error(`gh ${args[0]} failed: ${err.message}${stderr ? `\nstderr: ${stderr.slice(-500)}`: ""}`);
     }
     return stdout;
 }
@@ -205,8 +213,7 @@ export function resolveReleaseIdentity(owner, repo, {
     if (requestedTag !== null) ensureValidRef(requestedTag);
 
     const releaseEndpoint = requestedTag
-        ? `repos/${owner}/${repo}/releases/tags/${refPath(requestedTag)}`
-        : `repos/${owner}/${repo}/releases/latest`;
+        ? `repos/${owner}/${repo}/releases/tags/${refPath(requestedTag)}`: `repos/${owner}/${repo}/releases/latest`;
     const release = requestApiJson(releaseEndpoint, requestJson);
     const releaseId = release?.id;
     if ((!Number.isSafeInteger(releaseId) || releaseId <= 0)
@@ -326,12 +333,12 @@ export function listTreeBySha(owner, repo, treeSha, {
 } = {}) {
     ensureValidOwnerRepo(owner, repo);
     ensureValidSha(treeSha);
-    const apiPath = `repos/${owner}/${repo}/git/trees/${treeSha}${recursive ? "?recursive=1" : ""}`;
+    const apiPath = `repos/${owner}/${repo}/git/trees/${treeSha}${recursive ? "?recursive=1": ""}`;
     const parsed = requestApiJson(apiPath, requestJson);
     if (!SHA_RE.test(parsed?.sha || "") || parsed.sha.toLowerCase() !== treeSha.toLowerCase()) {
         throw new Error(`tree identity mismatch: requested ${treeSha}, API returned ${JSON.stringify(parsed?.sha)}`);
     }
-    const allEntries = Array.isArray(parsed?.tree) ? parsed.tree : [];
+    const allEntries = Array.isArray(parsed?.tree) ? parsed.tree: [];
     const normalizedEntries = allEntries.map((entry) => {
         if (typeof entry?.path !== "string" || entry.path.length < 1 || entry.path.length > 1024
             || /[\u0000-\u001f\u007f\\]/u.test(entry.path)
@@ -342,10 +349,18 @@ export function listTreeBySha(owner, repo, treeSha, {
         if (!["blob", "tree", "commit"].includes(entry?.type) || !SHA_RE.test(entry?.sha || "")) {
             throw new Error(`tree response contained an invalid entry for ${JSON.stringify(entry?.path)}`);
         }
+        const objectClassification = classifyGitTreeEntry({
+            type: entry.type,
+            mode: entry.mode,
+        });
         return {
             path: entry.path,
             type: entry.type,
-            size: Number.isSafeInteger(entry.size) && entry.size > 0 ? entry.size : 0,
+            mode: objectClassification.mode,
+            modeInferred: objectClassification.modeInferred,
+            objectKind: objectClassification.objectKind,
+            executable: objectClassification.executable,
+            size: Number.isSafeInteger(entry.size) && entry.size >= 0 ? entry.size: 0,
             sha: entry.sha.toLowerCase(),
         };
     });
@@ -415,8 +430,7 @@ function classifyActualBytes(buf, path) {
         return {
             kind: "text",
             reason: isKnownBinaryPath(path)
-                ? "valid_text_bytes_despite_binary_suffix"
-                : "valid_utf8",
+                ? "valid_text_bytes_despite_binary_suffix": "valid_utf8",
         };
     } catch {
         // Invalid UTF-8 alone is not evidence of binary content. A script or
@@ -498,23 +512,62 @@ function hasBinaryMagic(buf) {
     return false;
 }
 
+const FETCH_ANALYSIS_BYTES = Symbol("zerotrust.fetch-analysis-bytes");
+
+function attachFetchAnalysisBytes(result, buffer) {
+    Object.defineProperty(result, FETCH_ANALYSIS_BYTES, {
+        value: Buffer.from(buffer),
+        enumerable: false,
+        configurable: true,
+        writable: false,
+    });
+    return result;
+}
+
+export function takeFetchAnalysisBytes(result) {
+    const buffer = result?.[FETCH_ANALYSIS_BYTES] || null;
+    if (buffer) delete result[FETCH_ANALYSIS_BYTES];
+    return buffer;
+}
+
 function buildFetchResultFromBuffer(path, buf, {
     blobSha = null,
+    gitMode = null,
+    verifyGitBlobSha = false,
     maxBytes = DEFAULT_MAX_FILE_BYTES,
     maxTextBytes = DEFAULT_TEXT_INLINE_BYTES,
     previewBytes = DEFAULT_PREVIEW_BYTES,
     binaryPreviewBytes = BINARY_PREVIEW_BYTES,
 } = {}) {
     if (!Buffer.isBuffer(buf)) throw new Error("buildFetchResultFromBuffer requires a Buffer");
+    const gitClassification = gitMode === null
+        ? null: classifyGitTreeEntry({ type: "blob", mode: gitMode });
     const sizeBytes = buf.length;
     const sha256 = createHash("sha256").update(buf).digest("hex");
+    const gitBlobSha1 = computeGitBlobSha1(buf);
+    const normalizedBlobSha = typeof blobSha === "string"
+        ? blobSha.toLowerCase(): null;
+    if (verifyGitBlobSha) {
+        verifyGitBlobSha1(buf, normalizedBlobSha, path);
+    }
     const classification = classifyActualBytes(buf, path);
+    const symlinkTarget = gitMode === GIT_TREE_MODES.SYMLINK
+        ? parseGitSymlinkTarget(buf): null;
+    const lfsPointer = parseGitLfsPointer(buf);
     const common = {
         ok: true,
         path,
         sizeBytes,
         sha256,
-        ...(typeof blobSha === "string" ? { blobSha: blobSha.toLowerCase() } : {}),
+        ...(normalizedBlobSha ? { blobSha: normalizedBlobSha }: {}),
+        gitBlobSha1,
+        gitBlobSha1Verified: normalizedBlobSha !== null
+            && gitBlobSha1 === normalizedBlobSha,
+        gitMode: gitClassification?.mode || null,
+        gitObjectKind: gitClassification?.objectKind || null,
+        executable: gitClassification?.executable === true,
+        symlinkTarget,
+        lfsPointer,
         classification: classification.kind,
         classificationComplete: classification.kind !== "unknown",
         classificationReason: classification.reason,
@@ -523,40 +576,40 @@ function buildFetchResultFromBuffer(path, buf, {
     };
 
     if (sizeBytes > maxBytes) {
-        const cap = classification.kind === "binary" ? binaryPreviewBytes : previewBytes;
+        const cap = classification.kind === "binary" ? binaryPreviewBytes: previewBytes;
         const preview = buf.subarray(0, cap);
-        return {
+        return attachFetchAnalysisBytes({
             ...common,
-            ...(classification.kind === "binary" ? { encoding: "binary" } : {}),
+            ...(classification.kind === "binary" ? { encoding: "binary" }: {}),
             contentTooLarge: true,
             contentReturned: false,
             previewBase64: preview.toString("base64"),
             previewByteCount: preview.length,
             note: `${classification.kind} file exceeds ${maxBytes} bytes; bounded metadata/preview returned and mandatory acquisition remains incomplete.`,
-        };
+        }, buf);
     }
 
     if (classification.kind === "binary") {
         const preview = buf.subarray(0, binaryPreviewBytes);
-        return {
+        return attachFetchAnalysisBytes({
             ...common,
             encoding: "binary",
             contentReturned: false,
             previewBase64: preview.toString("base64"),
             previewByteCount: preview.length,
             note: `binary content not returned (bytes-on-disk minimization). previewBase64 is the first ${preview.length} bytes for magic-byte / file-type inspection only.`,
-        };
+        }, buf);
     }
 
     if (classification.kind === "unknown") {
         const preview = buf.subarray(0, previewBytes);
-        return {
+        return attachFetchAnalysisBytes({
             ...common,
             contentReturned: false,
             previewBase64: preview.toString("base64"),
             previewByteCount: preview.length,
             note: "bytes are neither valid supported text nor structurally verified binary; bounded preview returned without lossy decoding, and mandatory acquisition remains incomplete.",
-        };
+        }, buf);
     }
 
     const utf16 = detectUtf16Bom(buf);
@@ -564,45 +617,48 @@ function buildFetchResultFromBuffer(path, buf, {
         const decoded = new TextDecoder(utf16).decode(buf);
         const charCap = Math.floor(maxTextBytes / 2);
         if (decoded.length > charCap) {
-            return {
+            return attachFetchAnalysisBytes({
                 ...common,
                 encoding: utf16,
                 contentReturned: true,
                 textTruncated: true,
                 text: decoded.substring(0, charCap),
                 note: `text content (${utf16}) truncated to ${charCap} chars; full sizeBytes is ${sizeBytes}.`,
-            };
+            }, buf);
         }
-        return {
+        return attachFetchAnalysisBytes({
             ...common,
             encoding: utf16,
             contentReturned: true,
             text: decoded,
-        };
+        }, buf);
     }
 
     if (sizeBytes > maxTextBytes) {
-        return {
+        return attachFetchAnalysisBytes({
             ...common,
             encoding: "utf-8",
             contentReturned: true,
             textTruncated: true,
             text: new TextDecoder("utf-8").decode(buf.subarray(0, maxTextBytes)),
             note: `text content truncated to ${maxTextBytes} bytes; full sizeBytes is ${sizeBytes}. Hash matches the full file.`,
-        };
+        }, buf);
     }
-    return {
+    return attachFetchAnalysisBytes({
         ...common,
         encoding: "utf-8",
         contentReturned: true,
         text: new TextDecoder("utf-8").decode(buf),
-    };
+    }, buf);
 }
 
 // Exported so fetchFile (and tests) can decide which decoder to use.
 export { detectUtf16Bom };
 
 export function fetchFile(owner, repo, sha, path, {
+    expectedBlobSha = null,
+    expectedSize = null,
+    gitMode = null,
     maxBytes = DEFAULT_MAX_FILE_BYTES,
     maxTextBytes = DEFAULT_TEXT_INLINE_BYTES,
     previewBytes = DEFAULT_PREVIEW_BYTES,
@@ -611,6 +667,78 @@ export function fetchFile(owner, repo, sha, path, {
     ensureValidOwnerRepo(owner, repo);
     ensureValidSha(sha);
     const encodedPath = encodeRepoPath(path);
+    if (expectedBlobSha !== null) ensureValidSha(expectedBlobSha);
+    if (expectedSize !== null
+        && (!Number.isSafeInteger(expectedSize) || expectedSize < 0)) {
+        throw new Error(`invalid expected blob size for ${path}`);
+    }
+    if (gitMode !== null) classifyGitTreeEntry({ type: "blob", mode: gitMode });
+
+    if (expectedBlobSha !== null && expectedSize !== null && expectedSize > maxBytes) {
+        const gitClassification = gitMode === null
+            ? null: classifyGitTreeEntry({ type: "blob", mode: gitMode });
+        return {
+            ok: true,
+            path,
+            sizeBytes: expectedSize,
+            blobSha: expectedBlobSha.toLowerCase(),
+            gitBlobSha1: null,
+            gitBlobSha1Verified: false,
+            gitMode: gitClassification?.mode || null,
+            gitObjectKind: gitClassification?.objectKind || null,
+            executable: gitClassification?.executable === true,
+            symlinkTarget: null,
+            lfsPointer: null,
+            classification: "unknown",
+            classificationComplete: false,
+            classificationBytesInspected: 0,
+            likelyBinaryByExtension: isKnownBinaryPath(path),
+            contentTooLarge: true,
+            contentReturned: false,
+            note: `file exceeds ${maxBytes} bytes (size from pinned Git tree: ${expectedSize}); bytes were not fetched, Git blob identity was not recomputed, and mandatory acquisition cannot complete.`,
+        };
+    }
+
+    if (expectedBlobSha !== null) {
+        const raw = runGh([
+            "api",
+            `repos/${owner}/${repo}/git/blobs/${expectedBlobSha}`,
+            "-H",
+            "Accept: application/vnd.github+json",
+        ]);
+        const parsed = JSON.parse(raw);
+        if (String(parsed?.sha || "").toLowerCase() !== expectedBlobSha.toLowerCase()) {
+            throw new Error(
+                `blob identity mismatch for ${path}: requested ${expectedBlobSha}, API returned ${JSON.stringify(parsed?.sha)}`,
+            );
+        }
+        if (parsed?.encoding !== "base64") {
+            throw new Error(
+                `blobs endpoint returned unexpected encoding ${parsed?.encoding} for ${path}`,
+            );
+        }
+        const buf = Buffer.from(String(parsed.content || "").replace(/\s/gu, ""), "base64");
+        if (Number.isSafeInteger(parsed?.size) && parsed.size >= 0
+            && parsed.size !== buf.length) {
+            throw new Error(
+                `blob size mismatch for ${path}: blobs API=${parsed.size}, decoded=${buf.length}`,
+            );
+        }
+        if (expectedSize !== null && expectedSize !== buf.length) {
+            throw new Error(
+                `blob size mismatch for ${path}: pinned tree=${expectedSize}, decoded=${buf.length}`,
+            );
+        }
+        return buildFetchResultFromBuffer(path, buf, {
+            blobSha: expectedBlobSha,
+            gitMode,
+            verifyGitBlobSha: true,
+            maxBytes,
+            maxTextBytes,
+            previewBytes,
+            binaryPreviewBytes,
+        });
+    }
 
     // Use the contents API which returns base64-encoded content for any file type.
     const raw = runGh(["api", `repos/${owner}/${repo}/contents/${encodedPath}?ref=${sha}`, "-H", "Accept: application/vnd.github+json"]);
@@ -623,10 +751,10 @@ export function fetchFile(owner, repo, sha, path, {
         throw new Error(`file ${path} response did not include a valid blob sha`);
     }
 
-    // v4-r2 round-6 (C-R6-3 high): GitHub's Contents API returns
+    // GitHub's Contents API returns
     // `encoding: "none"` and empty content for files between 1 MB and
     // 100 MB (the API's hard limit for the contents endpoint). The
-    // round-3 code threw on this, blinding the audit to any file in
+    // Throwing on this would blind the audit to any file in
     // that size range. Fall back to the blobs endpoint, which always
     // returns base64 for blobs ≤100 MB. The contents response gives
     // us the blob SHA in `parsed.sha`.
@@ -635,13 +763,20 @@ export function fetchFile(owner, repo, sha, path, {
         // If the file is larger than our absolute ceiling, return
         // metadata-only and classification-incomplete — don't fetch via
         // blobs, since blobs would deliver the full bytes and bloat the response.
-        const apiSize = typeof parsed?.size === "number" ? parsed.size : 0;
+        const apiSize = typeof parsed?.size === "number" ? parsed.size: 0;
         if (apiSize > maxBytes) {
             return {
                 ok: true,
                 path,
                 sizeBytes: apiSize,
                 blobSha: blobSha.toLowerCase(),
+                gitBlobSha1: null,
+                gitBlobSha1Verified: false,
+                gitMode: null,
+                gitObjectKind: null,
+                executable: false,
+                symlinkTarget: null,
+                lfsPointer: null,
                 classification: "unknown",
                 classificationComplete: false,
                 classificationBytesInspected: 0,
@@ -653,6 +788,9 @@ export function fetchFile(owner, repo, sha, path, {
         }
         const blobRaw = runGh(["api", `repos/${owner}/${repo}/git/blobs/${blobSha}`, "-H", "Accept: application/vnd.github+json"]);
         const blobParsed = JSON.parse(blobRaw);
+        if (String(blobParsed?.sha || "").toLowerCase() !== blobSha.toLowerCase()) {
+            throw new Error(`blobs endpoint identity mismatch for ${path}`);
+        }
         if (blobParsed?.encoding !== "base64") {
             throw new Error(`blobs endpoint returned unexpected encoding ${blobParsed?.encoding} for ${path}`);
         }
@@ -670,6 +808,7 @@ export function fetchFile(owner, repo, sha, path, {
     }
     return buildFetchResultFromBuffer(path, buf, {
         blobSha,
+        verifyGitBlobSha: true,
         maxBytes,
         maxTextBytes,
         previewBytes,
@@ -691,6 +830,11 @@ export const __internals = {
     isKnownBinaryPath,
     classifyActualBytes,
     buildFetchResultFromBuffer,
+    takeFetchAnalysisBytes,
+    computeGitBlobSha1,
+    verifyGitBlobSha1,
+    parseGitSymlinkTarget,
+    parseGitLfsPointer,
     resolveTagReference,
     requestApiJson,
     GH_TIMEOUT_MS,

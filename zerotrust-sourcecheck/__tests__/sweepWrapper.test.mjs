@@ -35,7 +35,7 @@ const PARENT = join(tmpdir(), `zerotrust-sweep-${RUN_ID}`);
 const BR = join(PARENT, "build");
 const SESSION = `sweep-test-${RUN_ID}`;
 
-// Round-17: tests must register an audit so sweep recognises BR as
+// security rationale: tests must register an audit so sweep recognises BR as
 // the active-audit anchor. Without this, sweep refuses agent-supplied
 // build_root that doesn't match DEFAULT_BUILD_ROOT (a production
 // safety-net check). Real callers always have an active audit when
@@ -177,7 +177,7 @@ test("deletion errors fail and preserve active audit state for retry", async () 
         { build_root: BR, also_sweep_parent: false },
         { sessionId: SESSION },
         {
-            removeFile: () => ({
+            removeFile:() => ({
                 existed: true,
                 removed: false,
                 error: "simulated locked file",
@@ -293,10 +293,10 @@ test("survives empty build_root (no scratch, no error)", async () => {
     assert.equal(data.foundCount, 0);
 });
 
-// ---------- round-15: triple-review fixes ----------
+// ---------- security rationale: triple-review fixes ----------
 
-test("round-15: preserves Section 9b backup files at top level", async () => {
-    // Section 9b writes `<original>.zerotrust-backup-<utc-ts>`. If the
+test("preserves remediation backup files at top level", async () => {
+    // Remediation writes `<original>.zerotrust-backup-<utc-ts>`. If the
     // <original> happens to be at the top level of build_root (or parent),
     // the backup is too. The sweep wrapper must NOT delete those.
     if (existsSync(PARENT)) rmSync(PARENT, { recursive: true, force: true });
@@ -325,7 +325,7 @@ test("round-15: preserves Section 9b backup files at top level", async () => {
     assert.ok(!existsSync(join(BR, "scratch_to_kill.txt")), "scratch file should be deleted");
 });
 
-test("round-15: isAllowedFilename recognises backup naming convention", () => {
+test("isAllowedFilename recognises backup naming convention", () => {
     const samples = [
         "main.ts.zerotrust-backup-20260517T101800Z",
         "package.json.zerotrust-backup-20260517T101800Z",
@@ -341,7 +341,7 @@ test("round-15: isAllowedFilename recognises backup naming convention", () => {
     }
 });
 
-test("round-15: backup pattern doesn't false-match non-backup files", () => {
+test("backup pattern doesn't false-match non-backup files", () => {
     const samples = [
         "agent_scratch.txt",
         "BootEncryption.cpp",
@@ -360,11 +360,11 @@ test("round-15: backup pattern doesn't false-match non-backup files", () => {
     }
 });
 
-test("round-16: backup pattern rejects executables masquerading as backups (dot-in-suffix bypass)", () => {
-    // The round-15 regex was too permissive — `.` was in the character
+test("backup pattern rejects executables masquerading as backups (dot-in-suffix bypass)", () => {
+    // The security regex was too permissive — `.` was in the character
     // class for the timestamp suffix, so a file named
     // `evil.zerotrust-backup-DROP.exe` would match and be preserved by
-    // sweep. The round-16 fix tightens the class to exclude `.`.
+    // sweep. The security fix tightens the class to exclude `.`.
     const malicious = [
         "evil.zerotrust-backup-DROP.exe",
         "exploit.zerotrust-backup-anything.dll",
@@ -391,7 +391,7 @@ test("round-16: backup pattern rejects executables masquerading as backups (dot-
     }
 });
 
-test("round-15: expanded whitelist accepts common project files", () => {
+test("expanded whitelist accepts common project files", () => {
     const projectFiles = [
         "CHANGELOG.md", "CONTRIBUTING.md", "CODE_OF_CONDUCT.md", "SECURITY.md",
         "Makefile", "GnuMakefile", "Dockerfile", ".dockerignore",
@@ -415,7 +415,7 @@ test("round-15: expanded whitelist accepts common project files", () => {
     }
 });
 
-test("round-15: expanded whitelist preserves project files during sweep", async () => {
+test("expanded whitelist preserves project files during sweep", async () => {
     if (existsSync(PARENT)) rmSync(PARENT, { recursive: true, force: true });
     mkdirSync(BR, { recursive: true });
     registerSweepAudit();
@@ -437,12 +437,12 @@ test("round-15: expanded whitelist preserves project files during sweep", async 
 });
 
 
-// Round-17: defense-in-depth. The sweep wrapper MUST refuse a caller-
+// security rationale: defense-in-depth. The sweep wrapper MUST refuse a caller-
 // supplied build_root that doesn't match the default (or active audit)
 // even when invocation.sessionId is missing. Without this, a tool call
 // with a falsy sessionId could supply an arbitrary path like
 // `C:\Users\testuser` and have sweep operate on it destructively.
-test("round-17: sweep refuses non-default build_root when invocation has no sessionId (null)", async () => {
+test("sweep refuses non-default build_root when invocation has no sessionId (null)", async () => {
     const r = await sweepAuditScratchHandler(
         { build_root: "C:\\Users\\testuser", also_sweep_parent: false, dry_run: true },
         {},
@@ -451,7 +451,7 @@ test("round-17: sweep refuses non-default build_root when invocation has no sess
     assert.match(r.textResultForLlm, /does not match default build_root/i);
 });
 
-test("round-17: sweep refuses non-default build_root when invocation.sessionId is undefined", async () => {
+test("sweep refuses non-default build_root when invocation.sessionId is undefined", async () => {
     const r = await sweepAuditScratchHandler(
         { build_root: "C:\\evil", also_sweep_parent: true, dry_run: true },
         { sessionId: undefined },
@@ -460,7 +460,7 @@ test("round-17: sweep refuses non-default build_root when invocation.sessionId i
     assert.match(r.textResultForLlm, /does not match default build_root/i);
 });
 
-test("round-17: sweep refuses non-default build_root when invocation.sessionId is empty string", async () => {
+test("sweep refuses non-default build_root when invocation.sessionId is empty string", async () => {
     const r = await sweepAuditScratchHandler(
         { build_root: "C:\\Windows\\Temp", also_sweep_parent: false, dry_run: true },
         { sessionId: "" },
@@ -469,7 +469,7 @@ test("round-17: sweep refuses non-default build_root when invocation.sessionId i
     assert.match(r.textResultForLlm, /does not match default build_root/i);
 });
 
-test("round-17: sweep still allows the default build_root without sessionId", async () => {
+test("sweep still allows the default build_root without sessionId", async () => {
     // We dry-run so we don't actually delete anything in the real sandbox.
     const DEFAULT_BUILD_ROOT = sweepInternals.DEFAULT_BUILD_ROOT;
     assert.ok(DEFAULT_BUILD_ROOT, "test seam must expose DEFAULT_BUILD_ROOT");
@@ -480,7 +480,7 @@ test("round-17: sweep still allows the default build_root without sessionId", as
     assert.equal(r.resultType, "success", "default build_root must still be allowed");
 });
 
-test("round-17: sweep still works with no args at all (falls back to default)", async () => {
+test("sweep still works with no args at all (falls back to default)", async () => {
     const r = await sweepAuditScratchHandler({ dry_run: true, also_sweep_parent: false }, {});
     assert.equal(r.resultType, "success", "no build_root arg falls back to default and succeeds");
 });

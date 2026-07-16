@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { validateAuditId } from "./schemas.mjs";
 import { EXTRACTION_LIMITS, FACT_KINDS } from "./extractFacts.mjs";
 
-export const ANALYSIS_INDEX_SCHEMA_VERSION = 1;
+export const ANALYSIS_INDEX_SCHEMA_REVISION = 1;
 
 export const ANALYSIS_INDEX_LIMITS = Object.freeze({
     trackedFiles: 50_000,
@@ -49,8 +49,7 @@ function normalizeEntry(entry) {
         throw new Error(`invalid analysis-index size for ${path}`);
     }
     const blobSha = entry.blobSha === null || entry.blobSha === undefined
-        ? null
-        : String(entry.blobSha).toLowerCase();
+        ? null: String(entry.blobSha).toLowerCase();
     if (blobSha !== null && !BLOB_SHA_RE.test(blobSha)) {
         throw new Error(`invalid analysis-index blob SHA for ${path}`);
     }
@@ -69,7 +68,7 @@ function appendBlocker(state, kind, message, path = null) {
     const normalized = {
         kind: String(kind || "index-incomplete").slice(0, 64),
         message: normalizeBlockerMessage(message),
-        ...(path ? { path: normalizePath(path) } : {}),
+        ...(path ? { path: normalizePath(path) }: {}),
     };
     const key = JSON.stringify(normalized);
     if (state.blockerKeys.has(key)) return;
@@ -88,7 +87,7 @@ function clearPathBlockers(state, path) {
 
 function ensureState(state) {
     if (!state || typeof state !== "object"
-        || state.schemaVersion !== ANALYSIS_INDEX_SCHEMA_VERSION
+        || state.schemaVersion !== ANALYSIS_INDEX_SCHEMA_REVISION
         || !ANALYSIS_SOURCE_KINDS.includes(state.sourceKind)
         || !(state.fileIndex instanceof Map)
         || !(state.factIndex instanceof Map)
@@ -126,10 +125,9 @@ function normalizeFact(fact, expectedPath) {
     if (!name || name !== rawName || !/^[A-Za-z0-9_$@./:+-]+$/u.test(name)) {
         throw new Error(`analysis fact name is not normalized for ${path}`);
     }
-    const rawValue = fact.value === undefined ? undefined : String(fact.value);
+    const rawValue = fact.value === undefined ? undefined: String(fact.value);
     const value = rawValue === undefined
-        ? undefined
-        : rawValue.normalize("NFKC")
+        ? undefined: rawValue.normalize("NFKC")
             .replace(/[\u0000-\u001f\u007f]+/gu, " ")
             .replace(/\s+/gu, " ")
             .trim()
@@ -149,7 +147,7 @@ function normalizeFact(fact, expectedPath) {
         endLine,
         excerptHash: hash,
         name,
-        ...(value ? { value } : {}),
+        ...(value ? { value }: {}),
     });
 }
 
@@ -159,7 +157,7 @@ export function createAnalysisIndexState({ auditId, sourceKind } = {}) {
         throw new Error(`invalid analysis source kind: ${String(sourceKind)}`);
     }
     return {
-        schemaVersion: ANALYSIS_INDEX_SCHEMA_VERSION,
+        schemaVersion: ANALYSIS_INDEX_SCHEMA_REVISION,
         auditId: normalizedAuditId,
         sourceKind,
         enumeration: {
@@ -200,21 +198,21 @@ export function recordIndexEnumeration(state, {
     state.enumeration.trackingTruncated ||= trackingTruncated === true;
     state.enumeration.directories = Math.max(
         state.enumeration.directories,
-        Number.isSafeInteger(directories) ? directories : 0,
+        Number.isSafeInteger(directories) ? directories: 0,
     );
     state.enumeration.reparsePointsSkipped = Math.max(
         state.enumeration.reparsePointsSkipped,
-        Number.isSafeInteger(reparsePointsSkipped) ? reparsePointsSkipped : 0,
+        Number.isSafeInteger(reparsePointsSkipped) ? reparsePointsSkipped: 0,
     );
     state.enumeration.otherEntriesSkipped = Math.max(
         state.enumeration.otherEntriesSkipped,
-        Number.isSafeInteger(otherEntriesSkipped) ? otherEntriesSkipped : 0,
+        Number.isSafeInteger(otherEntriesSkipped) ? otherEntriesSkipped: 0,
     );
 
     for (const rawEntry of entries) {
         const entry = normalizeEntry(rawEntry);
         const existingIndex = state.fileIndex.get(entry.path);
-        const existing = Number.isInteger(existingIndex) ? state.files[existingIndex] : null;
+        const existing = Number.isInteger(existingIndex) ? state.files[existingIndex]: null;
         if (existing) {
             if (existing.size !== entry.size
                 || (existing.blobSha && entry.blobSha && existing.blobSha !== entry.blobSha)) {
@@ -273,7 +271,7 @@ export function recordIndexReadFailure(state, { path, error } = {}) {
     appendBlocker(
         state,
         "read-failed",
-        error instanceof Error ? error.message : String(error || "source read failed"),
+        error instanceof Error ? error.message: String(error || "source read failed"),
         normalizedPath,
     );
     return buildAnalysisIndexSnapshot(state);
@@ -303,8 +301,7 @@ export function recordIndexedFile(state, {
     const file = state.files[index];
     const normalizedSize = Number(size);
     const normalizedBlobSha = blobSha === null || blobSha === undefined
-        ? null
-        : String(blobSha).toLowerCase();
+        ? null: String(blobSha).toLowerCase();
     if (normalizedBlobSha !== null && !BLOB_SHA_RE.test(normalizedBlobSha)) {
         throw new Error(`invalid blob SHA at ${normalizedPath}`);
     }
@@ -331,8 +328,7 @@ export function recordIndexedFile(state, {
         throw new Error(`invalid analysis classification: ${normalizedClassification}`);
     }
     const normalizedLineCount = lineCount === null || lineCount === undefined
-        ? null
-        : Number(lineCount);
+        ? null: Number(lineCount);
     if (normalizedClassification === "text"
         && (!Number.isSafeInteger(normalizedLineCount)
             || normalizedLineCount < 1
@@ -343,8 +339,7 @@ export function recordIndexedFile(state, {
         throw new Error(`line count is valid only for text at ${normalizedPath}`);
     }
     const normalizedContentSha = contentSha256 === null || contentSha256 === undefined
-        ? null
-        : String(contentSha256).toLowerCase();
+        ? null: String(contentSha256).toLowerCase();
     if (normalizedContentSha !== null && !SHA256_RE.test(normalizedContentSha)) {
         throw new Error(`invalid content SHA-256 at ${normalizedPath}`);
     }
@@ -372,7 +367,7 @@ export function recordIndexedFile(state, {
         && textTruncated !== true
         && invisibleUnicodeScanComplete === true
         && normalizedClassification === "text") {
-        status = factsOverflow ? "index-overflow" : "indexed-text";
+        status = factsOverflow ? "index-overflow": "indexed-text";
     }
 
     if (file.contentSha256 && normalizedContentSha
@@ -397,7 +392,7 @@ export function recordIndexedFile(state, {
     if (normalizedBlobSha) file.blobSha = normalizedBlobSha;
     file.invisibleUnicodeMatchCount = Math.max(
         0,
-        Number.isSafeInteger(invisibleUnicodeMatchCount) ? invisibleUnicodeMatchCount : 0,
+        Number.isSafeInteger(invisibleUnicodeMatchCount) ? invisibleUnicodeMatchCount: 0,
     );
     file.invisibleUnicodeScanComplete = invisibleUnicodeScanComplete === true;
     file.factIds = [];
@@ -444,10 +439,9 @@ export function recordIndexedFile(state, {
     } else {
         appendBlocker(
             state,
-            status === "index-overflow" ? "index-overflow" : "file-incomplete",
+            status === "index-overflow" ? "index-overflow": "file-incomplete",
             status === "index-overflow"
-                ? "fact extraction exceeded a configured index cap"
-                : "file was not fully classified and indexed",
+                ? "fact extraction exceeded a configured index cap": "file was not fully classified and indexed",
             normalizedPath,
         );
     }
@@ -461,14 +455,13 @@ export function listIndexedFacts(state, {
     limit = 256,
 } = {}) {
     ensureState(state);
-    const normalizedPath = path === null ? null : normalizePath(path);
+    const normalizedPath = path === null ? null: normalizePath(path);
     if (kind !== null && !FACT_KINDS.includes(kind)) {
         throw new Error(`invalid analysis fact kind: ${String(kind)}`);
     }
-    const start = Number.isSafeInteger(cursor) && cursor >= 0 ? cursor : 0;
+    const start = Number.isSafeInteger(cursor) && cursor >= 0 ? cursor: 0;
     const pageSize = Number.isSafeInteger(limit) && limit > 0
-        ? Math.min(limit, 256)
-        : 256;
+        ? Math.min(limit, 256): 256;
     const filtered = state.facts.filter((fact) =>
         (!normalizedPath || fact.path === normalizedPath)
         && (!kind || fact.kind === kind));
@@ -476,7 +469,7 @@ export function listIndexedFacts(state, {
         facts: clone(filtered.slice(start, start + pageSize)),
         total: filtered.length,
         cursor: start,
-        nextCursor: start + pageSize < filtered.length ? start + pageSize : null,
+        nextCursor: start + pageSize < filtered.length ? start + pageSize: null,
     };
 }
 
@@ -553,7 +546,7 @@ export function buildAnalysisIndexSnapshot(state) {
     }
 
     return Object.freeze({
-        schemaVersion: ANALYSIS_INDEX_SCHEMA_VERSION,
+        schemaVersion: ANALYSIS_INDEX_SCHEMA_REVISION,
         auditId: state.auditId,
         sourceKind: state.sourceKind,
         complete,

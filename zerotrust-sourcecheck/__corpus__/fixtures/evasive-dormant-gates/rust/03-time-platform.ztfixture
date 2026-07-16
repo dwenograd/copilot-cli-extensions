@@ -1,0 +1,4 @@
+marker.fact("dormant-gate","time-selector","time-gate");
+marker.fact("dormant-gate","platform-selector","platform-gate");
+marker.node("gate-select","transform","time-platform-select","time-gate,platform-gate");
+marker.edge("gate-environment-select","enables","gate-environment","gate-select","dormant");

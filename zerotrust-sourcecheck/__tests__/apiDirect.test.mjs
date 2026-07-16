@@ -1,6 +1,6 @@
 // __tests__/apiDirect.test.mjs
 //
-// Tests for the v4 API-direct flow: zerotrust_safe_list_tree +
+// Tests for the current API-direct flow: zerotrust_safe_list_tree +
 // zerotrust_safe_fetch_file. Pure unit tests — no live network calls.
 
 import { test } from "node:test";
@@ -10,7 +10,7 @@ import { __internals as apiInternals } from "../safeWrappers/apiClient.mjs";
 import { safeListTreeHandler } from "../safeWrappers/safeListTreeHandler.mjs";
 import { safeFetchFileHandler } from "../safeWrappers/safeFetchHandler.mjs";
 
-const SESSION = "v4-api-direct-test-" + Math.random().toString(36).slice(2, 8);
+const SESSION = "current-api-direct-test-" + Math.random().toString(36).slice(2, 8);
 
 test("apiClient.ensureValidOwnerRepo rejects bad owner", () => {
     assert.throws(() => apiInternals.ensureValidOwnerRepo("ev/il", "repo"), /invalid owner/);
@@ -140,7 +140,7 @@ test("safeFetchFileHandler refuses owner/repo mismatch with active audit", async
 });
 
 // =====================================================================
-// v4.1 hardening: binary content is NEVER returned in full.
+// current security: binary content is NEVER returned in full.
 //
 // We can't make a live network call in tests, so we test the apiClient's
 // fetchFile by directly stubbing the runGh call via a wrapper. Instead:
@@ -155,7 +155,7 @@ test("safeFetchFileHandler refuses owner/repo mismatch with active audit", async
 // signature accepts maxTextBytes / binaryPreviewBytes and that the
 // constants are set to the documented values.
 
-test("v4.1: fetchFile exports DEFAULT_TEXT_INLINE_BYTES and BINARY_PREVIEW_BYTES", async () => {
+test("current security: fetchFile exports DEFAULT_TEXT_INLINE_BYTES and BINARY_PREVIEW_BYTES", async () => {
     const mod = await import("../safeWrappers/apiClient.mjs");
     assert.equal(typeof mod.DEFAULT_MAX_FILE_BYTES, "number");
     assert.equal(typeof mod.DEFAULT_TEXT_INLINE_BYTES, "number");
@@ -167,20 +167,19 @@ test("v4.1: fetchFile exports DEFAULT_TEXT_INLINE_BYTES and BINARY_PREVIEW_BYTES
     assert.ok(mod.BINARY_PREVIEW_BYTES <= 1024, "binary preview should be <=1KB");
 });
 
-test("v4.1: fetchFile signature accepts maxTextBytes option", async () => {
+test("current security: fetchFile signature accepts maxTextBytes option", async () => {
     // Just verify the function doesn't throw on the new option being passed
     // (we can't make a real API call without network). Use a no-op runGh
     // by passing invalid inputs that fail validation BEFORE the network
     // call — the option should be in the destructuring path.
     const mod = await import("../safeWrappers/apiClient.mjs");
     // This will throw at ensureValidOwnerRepo, BEFORE any network call.
-    assert.throws(
-        () => mod.fetchFile("..", "x", "abcdef0123456789abcdef0123456789abcdef01", "p", { maxTextBytes: 1000 }),
+    assert.throws(() => mod.fetchFile("..", "x", "abcdef0123456789abcdef0123456789abcdef01", "p", { maxTextBytes: 1000 }),
         /invalid owner/,
     );
 });
 
-test("v4.1: safeFetchFileHandler caps max_text_bytes at 1MB", async () => {
+test("current security: safeFetchFileHandler caps max_text_bytes at 1MB", async () => {
     // Just verify the input validation path: passing a huge max_text_bytes
     // should be silently capped. We can't observe the cap directly without
     // a live call, but we can verify the handler doesn't reject the input.
@@ -200,7 +199,7 @@ test("v4.1: safeFetchFileHandler caps max_text_bytes at 1MB", async () => {
     assert.ok(r.resultType === "success" || r.resultType === "failure");
 });
 
-test("v4.1: safeFetchFileHandler accepts max_text_bytes parameter", async () => {
+test("current security: safeFetchFileHandler accepts max_text_bytes parameter", async () => {
     // Round-trip test: pass max_text_bytes and verify the handler
     // doesn't reject it as an unknown parameter.
     const r = await safeFetchFileHandler(

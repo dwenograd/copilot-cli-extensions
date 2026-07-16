@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 
-import { ANALYSIS_SCHEMA_VERSION } from "./schemas.mjs";
+import { ANALYSIS_SCHEMA_REVISION } from "./schemas.mjs";
 
 export const TRACE_LIMITS = Object.freeze({
     chains: 128,
@@ -241,7 +241,7 @@ function chainIdentity(nodePath, edgePath, terminalIssue = null) {
     return {
         nodes: nodePath.map((node) => node.semanticKey),
         edges: edgePath.map((edge) => edge.semanticKey),
-        ...(terminalIssue ? { terminalIssue } : {}),
+        ...(terminalIssue ? { terminalIssue }: {}),
     };
 }
 
@@ -258,9 +258,9 @@ function buildValidationQueue(mergeResult, limit) {
         reasonCode: conflict.reasonCode,
         nodeIds: conflict.nodeIds || [],
         edgeIds: conflict.edgeIds || [],
-        ...(conflict.edgeKind ? { edgeKind: conflict.edgeKind } : {}),
-        ...(conflict.fromKind ? { fromKind: conflict.fromKind } : {}),
-        ...(conflict.toKind ? { toKind: conflict.toKind } : {}),
+        ...(conflict.edgeKind ? { edgeKind: conflict.edgeKind }: {}),
+        ...(conflict.fromKind ? { fromKind: conflict.fromKind }: {}),
+        ...(conflict.toKind ? { toKind: conflict.toKind }: {}),
     })).sort((left, right) => left.id.localeCompare(right.id));
     return {
         items: entries.slice(0, limit),
@@ -271,8 +271,8 @@ function buildValidationQueue(mergeResult, limit) {
 export function traceBehaviorGraph(mergeResult, {
     limits: limitOverrides = {},
 } = {}) {
-    if (!mergeResult || mergeResult.schemaVersion !== ANALYSIS_SCHEMA_VERSION) {
-        throw new TypeError("trace requires a version-5 merged graph");
+    if (!mergeResult || mergeResult.schemaVersion !== ANALYSIS_SCHEMA_REVISION) {
+        throw new TypeError("trace requires a baseline analysis merged graph");
     }
     const limits = normalizeLimits(limitOverrides);
     const mergedNodes = mergeSemanticNodes(mergeResult.nodeRecords);
@@ -303,7 +303,7 @@ export function traceBehaviorGraph(mergeResult, {
         .filter((node) => node.kind === "activation" || node.kind === "trigger")
         .sort((left, right) => left.semanticKey.localeCompare(right.semanticKey));
     const roots = allStarts.filter((node) => !incoming.has(node.semanticKey));
-    const starts = roots.length > 0 ? roots : allStarts;
+    const starts = roots.length > 0 ? roots: allStarts;
     const chains = new Map();
     const cycles = [];
     const blockers = [...mergeResult.blockers];
@@ -324,7 +324,7 @@ export function traceBehaviorGraph(mergeResult, {
     } = {}) => {
         if (nodePath.length === 0) return;
         const identity = chainIdentity(nodePath, edgePath, terminalIssue);
-        const id = `ztc-v5-${hash("zerotrust-behavior-chain-v5", identity)}`;
+        const id = `ztc-${hash("zerotrust-behavior-chain", identity)}`;
         if (chains.has(id)) return;
         if (chains.size >= limits.chains) {
             chainsTruncated = true;
@@ -355,7 +355,7 @@ export function traceBehaviorGraph(mergeResult, {
             id,
             pattern: pattern.code,
             priority: pattern.priority,
-            status: contested ? "contested" : complete ? "complete" : "unresolved",
+            status: contested ? "contested": complete ? "complete": "unresolved",
             crossFile: allPaths.length > 1,
             steps: nodePath.map((node) => ({
                 kind: node.kind,
@@ -375,7 +375,7 @@ export function traceBehaviorGraph(mergeResult, {
             pathsTruncated: allPaths.length > limits.pathsPerChain,
             effectKinds: unique(nodePath.filter((node) => EFFECT_KINDS.has(node.kind))
                 .map((node) => node.kind)),
-            unresolvedReasons: terminalIssue ? [terminalIssue.reasonCode] : [],
+            unresolvedReasons: terminalIssue ? [terminalIssue.reasonCode]: [],
             validationIds: unique(validationIds),
         });
     };
@@ -405,8 +405,7 @@ export function traceBehaviorGraph(mergeResult, {
                         reasonCode: "conflicting-or-unresolved-outgoing-edge",
                         transitionIds: blocked.map((entry) =>
                             entry.conflictId || entry.reasonCode).sort(),
-                    }
-                    : {
+                    }: {
                         reasonCode: "no-explicit-effect-edge",
                         node: node.semanticKey,
                     },
@@ -447,7 +446,7 @@ export function traceBehaviorGraph(mergeResult, {
                 );
                 if (cycleNodeIds.length > 64) cyclesTruncated = true;
                 const cycle = {
-                    id: `ztcycle-v5-${hash("zerotrust-behavior-cycle-v5", cycleSemantic)}`,
+                    id: `ztcycle-${hash("zerotrust-behavior-cycle", cycleSemantic)}`,
                     nodeIds: cycleNodeIds.slice(0, 64),
                     edgeIds: edge.edgeIds,
                 };
@@ -514,7 +513,7 @@ export function traceBehaviorGraph(mergeResult, {
     }
 
     return Object.freeze(structuredClone({
-        schemaVersion: ANALYSIS_SCHEMA_VERSION,
+        schemaVersion: ANALYSIS_SCHEMA_REVISION,
         auditId: mergeResult.auditId,
         sourceNamespace: mergeResult.sourceNamespace,
         inputFingerprint: mergeResult.inputFingerprint,

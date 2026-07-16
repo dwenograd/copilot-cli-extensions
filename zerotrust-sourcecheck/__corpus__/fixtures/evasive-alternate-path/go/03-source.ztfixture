@@ -1,0 +1,2 @@
+marker.node("alternate-source","sensitive-source","credential-source","credential,credential-source");
+marker.edge("alternate-start-source","reads-from","alternate-start","alternate-source","alternate-path");

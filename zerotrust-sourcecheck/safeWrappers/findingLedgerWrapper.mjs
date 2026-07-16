@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import nodePath from "node:path";
 
 import {
-    ANALYSIS_SCHEMA_VERSION,
+    ANALYSIS_SCHEMA_REVISION,
     BehaviorGraph,
     FindingLedger,
     computeFindingId,
@@ -99,8 +99,8 @@ function assertExactFields(value, required, label, optional = []) {
 }
 
 function assertVersion(value) {
-    if (value !== ANALYSIS_SCHEMA_VERSION) {
-        throw new Error(`schemaVersion must equal ${ANALYSIS_SCHEMA_VERSION}`);
+    if (value !== ANALYSIS_SCHEMA_REVISION) {
+        throw new Error(`schemaVersion must equal ${ANALYSIS_SCHEMA_REVISION}`);
     }
 }
 
@@ -139,15 +139,13 @@ function pathsEqual(left, right) {
     const a = nodePath.resolve(left);
     const b = nodePath.resolve(right);
     return process.platform === "win32"
-        ? a.toLowerCase() === b.toLowerCase()
-        : a === b;
+        ? a.toLowerCase() === b.toLowerCase(): a === b;
 }
 
 function roleManifestForAudit(audit) {
     const configured = audit.councilRoleManifest || audit.councilRoles;
     const roles = Array.isArray(configured) && configured.length > 0
-        ? configured
-        : ROLES;
+        ? configured: ROLES;
     return roles.map((role) => ({
         id: role.id,
         category: role.category,
@@ -207,8 +205,7 @@ function validateEvidenceReferenceAgainstIndex(evidence, {
         throw new Error(`evidence producer must equal ${producerRoleId}`);
     }
     const expectedScope = modeUsesLocalSource(audit.mode)
-        ? "local_source"
-        : "council_sample";
+        ? "local_source": "council_sample";
     if (evidence.coverageScope !== expectedScope) {
         throw new Error(
             `evidence coverageScope must be ${expectedScope}; candidate ingestion never satisfies mandatory acquisition`,
@@ -229,7 +226,7 @@ function validateSourceIdentityAgainstIndex(sourceIdentity, {
     sessionId,
 }) {
     const normalized = validateSourceIdentity(sourceIdentity);
-    const expectedType = modeUsesLocalSource(audit.mode) ? "local-file" : "git-blob";
+    const expectedType = modeUsesLocalSource(audit.mode) ? "local-file": "git-blob";
     if (normalized.type !== expectedType) {
         throw new Error(`finding sourceIdentity.type must be ${expectedType}`);
     }
@@ -247,8 +244,7 @@ function validateSourceIdentityAgainstIndex(sourceIdentity, {
         throw new Error(`finding contentSha256 mismatch at ${normalized.path}`);
     }
     const expectedSourceBlobSha = modeUsesLocalSource(audit.mode)
-        ? file.contentSha256
-        : file.blobSha;
+        ? file.contentSha256: file.blobSha;
     if (expectedSourceBlobSha) {
         if (normalized.blobSha !== expectedSourceBlobSha) {
             throw new Error(`finding blob/content identity mismatch at ${normalized.path}`);
@@ -501,7 +497,7 @@ function handleSubmit(args, sessionId, audit, roles) {
     }
 
     const canonicalBatch = Object.freeze({
-        schemaVersion: ANALYSIS_SCHEMA_VERSION,
+        schemaVersion: ANALYSIS_SCHEMA_REVISION,
         auditId: audit.auditId,
         producerRoleId: role.id,
         producerCategory: role.category,

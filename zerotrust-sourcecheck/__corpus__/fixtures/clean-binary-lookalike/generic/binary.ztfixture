@@ -1,0 +1,8 @@
+marker.fact("activation-surface","manual-preview","generic");
+marker.fact("inventory-object","image-binary","binary");
+marker.node("binary-preview","activation","manual-preview","activation,benign");
+marker.node("binary-image","dependency","image-binary","benign,binary-artifact");
+marker.node("binary-output","sink","preview-output","benign,local-output");
+marker.edge("binary-preview-image","depends-on","binary-preview","binary-image","benign");
+marker.edge("binary-image-output","flows-to","binary-image","binary-output","benign");
+marker.finding("binary-lookalike","refuted","low","medium","unlikely","preview","image-binary","local-output","benign,benign-lookalike,binary-artifact");

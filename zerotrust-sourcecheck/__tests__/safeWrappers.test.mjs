@@ -27,8 +27,7 @@ import { buildClonePath } from "../urlParser.mjs";
 
 const SESSION = "test-session-wrapper";
 const BUILD_ROOT = process.platform === "win32"
-    ? "C:\\test\\zerotrust-sourcecheck"
-    : "/tmp/zerotrust-sourcecheck";
+    ? "C:\\test\\zerotrust-sourcecheck": "/tmp/zerotrust-sourcecheck";
 
 beforeEach(() => {
     stateInternals.recordedOutcomes.clear();
@@ -244,35 +243,21 @@ test("evaluateCouncilGate: complete + 'low' → passes", () => {
     assert.equal(r.passes, true);
 });
 
-test("evaluateCouncilGate: complete + 'medium' → blocked unless override", () => {
-    assert.equal(evaluateCouncilGate({ verdict: "medium", criticalCount: 0, highCount: 0, complete: true }).passes, false);
-    assert.equal(
-        evaluateCouncilGate({ verdict: "medium", criticalCount: 0, highCount: 0, complete: true }, { override: true }).passes,
-        true,
-    );
+test("evaluateCouncilGate: complete + 'medium' → passes compatibility evaluator", () => {
+    assert.equal(evaluateCouncilGate({ verdict: "medium", criticalCount: 0, highCount: 0, complete: true }).passes, true);
 });
 
-test("evaluateCouncilGate: complete + 'high' → blocked unless override", () => {
+test("evaluateCouncilGate: complete + 'high' → blocked", () => {
     assert.equal(evaluateCouncilGate({ verdict: "high", criticalCount: 0, highCount: 5, complete: true }).passes, false);
-    assert.equal(
-        evaluateCouncilGate({ verdict: "high", criticalCount: 0, highCount: 5, complete: true }, { override: true }).passes,
-        true,
-    );
 });
 
-test("evaluateCouncilGate: complete + 'critical' → blocked unless override", () => {
+test("evaluateCouncilGate: complete + 'critical' → blocked", () => {
     assert.equal(evaluateCouncilGate({ verdict: "critical", criticalCount: 1, highCount: 0, complete: true }).passes, false);
-    assert.equal(
-        evaluateCouncilGate({ verdict: "critical", criticalCount: 1, highCount: 0, complete: true }, { override: true }).passes,
-        true,
-    );
 });
 
-test("evaluateCouncilGate: incomplete → blocked unless overrideOnFailure (NOT override)", () => {
+test("evaluateCouncilGate: incomplete → blocked without bypass", () => {
     const incomplete = { verdict: "low", criticalCount: 0, highCount: 0, complete: false };
     assert.equal(evaluateCouncilGate(incomplete).passes, false);
-    assert.equal(evaluateCouncilGate(incomplete, { override: true }).passes, false);
-    assert.equal(evaluateCouncilGate(incomplete, { overrideOnFailure: true }).passes, true);
 });
 
 // ---------- recordOutcomeHandler input validation ----------
@@ -340,13 +325,13 @@ test("safeBuildHandler rejects unknown ecosystem", async () => {
 });
 
 test("safeBuildHandler rejects clone_path outside build_root", async () => {
-    const outside = process.platform === "win32" ? "C:\\Windows\\Temp\\evil" : "/etc/evil";
+    const outside = process.platform === "win32" ? "C:\\Windows\\Temp\\evil": "/etc/evil";
     const r = await safeBuildHandler(
         { ecosystem: "npm", clone_path: outside },
         { sessionId: SESSION },
     );
     assert.equal(r.resultType, "failure");
-    // Round-3 hardening reordered checks: when no active audit, the no-active-audit
+    // security rationale reordered checks: when no active audit, the no-active-audit
     // failure fires before the path-containment failure. Either failure mode confirms
     // the call was refused; accept either message.
     assert.match(r.textResultForLlm, /not under build_root|no active audit/);
@@ -361,16 +346,7 @@ test("safeBuildHandler rejects extra_args with disallowed characters", async () 
     assert.equal(r.resultType, "failure");
 });
 
-// NOTE: The "council-build mode REFUSES when no outcome recorded" integration
-// test will land in Feature 3, once modes.mjs gains audit_and_safe_build_council
-// + audit_and_full_build_council. The gate function (evaluateCouncilGate) is
-// already unit-tested above; the integration test needs a real council-build
-// mode string to exercise buildWrapper's mode-aware codepath.
-//
-// What we CAN verify today: audit_source_council is council-only (not build),
-// so buildWrapper must NOT consult the gate when invoked with that mode.
-
-test("safeBuildHandler audit_source_council mode does NOT consult council gate (council-only, not build)", async () => {
+test("safeBuildHandler rejects council-only non-build mode before host gate", async () => {
     const cp = nodePath.join(BUILD_ROOT, "octocat-Hello-aaaaaaa");
     const r = await safeBuildHandler(
         { ecosystem: "npm", clone_path: cp, mode: "audit_source_council" },
@@ -391,7 +367,7 @@ test("safeInstallHandler rejects unknown ecosystem", async () => {
 });
 
 test("safeInstallHandler rejects clone_path outside build_root", async () => {
-    const outside = process.platform === "win32" ? "C:\\Windows\\Temp\\evil" : "/etc/evil";
+    const outside = process.platform === "win32" ? "C:\\Windows\\Temp\\evil": "/etc/evil";
     const r = await safeInstallHandler({ ecosystem: "npm", clone_path: outside });
     assert.equal(r.resultType, "failure");
     assert.match(r.textResultForLlm, /not under build_root/);
@@ -441,12 +417,12 @@ test("finalizeReportHandler rejects legacy short_sha", async () => {
     assert.equal(r.resultType, "failure");
 });
 
-// Round-17: same defense-in-depth class as sweepWrapper. finalize_report
-// writes 1MB markdown to <build_root>/_reports/zt-v1-<sha256-identity>/REPORT.md.
+// security rationale: same defense-in-depth class as sweepWrapper. finalize_report
+// writes 1MB markdown to <build_root>/_reports/zt-<sha256-identity>/REPORT.md.
 // If sessionId is missing and the agent supplies a non-default build_root,
 // refuse — without this check, a falsy-sessionId tool invocation could
 // redirect writes anywhere on disk (creating spurious _reports/... dirs).
-test("round-17: finalizeReportHandler refuses non-default build_root when sessionId is null", async () => {
+test("finalizeReportHandler refuses non-default build_root when sessionId is null", async () => {
     const r = await finalizeReportHandler(
         {
             build_root: "C:\\Users\\testuser",
@@ -461,7 +437,7 @@ test("round-17: finalizeReportHandler refuses non-default build_root when sessio
     assert.match(r.textResultForLlm, /no active audit/i);
 });
 
-test("round-17: finalizeReportHandler refuses non-default build_root when sessionId is undefined", async () => {
+test("finalizeReportHandler refuses non-default build_root when sessionId is undefined", async () => {
     const r = await finalizeReportHandler(
         {
             build_root: "C:\\evil",
@@ -476,7 +452,7 @@ test("round-17: finalizeReportHandler refuses non-default build_root when sessio
     assert.match(r.textResultForLlm, /no active audit/i);
 });
 
-test("round-17: finalizeReportHandler refuses non-default build_root when sessionId is empty string", async () => {
+test("finalizeReportHandler refuses non-default build_root when sessionId is empty string", async () => {
     const r = await finalizeReportHandler(
         {
             build_root: "C:\\Windows\\Temp",

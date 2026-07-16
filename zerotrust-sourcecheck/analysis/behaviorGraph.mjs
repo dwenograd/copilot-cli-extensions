@@ -1,5 +1,5 @@
 import {
-    ANALYSIS_SCHEMA_VERSION,
+    ANALYSIS_SCHEMA_REVISION,
     LIMITS,
     validateAuditId,
     validateBehaviorGraphDocument,
@@ -138,7 +138,7 @@ export class BehaviorGraph {
 
     toDocument() {
         return validateBehaviorGraphDocument({
-            schemaVersion: ANALYSIS_SCHEMA_VERSION,
+            schemaVersion: ANALYSIS_SCHEMA_REVISION,
             auditId: this.#auditId,
             nodes: [...this.#nodes.values()],
             edges: [...this.#edges.values()],

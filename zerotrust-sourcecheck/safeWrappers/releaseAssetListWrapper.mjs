@@ -39,15 +39,14 @@ export async function safeListReleaseAssetsHandler(args, invocation, dependencie
         sessionId,
         {
             ...identity.value,
-            createState: () => createReleaseAssetCoverageState(identity.value),
+            createState:() => createReleaseAssetCoverageState(identity.value),
         },
         mutator,
     );
     const recordFailure = (error) => {
         const updated = mutate((state) => recordReleaseAssetListFailure(state, error));
         return updated.ok
-            ? buildReleaseAssetCoverageSnapshot(getReleaseAssetCoverageState(sessionId))
-            : null;
+            ? buildReleaseAssetCoverageSnapshot(getReleaseAssetCoverageState(sessionId)): null;
     };
 
     let release;
@@ -175,10 +174,10 @@ function normalizeReleaseAssets(rawAssets) {
         }
         const asset = {
             id,
-            name: typeof raw?.name === "string" ? raw.name : "",
-            contentType: typeof raw?.content_type === "string" ? raw.content_type : "",
+            name: typeof raw?.name === "string" ? raw.name: "",
+            contentType: typeof raw?.content_type === "string" ? raw.content_type: "",
             sizeBytes,
-            digest: typeof raw?.digest === "string" ? raw.digest : null,
+            digest: typeof raw?.digest === "string" ? raw.digest: null,
         };
         const existing = unique.get(id);
         if (existing) {

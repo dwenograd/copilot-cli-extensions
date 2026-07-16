@@ -1,8 +1,8 @@
 // safeWrappers/state.mjs
 //
 // Module-level session state shared by the safe-wrapper tools. This is
-// the substitutional-safety equivalent of v2's enforcement.mjs::activeAudits
-// — but where activeAudits guards a hook that doesn't actually fire in
+// the substitutional-safety counterpart to enforcement.mjs::activeAudits.
+// activeAudits guards a hook that doesn't actually fire in
 // the current Copilot CLI runtime (Step 0.2 finding), this state guards
 // behavior INSIDE the wrapper tool implementations themselves. The agent
 // must call our tools, our tools own the dangerous commands, our tools
@@ -16,17 +16,12 @@ import {
 } from "../analysis/index.mjs";
 
 const recordedOutcomes = new Map(); // sessionId -> council result bound to one immutable audit identity
-const councilLedgers = new Map(); // sessionId -> audit-bound v5 candidate/graph state
+const councilLedgers = new Map(); // sessionId -> audit-bound baseline candidate/graph state
 const cacheBindings = new Map(); // sessionId -> active-audit-derived cache identity/path metadata
-
-const COMPLETE_VERDICTS_THAT_PASS = new Set([
-    "no red flags found",
-    "low",
-]);
 
 /**
  * Record the council's outcome for a session. The first write for an audit
- * generation is immutable; exact normalized retries are idempotent.
+ * identity is immutable; exact normalized retries are idempotent.
  */
 export function recordCouncilOutcome(sessionId, {
     auditId,
@@ -42,14 +37,14 @@ export function recordCouncilOutcome(sessionId, {
     if (typeof auditId !== "string" || auditId.length === 0) {
         throw new Error("recordCouncilOutcome requires auditId");
     }
-    const normalizedSha = resolvedSha === null ? null : String(resolvedSha).toLowerCase();
+    const normalizedSha = resolvedSha === null ? null: String(resolvedSha).toLowerCase();
     if (normalizedSha !== null && !/^[a-f0-9]{40}$/.test(normalizedSha)) {
         throw new Error("recordCouncilOutcome resolvedSha must be null or a full 40-character SHA");
     }
     const normalized = {
         auditId,
-        owner: owner === null ? null : String(owner).toLowerCase(),
-        repo: repo === null ? null : String(repo).toLowerCase(),
+        owner: owner === null ? null: String(owner).toLowerCase(),
+        repo: repo === null ? null: String(repo).toLowerCase(),
         resolvedSha: normalizedSha,
         verdict: String(verdict || ""),
         criticalCount: Number(criticalCount) || 0,
@@ -71,7 +66,7 @@ export function recordCouncilOutcome(sessionId, {
         ];
         const identical = immutableFields.every((field) => existing[field] === normalized[field]);
         if (identical) return existing;
-        throw new Error("council outcome is immutable after first write for this audit generation");
+        throw new Error("council outcome is immutable after first write for this audit identity");
     }
     recordedOutcomes.set(sessionId, normalized);
     return normalized;
@@ -118,7 +113,7 @@ export function recordCacheBinding(sessionId, {
     });
     const existing = cacheBindings.get(sessionId);
     if (existing && JSON.stringify(existing) !== JSON.stringify(normalized)) {
-        throw new Error("cache binding is immutable for the active audit generation");
+        throw new Error("cache binding is immutable for the active audit identity");
     }
     cacheBindings.set(sessionId, normalized);
     return structuredClone(normalized);
@@ -180,7 +175,7 @@ function createCouncilLedgerState(auditId, roles) {
 }
 
 /**
- * Mutate the current audit generation's candidate ledger synchronously.
+ * Mutate the current audit identity's candidate ledger synchronously.
  * The wrapper owns validation and atomic replacement of ledger/graph objects;
  * this function owns session/audit/role-manifest binding.
  */
@@ -198,10 +193,10 @@ export function mutateCouncilLedgerState(sessionId, {
         councilLedgers.set(sessionId, state);
     } else {
         if (state.auditId !== normalizedAuditId) {
-            throw new Error("council ledger auditId does not match current audit generation");
+            throw new Error("council ledger auditId does not match current audit identity");
         }
         if (!roleManifestsMatch(state.roles, normalizedRoles)) {
-            throw new Error("council ledger role manifest is immutable for this audit generation");
+            throw new Error("council ledger role manifest is immutable for this audit identity");
         }
     }
     return mutator(state);
@@ -239,63 +234,37 @@ export function clearCouncilLedgerState(sessionId) {
 }
 
 /**
- * Decide whether a recorded council outcome passes the build-council gate.
- *
- * The two override flags are STRICTLY ORTHOGONAL:
- *   - `overrideOnFailure` (`proceed_on_council_failure: true`) bypasses ONLY
- *     the incompleteness check. After it bypasses incompleteness, the
- *     severity-verdict check still applies — so an incomplete-council audit
- *     that nonetheless emitted `verdict: "critical"` will STILL be blocked
- *     unless `override` (`council_build_override: true`) is also set.
- *   - `override` bypasses ONLY the severity check. It does NOT bypass
- *     incompleteness on its own.
- *
- * Both flags must be set explicitly to bypass both protections — one flag
- * cannot accidentally bypass the other (per Triple-Duck Finding #3 + the
- * gpt-5.5 reviewer's confirmation in the v3.1 hardening pass).
+ * Deprecated compatibility evaluator for caller-recorded baseline outcomes.
+ * Host builds no longer consume this state; they require the durable report
+ * finalization record and its finalizer-derived trusted outcome.
  */
-export function evaluateCouncilGate(outcome, { override = false, overrideOnFailure = false } = {}) {
+export function evaluateCouncilGate(outcome) {
     if (!outcome) {
         return {
             passes: false,
-            reason: "council outcome not recorded — call zerotrust_record_council_outcome first",
+            reason: "deprecated council outcome not recorded",
         };
     }
-
-    const incomplete = !outcome.complete;
-    if (incomplete && !overrideOnFailure) {
+    if (!outcome.complete) {
         return {
             passes: false,
-            reason: "council INCOMPLETE; gate stays closed unless proceed_on_council_failure: true",
+            reason: "deprecated council outcome is incomplete",
         };
     }
-
-    // At this point: either the council is complete, OR overrideOnFailure
-    // bypassed the incompleteness gate. Either way, we still apply the
-    // severity-verdict check.
-    const severityPasses = COMPLETE_VERDICTS_THAT_PASS.has(outcome.verdict);
-    if (severityPasses) {
-        const completionNote = incomplete
-            ? `INCOMPLETE; opened via proceed_on_council_failure`
-            : `complete`;
+    if (outcome.verdict === "critical"
+        || outcome.verdict === "high"
+        || outcome.criticalCount > 0
+        || outcome.highCount > 0) {
         return {
-            passes: true,
-            reason: `council ${completionNote}; verdict=${outcome.verdict}, critical=${outcome.criticalCount}, high=${outcome.highCount}`,
+            passes: false,
+            reason:
+                `deprecated council outcome contains critical/high behavior (verdict=${outcome.verdict})`,
         };
     }
-    if (override) {
-        const completionNote = incomplete
-            ? `INCOMPLETE; opened via proceed_on_council_failure + council_build_override`
-            : `complete`;
-        return {
-            passes: true,
-            reason: `council ${completionNote}; verdict=${outcome.verdict} bypassed via council_build_override (critical=${outcome.criticalCount}, high=${outcome.highCount})`,
-        };
-    }
-    const completionNote = incomplete ? "INCOMPLETE (proceed_on_council_failure was set)" : "complete";
     return {
-        passes: false,
-        reason: `council ${completionNote} but verdict ${outcome.verdict} (critical=${outcome.criticalCount}, high=${outcome.highCount}) does not pass; gate closed unless council_build_override: true`,
+        passes: true,
+        reason:
+            `deprecated council outcome is complete without critical/high behavior (verdict=${outcome.verdict})`,
     };
 }
 
@@ -303,5 +272,4 @@ export const __internals = {
     recordedOutcomes,
     councilLedgers,
     cacheBindings,
-    COMPLETE_VERDICTS_THAT_PASS,
 };

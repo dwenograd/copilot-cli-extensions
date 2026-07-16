@@ -20,7 +20,7 @@ import {
     runAnalysisPlugins,
 } from "../../analysis/plugins/runner.mjs";
 import {
-    ANALYSIS_SCHEMA_VERSION,
+    ANALYSIS_SCHEMA_REVISION,
     computeFindingId,
 } from "../../analysis/schemas.mjs";
 import { buildTrustedDecisionSnapshot } from "../../analysis/scoring.mjs";
@@ -32,17 +32,13 @@ import {
     MARKER_FACT_NAME,
     __internals as pluginInternals,
 } from "./fixturePlugin.mjs";
+import {
+    parseMarkerLine,
+    validateFixtureText,
+} from "./fixtureSyntax.mjs";
+import { applyMetamorphicTransforms } from "./metamorphicTransforms.mjs";
 
-export const LOCAL_FINDINGS_ARTIFACT_VERSION = 1;
-const MARKER_LINE_RE = /^marker\.(fact|node|edge|finding)\((.*)\);?$/u;
-const ARGUMENT_RE = /"([a-z0-9][a-z0-9._:/@,-]{0,127})"/gu;
-const SAFE_BYTES_RE = /^[\x09\x0a\x0d\x20-\x7e]*$/u;
-const EXPECTED_ARGUMENTS = Object.freeze({
-    fact: 3,
-    node: 4,
-    edge: 5,
-    finding: 9,
-});
+export const LOCAL_FINDINGS_ARTIFACT_SCHEMA_REVISION = 1;
 
 function walkFiles(root) {
     const output = [];
@@ -58,44 +54,10 @@ function relativePath(root, absolute) {
     return nodePath.relative(root, absolute).replace(/\\/gu, "/");
 }
 
-function parseMarkerLine(line, { path, lineNumber }) {
-    const trimmed = line.trim();
-    if (!trimmed) return null;
-    const match = MARKER_LINE_RE.exec(trimmed);
-    if (!match) throw new Error(`${path}:${lineNumber}: invalid inert marker syntax`);
-    const args = [...match[2].matchAll(ARGUMENT_RE)].map((entry) => entry[1]);
-    const reconstructed = args.map((entry) => `"${entry}"`).join(",");
-    if (reconstructed !== match[2] || args.length !== EXPECTED_ARGUMENTS[match[1]]) {
-        throw new Error(`${path}:${lineNumber}: invalid inert marker arguments`);
-    }
-    return Object.freeze({
-        kind: match[1],
-        args: Object.freeze(args),
-        path,
-        line: lineNumber,
-        raw: trimmed,
-    });
-}
-
-function validateFixtureText(text, path) {
-    if (!SAFE_BYTES_RE.test(text)) {
-        throw new Error(`${path}: fixture must contain printable ASCII only`);
-    }
-    if (/https?:|file:|data:/iu.test(text)) {
-        throw new Error(`${path}: fixture must not contain URLs or payload schemes`);
-    }
-    const markers = [];
-    for (const [index, line] of text.split(/\r?\n/u).entries()) {
-        const marker = parseMarkerLine(line, { path, lineNumber: index + 1 });
-        if (marker) markers.push(marker);
-    }
-    return markers;
-}
-
 function markerFact(marker) {
     const value = [marker.kind, ...marker.args].join("|");
     const fact = {
-        kind: marker.kind === "fact" ? "execution-registration" : "config-key",
+        kind: marker.kind === "fact" ? "execution-registration": "config-key",
         path: marker.path,
         line: marker.line,
         endLine: marker.line,
@@ -109,16 +71,23 @@ function markerFact(marker) {
     return fact;
 }
 
-function buildIndex(fixtureRoot, auditId) {
+function fixtureDocuments(fixtureRoot) {
     const absoluteFiles = walkFiles(fixtureRoot);
     if (absoluteFiles.length === 0) throw new Error("local fixture contains no .ztfixture files");
+    return absoluteFiles.map((absolute) => ({
+        path: relativePath(fixtureRoot, absolute),
+        text: readFileSync(absolute, "utf8"),
+    }));
+}
+
+function buildIndex(fixtureRoot, auditId, { transforms = [] } = {}) {
+    const documents = fixtureDocuments(fixtureRoot);
+    const transformed = transforms.length > 0
+        ? applyMetamorphicTransforms(documents, transforms): documents;
     const state = createAnalysisIndexState({ auditId, sourceKind: "local-source" });
-    const sources = absoluteFiles.map((absolute) => {
-        const path = relativePath(fixtureRoot, absolute);
-        const text = readFileSync(absolute, "utf8");
+    const sources = transformed.map(({ path, text }) => {
         const markers = validateFixtureText(text, path);
         return {
-            absolute,
             path,
             text,
             markers,
@@ -162,8 +131,7 @@ function findingFromMarker(marker, {
     indexState,
     graphDocument,
 }) {
-    const [
-        ,
+    const [,
         state,
         severity,
         confidence,
@@ -197,7 +165,7 @@ function findingFromMarker(marker, {
         trigger: "fixture-activation",
     };
     return {
-        schemaVersion: ANALYSIS_SCHEMA_VERSION,
+        schemaVersion: ANALYSIS_SCHEMA_REVISION,
         auditId,
         id: computeFindingId(sourceIdentity, behaviorSignature),
         sourceIdentity,
@@ -227,8 +195,7 @@ function validationSnapshot(auditId, findings, traceSnapshot) {
             findingId: finding.id,
             decision: finding.state,
             chainIds: finding.state === "validated"
-                ? associated.filter((chain) => chain.status === "complete").map((chain) => chain.id)
-                : [],
+                ? associated.filter((chain) => chain.status === "complete").map((chain) => chain.id): [],
         };
     });
     return {
@@ -252,10 +219,10 @@ function failedArtifact({
         pluginId: entry.pluginId,
     }));
     return Object.freeze({
-        schemaVersion: ANALYSIS_SCHEMA_VERSION,
-        artifactVersion: LOCAL_FINDINGS_ARTIFACT_VERSION,
+        schemaVersion: ANALYSIS_SCHEMA_REVISION,
+        artifactSchemaRevision: LOCAL_FINDINGS_ARTIFACT_SCHEMA_REVISION,
         artifactType: "zerotrust-sourcecheck-findings",
-        flow: "corpus-local-v1",
+        flow: "corpus-local",
         auditId,
         sourceIdentity: { kind: "local", path: sourceNamespace },
         stage: {
@@ -282,6 +249,9 @@ function failedArtifact({
             trusted: false,
             deterministic: true,
         },
+        assurance: {
+            level: "partial",
+        },
         evaluation: {
             counts: {
                 candidate: 0,
@@ -291,6 +261,75 @@ function failedArtifact({
             },
             failureStage: "prepare",
             failureReason: blockers.map(blockerCode).join(",") || "plugin-coverage-incomplete",
+            assuranceLevel: "partial",
+        },
+    });
+}
+
+function explicitBlockers(markers) {
+    const entries = markers
+        .filter((marker) => marker.kind === "blocker")
+        .map((marker) => ({
+            stage: marker.args[0],
+            code: marker.args[1],
+        }));
+    const stages = new Set(entries.map((entry) => entry.stage));
+    if (stages.size > 1) {
+        throw new Error("fixture blocker declarations must use one failure stage");
+    }
+    const stage = entries[0]?.stage || null;
+    if (stage && !["prepare", "scan", "trace", "validate", "finalize"].includes(stage)) {
+        throw new Error(`invalid fixture blocker stage: ${stage}`);
+    }
+    return { stage, entries };
+}
+
+function finalStageForFailure(stage) {
+    return {
+        prepare: "acquired",
+        scan: "prepared",
+        trace: "scanned",
+        validate: "traced",
+        finalize: "validated",
+    }[stage] || "acquired";
+}
+
+function withExplicitBlockers(document, blockerState) {
+    if (blockerState.entries.length === 0) return document;
+    const final = finalStageForFailure(blockerState.stage);
+    const history = [
+        "acquired",
+        "prepared",
+        "scanned",
+        "traced",
+        "validated",
+    ];
+    const finalIndex = history.indexOf(final);
+    const blockers = blockerState.entries.map((entry) => ({
+        code: entry.code,
+        corpusFixture: true,
+    }));
+    return Object.freeze({
+        ...document,
+        stage: {
+            input: final,
+            history: history.slice(0, finalIndex + 1),
+            final,
+        },
+        blockers: [...document.blockers, ...blockers],
+        verdict: {
+            value: "incomplete",
+            trusted: false,
+            deterministic: true,
+        },
+        assurance: {
+            level: "partial",
+        },
+        evaluation: {
+            ...document.evaluation,
+            failureStage: blockerState.stage,
+            failureReason: blockerState.entries.map((entry) => entry.code).join(","),
+            assuranceLevel: "partial",
         },
     });
 }
@@ -299,12 +338,14 @@ export function executeLocalFixture({
     fixtureRoot,
     slug,
     auditId = randomUUID(),
+    transforms = [],
 } = {}) {
     if (!fixtureRoot || !statSync(fixtureRoot).isDirectory()) {
         throw new Error("fixtureRoot must be a local fixture directory");
     }
     const sourceNamespace = `corpus:${slug}`;
-    const indexed = buildIndex(fixtureRoot, auditId);
+    const indexed = buildIndex(fixtureRoot, auditId, { transforms });
+    const blockerState = explicitBlockers(indexed.markers);
     const indexSnapshot = buildAnalysisIndexSnapshot(indexed.state);
     const behaviorGraph = new BehaviorGraph({ auditId });
     const pluginState = createPluginRunnerState({
@@ -378,11 +419,11 @@ export function executeLocalFixture({
         refuted: findings.filter((finding) => finding.state === "refuted").length,
         unresolved: findings.filter((finding) => finding.state === "unresolved").length,
     };
-    return Object.freeze({
-        schemaVersion: ANALYSIS_SCHEMA_VERSION,
-        artifactVersion: LOCAL_FINDINGS_ARTIFACT_VERSION,
+    const document = Object.freeze({
+        schemaVersion: ANALYSIS_SCHEMA_REVISION,
+        artifactSchemaRevision: LOCAL_FINDINGS_ARTIFACT_SCHEMA_REVISION,
         artifactType: "zerotrust-sourcecheck-findings",
-        flow: "corpus-local-v1",
+        flow: "corpus-local",
         auditId,
         sourceIdentity: { kind: "local", path: sourceNamespace },
         stage: {
@@ -422,18 +463,24 @@ export function executeLocalFixture({
             trusted: decision.overallVerdictEligibility.trustedDecisionEligible,
             deterministic: true,
         },
+        assurance: {
+            level: "bounded-static",
+        },
         decision,
         evaluation: {
             counts,
             failureStage: null,
             failureReason: null,
+            assuranceLevel: "bounded-static",
         },
     });
+    return withExplicitBlockers(document, blockerState);
 }
 
 export const __internals = Object.freeze({
     walkFiles,
     relativePath,
+    fixtureDocuments,
     parseMarkerLine,
     validateFixtureText,
     markerFact,
@@ -442,5 +489,8 @@ export const __internals = Object.freeze({
     validationSnapshot,
     blockerCode,
     failedArtifact,
+    explicitBlockers,
+    finalStageForFailure,
+    withExplicitBlockers,
     stableId: pluginInternals.stableId,
 });

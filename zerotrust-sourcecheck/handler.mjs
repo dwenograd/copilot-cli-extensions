@@ -3,7 +3,7 @@
 // runHandler is the tool entry point. It:
 //   1. Validates and normalizes args (including ack flags).
 //   2. Parses + validates the GitHub URL via urlParser.
-//   3. Resolves the audit mode (explicit, env, or default from URL kind).
+//   3. Resolves the audit mode (explicit or default from URL kind).
 //   4. Scrubs and applies injection-policy to user-provided strings (focus, ref).
 //   5. Computes the canonical clone / report / quarantine paths under build_root.
 //   6. Activates audit state via enforcement.mjs::activateAudit. This state is
@@ -33,8 +33,10 @@ import {
 
 import { parseGithubUrl, buildClonePath, buildReportPath, buildQuarantinePath, validateRef } from "./urlParser.mjs";
 import { validateLocalPath } from "./localPathValidator.mjs";
-import { activateAudit, getAnalysisStageState } from "./enforcement.mjs";
-import { clearRecordedOutcome } from "./safeWrappers/state.mjs";
+import {
+    activateAudit,
+    getAnalysisStageState,
+} from "./enforcement.mjs";
 import { buildInstructionPacket } from "./packet.mjs";
 import { DEFAULT_BUILD_ROOT, ensureDefaultBuildRoot } from "./safeWrappers/defaults.mjs";
 import {
@@ -152,10 +154,10 @@ export function runHandler(args, { sessionId, log } = {}) {
         target = { kind: "url", parsed: urlResult.parsed };
     }
 
-    // --- 2. Resolve mode (explicit > env > kind-default) ---
+    // --- 2. Resolve mode (explicit > kind-default) ---
     let mode;
     if (target.kind === "local") {
-        // Default to council variant (matches the opt-out strategy for URL repo-class).
+        // Local audits default to the complete council assurance workflow.
         mode = args.mode || "audit_local_source_council";
     } else {
         const modeResolution = resolveEffectiveMode({
@@ -184,7 +186,7 @@ export function runHandler(args, { sessionId, log } = {}) {
 
     if (modeIsBuild(mode) && !buildExecAck) {
         return fail(
-            `mode '${mode}' requires \`i_understand_build_executes_code: true\`. Install lifecycle scripts remain suppressed, but build commands may execute repo-controlled npm build scripts, build.rs, and MSBuild targets.`,
+            `mode '${mode}' requires \`i_understand_build_executes_code: true\`. Install lifecycle scripts remain suppressed, but hazardous post-audit host execution may run repo-controlled npm build scripts, build.rs, and MSBuild targets.`,
         );
     }
     if (modeIsFullBuild(mode) && !unsafeAck) {
@@ -202,8 +204,8 @@ export function runHandler(args, { sessionId, log } = {}) {
         if (typeof args.ref !== "string") {
             return fail("ref must be a string when provided");
         }
-        // Round-2 hardening: validate args.ref directly via validateRef instead
-        // of round-tripping through parseGithubUrl on a synthetic URL. The
+        // Validate args.ref directly via validateRef instead of round-tripping
+        // through parseGithubUrl on a synthetic URL. The
         // URL re-parse path silently dropped any `#fragment` or `?query` from
         // the ref before validating, so a ref containing those would smuggle
         // additional bytes into the packet without triggering REF_RE.
@@ -220,11 +222,11 @@ export function runHandler(args, { sessionId, log } = {}) {
             }
         }
     }
-    const refOverride = args.ref ? String(args.ref) : null;
+    const refOverride = args.ref ? String(args.ref): null;
 
     // --- 5. Build root preflight ---
-    // Round-4 hardening (gpt-5.5 F3): args.build_root must be a non-empty
-    // string before any path operations. nodePath.isAbsolute throws on
+    // args.build_root must be a non-empty string before path operations.
+    // nodePath.isAbsolute throws on
     // non-string input which would otherwise surface as an uncaught
     // ERR_INVALID_ARG_TYPE.
     if (args.build_root !== undefined && args.build_root !== null) {
@@ -295,7 +297,6 @@ export function runHandler(args, { sessionId, log } = {}) {
     let councilJudgeModel = null;
     let councilSubJudgeModel = null;
     let maxPremiumCalls = null;
-    let validationMinSeverity = "high";
 
     if (modeUsesCouncil(mode)) {
         // Validate per-role model overrides
@@ -337,16 +338,6 @@ export function runHandler(args, { sessionId, log } = {}) {
         } else {
             maxPremiumCalls = DEFAULT_MAX_PREMIUM_CALLS;
         }
-        if (args.validation_min_severity !== undefined
-            && args.validation_min_severity !== null) {
-            if (!["high", "medium", "low", "info"].includes(args.validation_min_severity)) {
-                return fail(
-                    "validation_min_severity must be one of: high, medium, low, info",
-                );
-            }
-            validationMinSeverity = args.validation_min_severity;
-        }
-
         // Keep the handler manifest static. URL-driven role prompts are
         // materialized only after safe_list_tree/safe_clone returns the
         // concrete pinned SHA and wrapper-owned paths.
@@ -366,7 +357,6 @@ export function runHandler(args, { sessionId, log } = {}) {
             "extra_roles",
             "judge",
             "max_premium_calls",
-            "validation_min_severity",
         ]) {
             if (args[k] !== undefined && args[k] !== null) {
                 return fail(`parameter '${k}' is only valid in council modes`);
@@ -379,39 +369,27 @@ export function runHandler(args, { sessionId, log } = {}) {
     let analysisStageState = null;
     if (sessionId) {
         try {
-            // Clear any stale council outcome from a prior audit in the same
-            // session BEFORE activating the new audit. Without this, a passing
-            // outcome from audit-A could satisfy a council-build gate for an
-            // unrelated audit-B in the same session (gpt-5.5 reviewer Finding #4
-            // in the v3.1 hardening pass).
-            try {
-                clearRecordedOutcome(sessionId);
-            } catch {
-                // best-effort; clearRecordedOutcome is idempotent
-            }
             auditId = activateAudit({
                 sessionId,
                 buildPath: resolvedBuildRoot,
                 mode,
                 expectedClonePath,
-                owner: target.kind === "url" ? target.parsed.owner : undefined,
-                repo: target.kind === "url" ? target.parsed.repo : undefined,
-                ref: target.kind === "url" ? (refOverride || target.parsed.ref) : undefined,
-                refType: target.kind === "url" ? target.parsed.refType : undefined,
-                urlKind: target.kind === "url" ? target.parsed.kind : undefined,
-                releaseSelector: target.kind === "url" ? target.parsed.releaseSelector : undefined,
-                localPath: target.kind === "local" ? target.localPath : undefined,
+                owner: target.kind === "url" ? target.parsed.owner: undefined,
+                repo: target.kind === "url" ? target.parsed.repo: undefined,
+                ref: target.kind === "url" ? (refOverride || target.parsed.ref): undefined,
+                refType: target.kind === "url" ? target.parsed.refType: undefined,
+                urlKind: target.kind === "url" ? target.parsed.kind: undefined,
+                releaseSelector: target.kind === "url" ? target.parsed.releaseSelector: undefined,
+                localPath: target.kind === "local" ? target.localPath: undefined,
                 expectedReportPath,
                 expectedQuarantinePath,
                 councilRoleManifest: councilManifest,
-                validationMinSeverity,
             });
             analysisStageState = getAnalysisStageState(sessionId, { auditId });
             if (typeof log === "function") {
                 const targetLabel = target.kind === "url"
-                    ? `${target.parsed.owner}/${target.parsed.repo}`
-                    : `local:${target.localPath}`;
-                log(`zerotrust-sourcecheck: audit activated for ${targetLabel} (mode=${mode}); use the safe-wrapper tools for clone/install/build operations.`);
+                    ? `${target.parsed.owner}/${target.parsed.repo}`: `local:${target.localPath}`;
+                log(`zerotrust-sourcecheck: audit activated for ${targetLabel} (mode=${mode}); finalize the audit report before any wrapper-mediated hazardous post-audit host execution.`);
             }
         } catch (err) {
             return fail(`failed to activate enforcement state: ${err.message}`);
@@ -423,7 +401,7 @@ export function runHandler(args, { sessionId, log } = {}) {
         mode,
         target,
         // Back-compat for URL-driven sections: pass parsed when available.
-        parsed: target.kind === "url" ? target.parsed : null,
+        parsed: target.kind === "url" ? target.parsed: null,
         refOverride,
         focusWrapped,
         injectionPreamble,
@@ -446,7 +424,6 @@ export function runHandler(args, { sessionId, log } = {}) {
         councilJudgeModel,
         councilSubJudgeModel,
         maxPremiumCalls,
-        validationMinSeverity,
     });
 
     return {

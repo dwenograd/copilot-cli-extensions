@@ -10,7 +10,7 @@ import {
 } from "./helpers.mjs";
 import { PLUGIN_REGISTRY } from "./registry.mjs";
 
-export const PLUGIN_RUNNER_SCHEMA_VERSION = 1;
+export const PLUGIN_RUNNER_SCHEMA_REVISION = 1;
 export const PLUGIN_RUNNER_LIMITS = Object.freeze({
     blockers: 64,
     blockerMessage: 300,
@@ -53,7 +53,7 @@ export function createPluginRunnerState({
 } = {}) {
     const normalizedAuditId = validateAuditId(auditId);
     return {
-        schemaVersion: PLUGIN_RUNNER_SCHEMA_VERSION,
+        schemaVersion: PLUGIN_RUNNER_SCHEMA_REVISION,
         auditId: normalizedAuditId,
         runCount: 0,
         indexFingerprint: null,
@@ -65,7 +65,7 @@ export function createPluginRunnerState({
 }
 
 function ensureState(state, auditId) {
-    if (!state || state.schemaVersion !== PLUGIN_RUNNER_SCHEMA_VERSION
+    if (!state || state.schemaVersion !== PLUGIN_RUNNER_SCHEMA_REVISION
         || state.auditId !== validateAuditId(auditId)
         || !Array.isArray(state.plugins)
         || !Array.isArray(state.blockers)) {
@@ -87,7 +87,7 @@ function appendBlocker(state, pluginId, kind, message) {
     state.blockers.push(blocker);
 }
 
-function indexFingerprint(indexState) {
+function indexFingerprint(indexState, semanticInputs = []) {
     const hash = createHash("sha256").update(indexState.auditId, "utf8");
     for (const file of [...indexState.files].sort((left, right) =>
         left.path.localeCompare(right.path))) {
@@ -106,6 +106,20 @@ function indexFingerprint(indexState) {
         hash.update(fact.id, "utf8");
         hash.update("\0", "utf8");
         hash.update(fact.excerptHash, "utf8");
+    }
+    for (const input of [...semanticInputs].sort((left, right) =>
+        String(left.path).localeCompare(String(right.path)))) {
+        hash.update("\0semantic\0", "utf8");
+        hash.update(String(input.path || ""), "utf8");
+        hash.update("\0", "utf8");
+        hash.update(String(input.contentSha256 || ""), "utf8");
+        hash.update("\0", "utf8");
+        hash.update(String(input.scannerId || ""), "utf8");
+        for (const fact of [...(input.facts || [])].sort((left, right) =>
+            String(left.id).localeCompare(String(right.id)))) {
+            hash.update("\0semantic-fact\0", "utf8");
+            hash.update(String(fact.id || ""), "utf8");
+        }
     }
     return hash.digest("hex");
 }
@@ -142,12 +156,12 @@ function pluginFactSummary(plugin, fact) {
         pluginVersion: plugin.pluginVersion,
         kind: fact.kind,
         name: fact.name,
-        ...(fact.value ? { value: fact.value } : {}),
+        ...(fact.value ? { value: fact.value }: {}),
         path: fact.path,
         line: fact.line,
         endLine: fact.endLine,
         excerptHash: fact.excerptHash,
-        ...(node?.sourceIdentity ? { sourceIdentity: node.sourceIdentity } : {}),
+        ...(node?.sourceIdentity ? { sourceIdentity: node.sourceIdentity }: {}),
     };
 }
 
@@ -178,7 +192,7 @@ export function buildPluginRunnerSnapshot(state, behaviorGraph = null) {
         factsTruncated: allFacts.length > PLUGIN_RUNNER_LIMITS.snapshotFacts,
         blockers: state.blockers,
         blockersTruncated: state.blockersTruncated,
-        behaviorGraph: behaviorGraph ? graphSummary(behaviorGraph) : null,
+        behaviorGraph: behaviorGraph ? graphSummary(behaviorGraph): null,
     }));
 }
 
@@ -199,8 +213,7 @@ export function buildPluginCacheRecords(state) {
                     path: node.sourceIdentity.path,
                     contentSha256: node.sourceIdentity.contentSha256,
                     ...(node.sourceIdentity.blobSha
-                        ? { blobSha: node.sourceIdentity.blobSha }
-                        : {}),
+                        ? { blobSha: node.sourceIdentity.blobSha }: {}),
                 };
                 sourceBlobs.set(sourceBlob.path, sourceBlob);
             }
@@ -209,9 +222,9 @@ export function buildPluginCacheRecords(state) {
                 kind: node.kind,
                 producer: node.producer,
                 evidence: node.evidence,
-                ...(node.sourceIdentity ? { sourceIdentity: node.sourceIdentity } : {}),
-                ...(node.behaviorSignature ? { behaviorSignature: node.behaviorSignature } : {}),
-                ...(node.tags ? { tags: node.tags } : {}),
+                ...(node.sourceIdentity ? { sourceIdentity: node.sourceIdentity }: {}),
+                ...(node.behaviorSignature ? { behaviorSignature: node.behaviorSignature }: {}),
+                ...(node.tags ? { tags: node.tags }: {}),
             }));
             const edges = plugin.edges.map((edge) => ({
                 id: edge.id,
@@ -220,7 +233,7 @@ export function buildPluginCacheRecords(state) {
                 to: edge.to,
                 producer: edge.producer,
                 evidence: edge.evidence,
-                ...(edge.tags ? { tags: edge.tags } : {}),
+                ...(edge.tags ? { tags: edge.tags }: {}),
             }));
             const evidenceNodes = new Map();
             for (const node of plugin.nodes) {
@@ -273,6 +286,7 @@ export function runAnalysisPlugins({
     behaviorGraph,
     state,
     sourceNamespace,
+    semanticInputs = [],
     registry = PLUGIN_REGISTRY,
     limits = PLUGIN_EXECUTION_LIMITS,
 } = {}) {
@@ -287,7 +301,13 @@ export function runAnalysisPlugins({
     }
     if (!index.complete) return buildPluginRunnerSnapshot(state, behaviorGraph);
 
-    const fingerprint = indexFingerprint(indexState);
+    const context = buildPluginContext({
+        auditId: normalizedAuditId,
+        indexState,
+        sourceNamespace,
+        semanticInputs,
+    });
+    const fingerprint = indexFingerprint(indexState, context.semanticInputs);
     if (state.runCount > 0 && state.indexFingerprint === fingerprint) {
         return buildPluginRunnerSnapshot(state, behaviorGraph);
     }
@@ -302,11 +322,6 @@ export function runAnalysisPlugins({
         return buildPluginRunnerSnapshot(state, behaviorGraph);
     }
 
-    const context = buildPluginContext({
-        auditId: normalizedAuditId,
-        indexState,
-        sourceNamespace,
-    });
     state.runCount = 1;
     state.indexFingerprint = fingerprint;
     state.plugins = registry.map(pluginRecord);
@@ -362,7 +377,7 @@ export function runAnalysisPlugins({
         } catch (error) {
             record.failed = true;
             record.completed = false;
-            record.error = sanitizeMessage(error instanceof Error ? error.message : error);
+            record.error = sanitizeMessage(error instanceof Error ? error.message: error);
             appendBlocker(state, plugin.id, "plugin-failed", record.error);
         }
     }

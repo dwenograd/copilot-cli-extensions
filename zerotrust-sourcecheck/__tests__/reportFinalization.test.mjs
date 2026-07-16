@@ -115,7 +115,7 @@ test("URL reports use the full SHA and return canonical reportPath", async () =>
         const body = parseResult(result);
         assert.equal(body.reportIdentity.resolvedSha, SHA);
         assert.equal(body.reportPath, nodePath.join(reportDir, "REPORT.md"));
-        assert.match(body.reportPath, /zt-v1-[0-9a-f]{64}[\\/]REPORT\.md$/);
+        assert.match(body.reportPath, /zt-[0-9a-f]{64}[\\/]REPORT\.md$/);
         assert.equal(existsSync(body.reportPath), true);
     } finally {
         deactivateAudit(sessionId);
@@ -343,11 +343,10 @@ function urlPacket(mode, { council = false } = {}) {
             repo: "demo",
             ref: "main",
             refType: "branch_or_tag",
-            kind: mode === "verify_release" ? "release" : "tree",
-            releaseSelector: mode === "verify_release" ? "tag" : null,
+            kind: mode === "verify_release" ? "release": "tree",
+            releaseSelector: mode === "verify_release" ? "tag": null,
             canonicalUrl: mode === "verify_release"
-                ? "https://github.com/octocat/demo/releases/tag/v1"
-                : "https://github.com/octocat/demo/tree/main",
+                ? "https://github.com/octocat/demo/releases/tag/baseline": "https://github.com/octocat/demo/tree/main",
         },
         refOverride: null,
         focusWrapped: null,
@@ -380,10 +379,10 @@ function urlPacket(mode, { council = false } = {}) {
             mandatory: true,
             angle: "test",
             ignore_clauses: [],
-        }] : null,
-        councilJudgeModel: council ? "gpt-5.6-sol" : null,
-        councilSubJudgeModel: council ? "gpt-5.6-sol" : null,
-        maxPremiumCalls: council ? 10 : null,
+        }]: null,
+        councilJudgeModel: council ? "gpt-5.6-sol": null,
+        councilSubJudgeModel: council ? "gpt-5.6-sol": null,
+        maxPremiumCalls: council ? 10: null,
     });
 }
 
@@ -448,10 +447,11 @@ test("every mode routes its only report write through the finalizer wrapper", ()
     }
 });
 
-test("council incomplete fallback assembles in memory and uses the single shared finalizer", () => {
+test("council limitations remain in current assurance and use the single shared finalizer", () => {
     const packet = urlPacket("audit_source_council", { council: true });
-    assert.match(packet, /INCOMPLETE-report draft fallback/);
-    assert.match(packet, /Do not write it here/);
+    assert.doesNotMatch(packet, /INCOMPLETE-report draft fallback/);
+    assert.match(packet, /There is no council-owned finalize or verdict path/);
+    assert.match(packet, /zerotrust_finalize_assurance_validation/);
     assert.equal((packet.match(/zerotrust_finalize_report\(\{/g) || []).length, 1);
 });
 
@@ -474,19 +474,12 @@ test("report tool schema requires full resolved SHA for URL identity and exposes
     assert.doesNotMatch(reportBlock, /operator_context\s*:/);
 });
 
-test("outcome and cleanup schemas expose the hardened identity contract", () => {
+test("deprecated outcome schema cannot authorize build and cleanup stays identity-bound", () => {
     const extensionSource = readFileSync(
         nodePath.join(HERE, "..", "extension.mjs"),
         "utf-8",
     );
-    const outcomeBlock = extensionSource.slice(
-        extensionSource.indexOf('name: "zerotrust_record_council_outcome"'),
-        extensionSource.indexOf('name: "zerotrust_finalize_report"'),
-    );
-    assert.match(outcomeBlock, /audit_id/);
-    assert.match(outcomeBlock, /required:\s*\["audit_id"/);
-    assert.match(outcomeBlock, /immutable/i);
-    assert.match(outcomeBlock, /owner\/repo\/full resolved SHA/i);
+    assert.doesNotMatch(extensionSource, /name: "zerotrust_record_council_outcome"/);
 
     const cleanupBlock = extensionSource.slice(
         extensionSource.indexOf('name: "zerotrust_cleanup_audit"'),

@@ -4,7 +4,7 @@ import { modeNeedsClone, modeUsesApiDirect } from "../modes.mjs";
 
 // Cross-platform "discard hooks" path. NUL on Windows, /dev/null on
 // POSIX. See cloneWrapper.mjs for the rationale.
-const NULL_HOOKS_PATH = process.platform === "win32" ? "NUL" : "/dev/null";
+const NULL_HOOKS_PATH = process.platform === "win32" ? "NUL": "/dev/null";
 
 const HARDENED_CLONE_FLAGS = [
     "-c protocol.file.allow=never",
@@ -18,7 +18,9 @@ const HARDENED_CLONE_FLAGS = [
 const HARDENED_CLONE_TAIL = "--no-recurse-submodules --no-tags --filter=blob:none --no-checkout";
 
 export function renderAcquisitionStage(context) {
-    const { mode, owner, repo, canonicalUrl, parsed, expectedClonePath } = context;
+    const {
+        mode, owner, repo, canonicalUrl, parsed, expectedClonePath, auditId,
+    } = context;
 
     const cloneCommand =
         `git ${HARDENED_CLONE_FLAGS} clone ${HARDENED_CLONE_TAIL} ${canonicalUrl} ${expectedClonePath}`;
@@ -44,7 +46,13 @@ This mode obtains source through the GitHub API. The wrappers do not intentional
 **Step A — list the tree.** Call:
 
 \`\`\`
-zerotrust_safe_list_tree({ url: "${canonicalUrl}"${parsed.ref ? `, ref: "${parsed.ref}"` : ""} })
+const treeResult = zerotrust_safe_list_tree({ url: "${canonicalUrl}"${parsed.ref ? `, ref: "${parsed.ref}"`: ""} })
+const runtimeContext = Object.freeze({
+  auditId: ${JSON.stringify(auditId || "<unavailable: no session identity>")},
+  sourceCommitSha: treeResult.sha,
+  reportPath: treeResult.boundContext.reportPath,
+  quarantinePath: treeResult.boundContext.quarantinePath
+})
 \`\`\`
 
 This returns the pinned commit \`sha\`, distinct \`rootTreeSha\`, bounded current-call \`entries\`, \`entriesTruncated\`, merged/deduped aggregate counts, \`unresolvedSubtrees: [{path, sha}]\`, \`coverageBlockers\`, and aggregate \`coverageComplete\`. Every blob entry has \`classificationRequired: true\`; \`likelyBinaryByExtension\` is only a fetch-order hint and never an exclusion. The result includes bounded \`acquisitionCoverage\` accounting. Release audits also return \`releaseIdentity: {releaseId, tagName, sourceCommitSha, rootTreeSha, ...}\` plus \`boundContext.reportPath\` / \`boundContext.quarantinePath\`. Pin EVERY downstream source operation to \`sha\`; for releases, use ONLY that returned release id/tag and those bound paths.
@@ -84,7 +92,16 @@ For an audit finding on a true binary in source, the tree path/size plus the wra
 
 Over-ceiling blobs return only bounded fields available on that GitHub API path. They remain incomplete even if a bounded preview or byte classification is available. Unfetchable, identity-mismatched, metadata-only, truncated-text, not-fetched, and council-sample-only blobs likewise remain explicit gaps.
 
-**Step D — enforce acquisition + index + plugin coverage, then analyze.** Continue until the latest snapshot has \`acquisitionCoverage.requiredAcquisitionComplete === true\`, \`analysisIndex.complete === true\`, and \`analysisPlugins.coverageComplete === true\`, and \`analysisStageState.current\` has advanced to \`prepared\`. The wrapper advances \`acquired → prepared\` only after every enumerated blob is fully classified, every full text blob is indexed, no per-file/per-audit fact cap overflow occurred, and every detected ecosystem plugin completed without failure or truncation. The plugins consume only normalized facts/manifests, seed the audit-bound BehaviorGraph, and emit bounded normalized plugin facts and warnings — never source text, findings, validation decisions, or verdicts. If any coverage surface remains false, preserve its bounded blockers/details in REPORT.md and use verdict \`incomplete\`; **"no red flags found" is forbidden**. Use the graph seeds and normalized facts for deterministic preparation and fetched content for the existing v4 checklist. Council sampling remains separate from mandatory deterministic acquisition. The stage remains \`prepared\` until later council/scan/trace work explicitly advances it.
+**Step D — enforce acquisition + index + plugin coverage, then analyze.** Continue until the latest snapshot has \`acquisitionCoverage.requiredAcquisitionComplete === true\`, \`analysisIndex.complete === true\`, and \`analysisPlugins.coverageComplete === true\`, and \`analysisStageState.current\` has advanced to \`prepared\`. The wrapper advances \`acquired → prepared\` only after every enumerated blob is fully classified, every full text blob is indexed, no per-file/per-audit fact cap overflow occurred, and every detected ecosystem plugin completed without failure or truncation. The plugins consume only normalized facts/manifests, seed the audit-bound BehaviorGraph, and emit bounded normalized plugin facts and warnings — never source text, findings, validation decisions, or verdicts. If any coverage surface remains false, preserve its bounded blockers/details in REPORT.md and use verdict \`incomplete\`; **"no red flags found" is forbidden**. Use the graph seeds and normalized facts for deterministic preparation and the fetched content for the current semantic stage. Council sampling remains separate from mandatory deterministic acquisition. The assurance object inventory and derived-artifact decoding must reach \`decoded\` before semantic preparation.
+
+## Acquisition coverage (API-direct, mandatory whole tree)
+
+Carry the latest wrapper-owned quantitative snapshot into the finalizer handoff.
+Report \`Mandatory blobs classified+inspected / required\`, full-text scans
+completed / text blobs, binary metadata+preview inspections / binary blobs,
+unknown or truncated blobs, duplicate attempts, council-only samples, unresolved
+subtrees, and every bounded blocker. Do not substitute sampled-file counts or a
+model-authored coverage summary for these wrapper-derived totals.
 
 **Why API-direct + binary-never-returned:** the wrappers do not create an on-disk source tree, and true binaries return only bounded metadata/preview rather than full bodies. This materially reduces AV exposure, but Copilot CLI logs or oversized-output spill may still persist returned text and host AV may scan it. (Build modes are a separate explicit invocation that runs its own audit packet before using an on-disk clone.)`;
     } else if (modeNeedsClone(mode)) {
@@ -92,7 +109,25 @@ Over-ceiling blobs return only bounded fields available on that GitHub API path.
 
 ## Section 4 — Hardened clone (build mode)
 
-You're in a BUILD mode (${mode}). The audit needs source on disk so it can run install/build steps. Use \`zerotrust_safe_clone\` — the wrapper hardcodes the hardening flags below:
+You're in a BUILD mode (${mode}). The audit needs source on disk so it can run install/build steps. Use \`zerotrust_safe_clone\` — the wrapper hardcodes the security flags below:
+
+\`\`\`
+const cloneResult = zerotrust_safe_clone({
+  url: "${canonicalUrl}"${parsed.ref ? `,
+  ref: "${parsed.ref}"`: ""}
+})
+const runtimeContext = Object.freeze({
+  auditId: ${JSON.stringify(auditId || "<unavailable: no session identity>")},
+  sourceCommitSha: cloneResult.boundContext.sourceCommitSha,
+  clonePath: cloneResult.boundContext.clonePath,
+  reportPath: cloneResult.boundContext.reportPath,
+  quarantinePath: cloneResult.boundContext.quarantinePath
+})
+\`\`\`
+
+Treat \`runtimeContext\` as immutable. Its wrapper-returned values are the only
+source and artifact identities that council prompts, remediation, finalization,
+host-execution wrappers, cleanup, and user-facing paths may consume.
 
 \`\`\`powershell
 ${ENV_PRELUDE}

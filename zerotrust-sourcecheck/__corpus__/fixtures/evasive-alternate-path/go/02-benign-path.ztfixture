@@ -1,0 +1,4 @@
+marker.node("alternate-preview","capability","local-preview","benign,decoy-path");
+marker.node("alternate-local","sink","local-output","benign,local-output");
+marker.edge("alternate-start-preview","invokes","alternate-start","alternate-preview","benign");
+marker.edge("alternate-preview-local","flows-to","alternate-preview","alternate-local","benign");

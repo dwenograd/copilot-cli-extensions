@@ -1,8 +1,8 @@
 // safeWrappers/outcomeWrapper.mjs — zerotrust_record_council_outcome tool.
 //
-// Every council mode calls this after synthesis (or its incomplete fallback)
-// and before report finalization. Council-build modes additionally need the
-// same immutable outcome before zerotrust_safe_build.
+// Deprecated compatibility recorder. Report finalization now derives the only
+// trusted outcome atomically from validated state. This record never opens the
+// host build gate.
 
 import { recordCouncilOutcome } from "./state.mjs";
 import {
@@ -44,17 +44,13 @@ export async function recordOutcomeHandler(args, invocation) {
         return failure("complete must be boolean");
     }
 
-    // Round-10 hardening (gpt-5.5 R10 F1): reject the logically-impossible
-    // combination `verdict: "incomplete"` + `complete: true`. The
-    // "incomplete" verdict is supposed to mean the council aborted before
-    // producing a real verdict; recording it as `complete=true` would let
-    // a `council_build_override` (severity-only) bypass open the gate
-    // without `proceed_on_council_failure` (incompleteness) being set.
+    // Reject the logically-impossible combination `verdict: "incomplete"` +
+    // `complete: true`.
     if (args.verdict === "incomplete" && args.complete !== false) {
         return failure(`inconsistent outcome: verdict 'incomplete' must be recorded with complete=false`);
     }
 
-    // Round-3 hardening (gpt-5.5 F1): reject inconsistent verdict/counts.
+    // security rationale: reject inconsistent verdict/counts.
     // The meta-judge is supposed to set verdict and counts together, but
     // a buggy or compromised judge could record { verdict: "low",
     // critical_count: 5 } and the gate would still pass. Reject when the
@@ -138,10 +134,13 @@ export async function recordOutcomeHandler(args, invocation) {
         high_count: args.high_count,
         complete: args.complete,
         immutable: true,
+        deprecated: true,
+        trusted: false,
+        buildGateEligible: false,
         recordedAt: recorded.recordedAt,
         audit_id: activeAudit.auditId,
         sessionId: sessionId.slice(0, 12),
-        ...(acquisitionCoverage ? { acquisitionCoverage } : {}),
+        ...(acquisitionCoverage ? { acquisitionCoverage }: {}),
     });
 }
 

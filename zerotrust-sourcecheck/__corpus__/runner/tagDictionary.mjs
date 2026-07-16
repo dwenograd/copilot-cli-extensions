@@ -36,13 +36,13 @@ function wordRegex(word) {
 
 export function tagsForCategory(category) {
     const letter = normalizeCategory(category);
-    return letter ? [...CATEGORY_TAGS[letter]] : [];
+    return letter ? [...CATEGORY_TAGS[letter]]: [];
 }
 
 export function normalizeCategory(category) {
     if (typeof category !== "string") return null;
     const letter = category.trim().toUpperCase();
-    return Object.hasOwn(CATEGORY_TAGS, letter) ? letter : null;
+    return Object.hasOwn(CATEGORY_TAGS, letter) ? letter: null;
 }
 
 export function deriveTags({ category = null, text = "", extraTags = [] } = {}) {

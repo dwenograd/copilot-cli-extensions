@@ -1,0 +1,3 @@
+marker.fact("literal"+"-fragments","remote"+"-fetch","string"+"-split");
+marker.node("split-fetch","capability","remote-fetch","remote-fetch,string-split");
+marker.edge("split-start-fetch","activates","split-start","split-fetch","remote-fetch");

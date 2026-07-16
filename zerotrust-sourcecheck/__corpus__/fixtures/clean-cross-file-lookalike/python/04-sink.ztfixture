@@ -1,0 +1,3 @@
+marker.node("report-sink","sink","local-report-output","benign,local-output");
+marker.edge("report-transform-sink","flows-to","report-transform","report-sink","benign");
+marker.finding("report-lookalike","refuted","low","medium","unlikely","write","public-metadata","local-output","benign,benign-lookalike,cross-file");

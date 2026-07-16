@@ -106,12 +106,12 @@ function activateUrlAudit(sessionId, mode = "audit_source") {
 
 async function enumerate(sessionId, entries) {
     const client = {
-        resolveRefToSha: () => COMMIT,
-        getCommitIdentity: () => ({ commitSha: COMMIT, rootTreeSha: ROOT }),
-        resolveReleaseIdentity: () => {
+        resolveRefToSha:() => COMMIT,
+        getCommitIdentity:() => ({ commitSha: COMMIT, rootTreeSha: ROOT }),
+        resolveReleaseIdentity:() => {
             throw new Error("not a release");
         },
-        listTreeBySha: () => treeResult(entries),
+        listTreeBySha:() => treeResult(entries),
     };
     return safeListTreeHandler(
         { owner: "octocat", repo: "demo" },
@@ -451,7 +451,7 @@ test("every blob path requires classification regardless of suffix", () => {
 test("bounded snapshots cap required-blob gap details", () => {
     const state = createCoverageState(COMMIT, ROOT);
     const entries = Array.from({ length: 55 }, (_, index) =>
-        blob(`src/file-${String(index).padStart(2, "0")}.js`, index % 2 ? BLOB_A : BLOB_B));
+        blob(`src/file-${String(index).padStart(2, "0")}.js`, index % 2 ? BLOB_A: BLOB_B));
     recordEnumeratedEntries(state, entries);
     const snapshot = buildCoverageSnapshot(state, completeTreeState(entries));
     assert.equal(snapshot.deterministicMandatory.missingOrIncomplete, 55);
@@ -483,7 +483,7 @@ test("list and fetch handlers expose required classification and running coverag
             {
                 sessionId,
                 apiClient: {
-                    fetchFile: () => fetchedText("src/index.js", "const x = 1;"),
+                    fetchFile:() => fetchedText("src/index.js", "const x = 1;"),
                 },
             },
         );
@@ -504,7 +504,7 @@ test("list and fetch handlers expose required classification and running coverag
             {
                 sessionId,
                 apiClient: {
-                    fetchFile: () => fetchedText("src/index.js", "const x = 1;"),
+                    fetchFile:() => fetchedText("src/index.js", "const x = 1;"),
                 },
             },
         );
@@ -545,7 +545,7 @@ test("fetch handler records failures and rejects invalid coverage scope", async 
             {
                 sessionId,
                 apiClient: {
-                    fetchFile: () => {
+                    fetchFile:() => {
                         throw new Error("synthetic fetch failure");
                     },
                 },
@@ -609,7 +609,7 @@ test("no-red-flags outcome is blocked until mandatory acquisition completes", as
             {
                 sessionId,
                 apiClient: {
-                    fetchFile: () => fetchedText(
+                    fetchFile:() => fetchedText(
                         "payload.exe",
                         "console.log('text under exe');",
                     ),
@@ -668,8 +668,7 @@ test("report finalizer recognizes normalized verdict lines and blocks incomplete
             );
             assert.equal(result.resultType, "failure");
             const body = parseResult(result);
-            assert.match(body.error, /mandatory acquisition coverage/i);
-            assert.equal(body.acquisitionCoverage.requiredAcquisitionComplete, false);
+            assert.match(body.error, /assurance analysis is not validated \(current: acquired\)/i);
         }
         assert.equal(
             reportInternals.extractDeclaredVerdict([

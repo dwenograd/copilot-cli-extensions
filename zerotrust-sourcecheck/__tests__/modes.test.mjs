@@ -150,7 +150,7 @@ test("modeIsAudit returns true for source-audit-class modes", () => {
     assert.equal(modeIsAudit("verify_release"), false);
 });
 
-test("modeNeedsClone (v4): only build modes need a clone; audit modes are API-direct or local", () => {
+test("modeNeedsClone (current): only build modes need a clone; audit modes are API-direct or local", () => {
     // Non-clone modes: metadata_only, all API-direct audit modes, and local-source modes
     for (const m of ["metadata_only", "audit_source", "audit_source_council",
                      "audit_local_source", "audit_local_source_council", "verify_release"]) {
@@ -208,12 +208,12 @@ test("LOCAL_SOURCE_MODES + LOCAL_SOURCE_MODES_SET are consistent", () => {
 
 // ---------- Default-mode resolution ----------
 
-test("defaultModeForUrlKind: release → verify_release, others → audit_source", () => {
+test("defaultModeForUrlKind: release → verify_release, others → audit_source_council", () => {
     assert.equal(defaultModeForUrlKind("release"), "verify_release");
     for (const k of ["repo", "tree", "commit", "pr"]) {
-        assert.equal(defaultModeForUrlKind(k), "audit_source", `kind ${k}`);
+        assert.equal(defaultModeForUrlKind(k), "audit_source_council", `kind ${k}`);
     }
-    assert.equal(defaultModeForUrlKind("anything-else"), "audit_source");
+    assert.equal(defaultModeForUrlKind("anything-else"), "audit_source_council");
 });
 
 test("resolveEffectiveMode: explicit mode always wins", () => {
@@ -248,10 +248,10 @@ test("resolveEffectiveMode: council is the default for all repo-class URLs (tree
     }
 });
 
-test("resolveEffectiveMode: ZEROTRUST_DETERMINISTIC_ONLY=1 downgrades to audit_source for repo URLs", () => {
+test("resolveEffectiveMode: environment cannot silently downgrade the council default", () => {
     const r = resolveEffectiveMode({ urlKind: "repo", env: { ZEROTRUST_DETERMINISTIC_ONLY: "1" } });
-    assert.equal(r.mode, "audit_source");
-    assert.equal(r.source, "env");
+    assert.equal(r.mode, "audit_source_council");
+    assert.equal(r.source, "default");
 });
 
 test("resolveEffectiveMode: ZEROTRUST_DETERMINISTIC_ONLY env value other than '1' does NOT trigger downgrade", () => {

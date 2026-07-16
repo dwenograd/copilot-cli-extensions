@@ -12,6 +12,7 @@ import nodePath from "node:path";
 
 import { getTrustedAuditContext } from "../enforcement.mjs";
 import { modeIsBuild } from "../modes.mjs";
+import { evaluateFinalizedReportExecutionGate } from "./finalizedReportGate.mjs";
 import { resolveTrustedProgram } from "./programResolver.mjs";
 
 import { DEFAULT_BUILD_ROOT } from "./defaults.mjs";
@@ -54,9 +55,9 @@ const ARG_RE = /^[A-Za-z0-9._=:@/\\-]+$/;
 // the hardcoded safety flags via last-wins precedence. Anything matching
 // one of these denylist regexes is rejected before being appended to argv.
 //
-// Round-2 hardening: each negation flag is matched in BOTH the `flag=value`
+// security rationale: each negation flag is matched in BOTH the `flag=value`
 // AND the bare `flag` form (which would consume the next positional arg as
-// its value). Round-1's regex was `/^--no-binary[=$]/i` which incorrectly
+// its value). earlier implementation's regex was `/^--no-binary[=$]/i` which incorrectly
 // used `[=$]` (a character class containing `=` and literal `$`) instead of
 // `(?:=|$)`. That allowed the bare `--no-binary` form (with the value
 // passed as the next argv token) to slip through.
@@ -82,14 +83,14 @@ const URL_SCHEME_RE = /^[A-Za-z][A-Za-z0-9+.\-]*:\/\//;
 // Version-pinned package specs (npm `pkg@1.2.3`, npm scoped `@scope/pkg@1.2.3`,
 // pip `pkg==1.2.3`). These reach the install command as positional args and
 // pull arbitrary versions from the (default) registry — bypassing the
-// lockfile-pinning the safe-mode flags rely on. Round-5 hardening
-// (opus47xhigh F1 + gpt-5.5 F2). Round-6 hardening (opus47xhigh + gpt-5.5):
+// lockfile-pinning the safe-mode flags rely on. security rationale
+// . security rationale:
 // also block npm scoped form `@scope/pkg(@version)?`.
 const VERSION_PIN_RE = /^[A-Za-z0-9_.-]+(?:@|==).+/;
 const SCOPED_PKG_RE = /^@[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+(?:@.*)?$/;
 
 const ARG_DENYLIST = [
-    // Round-7 hardening (gpt-5.5 R7 F1): catch ANY form of the
+    // security rationale: catch ANY form of the
     // ignore-scripts toggle, including `--no-ignore-scripts=true`,
     // `--ignore-scripts=anything-other-than-the-hardcoded-default`, etc.
     // The safe-mode `--ignore-scripts` is already hardcoded; agents have
@@ -152,7 +153,7 @@ function validateExtraArgs(args) {
         if (a.length > 256) throw new Error("extra_args contains an entry over 256 chars");
         if (!ARG_RE.test(a)) throw new Error(`extra_args contains entry with disallowed characters: ${JSON.stringify(a)}`);
 
-        // Round-8 hardening (gpt-5.5 R8 F2): reject positional (non-flag)
+        // security rationale: reject positional (non-flag)
         // arguments entirely. The install wrappers exist to install the
         // audited project's pre-pinned dependencies (lockfile). They MUST
         // NOT be used to install arbitrary additional packages — that
@@ -228,8 +229,8 @@ export async function safeInstallHandler(args, invocation) {
         return failure(`safe_install refused: active audit is local-source mode (target: ${ctx.localPath}). Install operations apply to build-mode audits only. If you need to verify install behavior of this local project, run \`npm install\` (or your package manager) yourself outside zerotrust-sourcecheck — the wrappers don't apply to operator-owned local code.`);
     }
 
-    // Round-3 hardening: if a sessionId was supplied (production agents
-    // always have one) but no active audit exists, REFUSE. The round-2
+    // security rationale: if a sessionId was supplied (production agents
+    // always have one) but no active audit exists, REFUSE. The security rationale
     // mode-is-build check above only fires when ctx.mode is non-null, so
     // an expired/absent audit would let the agent run installs without
     // the i_understand_build_executes_code ack ever being checked. The
@@ -239,7 +240,7 @@ export async function safeInstallHandler(args, invocation) {
         return failure(`safe_install refused: no active audit for this session (TTL expired or zerotrust_sourcecheck not invoked). Re-invoke zerotrust_sourcecheck with audit_and_safe_build* or audit_and_full_build* to authorize installs.`);
     }
 
-    // Round-2 hardening: refuse to install when active audit mode is not a
+    // security rationale: refuse to install when active audit mode is not a
     // build mode. Without this, an audit activated as audit_source gives the
     // agent a no-ack path to install packages (which can run setup.py / lifecycle
     // scripts depending on ecosystem). The ack-flag gate at activation time is
@@ -252,13 +253,13 @@ export async function safeInstallHandler(args, invocation) {
         return failure(`clone_path ${args.clone_path} is not under build_root ${buildRoot}`);
     }
 
-    // Round-4 hardening (gpt-5.5 F2): if the active audit has a recorded
+    // security rationale: if the active audit has a recorded
     // resolved clone path (set by safe_clone success), the install must
     // target THAT path exactly. Without this, a session activated for repo
     // A could install dependencies into a sibling repo-B directory under
     // the same sandbox.
     //
-    // Round-6 hardening (gpt-5.5 R6 F1): when the audit IS active but no
+    // security rationale: when the audit IS active but no
     // resolved clone path has been recorded yet (i.e. safe_clone hasn't
     // run), REFUSE — otherwise an agent could install into ANY sibling
     // before the binding is established. The intended sequence is
@@ -273,6 +274,10 @@ export async function safeInstallHandler(args, invocation) {
             return failure(`safe_install refused: clone_path ${args.clone_path} does not match the active audit's resolved clone path ${ctx.resolvedClonePath}`);
         }
     }
+    const gate = evaluateFinalizedReportExecutionGate(ctx.reportFinalization, ctx);
+    if (!gate.passes) {
+        return failure(`host install gate CLOSED: ${gate.reason}`);
+    }
     let extraArgs;
     try {
         extraArgs = validateExtraArgs(args.extra_args);
@@ -284,7 +289,7 @@ export async function safeInstallHandler(args, invocation) {
     const bareProgram = argv[0];
     const programArgs = argv.slice(1);
 
-    // Round-11 hardening (gpt-5.5 R11 F1): resolve the bare program name
+    // security rationale: resolve the bare program name
     // (npm/pip/cargo/dotnet/etc.) to a TRUSTED absolute path BEFORE
     // execFileSync. On Windows, the package managers are typically `.cmd`
     // shims; Node's child_process spawns `.cmd` via cmd.exe, which searches
@@ -317,8 +322,8 @@ export async function safeInstallHandler(args, invocation) {
             stdio: ["ignore", "pipe", "pipe"],
         });
     } catch (err) {
-        stdout = err.stdout ? String(err.stdout) : "";
-        stderr = err.stderr ? String(err.stderr) : err.message;
+        stdout = err.stdout ? String(err.stdout): "";
+        stderr = err.stderr ? String(err.stderr): err.message;
         exitCode = err.status || 1;
         return failure(`${ecosystem} install failed (exit ${exitCode}): ${stderr.slice(-2000)}`);
     }
@@ -330,6 +335,7 @@ export async function safeInstallHandler(args, invocation) {
         exitCode,
         stdout: stdout.slice(-4000),
         stderr: stderr.slice(-2000),
+        hostInstallGate: gate.reason,
     });
 }
 

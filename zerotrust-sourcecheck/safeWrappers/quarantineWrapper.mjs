@@ -24,7 +24,7 @@ function safeRemove(p) {
 function pathsEqual(left, right) {
     const a = nodePath.resolve(left);
     const b = nodePath.resolve(right);
-    return process.platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b;
+    return process.platform === "win32" ? a.toLowerCase() === b.toLowerCase(): a === b;
 }
 
 function resolvedQuarantinePath(ctx) {

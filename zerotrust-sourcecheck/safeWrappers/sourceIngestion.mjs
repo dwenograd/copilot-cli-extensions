@@ -13,8 +13,11 @@ import {
     getAnalysisIndexSnapshot,
     getAnalysisIndexState,
     getTrustedAuditContext,
+    getAssuranceState,
+    advanceAssuranceStage,
     maybeAdvanceAnalysisPrepared,
     mutateAnalysisIndexState,
+    recordAssuranceSnapshot,
 } from "../enforcement.mjs";
 import { modeNeedsClone, modeUsesLocalSource } from "../modes.mjs";
 import { extractFactsFromText } from "../analysis/extractFacts.mjs";
@@ -25,6 +28,14 @@ import {
     recordIndexedFile,
     recordIndexReadFailure,
 } from "../analysis/indexState.mjs";
+import {
+    ASSURANCE_ANALYSIS_SCHEMA_REVISION,
+    EVASIVE_BLOCKERS,
+    applyDerivedArtifactsToSnapshot,
+    buildDerivedArtifacts,
+    buildLocalObjectInventory,
+    rebindDerivedArtifactSummary,
+} from "../analysis/index.mjs";
 import { __internals as apiClientInternals } from "./apiClient.mjs";
 import { DEFAULT_BUILD_ROOT } from "./defaults.mjs";
 import { failure, success } from "./result.mjs";
@@ -40,8 +51,7 @@ function pathsEqual(left, right) {
     const a = nodePath.resolve(left);
     const b = nodePath.resolve(right);
     return process.platform === "win32"
-        ? a.toLowerCase() === b.toLowerCase()
-        : a === b;
+        ? a.toLowerCase() === b.toLowerCase(): a === b;
 }
 
 function pathIsUnder(root, candidate) {
@@ -100,6 +110,8 @@ function assertSafeRoot(root) {
 function enumerateSource(root) {
     assertSafeRoot(root);
     const files = [];
+    const directoryEntries = [];
+    const reparsePoints = [];
     const stack = [{ absolute: root, relative: "" }];
     let directories = 0;
     let reparsePointsSkipped = 0;
@@ -128,8 +140,7 @@ function enumerateSource(root) {
                 continue;
             }
             const relative = current.relative
-                ? `${current.relative}/${entry.name}`
-                : entry.name;
+                ? `${current.relative}/${entry.name}`: entry.name;
             const normalized = normalizeRelativePath(relative.replace(/\\/g, "/"));
             const absolute = nodePath.resolve(root, ...normalized.split("/"));
             if (!pathIsUnder(root, absolute)) {
@@ -138,9 +149,15 @@ function enumerateSource(root) {
             const stats = lstatSync(absolute);
             if (stats.isSymbolicLink()) {
                 reparsePointsSkipped += 1;
+                reparsePoints.push({
+                    path: normalized,
+                    size: Number.isSafeInteger(stats.size) && stats.size >= 0
+                        ? stats.size: 0,
+                });
                 continue;
             }
             if (stats.isDirectory()) {
+                directoryEntries.push({ path: normalized, size: 0 });
                 stack.push({ absolute, relative: normalized });
                 continue;
             }
@@ -163,6 +180,8 @@ function enumerateSource(root) {
     files.sort((a, b) => a.path.localeCompare(b.path));
     return {
         files,
+        directoryEntries,
+        reparsePoints,
         directories,
         reparsePointsSkipped,
         otherEntriesSkipped,
@@ -213,6 +232,7 @@ function publicClassification(result) {
         likelyBinaryByExtension: result.likelyBinaryByExtension === true,
         contentTooLarge: result.contentTooLarge === true,
         textTruncated: result.textTruncated === true,
+        lfsPointer: result.lfsPointer || null,
     };
 }
 
@@ -233,10 +253,9 @@ export async function safeListSourceHandler(args, invocation) {
         return failure(`safe_list_source refused: ${err.message}`);
     }
 
-    const cursor = args.cursor === undefined ? 0 : Number(args.cursor);
+    const cursor = args.cursor === undefined ? 0: Number(args.cursor);
     const pageSize = args.page_size === undefined
-        ? MAX_OUTPUT_ENTRIES
-        : Number(args.page_size);
+        ? MAX_OUTPUT_ENTRIES: Number(args.page_size);
     if (!Number.isSafeInteger(cursor) || cursor < 0) {
         return failure("cursor must be a non-negative integer");
     }
@@ -245,12 +264,14 @@ export async function safeListSourceHandler(args, invocation) {
     }
 
     let indexState = getAnalysisIndexState(sessionId);
+    let inventoryEnumeration = null;
     try {
         if (!indexState || indexState.sourceKind !== bound.sourceKind) {
             return failure("safe_list_source refused: analysis index source kind is not bound to this audit");
         }
         if (indexState.enumeration.attempts === 0) {
             const enumerated = enumerateSource(bound.root);
+            inventoryEnumeration = enumerated;
             const mutation = mutateAnalysisIndexState(sessionId, (state) =>
                 recordIndexEnumeration(state, {
                     entries: enumerated.files,
@@ -260,8 +281,7 @@ export async function safeListSourceHandler(args, invocation) {
                     reparsePointsSkipped: enumerated.reparsePointsSkipped,
                     otherEntriesSkipped: enumerated.otherEntriesSkipped,
                     blocker: enumerated.trackingTruncated
-                        ? "source file count exceeded the bounded enumeration cap"
-                        : null,
+                        ? "source file count exceeded the bounded enumeration cap": null,
                 }));
             if (!mutation.ok) {
                 return failure("safe_list_source refused: could not persist source enumeration");
@@ -280,9 +300,24 @@ export async function safeListSourceHandler(args, invocation) {
         status: file.status,
     }));
     const nextCursor = cursor + pageSize < indexState.files.length
-        ? cursor + pageSize
-        : null;
+        ? cursor + pageSize: null;
     const preparation = maybeAdvanceAnalysisPrepared(sessionId);
+    let assuranceObjectInventory = null;
+    try {
+        assuranceObjectInventory = persistLocalObjectInventory({
+            sessionId,
+            ctx,
+            bound,
+            enumeration: inventoryEnumeration,
+            indexState: getAnalysisIndexState(sessionId),
+        });
+    } catch {
+        assuranceObjectInventory = {
+            schemaVersion: ASSURANCE_ANALYSIS_SCHEMA_REVISION,
+            complete: false,
+            blockerCodes: [EVASIVE_BLOCKERS.INVENTORY_INCOMPLETE],
+        };
+    }
     return success({
         sourceKind: bound.sourceKind,
         sourceRoot: bound.root,
@@ -294,6 +329,7 @@ export async function safeListSourceHandler(args, invocation) {
         analysisStageState: preparation?.analysisStageState || ctx.analysisStageState,
         analysisPlugins: preparation?.analysisPlugins || ctx.analysisPlugins,
         behaviorGraph: preparation?.behaviorGraph || ctx.behaviorGraph,
+        assuranceObjectInventory,
     });
 }
 
@@ -321,15 +357,14 @@ export async function safeIndexSourceFileHandler(args, invocation) {
         return failure(`safe_index_source_file refused: ${err.message}`);
     }
     const maxBytes = args.max_bytes === undefined
-        ? DEFAULT_MAX_FILE_BYTES
-        : Math.min(Number(args.max_bytes), HARD_MAX_FILE_BYTES);
+        ? DEFAULT_MAX_FILE_BYTES: Math.min(Number(args.max_bytes), HARD_MAX_FILE_BYTES);
     if (!Number.isSafeInteger(maxBytes) || maxBytes < 1) {
         return failure("max_bytes must be a positive integer");
     }
 
     const indexState = getAnalysisIndexState(sessionId);
     const fileIndex = indexState?.fileIndex?.get(relativePath);
-    const enumerated = Number.isInteger(fileIndex) ? indexState.files[fileIndex] : null;
+    const enumerated = Number.isInteger(fileIndex) ? indexState.files[fileIndex]: null;
     if (!enumerated) {
         return failure(
             `safe_index_source_file refused: path was not enumerated by zerotrust_safe_list_source: ${relativePath}`,
@@ -338,6 +373,14 @@ export async function safeIndexSourceFileHandler(args, invocation) {
 
     let absolutePath;
     let preOpenStats;
+    let buffer = null;
+    let bufferZeroed = false;
+    const zeroBufferOnce = () => {
+        if (buffer !== null && !bufferZeroed) {
+            buffer.fill(0);
+            bufferZeroed = true;
+        }
+    };
     try {
         absolutePath = assertPathChainNoReparse(bound.root, relativePath);
         if (!pathsEqual(absolutePath, nodePath.resolve(bound.root, ...relativePath.split("/")))) {
@@ -350,6 +393,7 @@ export async function safeIndexSourceFileHandler(args, invocation) {
             );
         }
     } catch (err) {
+        zeroBufferOnce;
         mutateAnalysisIndexState(sessionId, (state) =>
             recordIndexReadFailure(state, { path: relativePath, error: err }));
         return failure(`safe_index_source_file refused: ${err.message}`, {
@@ -388,10 +432,10 @@ export async function safeIndexSourceFileHandler(args, invocation) {
     }
 
     let fd = null;
-    let buffer = null;
     let fetchResult = null;
     let extraction = { facts: [], overflow: false, lineCount: null };
     let unicode = { complete: false, matchCount: 0 };
+    let preserveBufferForAssurance = false;
     try {
         fd = openSync(
             absolutePath,
@@ -427,6 +471,8 @@ export async function safeIndexSourceFileHandler(args, invocation) {
                 maxTextBytes: maxBytes,
             },
         );
+        const copiedAnalysisBytes = apiClientInternals.takeFetchAnalysisBytes(fetchResult);
+        if (copiedAnalysisBytes) copiedAnalysisBytes.fill(0);
         const fullText = fetchResult.classification === "text"
             && fetchResult.classificationComplete === true
             && fetchResult.contentReturned === true
@@ -440,64 +486,194 @@ export async function safeIndexSourceFileHandler(args, invocation) {
             });
             delete fetchResult.text;
         }
+        preserveBufferForAssurance = true;
     } catch (err) {
+        zeroBufferOnce;
         mutateAnalysisIndexState(sessionId, (state) =>
             recordIndexReadFailure(state, { path: relativePath, error: err }));
         return failure(`safe_index_source_file failed: ${err.message}`, {
             analysisIndex: getAnalysisIndexSnapshot(sessionId),
         });
     } finally {
-        if (fd !== null) closeSync(fd);
-        if (buffer) buffer.fill(0);
-    }
-
-    let analysisFacts;
-    try {
-        const mutation = mutateAnalysisIndexState(sessionId, (state) => {
-            recordIndexedFile(state, {
-                path: relativePath,
-                size: fetchResult.sizeBytes,
-                classification: fetchResult.classification,
-                classificationComplete: fetchResult.classificationComplete,
-                contentTooLarge: fetchResult.contentTooLarge === true,
-                textTruncated: fetchResult.textTruncated === true,
-                contentSha256: fetchResult.sha256 || null,
-                facts: extraction.facts,
-                factsOverflow: extraction.overflow,
-                lineCount: fetchResult.classification === "text"
-                    ? extraction.lineCount
-                    : null,
-                invisibleUnicodeScanComplete: unicode.complete,
-                invisibleUnicodeMatchCount: unicode.matchCount,
-            });
-            analysisFacts = listIndexedFacts(state, {
-                path: relativePath,
-                limit: 256,
-            }).facts;
-            return true;
-        });
-        if (!mutation.ok) {
-            return failure("safe_index_source_file refused: could not persist analysis facts");
+        try {
+            if (fd !== null) closeSync(fd);
+        } catch (err) {
+            zeroBufferOnce;
+            throw err;
+        } finally {
+            if (!preserveBufferForAssurance) zeroBufferOnce;
         }
-    } catch (err) {
-        return failure(`safe_index_source_file accounting failed: ${err.message}`);
-    } finally {
-        if (fetchResult && Object.hasOwn(fetchResult, "text")) delete fetchResult.text;
-        extraction = null;
     }
 
-    const preparation = maybeAdvanceAnalysisPrepared(sessionId);
-    return success({
-        sourceKind: bound.sourceKind,
+    try {
+        let analysisFacts;
+        try {
+            const mutation = mutateAnalysisIndexState(sessionId, (state) => {
+                recordIndexedFile(state, {
+                    path: relativePath,
+                    size: fetchResult.sizeBytes,
+                    classification: fetchResult.classification,
+                    classificationComplete: fetchResult.classificationComplete,
+                    contentTooLarge: fetchResult.contentTooLarge === true,
+                    textTruncated: fetchResult.textTruncated === true,
+                    contentSha256: fetchResult.sha256 || null,
+                    facts: extraction.facts,
+                    factsOverflow: extraction.overflow,
+                    lineCount: fetchResult.classification === "text"
+                        ? extraction.lineCount: null,
+                    invisibleUnicodeScanComplete: unicode.complete,
+                    invisibleUnicodeMatchCount: unicode.matchCount,
+                });
+                analysisFacts = listIndexedFacts(state, {
+                    path: relativePath,
+                    limit: 256,
+                }).facts;
+                return true;
+            });
+            if (!mutation.ok) {
+                return failure("safe_index_source_file refused: could not persist analysis facts");
+            }
+        } catch (err) {
+            return failure(`safe_index_source_file accounting failed: ${err.message}`);
+        } finally {
+            if (fetchResult && Object.hasOwn(fetchResult, "text")) delete fetchResult.text;
+            extraction = null;
+        }
+
+        const preparation = maybeAdvanceAnalysisPrepared(sessionId);
+        let assuranceObjectInventory = null;
+        let assuranceDerivedAnalysis = null;
+        try {
+            assuranceObjectInventory = persistLocalObjectInventory({
+                sessionId,
+                ctx,
+                bound,
+                enumeration: null,
+                indexState: getAnalysisIndexState(sessionId),
+                observations: { [relativePath]: fetchResult },
+            });
+        } catch {
+            assuranceObjectInventory = {
+                schemaVersion: ASSURANCE_ANALYSIS_SCHEMA_REVISION,
+                complete: false,
+                blockerCodes: [EVASIVE_BLOCKERS.INVENTORY_INCOMPLETE],
+            };
+        }
+        try {
+            assuranceDerivedAnalysis = persistLocalDerivedAnalysis({
+                sessionId,
+                ctx,
+                path: relativePath,
+                buffer,
+            });
+        } catch {
+            assuranceDerivedAnalysis = null;
+        }
+        return success({
+            sourceKind: bound.sourceKind,
+            sourceRoot: bound.root,
+            ...publicClassification(fetchResult),
+            invisibleUnicodeScan: unicode,
+            analysisFacts,
+            analysisIndex: preparation?.analysisIndex || getAnalysisIndexSnapshot(sessionId),
+            analysisStageState: preparation?.analysisStageState || ctx.analysisStageState,
+            analysisPlugins: preparation?.analysisPlugins || ctx.analysisPlugins,
+            behaviorGraph: preparation?.behaviorGraph || ctx.behaviorGraph,
+            assuranceObjectInventory,
+            assuranceDerivedAnalysis,
+        });
+    } finally {
+        zeroBufferOnce;
+    }
+}
+
+function persistLocalObjectInventory({
+    sessionId,
+    ctx,
+    bound,
+    enumeration,
+    indexState,
+    observations = null,
+}) {
+    let current = getAssuranceState(sessionId, { auditId: ctx.auditId });
+    if (!current || !["acquired", "inventoried"].includes(current.stageState.current)) {
+        return current?.analysisSnapshot
+            ? {
+                schemaVersion: ASSURANCE_ANALYSIS_SCHEMA_REVISION,
+                snapshotId: current.analysisSnapshot.snapshotId,
+                stage: current.stageState.current,
+                complete: current.stageState.history.includes("inventoried"),
+                blockerCodes: current.analysisSnapshot.blockerCodes,
+                inventorySha256: current.analysisSnapshot.hashes.inventorySha256,
+                sourceIdentitySha256:
+                    current.analysisSnapshot.hashes.sourceIdentitySha256,
+            }: null;
+    }
+    let built = buildLocalObjectInventory({
+        auditId: current.auditId,
+        sourceNamespace: current.sourceNamespace,
+        stageState: current.stageState,
         sourceRoot: bound.root,
-        ...publicClassification(fetchResult),
-        invisibleUnicodeScan: unicode,
-        analysisFacts,
-        analysisIndex: preparation?.analysisIndex || getAnalysisIndexSnapshot(sessionId),
-        analysisStageState: preparation?.analysisStageState || ctx.analysisStageState,
-        analysisPlugins: preparation?.analysisPlugins || ctx.analysisPlugins,
-        behaviorGraph: preparation?.behaviorGraph || ctx.behaviorGraph,
+        enumeration,
+        indexState,
+        observations,
+        previousSnapshot: current.analysisSnapshot,
     });
+    if (built.summary.complete && current.stageState.current === "acquired") {
+        current = advanceAssuranceStage(sessionId, {
+            auditId: current.auditId,
+            from: "acquired",
+            to: "inventoried",
+        });
+        built = buildLocalObjectInventory({
+            auditId: current.auditId,
+            sourceNamespace: current.sourceNamespace,
+            stageState: current.stageState,
+            sourceRoot: bound.root,
+            enumeration,
+            indexState,
+            observations,
+            previousSnapshot: built.snapshot,
+        });
+    }
+    recordAssuranceSnapshot(sessionId, {
+        auditId: current.auditId,
+        snapshot: built.snapshot,
+    });
+    return built.summary;
+}
+
+function persistLocalDerivedAnalysis({ sessionId, ctx, path, buffer }) {
+    let current = getAssuranceState(sessionId, { auditId: ctx.auditId });
+    if (!current?.analysisSnapshot
+        || !["acquired", "inventoried"].includes(current.stageState.current)) {
+        return null;
+    }
+    const built = buildDerivedArtifacts({
+        snapshot: current.analysisSnapshot,
+        path,
+        buffer,
+    });
+    let snapshot = built.snapshot;
+    let summary = built.summary;
+    if (built.decodeComplete && current.stageState.current === "inventoried") {
+        current = advanceAssuranceStage(sessionId, {
+            auditId: current.auditId,
+            from: "inventoried",
+            to: "decoded",
+        });
+        snapshot = applyDerivedArtifactsToSnapshot({
+            snapshot,
+            artifacts: [],
+            stageState: current.stageState,
+        });
+        summary = rebindDerivedArtifactSummary(summary, snapshot);
+    }
+    recordAssuranceSnapshot(sessionId, {
+        auditId: current.auditId,
+        snapshot,
+    });
+    return summary;
 }
 
 export const __internals = Object.freeze({

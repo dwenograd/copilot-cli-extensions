@@ -1,6 +1,163 @@
 import { createHash } from "node:crypto";
 
-export const ANALYSIS_SCHEMA_VERSION = 5;
+// Assurance is the current additive static contract. The baseline analysis
+// contracts below remain inputs to earlier stages of the same workflow.
+export {
+    ARTIFACT_SUPPORT_LEVELS,
+    ASSURANCE_BLOCKER_CODES,
+    ASSURANCE_BLOCKERS,
+    ASSURANCE_COVERAGE_STATUSES,
+    ASSURANCE_LEVELS,
+    ASSURANCE_LIMITS,
+    ASSURANCE_SCHEMA_REVISION,
+    EVASION_CLASSES,
+    EVASION_CLASS_VALUES,
+    SUPPLY_CHAIN_EVASION_CLASSES,
+    AssuranceContractError,
+    computeAssurance,
+    normalizeAssuranceInputs,
+    renderAssuranceWording,
+    validateAssuranceResult,
+} from "./assurance.mjs";
+
+export {
+    EVASIVE_BLOCKER_ASSURANCE_CODES,
+    EVASIVE_BLOCKER_CODES,
+    EVASIVE_BLOCKER_NAMESPACES,
+    EVASIVE_BLOCKERS,
+    EVASIVE_COVERAGE_STATUSES,
+    EVASIVE_DERIVED_ARTIFACT_KINDS,
+    EVASIVE_DERIVED_ARTIFACT_STATUSES,
+    EVASIVE_GIT_MODES,
+    EVASIVE_GIT_OBJECT_TYPES,
+    EVASIVE_LIMITS,
+    EVASIVE_OBJECT_KINDS,
+    EVASIVE_OBJECT_STATUSES,
+    EVASIVE_SNAPSHOT_STATUSES,
+    EVASIVE_SEMANTIC_BENIGN_HYPOTHESIS_CODES,
+    EVASIVE_SEMANTIC_CANDIDATE_CONFIDENCE_LEVELS,
+    EVASIVE_SEMANTIC_CANDIDATE_FIT_LEVELS,
+    EVASIVE_SEMANTIC_CANDIDATE_SEVERITIES,
+    EVASIVE_SYMLINK_TARGET_KINDS,
+    EVASIVE_TRANSFORM_KINDS,
+    EvasiveContractError,
+    createAssuranceAnalysisSnapshot,
+    createEvasiveDerivedArtifactRecord,
+    createEvasiveObjectInventoryRecord,
+    createEvasiveRedTeamCoverageRecord,
+    createEvasiveSemanticCandidateRecord,
+    createEvasiveSemanticReviewCoverageRecord,
+    mapEvasiveBlockerToAssuranceCode,
+    validateAssuranceAnalysisSnapshot,
+    validateEvasiveDerivedArtifactRecord,
+    validateEvasiveObjectInventoryRecord,
+    validateEvasiveRedTeamCoverageRecord,
+    validateEvasiveSemanticCandidateRecord,
+    validateEvasiveSemanticReviewCoverageRecord,
+} from "./evasiveSchemas.mjs";
+
+export {
+    ASSURANCE_ANALYSIS_SCHEMA_REVISION,
+    ASSURANCE_STAGES,
+    AssuranceStateContractError,
+    createInitialAssuranceStageState,
+    isAdjacentAssuranceStageTransition,
+    transitionAssuranceStageState,
+    validateAssuranceStageState,
+} from "./assuranceState.mjs";
+
+export {
+    EVASIVE_GRAPH_EDGE_KINDS,
+    EVASIVE_GRAPH_FINDING_ORIGINS,
+    EVASIVE_GRAPH_LIMITS,
+    EVASIVE_GRAPH_NODE_KINDS,
+    EVASIVE_GRAPH_NODE_STATUSES,
+    EVASIVE_GRAPH_PLAN_KIND,
+    EVASIVE_GRAPH_SCHEMA_REVISION,
+    EvasiveGraphContractError,
+    createEvasiveGraphConflict,
+    createEvasiveGraphEdge,
+    createEvasiveGraphEvidenceRecord,
+    createEvasiveGraphFinding,
+    createEvasiveGraphNode,
+    createEvasiveGraphPlan,
+    normalizeEvasiveGraphLimits,
+    validateEvasiveGraphConflict,
+    validateEvasiveGraphEdge,
+    validateEvasiveGraphFinding,
+    validateEvasiveGraphNode,
+    validateEvasiveGraphPlan,
+} from "./evasiveGraphSchemas.mjs";
+
+export {
+    SEMANTIC_ASSIGNMENT_ISSUER_ID,
+    SEMANTIC_CHECK_NAMES,
+    SEMANTIC_CHECK_RESULTS,
+    SEMANTIC_COVERAGE_EVALUATION_KIND,
+    SEMANTIC_COVERAGE_LIMITS,
+    SEMANTIC_COVERAGE_PLAN_KIND,
+    SEMANTIC_COVERAGE_SCHEMA_REVISION,
+    SEMANTIC_NEGATIVE_EVIDENCE_CODES,
+    SEMANTIC_OBJECT_CLASSES,
+    SEMANTIC_REVIEW_ASSIGNMENT_KIND,
+    SEMANTIC_REVIEW_DECISIONS,
+    SEMANTIC_REVIEW_MODE,
+    SEMANTIC_REVIEW_RECORD_KIND,
+    SEMANTIC_SCANNER_ASSIGNMENT_KIND,
+    SEMANTIC_SCANNER_RECORD_KIND,
+    SEMANTIC_VIEW_KIND,
+    SemanticCoverageContractError,
+    applySemanticCoverageToSnapshot,
+    classifyObjectForSemanticCoverage,
+    createSemanticCandidate,
+    createSemanticCoveragePlan,
+    createSemanticReviewAssignment,
+    createSemanticReviewRecord,
+    createSemanticScannerCoverageRecord,
+    createSemanticView,
+    evaluateSemanticCoverage,
+    semanticSnapshotCanAdvance,
+    validateSemanticCoveragePlan,
+    validateSemanticCandidate,
+    validateSemanticReviewAssignment,
+    validateSemanticReviewRecord,
+    validateSemanticScannerCoverageRecord,
+    validateSemanticView,
+} from "./semanticCoverage.mjs";
+
+export {
+    RED_TEAM_ASSIGNMENT_ISSUER_ID,
+    RED_TEAM_ASSIGNMENT_KIND,
+    RED_TEAM_BENIGN_HYPOTHESIS_CODES,
+    RED_TEAM_CANARY_MARKER,
+    RED_TEAM_CATEGORIES,
+    RED_TEAM_CATEGORY_IDS,
+    RED_TEAM_EVALUATION_KIND,
+    RED_TEAM_HANDOFF_KIND,
+    RED_TEAM_LIMITS,
+    RED_TEAM_MANDATORY_CATEGORY_IDS,
+    RED_TEAM_OUTPUT_CONTRACT_MARKER,
+    RED_TEAM_PLAN_KIND,
+    RED_TEAM_PROCEDURAL_LIMIT_CODES,
+    RED_TEAM_REVIEW_DECISIONS,
+    RED_TEAM_REVIEW_MODE,
+    RED_TEAM_REVIEW_RECORD_KIND,
+    RED_TEAM_SCHEMA_REVISION,
+    RedTeamContractError,
+    applyRedTeamCoverageToSnapshot,
+    createRedTeamAssignment,
+    createRedTeamPlan,
+    createRedTeamReviewRecord,
+    createRedTeamScannedSnapshot,
+    evaluateRedTeamCoverage,
+    redTeamSnapshotCanAdvance,
+    validateRedTeamAssignment,
+    validateRedTeamEvaluation,
+    validateRedTeamPlan,
+    validateRedTeamReviewRecord,
+} from "./redTeam.mjs";
+
+export const ANALYSIS_SCHEMA_REVISION = 5;
 
 export const LIMITS = Object.freeze({
     auditId: 36,
@@ -109,8 +266,8 @@ export const ANALYSIS_STAGES = Object.freeze([
 
 const IDENTIFIER_RE = /^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,127}$/;
 const BEHAVIOR_TOKEN_RE = /^[a-z][a-z0-9._:/-]{0,127}$/;
-const FINDING_ID_RE = /^ztf-v5-[a-f0-9]{64}$/;
-const UUID_V4_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const FINDING_ID_RE = /^ztf-[a-f0-9]{64}$/;
+const AUDIT_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const SHA256_RE = /^[a-f0-9]{64}$/i;
 const BLOB_SHA_RE = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i;
 
@@ -150,7 +307,7 @@ function boundedString(value, path, {
     normalize = false,
 } = {}) {
     if (typeof value !== "string") fail(path, "must be a string");
-    const result = normalize ? value.normalize("NFKC").trim() : value;
+    const result = normalize ? value.normalize("NFKC").trim(): value;
     if (result.length < min || result.length > max) {
         fail(path, `length must be between ${min} and ${max}`);
     }
@@ -212,7 +369,7 @@ function uniqueStrings(values, path, {
             normalize,
         }));
     if (new Set(result).size !== result.length) fail(path, "must not contain duplicates");
-    return sort ? [...result].sort() : result;
+    return sort ? [...result].sort(): result;
 }
 
 function cloneFrozen(value) {
@@ -241,7 +398,7 @@ function canonicalJson(value) {
 export function validateAuditId(value, path = "auditId") {
     return boundedString(value, path, {
         max: LIMITS.auditId,
-        pattern: UUID_V4_RE,
+        pattern: AUDIT_ID_RE,
     }).toLowerCase();
 }
 
@@ -380,12 +537,12 @@ export function computeFindingId(sourceIdentity, behaviorSignature) {
     const source = validateSourceIdentity(sourceIdentity);
     const behavior = normalizeBehaviorSignature(behaviorSignature);
     const digest = createHash("sha256")
-        .update("zerotrust-finding-v5\0", "utf8")
+        .update("zerotrust-finding\0", "utf8")
         .update(canonicalJson(source), "utf8")
         .update("\0", "utf8")
         .update(canonicalJson(behavior), "utf8")
         .digest("hex");
-    return `ztf-v5-${digest}`;
+    return `ztf-${digest}`;
 }
 
 export function validateGraphNode(value, path = "graphNode") {
@@ -402,11 +559,11 @@ export function validateGraphNode(value, path = "graphNode") {
         "behaviorSignature",
         "tags",
     ]);
-    if (value.schemaVersion !== ANALYSIS_SCHEMA_VERSION) {
-        fail(`${path}.schemaVersion`, `must equal ${ANALYSIS_SCHEMA_VERSION}`);
+    if (value.schemaVersion !== ANALYSIS_SCHEMA_REVISION) {
+        fail(`${path}.schemaVersion`, `must equal ${ANALYSIS_SCHEMA_REVISION}`);
     }
     const result = {
-        schemaVersion: ANALYSIS_SCHEMA_VERSION,
+        schemaVersion: ANALYSIS_SCHEMA_REVISION,
         auditId: validateAuditId(value.auditId, `${path}.auditId`),
         id: validateIdentifier(value.id, `${path}.id`),
         kind: enumValue(value.kind, `${path}.kind`, GRAPH_NODE_KINDS),
@@ -452,11 +609,11 @@ export function validateGraphEdge(value, path = "graphEdge") {
         "producer",
         "evidence",
     ], ["label", "tags"]);
-    if (value.schemaVersion !== ANALYSIS_SCHEMA_VERSION) {
-        fail(`${path}.schemaVersion`, `must equal ${ANALYSIS_SCHEMA_VERSION}`);
+    if (value.schemaVersion !== ANALYSIS_SCHEMA_REVISION) {
+        fail(`${path}.schemaVersion`, `must equal ${ANALYSIS_SCHEMA_REVISION}`);
     }
     const result = {
-        schemaVersion: ANALYSIS_SCHEMA_VERSION,
+        schemaVersion: ANALYSIS_SCHEMA_REVISION,
         auditId: validateAuditId(value.auditId, `${path}.auditId`),
         id: validateIdentifier(value.id, `${path}.id`),
         kind: enumValue(value.kind, `${path}.kind`, GRAPH_EDGE_KINDS),
@@ -485,8 +642,8 @@ export function validateGraphEdge(value, path = "graphEdge") {
 
 export function validateBehaviorGraphDocument(value, path = "behaviorGraph") {
     objectShape(value, path, ["schemaVersion", "auditId", "nodes", "edges"]);
-    if (value.schemaVersion !== ANALYSIS_SCHEMA_VERSION) {
-        fail(`${path}.schemaVersion`, `must equal ${ANALYSIS_SCHEMA_VERSION}`);
+    if (value.schemaVersion !== ANALYSIS_SCHEMA_REVISION) {
+        fail(`${path}.schemaVersion`, `must equal ${ANALYSIS_SCHEMA_REVISION}`);
     }
     const auditId = validateAuditId(value.auditId, `${path}.auditId`);
     const nodes = boundedArray(value.nodes, `${path}.nodes`, LIMITS.graphNodes)
@@ -509,7 +666,7 @@ export function validateBehaviorGraphDocument(value, path = "behaviorGraph") {
         }
     }
     return cloneFrozen({
-        schemaVersion: ANALYSIS_SCHEMA_VERSION,
+        schemaVersion: ANALYSIS_SCHEMA_REVISION,
         auditId,
         nodes,
         edges,
@@ -534,8 +691,8 @@ export function validateCandidateFinding(value, path = "finding") {
         "edgeIds",
         "producer",
     ], ["tags"]);
-    if (value.schemaVersion !== ANALYSIS_SCHEMA_VERSION) {
-        fail(`${path}.schemaVersion`, `must equal ${ANALYSIS_SCHEMA_VERSION}`);
+    if (value.schemaVersion !== ANALYSIS_SCHEMA_REVISION) {
+        fail(`${path}.schemaVersion`, `must equal ${ANALYSIS_SCHEMA_REVISION}`);
     }
     const sourceIdentity = validateSourceIdentity(
         value.sourceIdentity,
@@ -554,7 +711,7 @@ export function validateCandidateFinding(value, path = "finding") {
         fail(`${path}.id`, "must be derived from sourceIdentity and behaviorSignature");
     }
     const result = {
-        schemaVersion: ANALYSIS_SCHEMA_VERSION,
+        schemaVersion: ANALYSIS_SCHEMA_REVISION,
         auditId: validateAuditId(value.auditId, `${path}.auditId`),
         id,
         sourceIdentity,
@@ -618,11 +775,11 @@ export function validateValidationDecision(value, path = "validationDecision") {
         "rationale",
         "evidence",
     ]);
-    if (value.schemaVersion !== ANALYSIS_SCHEMA_VERSION) {
-        fail(`${path}.schemaVersion`, `must equal ${ANALYSIS_SCHEMA_VERSION}`);
+    if (value.schemaVersion !== ANALYSIS_SCHEMA_REVISION) {
+        fail(`${path}.schemaVersion`, `must equal ${ANALYSIS_SCHEMA_REVISION}`);
     }
     return cloneFrozen({
-        schemaVersion: ANALYSIS_SCHEMA_VERSION,
+        schemaVersion: ANALYSIS_SCHEMA_REVISION,
         auditId: validateAuditId(value.auditId, `${path}.auditId`),
         findingId: boundedString(value.findingId, `${path}.findingId`, {
             max: 71,
@@ -704,8 +861,8 @@ export function validateMetadataCacheDocument(value, path = "metadataDocument") 
         "capturedAt",
         "entries",
     ], ["expiresAt"]);
-    if (value.schemaVersion !== ANALYSIS_SCHEMA_VERSION) {
-        fail(`${path}.schemaVersion`, `must equal ${ANALYSIS_SCHEMA_VERSION}`);
+    if (value.schemaVersion !== ANALYSIS_SCHEMA_REVISION) {
+        fail(`${path}.schemaVersion`, `must equal ${ANALYSIS_SCHEMA_REVISION}`);
     }
     const capturedAt = isoTimestamp(value.capturedAt, `${path}.capturedAt`);
     const entries = boundedArray(
@@ -720,7 +877,7 @@ export function validateMetadataCacheDocument(value, path = "metadataDocument") 
         entryKeys.add(entry.key);
     }
     const result = {
-        schemaVersion: ANALYSIS_SCHEMA_VERSION,
+        schemaVersion: ANALYSIS_SCHEMA_REVISION,
         auditId: validateAuditId(value.auditId, `${path}.auditId`),
         namespace: validateIdentifier(value.namespace, `${path}.namespace`),
         key: validateIdentifier(value.key, `${path}.key`),
@@ -756,8 +913,8 @@ export function validatePluginOutput(value, path = "pluginOutput") {
         "metadataDocuments",
         "warnings",
     ]);
-    if (value.schemaVersion !== ANALYSIS_SCHEMA_VERSION) {
-        fail(`${path}.schemaVersion`, `must equal ${ANALYSIS_SCHEMA_VERSION}`);
+    if (value.schemaVersion !== ANALYSIS_SCHEMA_REVISION) {
+        fail(`${path}.schemaVersion`, `must equal ${ANALYSIS_SCHEMA_REVISION}`);
     }
     const auditId = validateAuditId(value.auditId, `${path}.auditId`);
     const nodes = boundedArray(value.nodes, `${path}.nodes`, LIMITS.graphNodes)
@@ -805,7 +962,7 @@ export function validatePluginOutput(value, path = "pluginOutput") {
         }
     }
     return cloneFrozen({
-        schemaVersion: ANALYSIS_SCHEMA_VERSION,
+        schemaVersion: ANALYSIS_SCHEMA_REVISION,
         auditId,
         pluginId: validateIdentifier(value.pluginId, `${path}.pluginId`),
         pluginVersion: boundedString(value.pluginVersion, `${path}.pluginVersion`, {
@@ -843,8 +1000,8 @@ export function validateAnalysisStageState(value, path = "analysisStageState") {
         "current",
         "history",
     ]);
-    if (value.schemaVersion !== ANALYSIS_SCHEMA_VERSION) {
-        fail(`${path}.schemaVersion`, `must equal ${ANALYSIS_SCHEMA_VERSION}`);
+    if (value.schemaVersion !== ANALYSIS_SCHEMA_REVISION) {
+        fail(`${path}.schemaVersion`, `must equal ${ANALYSIS_SCHEMA_REVISION}`);
     }
     const current = enumValue(value.current, `${path}.current`, ANALYSIS_STAGES);
     const history = boundedArray(
@@ -859,7 +1016,7 @@ export function validateAnalysisStageState(value, path = "analysisStageState") {
         fail(`${path}.history`, "must be the legal stage prefix ending at current");
     }
     return cloneFrozen({
-        schemaVersion: ANALYSIS_SCHEMA_VERSION,
+        schemaVersion: ANALYSIS_SCHEMA_REVISION,
         auditId: validateAuditId(value.auditId, `${path}.auditId`),
         current,
         history,
@@ -868,7 +1025,7 @@ export function validateAnalysisStageState(value, path = "analysisStageState") {
 
 export function createInitialAnalysisStageState(auditId) {
     return validateAnalysisStageState({
-        schemaVersion: ANALYSIS_SCHEMA_VERSION,
+        schemaVersion: ANALYSIS_SCHEMA_REVISION,
         auditId,
         current: "acquired",
         history: ["acquired"],

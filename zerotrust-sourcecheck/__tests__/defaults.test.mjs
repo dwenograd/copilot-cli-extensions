@@ -1,7 +1,7 @@
 // __tests__/defaults.test.mjs
 //
 // Tests for safeWrappers/defaults.mjs — the centralised DEFAULT_BUILD_ROOT
-// resolution. Round-18 introduced this module to replace the hardcoded
+// resolution. security rationale introduced this module to replace the hardcoded
 // hardcoded Windows path that used to be embedded in 9 source
 // files. The default now resolves from:
 //   1. ZEROTRUST_BUILD_ROOT env var, OR
@@ -36,8 +36,7 @@ test("resolveDefault: ZEROTRUST_BUILD_ROOT env var takes precedence", () => {
     const saved = process.env.ZEROTRUST_BUILD_ROOT;
     try {
         const override = process.platform === "win32"
-            ? "D:\\custom\\sandbox"
-            : "/var/custom/sandbox";
+            ? "D:\\custom\\sandbox": "/var/custom/sandbox";
         process.env.ZEROTRUST_BUILD_ROOT = override;
         const got = __internals.resolveDefault();
         assert.equal(got, nodePath.resolve(override));
@@ -77,7 +76,7 @@ test("resolveDefault: empty/whitespace env var is ignored, falls back to homedir
     }
 });
 
-// Round-19: env var path denylist
+// security rationale: env var path denylist
 test("isDangerousRoot: filesystem roots are rejected", () => {
     assert.equal(__internals.isDangerousRoot("/"), true);
     assert.equal(__internals.isDangerousRoot("C:\\"), true);
@@ -111,7 +110,7 @@ test("isDangerousRoot: legitimate sandbox paths are accepted", () => {
     }
 });
 
-// Round-19 segment-count tightening: 1-segment paths under root are also
+// security rationale segment-count tightening: 1-segment paths under root are also
 // rejected even when not on the explicit denylist, because they're
 // equally risky (e.g. `/sandbox`, `C:\foo`).
 test("isDangerousRoot: shallow 1-segment paths are rejected even if not on denylist", () => {
@@ -138,7 +137,7 @@ test("resolveDefault: dangerous env var path falls back to homedir + warns", () 
     let warned = false;
     console.warn = () => { warned = true; };
     try {
-        process.env.ZEROTRUST_BUILD_ROOT = process.platform === "win32" ? "C:\\Windows" : "/etc";
+        process.env.ZEROTRUST_BUILD_ROOT = process.platform === "win32" ? "C:\\Windows": "/etc";
         const got = __internals.resolveDefault();
         const expected = nodePath.resolve(
             nodePath.join(os.homedir(), ".copilot", "zerotrust-sandbox"),
@@ -156,8 +155,7 @@ test("resolveDefault: env var is trimmed before use", () => {
     const saved = process.env.ZEROTRUST_BUILD_ROOT;
     try {
         const inner = process.platform === "win32"
-            ? "D:\\sandbox\\trimmed"
-            : "/var/lib/trimmed-sandbox";
+            ? "D:\\sandbox\\trimmed": "/var/lib/trimmed-sandbox";
         process.env.ZEROTRUST_BUILD_ROOT = `   ${inner}   `;
         const got = __internals.resolveDefault();
         assert.equal(got, nodePath.resolve(inner));

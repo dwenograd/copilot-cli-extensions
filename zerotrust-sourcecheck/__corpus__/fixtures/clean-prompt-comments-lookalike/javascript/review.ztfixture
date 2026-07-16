@@ -1,0 +1,7 @@
+marker.comment("contributor-guidance-like-comment");
+marker.fact("activation-surface","manual-doc-review","javascript");
+marker.fact("language","javascript","source-text");
+marker.node("guidance-start","activation","manual-doc-review","activation,benign");
+marker.node("guidance-text","capability","tool-description","benign,documentation");
+marker.edge("guidance-flow","invokes","guidance-start","guidance-text","benign");
+marker.finding("guidance-lookalike","refuted","low","medium","unlikely","describe","tool-interface","documentation-output","benign,benign-lookalike,prompt-like");

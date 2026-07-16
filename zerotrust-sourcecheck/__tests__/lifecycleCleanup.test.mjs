@@ -35,7 +35,7 @@ function activateVerify(sessionId, { resolved = true } = {}) {
         expectedClonePath: buildClonePath(ROOT, "OctoCat", "Hello", "0".repeat(40)),
         owner: "OctoCat",
         repo: "Hello",
-        ref: "v1.0.0",
+        ref: "baseline.0.0",
         refType: "tag",
     });
     if (resolved) {
@@ -166,14 +166,12 @@ test("artifact-free metadata, API, and local audits are closable", async () => {
             buildPath: ROOT,
             mode: item.mode,
             expectedClonePath: item.local
-                ? undefined
-                : nodePath.join(ROOT, `OctoCat-Hello-${"0".repeat(40)}`),
-            owner: item.local ? undefined : "OctoCat",
-            repo: item.local ? undefined : "Hello",
-            localPath: item.local ? nodePath.join(ROOT, "local-source") : undefined,
+                ? undefined: nodePath.join(ROOT, `OctoCat-Hello-${"0".repeat(40)}`),
+            owner: item.local ? undefined: "OctoCat",
+            repo: item.local ? undefined: "Hello",
+            localPath: item.local ? nodePath.join(ROOT, "local-source"): undefined,
             expectedReportPath: item.local
-                ? nodePath.join(ROOT, "_reports", "local-local-source-20260713100727")
-                : undefined,
+                ? nodePath.join(ROOT, "_reports", "local-local-source-20260713100727"): undefined,
         });
         const result = await closeAuditHandler({}, { sessionId });
         assert.equal(result.resultType, "success", item.mode);
@@ -213,7 +211,7 @@ test("cleanupQuarantineHandler deletion failure leaves trusted context active", 
             {},
             { sessionId },
             {
-                remove: () => ({
+                remove:() => ({
                     existed: true,
                     removed: false,
                     error: "simulated quarantine lock",

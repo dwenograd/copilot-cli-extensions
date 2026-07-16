@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 
 import {
-    ANALYSIS_SCHEMA_VERSION,
+    ANALYSIS_SCHEMA_REVISION,
     CONFIDENCE_LEVELS,
     MALICIOUS_PROJECT_FIT_LEVELS,
     SEVERITIES,
@@ -60,7 +60,7 @@ function unique(values) {
 
 function strongest(values, ranks, fallback) {
     return values.reduce((current, value) =>
-        ranks[value] > ranks[current] ? value : current, fallback);
+        ranks[value] > ranks[current] ? value: current, fallback);
 }
 
 function bumpConfidence(level, amount = 1) {
@@ -204,8 +204,7 @@ export function buildTrustedDecisionSnapshot({
         scores: scoreFinding(finding),
     }));
     const stateCounts = deduped.stateCounts
-        ? { ...stateCountTemplate(), ...deduped.stateCounts }
-        : stateCountTemplate();
+        ? { ...stateCountTemplate(), ...deduped.stateCounts }: stateCountTemplate();
     const severityCounts = {
         active: countTemplate(),
         trustedValidated: countTemplate(),
@@ -263,14 +262,12 @@ export function buildTrustedDecisionSnapshot({
     else rationaleCodes.push("dedupe-incomplete");
 
     const blockerLimit = Number.isSafeInteger(limits.blockers)
-        ? Math.max(1, Math.min(limits.blockers, DECISION_SNAPSHOT_LIMITS.blockers))
-        : DECISION_SNAPSHOT_LIMITS.blockers;
+        ? Math.max(1, Math.min(limits.blockers, DECISION_SNAPSHOT_LIMITS.blockers)): DECISION_SNAPSHOT_LIMITS.blockers;
     const rationaleLimit = Number.isSafeInteger(limits.rationaleCodes)
         ? Math.max(1, Math.min(
             limits.rationaleCodes,
             DECISION_SNAPSHOT_LIMITS.rationaleCodes,
-        ))
-        : DECISION_SNAPSHOT_LIMITS.rationaleCodes;
+        )): DECISION_SNAPSHOT_LIMITS.rationaleCodes;
     const orderedBlockers = [...new Map(blockers.map((blocker) => [
         canonicalJson(blocker),
         blocker,
@@ -309,8 +306,7 @@ export function buildTrustedDecisionSnapshot({
         recommendedVerdict = "no red flags found";
         eligibleVerdicts.push("no red flags found");
         rationaleCodes.push(activeCount === 0
-            ? "no-active-findings"
-            : "policy-allows-unresolved-severe-no-red-flags");
+            ? "no-active-findings": "policy-allows-unresolved-severe-no-red-flags");
     } else if (severityVerdictEligible) {
         const highest = strongest(
             canonicalFindings
@@ -340,13 +336,13 @@ export function buildTrustedDecisionSnapshot({
     });
     const boundedBlockers = orderedBlockers.slice(0, blockerLimit);
     const boundedRationaleCodes = orderedRationaleCodes.slice(0, rationaleLimit);
-    const inputFingerprint = digest("zerotrust-decision-input-v5", {
+    const inputFingerprint = digest("zerotrust-decision-input-baseline", {
         auditId: normalizedAuditId,
         dedupeInputFingerprint: deduped.inputFingerprint,
         coverage: normalizedCoverage,
         policy: normalizedPolicy,
     });
-    const decisionId = `ztd-v5-${digest("zerotrust-decision-snapshot-v5", {
+    const decisionId = `ztd-${digest("zerotrust-decision-snapshot-baseline", {
         auditId: normalizedAuditId,
         inputFingerprint,
         canonicalFindings,
@@ -363,7 +359,7 @@ export function buildTrustedDecisionSnapshot({
     })}`;
 
     return Object.freeze(structuredClone({
-        schemaVersion: ANALYSIS_SCHEMA_VERSION,
+        schemaVersion: ANALYSIS_SCHEMA_REVISION,
         auditId: normalizedAuditId,
         decisionId,
         inputFingerprint,

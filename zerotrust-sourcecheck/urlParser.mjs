@@ -182,7 +182,7 @@ export function parseGithubUrl(input) {
         releaseSelector = "tag";
         // Slash-containing tags ARE supported here because there's no
         // path-into-tree ambiguity for /releases/tag/<tag> (everything
-        // after /tag/ is the tag name). gpt-5.5 reviewer Finding #6.
+        // after /tag/ is the tag name).
         ref = segments.slice(4).join("/");
         refType = "release_tag";
     } else if (segments.length === 3 && segments[2] === "releases") {
@@ -233,8 +233,8 @@ function ensureValidComponents(owner, repo, resolvedSha) {
     }
 }
 
-export const ARTIFACT_ID_PREFIX = "zt-v1-";
-export const ARTIFACT_NAME_RE = /^zt-v1-[0-9a-f]{64}$/;
+export const ARTIFACT_ID_PREFIX = "zt-";
+export const ARTIFACT_NAME_RE = /^zt-[0-9a-f]{64}$/;
 
 /**
  * Build a compact, collision-resistant basename for one repository commit.
@@ -281,7 +281,7 @@ export function buildClonePath(buildRoot, owner, repo, resolvedSha) {
 
 /**
  * Build the per-audit report directory:
- * <buildRoot>\_reports\<zt-v1-sha256-of-owner-repo-sha>.
+ * <buildRoot>\_reports\<zt-sha256-of-owner-repo-sha>.
  * Reports live OUTSIDE the cloned (untrusted) tree.
  */
 export function buildReportPath(buildRoot, owner, repo, resolvedSha) {
@@ -294,7 +294,7 @@ export function buildReportPath(buildRoot, owner, repo, resolvedSha) {
 
 /**
  * Build the per-audit quarantine directory for release assets:
- *   <buildRoot>\_quarantine\<zt-v1-sha256-of-owner-repo-sha>
+ *   <buildRoot>\_quarantine\<zt-sha256-of-owner-repo-sha>
  * Same containment guarantees as buildReportPath.
  */
 export function buildQuarantinePath(buildRoot, owner, repo, resolvedSha) {

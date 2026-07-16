@@ -33,7 +33,7 @@ export function mapOverallVerdict(findings, {
         return "incomplete";
     }
     let highestIndex = FINDING_SEVERITIES.length;
-    for (const finding of Array.isArray(findings) ? findings : []) {
+    for (const finding of Array.isArray(findings) ? findings: []) {
         if (!finding || finding.credible === false || finding.dismissed === true) continue;
         const severity = String(finding.severity || "").toLowerCase();
         const index = FINDING_SEVERITIES.indexOf(severity);
@@ -111,9 +111,8 @@ export function scoreGitAttributesFilter({
         finding: true,
         severity,
         classification: commands.length > 0
-            ? "custom-filter-with-driver"
-            : "custom-filter-declaration",
-        confidence: commands.length > 0 ? "high" : "medium",
+            ? "custom-filter-with-driver": "custom-filter-declaration",
+        confidence: commands.length > 0 ? "high": "medium",
     };
 }
 
@@ -137,10 +136,10 @@ function adjacentCodePoint(text, index, direction) {
     if (direction < 0) {
         const prefix = text.slice(0, index);
         const chars = Array.from(prefix);
-        return chars.length > 0 ? chars.at(-1) : "";
+        return chars.length > 0 ? chars.at(-1): "";
     }
     const codePoint = text.codePointAt(index);
-    const width = codePoint === undefined ? 0 : String.fromCodePoint(codePoint).length;
+    const width = codePoint === undefined ? 0: String.fromCodePoint(codePoint).length;
     return Array.from(text.slice(index + width))[0] || "";
 }
 
@@ -208,7 +207,7 @@ export function scoreInvisibleUnicode(text, { filePath = "" } = {}) {
     return {
         finding: true,
         severity,
-        confidence: severity === "critical" ? "high" : "medium",
+        confidence: severity === "critical" ? "high": "medium",
         suspiciousCount: suspicious.length,
         maxRun,
         counts,
@@ -217,198 +216,7 @@ export function scoreInvisibleUnicode(text, { filePath = "" } = {}) {
     };
 }
 
-// Shared lifecycle/remediation prose used by URL and local packets.
-
-/**
- * Section-9 remediation block: per active non-refuted finding, walk the user
- * through defang / delete-project / keep-as-is. Rendered into:
- *   - the local-source packet (always)
- *   - the URL-driven packet IF the mode wrote source to disk (build modes)
- *
- * `pinnedPath` is the path the agent is allowed to operate on for delete /
- * defang: `localPath` for local-source audits, `expectedClonePath` for
- * build modes. The packet refuses any other path.
- */
-export function renderRemediationBlock({
-    pinnedPath,
-    modeLabel,
-    remediationSource = null,
-}) {
-    const ledgerFlow = remediationSource
-        ? `Use \`${remediationSource}\` as the authoritative remediation ledger.
-Require its audit ID to match the active audit. It contains at most one
-source-text-free candidate per validated active canonical finding:
-target behavior-chain edge IDs, evidence-bound paths/lines and hashes, expected
-behavior removed, legitimate-functionality risk, and static verification
-criteria. Refuted findings have no entry. Unresolved findings may have only
-\`investigationGuidance\` with \`confidentPatchAllowed: false\`.
-
-Reject duplicate candidate IDs, multiple candidates for the same canonical or
-source finding, identity mismatch, cap/truncation flags, or any unexpected
-source/snippet/diff field. The persistent ledger stores locations, hashes, and
-intent only. A bounded diff proposal is assembled ephemerally in the parent
-conversation after \`view\`; never write that proposal back into the ledger or
-REPORT.md/FINDINGS.json.`
-        : `This non-council flow has no validated remediation ledger. Treat the
-report finding as the single remediation identity and retain the same
-one-finding approval, path, backup, and re-audit rules below. Do not infer that a
-local edit breaks every activation-to-effect path; only a fresh full audit can
-establish that.`;
-    return `## Section 9b — Remediation: defang, delete, or knowingly keep (pre-finalization)
-
-${remediationSource
-        ? `Run this block while \`validationFinal.decisionSnapshot\`, the
-source-text-free remediation ledger, and structured \`operatorDecisions\` are in
-memory and **before** the single finalizer call. Do not assemble or write
-REPORT.md/FINDINGS.json directly.`
-        : `Run this block while the complete report is still held in the
-in-memory \`reportMarkdown\` draft and **before** the single finalizer call. Do
-not create, append, edit, or otherwise write REPORT.md directly.`}
-
-${ledgerFlow}
-
-If ${remediationSource
-        ? "\`validationFinal.decisionSnapshot.canonicalFindings\` contains any active non-refuted finding at any impact severity"
-        : "the report draft contains ANY active finding at any severity"},
-walk the user through this decision flow **per finding**. Do NOT batch
-findings; prompt for one at a time. Preserve one-finding approval and
-one-finding/one-approval sequencing throughout.
-
-For each active non-refuted finding, regardless of impact severity:
-
-1. **Present exactly one finding.** ${remediationSource
-        ? `Use its canonical ID, impact severity, state, evidence references/hashes,
-   chain IDs, and scoring axes directly from
-   \`validationFinal.decisionSnapshot\`; do not invent a title or quote source
-   text. Show the matching ledger candidate's target edge IDs,
-   evidence locations, expected behavior removed, legitimate-functionality
-   risk, and static verification outcome. If the outcome is
-   \`alternate-path-remains\`, say plainly that another malicious
-   activation-to-effect chain remains. If it is \`graph-incomplete\`, say that
-   reachability is unknown. In either case, NEVER claim the finding is fixed or
-   offer the candidate as a sufficient defang.`
-        : "Read its title, severity, file reference(s), and one-sentence summary verbatim from `reportMarkdown`. Do NOT paraphrase."}
-
-${remediationSource ? `If this active finding has only
-\`investigationGuidance\` (state \`unresolved\`) and no candidate, present the
-bounded evidence locations and guidance codes, but do not synthesize a diff or
-offer a confident **defang**. The operator may investigate later, delete the
-project, or keep it with a written rationale. Refuted findings are not presented
-for remediation at all.
-
-` : ""}2. **Ask the user to pick one of:**
-
-   - **defang** — surgically remove this specific finding from the tree,
-     keeping the rest of the project intact. ${remediationSource ? `Offer a
-     confident defang only when
-     \`candidate.staticVerification.fixClaimAllowed === true\`. Otherwise this
-     option is only a partial hardening/investigation step and the finding stays
-     active. Skip this branch entirely for guidance-only unresolved findings.`
-        : ""} First call \`view\` on every evidence-bound affected file
-     and exact line range. Then assemble one bounded concrete diff in the parent
-     conversation, limited to the candidate's target edge(s). Do not include
-     unrelated cleanup. Ask exactly:
-
-     **"Approve this one finding's proposed diff exactly as shown? (yes/no)"**
-
-     **Wait for that one approval before any write.** Then apply via a single
-     \`edit\` (or \`Remove-Item\` for one whole-file deletion).
-     **Before every write, copy the original file to
-     \`<file>.zerotrust-backup-<utc-ts>\`** (where \`<utc-ts>\` is a single
-     timestamp generated at the start of this remediation pass — re-use
-     it across all backups in the same pass so the user can identify the
-     set) so the change is reversible without git. **NEVER auto-apply.
-     NEVER batch multiple defangs together** — one finding, one edit,
-     one acknowledgement.
-
-   - **delete project** — \`Remove-Item -Recurse -Force <pinned-path>\`.
-     The pinned path for this audit is **exactly** \`${pinnedPath}\`.
-     Confirm the path with the user one more time before running.
-     **Refuse if the user requests a different path** even by one
-     character — re-state the pinned path and ask them to confirm or
-     pick a different option. ${remediationSource
-        ? "The structured `operatorDecisions` remain in memory and the canonical REPORT.md/FINDINGS.json pair will later be finalized under `_reports\\`, outside the pinned path."
-        : "The not-yet-written report draft remains in memory and will later be finalized under `_reports\\`, outside the pinned path."}
-
-   - **keep as-is** — the user has decided to accept this finding.
-     ${remediationSource
-        ? `Append one \`operatorDecisions\` record with the canonical
-     \`finding_id\`, \`action: "kept-as-is"\`, and one predefined
-     \`rationale_category\` (\`accepted-risk\`, \`required-functionality\`,
-     \`false-positive-suspected\`, \`deferred-review\`, or \`other\`). Use
-     \`operator_rationale\` only for the user's own short one-line words; never
-     paraphrase, expand, or substitute model prose. The finalizer labels it
-     user-supplied and rejects code/backticks, URLs, control characters, long
-     encoded tokens, finding/verdict claims, and known source-derived text.`
-        : "Append a `## Operator decision` block to the in-memory `reportMarkdown` draft with the finding's title, severity, and the user's one-line rationale."}
-     **Refuse "keep" without a written rationale** — re-ask if they say "just
-     keep it" without explanation. This becomes the immutable audit trail when
-     the finalizer writes the canonical artifact(s) once.
-
-${remediationSource ? `For every completed choice, add exactly one structured
-\`operatorDecisions\` record for that canonical finding. Use
-\`action: "defanged"\` with \`rationale_category: "remediation-applied"\` only
-when the trusted candidate allowed a fix claim and the approved edit completed;
-use \`action: "investigate"\` with \`alternate-path-remains\`,
-\`graph-incomplete\`, or \`deferred-review\` for partial work; and use
-\`action: "delete-project"\` with \`project-deleted\` after confirmed deletion.
-Do not record model-authored rationales or claim that an unverified edit fixed a
-finding.` : ""}
-
-3. Do NOT collapse MEDIUM/LOW/INFO findings into a summary or defer their
-   decision solely because of severity. Severity affects prioritization, not
-   operator choice eligibility. Present each active non-refuted finding through
-   the same one-finding decision flow. Unresolved guidance-only findings still
-   cannot receive a confident defang because they have no trusted fix-claim
-   candidate.
-
-4. After all active finding decisions are made, ${remediationSource
-       ? `retain only one structured record per decided canonical finding.
-   Do not add a free-form aggregate summary or backup-file names; the finalizer
-   derives action counts deterministically from \`operatorDecisions\`.`
-       : `append this final summary to \`reportMarkdown\`:
-   "Of N active findings: defanged X, kept Y, deleted project Z."
-   List any \`.zerotrust-backup-<utc-ts>\` files written. If \`delete
-   project\` was chosen, note that the audit pinned path is now gone and
-   the report will be finalized outside it.`}
-
-**Safety invariants (DO NOT VIOLATE):**
-
-- Do NOT propose a defang you cannot describe concretely from the candidate's
-  exact edge IDs and evidence locations. "Sanitize this somehow" is not a
-  defang.
-- Do NOT touch ANY path outside \`${pinnedPath}\`. The agent's
-  ${modeLabel} sandbox boundary is the pinned path; reaching outside
-  defeats it.
-- Do NOT delete files that were not flagged in ${remediationSource
-        ? "the trusted decision/remediation ledgers"
-        : "REPORT.md"}, even if you think they look related.
-- One \`edit\`/\`Remove-Item\` per user acknowledgement. NO BATCH mode.
-  If the user says "yes, do all of them," refuse — re-prompt one
-  finding at a time.
-- Do NOT call \`zerotrust_finalize_report\` inside this block. Finalization
-  happens once, after every decision has been incorporated into
-  ${remediationSource ? "structured `operatorDecisions`" : "the draft"}.
-- NEVER auto-apply. Never execute project code, run install/build/test commands,
-  create a PoC, or treat build output as proof that remediation worked.
-  Static source/graph checks and the full re-audit are the only permitted
-  verification here.
-- Simulate removal/guard of the targeted edge IDs against every known complete
-  activation/trigger-to-effect chain. If any non-targeted path remains, retain
-  the finding and say \`alternate-path-remains\`. If graph coverage or topology
-  is incomplete, say \`graph-incomplete\`. Never claim fixed in either case.
-- If user picks "delete project", confirm the pinned path one more
-  time before running \`Remove-Item\`. Refuse if the path the user
-  confirms back is different.
-
-**Re-audit recommendation:** After all defangs are applied, suggest
-the user re-run the same \`zerotrust_sourcecheck\` invocation. Do not mark a
-finding remediated until that fresh audit re-indexes the edited bytes, rebuilds
-the behavior graph, and confirms no alternate activation-to-effect chain.
-
----
-`;
-}
+// Shared lifecycle prose used by URL and local packets.
 
 export function renderSweepAndCloseBlock({ buildRoot }) {
     return `### Sweep scratch, then close audit state

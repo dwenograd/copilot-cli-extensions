@@ -44,7 +44,7 @@ function assertExactFields(value, allowed, label) {
         const path = String(value.path || "").replace(/\\/g, "/").replace(/^\.\/+/, "");
         const line = Number(value.line);
         const name = String(value.name || "");
-        const factValue = value.value === undefined ? "" : normalizedValue(
+        const factValue = value.value === undefined ? "": normalizedValue(
             value.value,
             "pluginFact.value",
         );

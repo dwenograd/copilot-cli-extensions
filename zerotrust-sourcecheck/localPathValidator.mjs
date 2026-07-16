@@ -178,7 +178,7 @@ export function validateLocalPath(input) {
     }
 
     if (!stats.isDirectory()) {
-        return { ok: false, error: `local_path must be a directory (got ${stats.isFile() ? "file" : "non-directory"})` };
+        return { ok: false, error: `local_path must be a directory (got ${stats.isFile() ? "file": "non-directory"})` };
     }
 
     const slug = slugForPath(resolved);

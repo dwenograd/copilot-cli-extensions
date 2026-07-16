@@ -1,0 +1,11 @@
+marker.fact("activation-surface","startup-load","go");
+marker.fact("language","go","source-text");
+marker.node("clean-alternate-start","activation","startup-load","activation,benign");
+marker.node("clean-alternate-preview","capability","local-preview","benign");
+marker.node("clean-alternate-cache","capability","local-cache","benign");
+marker.node("clean-alternate-output","sink","local-output","benign,local-output");
+marker.edge("clean-start-preview","invokes","clean-alternate-start","clean-alternate-preview","benign");
+marker.edge("clean-start-cache","invokes","clean-alternate-start","clean-alternate-cache","benign");
+marker.edge("clean-preview-output","flows-to","clean-alternate-preview","clean-alternate-output","benign");
+marker.edge("clean-cache-output","flows-to","clean-alternate-cache","clean-alternate-output","benign");
+marker.finding("clean-alternate-lookalike","refuted","low","medium","unlikely","write","local-data","local-output","benign,benign-lookalike,alternate-path");

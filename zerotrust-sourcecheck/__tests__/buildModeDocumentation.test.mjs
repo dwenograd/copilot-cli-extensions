@@ -60,11 +60,30 @@ function packet(mode, overrides = {}) {
     });
 }
 
-test("central build-mode taxonomy pins current safe/full behavior", () => {
-    assert.equal(
-        BUILD_MODE_TAXONOMY_NOTE,
-        "Safe/full modes currently use the same install/build wrappers. Install lifecycle scripts remain suppressed. Build commands may execute repo-controlled npm build scripts, build.rs, and MSBuild targets in both modes. Full mode currently changes admission/warning posture only, still requires unsafe, and reserves a future distinction.",
+function assertFinalizationPrecedesHostExecution(text) {
+    const finalizerCall = text.indexOf(
+        "const finalizeResult = zerotrust_finalize_report({",
     );
+    const hostExecutionInstructions = text.indexOf(
+        "Use `zerotrust_safe_install` for installs",
+        finalizerCall,
+    );
+    assert.ok(finalizerCall >= 0, "packet must invoke the canonical finalizer");
+    assert.ok(
+        hostExecutionInstructions > finalizerCall,
+        "wrapper-mediated host execution must follow canonical finalization",
+    );
+}
+
+test("central build-mode taxonomy pins current safe/full behavior", () => {
+    assert.match(BUILD_MODE_TAXONOMY_NOTE, /Safe\/full mode names are retained for compatibility/i);
+    assert.match(BUILD_MODE_TAXONOMY_NOTE, /identical install\/build wrappers/i);
+    assert.match(BUILD_MODE_TAXONOMY_NOTE, /Install lifecycle scripts remain suppressed/i);
+    assert.match(BUILD_MODE_TAXONOMY_NOTE, /repo-controlled npm build scripts/i);
+    assert.match(BUILD_MODE_TAXONOMY_NOTE, /build\.rs/i);
+    assert.match(BUILD_MODE_TAXONOMY_NOTE, /MSBuild targets/i);
+    assert.match(BUILD_MODE_TAXONOMY_NOTE, /admission\/warning posture only/i);
+    assert.match(BUILD_MODE_TAXONOMY_NOTE, /future distinction/i);
     assert.deepEqual([...FULL_BUILD_MODES], [
         "audit_and_full_build",
         "audit_and_full_build_council",
@@ -78,7 +97,9 @@ test("extension schema consumes the central mode enum and build taxonomy", () =>
     assert.match(text, /enum:\s*\[\.\.\.VALID_MODES\]/);
     assert.match(text, /BUILD_MODE_TAXONOMY_NOTE/);
     assert.match(text, /does not enable install lifecycle scripts or a less-restricted installer/);
-    assert.match(text, /npm build scripts, build\.rs, or MSBuild targets may execute in either mode/);
+    assert.match(text, /hazardous post-audit host execution may run repo-controlled npm build scripts/i);
+    assert.match(text, /build\.rs/i);
+    assert.match(text, /MSBuild targets/i);
 });
 
 test("handler acknowledgement errors describe actual build execution posture", () => {
@@ -105,27 +126,30 @@ test("handler acknowledgement errors describe actual build execution posture", (
     );
     assert.equal(missingUnsafe.resultType, "failure");
     assert.match(missingUnsafe.textResultForLlm, /requires `unsafe: true`/);
-    assert.match(missingUnsafe.textResultForLlm, /same install\/build wrappers/);
+    assert.match(missingUnsafe.textResultForLlm, /(?:same|identical) install\/build wrappers/);
     assert.match(missingUnsafe.textResultForLlm, /admission\/warning posture only/);
 });
 
 test("safe and full packets state the shared wrappers and build-time risk", () => {
     for (const mode of ["audit_and_safe_build", "audit_and_full_build"]) {
         const text = packet(mode);
-        assert.match(text, /Safe\/full modes currently use the same install\/build wrappers/);
+        assert.match(text, /Safe\/full mode names are retained for compatibility/);
         assert.match(text, /Install lifecycle scripts remain suppressed/);
-        assert.match(text, /npm build scripts, build\.rs, and MSBuild targets/);
+        assert.match(text, /npm build scripts/);
+        assert.match(text, /build\.rs/);
+        assert.match(text, /MSBuild targets/);
         assert.doesNotMatch(text, /lifecycle scripts (?:will|WILL) execute/i);
         assert.doesNotMatch(text, /allow lifecycle scripts/i);
     }
     assert.match(packet("audit_and_full_build"), /requires BOTH i_understand_build_executes_code: true AND unsafe: true|Both required acknowledgement flags are set/);
+    assertFinalizationPrecedesHostExecution(packet("audit_and_safe_build"));
 });
 
 test("API-direct post-audit build wording does not promise a full installer", () => {
     const text = packet("audit_source");
     assert.match(text, /Install lifecycle scripts stay suppressed/);
-    assert.match(text, /audit_and_full_build` currently uses the same wrappers/);
-    assert.match(text, /changes admission\/warning posture only and reserves a future distinction/);
+    assert.match(text, /Safe\/full names are compatibility aliases for identical wrappers/);
+    assert.match(text, /admission\/warning posture.*reserves a future distinction/);
     assert.doesNotMatch(text, /For full lifecycle scripts/);
 });
 
@@ -133,8 +157,8 @@ test("README and agent notes pin the safe/full documentation contract", () => {
     const readme = source("README.md");
     const agents = source("AGENTS.md");
     for (const text of [readme, agents]) {
-        assert.match(text, /same (?:install\/build )?wrappers/i);
-        assert.match(text, /Install lifecycle scripts remain suppressed|install lifecycle scripts stay suppressed/i);
+        assert.match(text, /(?:same|identical) (?:install\/build\s+)?wrappers/i);
+        assert.match(text, /Install lifecycle scripts (?:remain|stay)\s+suppressed/i);
         assert.match(text, /build\.rs/);
         assert.match(text, /admission\/warning\s+posture/i);
         assert.match(text, /future distinction/i);

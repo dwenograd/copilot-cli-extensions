@@ -38,7 +38,7 @@ const SHA = "a".repeat(40);
 const ROOT = "b".repeat(40);
 const TAG_REF = "c".repeat(40);
 const RELEASE_ID = "12345";
-const TAG = "v1.2.3";
+const TAG = "baseline.2.3";
 let sequence = 0;
 
 beforeEach(() => {
@@ -154,7 +154,7 @@ test("release asset listing rejects caller and API identity mismatches", async (
             {
                 requestRelease: async () => releaseResponse([], {
                     id: 999,
-                    tag_name: "v9",
+                    tag_name: "release-test",
                 }),
             },
         );

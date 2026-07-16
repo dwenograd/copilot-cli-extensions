@@ -1,0 +1,3 @@
+marker.node("split-effect","sink","execution-effect","execute-effect");
+marker.edge("split-decode-effect","transforms","split-decode","split-effect","execute-effect");
+marker.finding("split-encoding-chain","validated","high","high","strong","execute","remote-fetch","external-effect","string-split,encoding,remote-fetch,decode-transform,execute-effect");

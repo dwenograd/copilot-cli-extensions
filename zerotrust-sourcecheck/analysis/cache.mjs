@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import nodePath from "node:path";
 
 import {
-    ANALYSIS_SCHEMA_VERSION,
+    ANALYSIS_SCHEMA_REVISION,
     ANALYSIS_STAGES,
     CONFIDENCE_LEVELS,
     COVERAGE_SCOPES,
@@ -19,11 +19,14 @@ import {
 } from "./schemas.mjs";
 import { FACT_KINDS } from "./extractFacts.mjs";
 
-// Optional, untrusted metadata-only reuse. This schema never stores source or
-// excerpt text, prompts, credentials, verdicts, report bodies, or finalized
-// state; absence, version mismatch, and corruption are normal cache misses.
-export const CACHE_SCHEMA_VERSION = 1;
-export const CACHE_TOOL_VERSION = "zerotrust-sourcecheck-v5";
+// Optional, untrusted baseline analysis metadata reuse. The current cache
+// schema is explicitly analysis-metadata-only: it excludes assurance state,
+// source or excerpt text, prompts, credentials, verdicts, report bodies, and
+// finalization state. Absence, schema mismatch, and corruption are normal misses.
+export const CACHE_SCHEMA_REVISION = 2;
+export const CACHE_FORMAT_ID = "analysis-metadata-only";
+export const CACHE_CONTENT_SCOPE = "analysis-metadata-only";
+export const ASSURANCE_CACHE_POLICY = "excluded-from-current-cache-schema";
 
 export const CACHE_LIMITS = Object.freeze({
     fileBytes: 4 * 1024 * 1024,
@@ -115,7 +118,7 @@ function string(value, path, {
     normalize = true,
 } = {}) {
     if (typeof value !== "string") fail(path, "must be a string");
-    let result = normalize ? value.normalize("NFKC").trim() : value;
+    let result = normalize ? value.normalize("NFKC").trim(): value;
     if (lower) result = result.toLowerCase();
     if (result.length < min || result.length > max) {
         fail(path, `length must be between ${min} and ${max}`);
@@ -187,7 +190,7 @@ function normalizeLocalPath(value, path = "sourceIdentity.path") {
     }));
     if (!nodePath.isAbsolute(resolved)) fail(path, "must be absolute");
     const normalized = resolved.replaceAll("\\", "/");
-    return process.platform === "win32" ? normalized.toLowerCase() : normalized;
+    return process.platform === "win32" ? normalized.toLowerCase(): normalized;
 }
 
 export function validateCacheSourceIdentity(value, path = "sourceIdentity") {
@@ -246,8 +249,7 @@ export function validateCacheSourceIdentity(value, path = "sourceIdentity") {
 export function cacheNamespaceIdentity(sourceIdentity) {
     const source = validateCacheSourceIdentity(sourceIdentity);
     return source.kind === "github"
-        ? frozen({ kind: source.kind, owner: source.owner, repo: source.repo })
-        : frozen({ kind: source.kind, path: source.path });
+        ? frozen({ kind: source.kind, owner: source.owner, repo: source.repo }): frozen({ kind: source.kind, path: source.path });
 }
 
 export function cacheNamespaceKey(sourceIdentity) {
@@ -257,9 +259,10 @@ export function cacheNamespaceKey(sourceIdentity) {
 export function cacheSourceKey(sourceIdentity) {
     const source = validateCacheSourceIdentity(sourceIdentity);
     return sha256Canonical({
-        cacheSchemaVersion: CACHE_SCHEMA_VERSION,
-        analysisSchemaVersion: ANALYSIS_SCHEMA_VERSION,
-        toolVersion: CACHE_TOOL_VERSION,
+        cacheSchemaRevision: CACHE_SCHEMA_REVISION,
+        analysisSchemaRevision: ANALYSIS_SCHEMA_REVISION,
+        formatId: CACHE_FORMAT_ID,
+        contentScope: CACHE_CONTENT_SCOPE,
         sourceIdentity: source,
     });
 }
@@ -279,19 +282,19 @@ export function buildCachePaths(cacheRoot, sourceIdentity) {
         throw new Error("cacheRoot must be absolute");
     }
     const source = validateCacheSourceIdentity(sourceIdentity);
-    const toolKey = sha256Canonical({ toolVersion: CACHE_TOOL_VERSION });
+    const formatKey = sha256Canonical({ formatId: CACHE_FORMAT_ID });
     const namespaceKey = cacheNamespaceKey(source);
     const sourceKey = cacheSourceKey(source);
-    const versionRoot = containedJoin(
+    const formatRoot = containedJoin(
         cacheRoot,
-        `schema-${CACHE_SCHEMA_VERSION}`,
-        `tool-${toolKey}`,
+        `schema-${CACHE_SCHEMA_REVISION}`,
+        `format-${formatKey}`,
     );
-    const namespacePath = containedJoin(versionRoot, `namespace-${namespaceKey}`);
+    const namespacePath = containedJoin(formatRoot, `namespace-${namespaceKey}`);
     const filePath = containedJoin(namespacePath, `source-${sourceKey}.json`);
     return frozen({
         cacheRoot: nodePath.resolve(cacheRoot),
-        versionRoot,
+        formatRoot,
         namespacePath,
         filePath,
         namespaceKey,
@@ -325,8 +328,7 @@ function validateFact(value, path, expectedPath = null) {
             min: 1,
             max: CACHE_LIMITS.factValue,
             pattern: FACT_TOKEN_RE,
-        })
-        : null;
+        }): null;
     const id = string(value.id, `${path}.id`, {
         max: 64,
         pattern: HASH_RE,
@@ -348,7 +350,7 @@ function validateFact(value, path, expectedPath = null) {
             lower: true,
         }),
         name,
-        ...(normalizedValue ? { value: normalizedValue } : {}),
+        ...(normalizedValue ? { value: normalizedValue }: {}),
     });
 }
 
@@ -549,7 +551,7 @@ export function computeCachedPluginFactId(value) {
         evidence: value.evidence,
         tags: value.tags,
     };
-    return `zpcf-v1-${sha256Canonical(identity)}`;
+    return `zpcf-${sha256Canonical(identity)}`;
 }
 
 function validateCachedPluginFact(value, path, sourceBlobMap) {
@@ -586,7 +588,7 @@ function validateCachedPluginFact(value, path, sourceBlobMap) {
     }
     const id = string(value.id, `${path}.id`, {
         max: 72,
-        pattern: /^zpcf-v1-[a-f0-9]{64}$/u,
+        pattern: /^zpcf-[a-f0-9]{64}$/u,
         lower: true,
     });
     if (id !== computeCachedPluginFactId(normalized)) {
@@ -683,7 +685,7 @@ function validateFinding(value, path, sourceBlobMap, nodeIds, edgeIds) {
     );
     const id = string(value.id, `${path}.id`, {
         max: 71,
-        pattern: /^ztf-v5-[a-f0-9]{64}$/u,
+        pattern: /^ztf-[a-f0-9]{64}$/u,
         lower: true,
     });
     if (id !== computeFindingId(sourceIdentity, behaviorSignature)) {
@@ -745,7 +747,7 @@ function validateDecision(value, path, sourceBlobMap, findingIds) {
     ]);
     const findingId = string(value.findingId, `${path}.findingId`, {
         max: 71,
-        pattern: /^ztf-v5-[a-f0-9]{64}$/u,
+        pattern: /^ztf-[a-f0-9]{64}$/u,
         lower: true,
     });
     if (!findingIds.has(findingId)) fail(`${path}.findingId`, "does not name a cached finding");
@@ -918,9 +920,10 @@ function validateCoverageEntry(value, path) {
 
 export function validateCachePayload(value, path = "cachePayload") {
     strictObject(value, path, [
-        "cacheSchemaVersion",
-        "analysisSchemaVersion",
-        "toolVersion",
+        "cacheSchemaRevision",
+        "analysisSchemaRevision",
+        "formatId",
+        "contentScope",
         "sourceIdentity",
         "sourceKey",
         "storedAt",
@@ -929,14 +932,17 @@ export function validateCachePayload(value, path = "cachePayload") {
         "stage",
         "coverage",
     ]);
-    if (value.cacheSchemaVersion !== CACHE_SCHEMA_VERSION) {
-        fail(`${path}.cacheSchemaVersion`, `must equal ${CACHE_SCHEMA_VERSION}`);
+    if (value.cacheSchemaRevision !== CACHE_SCHEMA_REVISION) {
+        fail(`${path}.cacheSchemaRevision`, `must equal ${CACHE_SCHEMA_REVISION}`);
     }
-    if (value.analysisSchemaVersion !== ANALYSIS_SCHEMA_VERSION) {
-        fail(`${path}.analysisSchemaVersion`, `must equal ${ANALYSIS_SCHEMA_VERSION}`);
+    if (value.analysisSchemaRevision !== ANALYSIS_SCHEMA_REVISION) {
+        fail(`${path}.analysisSchemaRevision`, `must equal ${ANALYSIS_SCHEMA_REVISION}`);
     }
-    if (value.toolVersion !== CACHE_TOOL_VERSION) {
-        fail(`${path}.toolVersion`, `must equal ${CACHE_TOOL_VERSION}`);
+    if (value.formatId !== CACHE_FORMAT_ID) {
+        fail(`${path}.formatId`, `must equal ${CACHE_FORMAT_ID}`);
+    }
+    if (value.contentScope !== CACHE_CONTENT_SCOPE) {
+        fail(`${path}.contentScope`, `must equal ${CACHE_CONTENT_SCOPE}`);
     }
     const sourceIdentity = validateCacheSourceIdentity(
         value.sourceIdentity,
@@ -948,7 +954,7 @@ export function validateCachePayload(value, path = "cachePayload") {
         lower: true,
     });
     if (sourceKey !== cacheSourceKey(sourceIdentity)) {
-        fail(`${path}.sourceKey`, "does not match source identity and cache versions");
+        fail(`${path}.sourceKey`, "does not match source identity and cache schema revisions");
     }
     const files = array(value.files, `${path}.files`, CACHE_LIMITS.cachedSourceFiles)
         .map((file, index) => validateCachedFile(file, `${path}.files[${index}]`))
@@ -982,9 +988,10 @@ export function validateCachePayload(value, path = "cachePayload") {
         fail(`${path}.coverage`, "contains duplicate keys");
     }
     return frozen({
-        cacheSchemaVersion: CACHE_SCHEMA_VERSION,
-        analysisSchemaVersion: ANALYSIS_SCHEMA_VERSION,
-        toolVersion: CACHE_TOOL_VERSION,
+        cacheSchemaRevision: CACHE_SCHEMA_REVISION,
+        analysisSchemaRevision: ANALYSIS_SCHEMA_REVISION,
+        formatId: CACHE_FORMAT_ID,
+        contentScope: CACHE_CONTENT_SCOPE,
         sourceIdentity,
         sourceKey,
         storedAt: timestamp(value.storedAt, `${path}.storedAt`),
@@ -1093,15 +1100,13 @@ export function buildCachePayload({
             status: file.status,
             classification: file.classification,
             contentSha256: file.contentSha256,
-            ...(file.blobSha ? { blobSha: file.blobSha } : {}),
+            ...(file.blobSha ? { blobSha: file.blobSha }: {}),
             ...(file.lineCount !== null && file.lineCount !== undefined
-                ? { lineCount: file.lineCount }
-                : {}),
+                ? { lineCount: file.lineCount }: {}),
             facts: factsForFile(indexState, file),
             invisibleUnicodeScanComplete: file.invisibleUnicodeScanComplete === true,
             invisibleUnicodeMatchCount: Number.isSafeInteger(file.invisibleUnicodeMatchCount)
-                ? file.invisibleUnicodeMatchCount
-                : 0,
+                ? file.invisibleUnicodeMatchCount: 0,
         }));
     const snapshot = indexState || {};
     const coverage = [
@@ -1132,15 +1137,15 @@ export function buildCachePayload({
         ? {
             current: "validated",
             history: ANALYSIS_STAGES.slice(0, ANALYSIS_STAGES.indexOf("validated") + 1),
-        }
-        : {
+        }: {
             current: requestedStage,
             history: stageState?.history || ["acquired"],
         };
     return validateCachePayload({
-        cacheSchemaVersion: CACHE_SCHEMA_VERSION,
-        analysisSchemaVersion: ANALYSIS_SCHEMA_VERSION,
-        toolVersion: CACHE_TOOL_VERSION,
+        cacheSchemaRevision: CACHE_SCHEMA_REVISION,
+        analysisSchemaRevision: ANALYSIS_SCHEMA_REVISION,
+        formatId: CACHE_FORMAT_ID,
+        contentScope: CACHE_CONTENT_SCOPE,
         sourceIdentity,
         sourceKey: cacheSourceKey(sourceIdentity),
         storedAt,
@@ -1156,11 +1161,9 @@ function currentFileIdentityMap(indexState) {
     for (const file of indexState?.files || []) {
         const path = normalizeRepoPath(file.path);
         const blobSha = file.blobSha
-            ? String(file.blobSha).toLowerCase()
-            : null;
+            ? String(file.blobSha).toLowerCase(): null;
         const contentSha256 = file.contentSha256
-            ? String(file.contentSha256).toLowerCase()
-            : null;
+            ? String(file.contentSha256).toLowerCase(): null;
         result.set(path, { path, blobSha, contentSha256 });
     }
     return result;
@@ -1231,8 +1234,8 @@ export function selectReusableCache(payload, {
         exactSource,
         files,
         pluginRecords,
-        stage: exactSource ? cached.stage : null,
-        coverage: exactSource ? cached.coverage : [],
+        stage: exactSource ? cached.stage: null,
+        coverage: exactSource ? cached.coverage: [],
     });
 }
 

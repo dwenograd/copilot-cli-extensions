@@ -53,8 +53,7 @@ export async function closeAuditHandler(args, invocation, dependencies = {}) {
         ? [
             activeAudit.reportFinalization.reportPath,
             activeAudit.reportFinalization.findingsPath,
-        ].filter((path) => typeof path === "string")
-        : [];
+        ].filter((path) => typeof path === "string"): [];
 
     const pathExists = dependencies.exists || existsSync;
     const blockingArtifacts = [];
@@ -105,6 +104,6 @@ export async function closeAuditHandler(args, invocation, dependencies = {}) {
         diskCachePreserved: true,
         finalizedArtifactsPreserved: finalizedArtifacts,
         artifactsAbandoned: abandoning && blockingArtifacts.length > 0,
-        ...(blockingArtifacts.length > 0 ? { abandonedArtifacts: blockingArtifacts } : {}),
+        ...(blockingArtifacts.length > 0 ? { abandonedArtifacts: blockingArtifacts }: {}),
     });
 }

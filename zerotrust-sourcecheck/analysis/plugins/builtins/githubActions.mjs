@@ -36,18 +36,15 @@ export default defineRulePlugin({
         return {
             fact,
             key: `actions:${fact.kind}:${fact.name}:${fact.value || ""}`,
-            activationKind: fact.kind === "config-key" ? "trigger" : "activation",
+            activationKind: fact.kind === "config-key" ? "trigger": "activation",
             activationLabel: fact.kind === "config-key"
-                ? `GitHub Actions trigger: ${fact.name}`
-                : `GitHub Actions registration: ${fact.name}`,
-            targetKind: isSecret ? "sensitive-source" : isActionRef ? "dependency" : "capability",
+                ? `GitHub Actions trigger: ${fact.name}`: `GitHub Actions registration: ${fact.name}`,
+            targetKind: isSecret ? "sensitive-source": isActionRef ? "dependency": "capability",
             targetLabel: isSecret
-                ? `Workflow secret/environment reference: ${fact.value || fact.name}`
-                : isActionRef
-                    ? `Workflow action reference: ${fact.value}`
-                    : `Workflow command surface: ${fact.value || fact.name}`,
-            edgeKind: isSecret ? "reads-from" : isActionRef ? "depends-on" : "invokes",
-            tags: ["github-actions", isSecret ? "secret-reference" : "workflow-activation"],
+                ? `Workflow secret/environment reference: ${fact.value || fact.name}`: isActionRef
+                    ? `Workflow action reference: ${fact.value}`: `Workflow command surface: ${fact.value || fact.name}`,
+            edgeKind: isSecret ? "reads-from": isActionRef ? "depends-on": "invokes",
+            tags: ["github-actions", isSecret ? "secret-reference": "workflow-activation"],
         };
     },
     detectedWarning: (count) =>

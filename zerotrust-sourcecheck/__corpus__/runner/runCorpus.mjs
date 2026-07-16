@@ -22,7 +22,7 @@ import { classifyFailure } from "./failureClassifier.mjs";
 import { executeLocalFixture } from "./localFixtureExecutor.mjs";
 import {
     calculateMetrics,
-    evaluatePromotionGate,
+    evaluateQualityGate,
 } from "./metrics.mjs";
 import {
     parseAuditArtifacts,
@@ -35,14 +35,14 @@ const URLS_PATH = nodePath.join(CORPUS_ROOT, "urls.txt");
 const EXPECTATIONS_DIR = nodePath.join(CORPUS_ROOT, "expectations");
 const FIXTURES_DIR = nodePath.join(CORPUS_ROOT, "fixtures");
 const RESULTS_DIR = nodePath.join(CORPUS_ROOT, "results");
-const PROMOTION_GATE_PATH = nodePath.join(CORPUS_ROOT, "promotion-gate.v1.json");
+const QUALITY_GATE_PATH = nodePath.join(CORPUS_ROOT, "quality-gate.json");
 const SPACING_MS = 30_000;
 
 function parseArgs(argv) {
     const args = {
         execution: "dry-run",
         fixture: null,
-        promoteGate: false,
+        qualityGate: false,
     };
     let explicitExecution = false;
     for (let i = 0; i < argv.length; i += 1) {
@@ -51,7 +51,7 @@ function parseArgs(argv) {
             if (explicitExecution) throw new Error("choose only one of --dry-run, --local, or --live");
             args.execution = arg.slice(2);
             explicitExecution = true;
-        } else if (arg === "--promote-gate") args.promoteGate = true;
+        } else if (arg === "--quality-gate") args.qualityGate = true;
         else if (arg === "--fixture") args.fixture = argv[++i];
         else if (arg === "--help" || arg === "-h") args.help = true;
         else throw new Error(`unknown argument: ${arg}`);
@@ -61,13 +61,13 @@ function parseArgs(argv) {
 
 function usage() {
     return [
-        "Usage: node __corpus__/runner/runCorpus.mjs [--dry-run|--local|--live] [--fixture <slug>] [--promote-gate]",
+        "Usage: node __corpus__/runner/runCorpus.mjs [--dry-run|--local|--live] [--fixture <slug>] [--quality-gate]",
         "",
         "--dry-run       validate every expectation and execute local inert fixtures in memory",
         "--local         execute local inert fixtures and write ignored result artifacts",
         "--live          run GitHub URL fixtures; requires ZEROTRUST_CORPUS_LIVE=1",
         "--fixture       select one expectation slug",
-        "--promote-gate  apply versioned metric thresholds",
+        "--quality-gate  apply the committed quality thresholds",
         "",
         "No execution flag defaults to --dry-run. Live network/model use is never implicit.",
     ].join("\n");
@@ -111,7 +111,7 @@ function expectationFiles() {
         .filter((entry) =>
             entry.isFile()
             && entry.name.endsWith(".json")
-            && entry.name !== "schema-v1.json")
+            && entry.name !== "schema.json")
         .map((entry) => nodePath.join(EXPECTATIONS_DIR, entry.name))
         .sort();
 }
@@ -148,7 +148,7 @@ function loadExpectations() {
 
 function loadExpectation(fixture) {
     const expectations = loadExpectations();
-    const slug = typeof fixture === "string" ? fixture : fixture.slug;
+    const slug = typeof fixture === "string" ? fixture: fixture.slug;
     const expectation = expectations.find((entry) => entry.slug === slug);
     if (!expectation) throw new Error(`missing expectation file for ${slug}`);
     return expectation;
@@ -172,6 +172,35 @@ function localResult(expectation, { dryRun, runDir }) {
         source: `${expectation.slug}/FINDINGS.json`,
     });
     const comparison = compareEvaluation(actual, expectation);
+    const requestedTransforms =
+        expectation.dimensions?.metamorphic_transforms || [];
+    const variantTransformSets = requestedTransforms.map((transform) => [transform]);
+    if (requestedTransforms.length > 1) {
+        variantTransformSets.push(requestedTransforms);
+    }
+    const variants = variantTransformSets.map((transforms) => {
+        const variantDocument = executeLocalFixture({
+            fixtureRoot,
+            slug: expectation.slug,
+            transforms,
+        });
+        const variantActual = parseFindingsJson(variantDocument, {
+            source: `${expectation.slug}/${transforms.join("+")}/FINDINGS.json`,
+        });
+        const variantComparison = compareEvaluation(variantActual, expectation);
+        return {
+            transforms,
+            passed: variantComparison.passed,
+            status: variantComparison.status,
+            failures: variantComparison.failures,
+        };
+    });
+    const metamorphic = {
+        evaluated: variants.length,
+        passed: variants.every((variant) => variant.passed),
+        variants,
+    };
+    const passed = comparison.passed && metamorphic.passed;
     let outPath = null;
     if (!dryRun) {
         const fixtureDir = nodePath.join(runDir, expectation.slug);
@@ -183,15 +212,16 @@ function localResult(expectation, { dryRun, runDir }) {
         outPath = nodePath.join(fixtureDir, "comparison.json");
         writeFileSync(
             outPath,
-            `${JSON.stringify({ expectation, comparison }, null, 2)}\n`,
+            `${JSON.stringify({ expectation, comparison, metamorphic }, null, 2)}\n`,
         );
     }
     return {
         slug: expectation.slug,
-        status: comparison.status,
-        passed: comparison.passed,
+        status: passed ? "PASS": "FAIL",
+        passed,
         expectation,
         comparison,
+        metamorphic,
         outPath,
     };
 }
@@ -237,16 +267,16 @@ async function liveResult(expectation, { runDir }) {
     const baselineComparison = compareEvaluation(baseline, expectation);
     const comparison = compareEvaluation(council, expectation);
     const continuity = compareFindings({
-        v1Findings: baseline.findings,
-        v2Findings: council.findings,
+        baselineFindings: baseline.findings,
+        councilFindings: council.findings,
         expectation: {
             kind: expectation.kind,
             expected_min_verdict: expectation.expected.scores.severity.min,
             required_tags: expectation.expected.tags.required,
             forbidden_tags: expectation.expected.tags.forbidden,
         },
-        v1Verdict: baseline.verdict,
-        v2Verdict: council.verdict,
+        baselineVerdict: baseline.verdict,
+        councilVerdict: council.verdict,
         councilComplete: council.stage.completed.includes("validated"),
     });
     const passed = baselineComparison.passed && comparison.passed && continuity.passed;
@@ -262,7 +292,7 @@ async function liveResult(expectation, { runDir }) {
     );
     return {
         slug: expectation.slug,
-        status: passed ? "PASS" : "FAIL",
+        status: passed ? "PASS": "FAIL",
         passed,
         expectation,
         comparison,
@@ -299,8 +329,8 @@ async function runFixture(expectation, options) {
     return liveResult(expectation, options);
 }
 
-function loadPromotionThresholds() {
-    return JSON.parse(readFileSync(PROMOTION_GATE_PATH, "utf8"));
+function loadQualityThresholds() {
+    return JSON.parse(readFileSync(QUALITY_GATE_PATH, "utf8"));
 }
 
 export async function main(argv = process.argv.slice(2)) {
@@ -312,13 +342,12 @@ export async function main(argv = process.argv.slice(2)) {
     if (args.execution === "live" && process.env.ZEROTRUST_CORPUS_LIVE !== "1") {
         throw new Error("--live requires ZEROTRUST_CORPUS_LIVE=1");
     }
-
     let expectations = loadExpectations();
     if (args.fixture) {
         expectations = expectations.filter((entry) => entry.slug === args.fixture);
     }
     if (expectations.length === 0) {
-        throw new Error(args.fixture ? `no such fixture: ${args.fixture}` : "no fixtures configured");
+        throw new Error(args.fixture ? `no such fixture: ${args.fixture}`: "no fixtures configured");
     }
 
     const thisRunId = runId();
@@ -327,13 +356,12 @@ export async function main(argv = process.argv.slice(2)) {
 
     console.log(`Corpus fixtures: ${expectations.length}`);
     console.log(`Expectation schema: ${EXPECTATION_SCHEMA}`);
-    console.log(`Mode: ${args.execution}${args.promoteGate ? " promote-gate" : ""}`);
+    console.log(`Mode: ${args.execution}${args.qualityGate ? " quality-gate": ""}`);
 
     const results = [];
     const runnable = expectations.filter((expectation) =>
         args.execution === "live"
-            ? expectation.source.type === "github"
-            : expectation.source.type === "local");
+            ? expectation.source.type === "github": expectation.source.type === "local");
     let runnableIndex = 0;
     for (const expectation of expectations) {
         const result = await runFixture(expectation, {
@@ -356,8 +384,11 @@ export async function main(argv = process.argv.slice(2)) {
         + ` candidate=${metrics.candidateRecall.toFixed(3)}`
         + ` complete-chain=${metrics.completeChainRecall.toFixed(3)}`
         + ` validation/refutation=${metrics.validationRefutationAccuracy.toFixed(3)}`
+        + ` refutation=${metrics.refutationAccuracy.toFixed(3)}`
         + ` false-positive=${metrics.falsePositiveRate.toFixed(3)}`
-        + ` unresolved=${metrics.unresolvedRate.toFixed(3)}`,
+        + ` unresolved=${metrics.unresolvedRate.toFixed(3)}`
+        + ` metamorphic=${metrics.metamorphicStability.toFixed(3)}`
+        + ` favorable-blocked=${metrics.favorableAssuranceWithKnownBlockers}`,
     );
     console.log(
         `Summary: pass=${results.filter((result) => result.status === "PASS").length}`
@@ -365,26 +396,36 @@ export async function main(argv = process.argv.slice(2)) {
         + ` failed=${failed.length} inconclusive=${inconclusive.length}`,
     );
 
-    let gate = { passed: true, failures: [] };
-    if (args.promoteGate) {
-        gate = evaluatePromotionGate(metrics, loadPromotionThresholds());
-        if (!gate.passed) {
-            for (const failure of gate.failures) {
+    let qualityGate = { passed: true, failures: [] };
+    if (args.qualityGate) {
+        qualityGate = evaluateQualityGate(metrics, loadQualityThresholds());
+        if (!qualityGate.passed) {
+            for (const failure of qualityGate.failures) {
                 console.error(
-                    `promotion gate: ${failure.metric} ${failure.direction}`
+                    `quality gate: ${failure.metric} ${failure.direction}`
                     + ` ${failure.threshold}, got ${failure.actual}`,
                 );
             }
         }
     }
 
+    const summary = {
+        schema: "zerotrust-corpus-summary",
+        execution: args.execution,
+        fixtureScope: args.fixture ? "selected": "all",
+        runId: thisRunId,
+        expectationSchema: EXPECTATION_SCHEMA,
+        results,
+        metrics,
+        qualityGate,
+    };
     if (args.execution !== "dry-run") {
         writeFileSync(
             nodePath.join(runDir, "summary.json"),
-            `${JSON.stringify({ results, metrics, gate }, null, 2)}\n`,
+            `${JSON.stringify(summary, null, 2)}\n`,
         );
     }
-    return failed.length > 0 || inconclusive.length > 0 || !gate.passed ? 1 : 0;
+    return failed.length > 0 || inconclusive.length > 0 || !qualityGate.passed ? 1: 0;
 }
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === nodePath.resolve(process.argv[1])) {
@@ -402,7 +443,7 @@ export const __internals = {
     EXPECTATIONS_DIR,
     FIXTURES_DIR,
     RESULTS_DIR,
-    PROMOTION_GATE_PATH,
+    QUALITY_GATE_PATH,
     parseArgs,
     parseList,
     slugFromParsed,
@@ -412,5 +453,5 @@ export const __internals = {
     loadExpectation,
     runId,
     localResult,
-    loadPromotionThresholds,
+    loadQualityThresholds,
 };

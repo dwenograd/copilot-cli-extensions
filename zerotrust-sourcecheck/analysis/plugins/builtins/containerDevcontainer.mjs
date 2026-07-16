@@ -21,7 +21,7 @@ export default defineRulePlugin({
         key: `container:${fact.path}:${fact.kind}:${fact.name}`,
         activationLabel: `Container/devcontainer definition: ${fact.name}`,
         targetLabel: `Container build/start capability: ${fact.value || fact.name}`,
-        edgeKind: fact.kind === "import" ? "depends-on" : "invokes",
+        edgeKind: fact.kind === "import" ? "depends-on": "invokes",
         tags: ["container", "devcontainer", "build-definition"],
     }),
     detectedWarning: (count) =>

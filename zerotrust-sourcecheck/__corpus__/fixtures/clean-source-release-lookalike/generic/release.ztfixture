@@ -1,0 +1,8 @@
+marker.fact("activation-surface","publish-trigger","generic");
+marker.fact("artifact-shape","source-matched-release","release-asset");
+marker.node("matched-release-start","trigger","publish-trigger","activation,benign");
+marker.node("matched-release-source","provenance","source-artifact","benign,provenance");
+marker.node("matched-release-output","sink","matched-release","benign,release-asset");
+marker.edge("matched-release-provenance","reads-from","matched-release-start","matched-release-source","benign");
+marker.edge("matched-release-publish","enables","matched-release-source","matched-release-output","benign");
+marker.finding("matched-release-lookalike","refuted","low","medium","unlikely","publish","source-artifact","matched-release","benign,benign-lookalike,release-asset,provenance");

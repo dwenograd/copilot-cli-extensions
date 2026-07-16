@@ -1,0 +1,4 @@
+marker.fact("activation-surface","build-hook","msbuild");
+marker.fact("language","csharp","generated-source");
+marker.fact("language","msbuild","generated-source");
+marker.node("generate-start","activation","build-hook","activation,build-hook");

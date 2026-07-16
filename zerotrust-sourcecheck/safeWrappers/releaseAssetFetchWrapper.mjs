@@ -71,7 +71,7 @@ export async function safeFetchReleaseAssetHandler(args, invocation, dependencie
         sourceCommitSha: ctx.releaseIdentity.sourceCommitSha,
     };
     const state = getReleaseAssetCoverageState(sessionId);
-    const asset = state ? findEnumeratedReleaseAsset(state, assetId) : null;
+    const asset = state ? findEnumeratedReleaseAsset(state, assetId): null;
     if (!asset) {
         return failure(
             `safe_fetch_release_asset refused: asset id ${assetId} was not discovered by safe_list_release_assets for this active audit`,
@@ -93,7 +93,7 @@ export async function safeFetchReleaseAssetHandler(args, invocation, dependencie
         sessionId,
         {
             ...identity,
-            createState: () => createReleaseAssetCoverageState(identity),
+            createState:() => createReleaseAssetCoverageState(identity),
         },
         mutator,
     );
@@ -158,8 +158,7 @@ export async function safeFetchReleaseAssetHandler(args, invocation, dependencie
         mutate((live) => recordReleaseAssetFetchFailure(live, {
             assetId,
             kind: /maxBuffer|hard cap|ENOBUFS/i.test(String(err?.message || err))
-                ? "oversized"
-                : "download_failed",
+                ? "oversized": "download_failed",
             error: err,
         }));
         return failure(`release asset ${assetId} download failed: ${err.message}`, {
@@ -312,7 +311,7 @@ function normalizePositiveId(value) {
 function pathsEqual(left, right) {
     const a = nodePath.resolve(left);
     const b = nodePath.resolve(right);
-    return process.platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b;
+    return process.platform === "win32" ? a.toLowerCase() === b.toLowerCase(): a === b;
 }
 
 export const __internals = {

@@ -90,17 +90,11 @@ export function classifyStageFailure({
     blockers = [],
 } = {}) {
     const inferred = failureStage
-        || (finalStage === "acquired" ? "prepare"
-            : finalStage === "prepared" ? "scan"
-                : finalStage === "scanned" ? "trace"
-                    : finalStage === "traced" ? "validate"
-                        : finalStage === "validated" ? "finalize"
-                            : null);
+        || (finalStage === "acquired" ? "prepare": finalStage === "prepared" ? "scan": finalStage === "scanned" ? "trace": finalStage === "traced" ? "validate": finalStage === "validated" ? "finalize": null);
     if (!inferred) return result(null, "no stage failure detected");
     const blockerReason = blockers.map((blocker) =>
         typeof blocker === "string"
-            ? blocker
-            : blocker?.code || blocker?.kind).filter(Boolean).join(",");
+            ? blocker: blocker?.code || blocker?.kind).filter(Boolean).join(",");
     return result(
         STAGE_CLASS[inferred],
         failureReason || blockerReason || `${inferred} stage did not complete`,

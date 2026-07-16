@@ -34,7 +34,7 @@ import { failure, success } from "./result.mjs";
 // hook scripts — on Linux/macOS that could be subverted if a sub-agent
 // or repo file created a `NUL/` dir with executable scripts at the
 // right cwd. Switch on platform.
-const NULL_HOOKS_PATH = process.platform === "win32" ? "NUL" : "/dev/null";
+const NULL_HOOKS_PATH = process.platform === "win32" ? "NUL": "/dev/null";
 
 const HARDENED_GIT_FLAGS = [
     "-c", "protocol.file.allow=never",
@@ -63,7 +63,7 @@ function looksLikeSha(s) {
 /**
  * Resolve a ref to a SHA via `git ls-remote`.
  *
- * Round-10 hardening (gpt-5.5 R10 F2): for known ref types, use the exact
+ * security rationale: for known ref types, use the exact
  * refspec form so we don't get the wrong commit due to:
  *   - branch/tag name collisions (a branch and tag with the same name)
  *   - annotated tags returning the tag-object SHA before the peeled commit
@@ -202,13 +202,13 @@ export async function safeCloneHandler(args, invocation) {
         return failure(`safe_clone refused: active audit is local-source mode (target: ${ctx.localPath}). Clone operations apply to URL-driven audits only. Use view/grep/glob on the local path; the role agents already have those.`);
     }
 
-    // Round-7 hardening (gpt-5.5 R7 F2) + v4: only build modes need a
-    // clone. Refuse if the active audit's mode doesn't need a clone.
+    // Only build modes need a clone. Refuse if the active audit's mode
+    // does not need one.
     if (ctx.hasActiveAudit && ctx.mode && !modeNeedsClone(ctx.mode)) {
-        return failure(`safe_clone refused: active audit mode '${ctx.mode}' does not need a clone (only build modes use on-disk clones in v4; pure audit modes operate via API-direct using zerotrust_safe_list_tree + zerotrust_safe_fetch_file). To run a build, re-invoke zerotrust_sourcecheck with audit_and_safe_build* / audit_and_full_build* + the required ack flags.`);
+        return failure(`safe_clone refused: active audit mode '${ctx.mode}' does not need a clone (only build modes use on-disk clones; pure audit modes operate via API-direct using zerotrust_safe_list_tree + zerotrust_safe_fetch_file). To run a build, re-invoke zerotrust_sourcecheck with audit_and_safe_build* / audit_and_full_build* + the required ack flags.`);
     }
 
-    // v4-r1 hardening (gpt-5.5 R1 F1): when sessionId is supplied (production
+    // When sessionId is supplied (production
     // agents always have one) but no active audit exists (TTL expired or
     // zerotrust_sourcecheck not invoked), REFUSE the clone. Without this
     // guard, an audit-mode session whose TTL elapsed mid-audit would let
@@ -218,7 +218,7 @@ export async function safeCloneHandler(args, invocation) {
         return failure(`safe_clone refused: no active audit for this session (TTL expired or zerotrust_sourcecheck not invoked). Re-invoke zerotrust_sourcecheck before any wrapper call.`);
     }
 
-    // Round-5 hardening (gpt-5.5 R5 F1): an active audit pins owner/repo;
+    // security rationale: an active audit pins owner/repo;
     // safe_clone must refuse a different repo so an agent can't activate an
     // audit for repo A and then clone repo B under audit-A's mode + ack
     // flags + (later) audit-A's council outcome.
@@ -228,12 +228,12 @@ export async function safeCloneHandler(args, invocation) {
         }
     }
 
-    // Round-8 hardening (gpt-5.5 R8 F1): if the active audit pinned a
+    // security rationale: if the active audit pinned a
     // specific ref (the user invoked sourcecheck with a /tree/<ref> URL,
     // /commit/<sha> URL, /pull/<n> URL, or /releases/tag/<tag> URL),
     // safe_clone must refuse a different ref. Without this, an audit
-    // pinned to v1.0 could be tricked into cloning v2.0.
-    // Round-8 hardening (gpt-5.5 R8 F1) + round-9 (gpt-5.5 R9 F1): if the
+    // pinned to one release could be tricked into cloning another.
+    // If the
     // active audit pinned a specific ref, safe_clone must use THAT ref.
     // - If args.ref is supplied, it must equal the pinned ref.
     // - If args.ref is OMITTED (bare repo URL), default to the pinned ref
@@ -258,7 +258,7 @@ export async function safeCloneHandler(args, invocation) {
         if (refError) return failure(`ref rejected: ${refError}`);
     }
 
-    // v4-r2 round-10 (B-R10-1 high): resolve `git` through
+    // Resolve `git` through
     // resolveTrustedProgram (mirrors apiClient/install/build wrappers).
     // Forbids any candidate under build_root so an attacker can't plant
     // git.exe / git.cmd in the audit sandbox to win OS search order.
@@ -278,7 +278,7 @@ export async function safeCloneHandler(args, invocation) {
         return failure(`SHA resolution failed: ${err.message}`);
     }
 
-    // v4-r2 round-12 (C-R12-1 high): if the audit already has a pinned
+    // If the audit already has a pinned
     // resolvedSha (from a prior safe_list_tree or safe_clone call),
     // refuse to clone any other SHA. Without this, a bare-repo-URL
     // build audit (no pinned ref) could be re-cloned to a different
@@ -340,8 +340,8 @@ export async function safeCloneHandler(args, invocation) {
     try {
         doHardenedClone({ canonicalUrl, sha: resolvedSha, clonePath, gitPath });
     } catch (err) {
-        const stderr = err.stderr ? String(err.stderr) : "";
-        return failure(`hardened clone failed: ${err.message}${stderr ? `\nstderr: ${stderr}` : ""}`);
+        const stderr = err.stderr ? String(err.stderr): "";
+        return failure(`hardened clone failed: ${err.message}${stderr ? `\nstderr: ${stderr}`: ""}`);
     }
 
     if (sessionId) {
@@ -374,7 +374,7 @@ export async function safeCloneHandler(args, invocation) {
         sha: resolvedSha,
         canonicalUrl,
         boundContext,
-        ...(purgeSummary ? { autoPurge: purgeSummary } : {}),
+        ...(purgeSummary ? { autoPurge: purgeSummary }: {}),
     });
 }
 

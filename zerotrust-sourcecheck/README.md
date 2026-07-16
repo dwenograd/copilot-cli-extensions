@@ -1,279 +1,154 @@
 # zerotrust-sourcecheck
 
-`zerotrust-sourcecheck` answers a narrow question:
+Self-contained Copilot CLI extension for static auditing of source-level
+malicious behavior. It is not a generic vulnerability scanner, dependency-CVE
+scanner, sandbox, or malware execution environment.
+
+## Assurance contract
+
+Every `zerotrust_sourcecheck` activation creates an immutable random audit ID
+and automatically owns one current assurance state.
+
+The continuous lifecycle is:
+
+1. activate and bind the target identity;
+2. acquire every required source object without executing repository code;
+3. inventory objects and decode bounded derived artifacts;
+4. inventory and statically analyze supported dependency closures;
+5. prepare deterministic semantic scanner assignments;
+6. record every exact scanner result;
+7. issue and record assignment-bound model semantic reviews;
+8. optionally use the 32-role council as discovery input;
+9. run every mandatory evasive red-team category;
+10. prepare and exhaustively trace the evasive behavior graph;
+11. run independent assurance validation;
+12. collect operator remediation decisions;
+13. deterministically finalize `REPORT.md` and `FINDINGS.json`;
+14. only then permit wrapper-mediated install/build when the trusted gate passes;
+15. clean up and close the audit.
+
+Any missing identity, acquisition, scanner, reviewer, red-team, graph, trace,
+validation, dependency, release-asset, or truncation gate yields partial or
+incomplete assurance. Static analysis never proves that a project is clean.
+
+Modes without the 32-role council still run the required semantic-review and
+red-team model stages. They must not claim comprehensive assurance if those
+assignments are skipped.
 
-> Does this repository or release appear to contain intentionally malicious
-> source behavior?
+## Primary modes
 
-It pins the source identity, reads and indexes the source without executing it,
-traces suspicious behavior from activation to effect, independently validates
-the evidence, and writes a report.
+- `metadata_only` — reconnaissance only; no source assurance.
+- `audit_source` — API-direct source audit without the 32-role discovery council.
+- `audit_source_council` — API-direct source audit with council discovery.
+- `audit_local_source` — audit exact local bytes without council discovery.
+- `audit_local_source_council` — local audit with council discovery.
+- `verify_release` — source audit plus bound release-asset acquisition.
+- `audit_and_safe_build` / `audit_and_full_build` — source audit followed by
+  wrapper-mediated host execution only after trusted finalization.
+- Council build variants add council discovery to the same lifecycle.
+
+Safe/full build names currently use identical install/build wrappers. Full mode
+adds an explicit `unsafe` acknowledgement and stronger admission/warning
+posture, reserving a future distinction. Install lifecycle scripts remain
+suppressed in both modes; full mode does not enable a less-restricted installer.
+Hazardous builds may still execute repo-controlled npm build scripts,
+`build.rs`, and MSBuild targets.
+
+## Current assurance tools
+
+Semantic coverage:
+
+- `zerotrust_prepare_semantic_coverage`
+- `zerotrust_record_semantic_scanner`
+- `zerotrust_assign_semantic_review`
+- `zerotrust_record_semantic_review`
+- `zerotrust_get_semantic_coverage`
+
+Evasive red team:
+
+- `zerotrust_prepare_red_team`
+- `zerotrust_assign_red_team_review`
+- `zerotrust_record_red_team_review`
+- `zerotrust_get_red_team`
+- `zerotrust_finalize_red_team`
+
+Graph and validation:
+
+- `zerotrust_prepare_evasive_graph`
+- `zerotrust_trace_evasive_graph`
+- `zerotrust_get_evasive_graph`
+- `zerotrust_prepare_assurance_validation`
+- `zerotrust_record_assurance_validation`
+- `zerotrust_finalize_assurance_validation`
+
+Dependency tools use the same stable public naming contract:
+
+- `zerotrust_inventory_dependencies`
+- `zerotrust_analyze_dependencies`
+
+The 32-role council submits discovery candidates through
+`zerotrust_record_council_candidates`. Council output is not a second verdict
+path: a lead becomes trusted only through current scanner, semantic-review,
+red-team, graph, and validation records.
+
+## Acquisition and containment
+
+API-direct audits use:
+
+- `zerotrust_safe_list_tree`
+- `zerotrust_safe_fetch_file`
+
+Local/build source ingestion uses:
+
+- `zerotrust_safe_list_source`
+- `zerotrust_safe_index_source_file`
+- `zerotrust_safe_list_analysis_facts`
 
-It is designed for the "someone sent me a repo, installer, dependency, or
-release asset - should I trust it?" problem. It is not a general code-quality,
-license, dependency-CVE, or vulnerability scanner.
+Release audits additionally use:
 
-## Quick start
+- `zerotrust_safe_list_release_assets`
+- `zerotrust_safe_fetch_release_asset`
 
-Audit a GitHub repository:
+Wrappers bind the active audit, target identity, source SHA or local path,
+canonical artifact paths, and bounded coverage. They do not follow source-tree
+reparse points or execute repository code during preparation.
 
-```text
-@zerotrust_sourcecheck https://github.com/<owner>/<repo>
-```
+## Finalization and build gate
 
-That runs the default council audit: deterministic checks plus 32 specialized
-review roles, behavior tracing, and independent validation.
+`zerotrust_finalize_report` is the only report writer. For source audits it
+accepts structured operator decisions, derives the verdict and assurance result
+from validated state, writes the canonical artifact pair atomically, and records
+the only trusted outcome.
 
-Run the faster deterministic-only audit:
+`zerotrust_safe_install` and `zerotrust_safe_build` require the active build
+audit and its durable identity-matching finalized assurance report. Incomplete
+assurance or supported critical/high malicious behavior closes the build gate.
+Build output is never assurance evidence.
 
-```text
-@zerotrust_sourcecheck https://github.com/<owner>/<repo> mode=audit_source
-```
+## Strict contracts
 
-Audit a local directory without cloning or fetching its source:
+Tool payloads reject unknown fields, identity substitution, changed retries,
+source-text leakage, unsupported topology, and caller-supplied completeness
+claims. A numeric `schemaVersion` is strict contract metadata only; it does not
+select a workflow.
 
-```text
-@zerotrust_sourcecheck local_path="C:\path\to\repo"
-                        i_understand_local_path_reads_my_disk=true
-```
+## Lifecycle cleanup
 
-Audit a GitHub release and its published assets:
-
-```text
-@zerotrust_sourcecheck https://github.com/<owner>/<repo>/releases/tag/<tag>
-```
-
-The extension returns an instruction packet. Copilot follows that packet using
-the registered `zerotrust_*` tools and produces the final report.
-
-## What happens during an audit
-
-```text
-Pin identity -> acquire source -> index facts -> find candidates
-             -> trace behavior -> confirm/refute -> write report
-```
-
-1. **Pin identity** - resolve the exact commit, local source identity, or
-   release being audited.
-2. **Acquire source** - enumerate every required file. API-direct audits do not
-   intentionally create a source checkout.
-3. **Index facts** - record bounded facts, hashes, line ranges, and evidence
-   identities.
-4. **Find candidates** - deterministic checks and, in council modes, specialized
-   reviewers look for suspicious activation-to-effect behavior.
-5. **Trace behavior** - connect triggers, capabilities, effects, and targets.
-6. **Validate** - separate confirm, refute, and adjudication passes evaluate the
-   existing evidence without executing repository code.
-7. **Finalize** - write `REPORT.md` and `FINDINGS.json`.
-
-If required coverage or validation is incomplete, the verdict is
-`incomplete`. The extension does not turn missing evidence into a clean bill of
-health.
-
-## Choose a mode
-
-| Mode | Use it for | Executes repository code? |
-|---|---|---:|
-| `audit_source_council` | Thorough GitHub source audit. Default for repo, commit, tree, and pull-request URLs. | No |
-| `audit_source` | Faster deterministic GitHub source audit. | No |
-| `audit_local_source_council` | Thorough audit of exact files already on disk. Default with `local_path`. | No |
-| `audit_local_source` | Faster deterministic audit of local files. | No |
-| `verify_release` | Source audit plus release-asset download, hashing, and provenance checks. Default for release URLs. | No |
-| `metadata_only` | Repository metadata reconnaissance. This is not a security audit. | No |
-| `audit_and_safe_build` | Deterministic audit followed by dependency install and build. | **Yes** |
-| `audit_and_safe_build_council` | Council audit followed by dependency install and build. | **Yes** |
-| `audit_and_full_build` | Currently the same build wrappers as safe build, with an additional `unsafe` acknowledgement. | **Yes** |
-| `audit_and_full_build_council` | Council version of full build. | **Yes** |
-
-To make omitted-mode GitHub audits deterministic-only:
-
-```text
-ZEROTRUST_DETERMINISTIC_ONLY=1
-```
-
-Release URLs still default to `verify_release`.
-
-## Important safety boundaries
-
-### Source audits are static
-
-Normal URL and local-source audits do not execute repository code. Validators
-also do not build, fuzz, or create proof-of-concept files.
-
-API-direct source wrappers do not intentionally write source files, but source
-text returned to Copilot may still be retained in CLI session logs or temporary
-oversized-output storage.
-
-### Build modes execute untrusted code
-
-Build modes clone the pinned commit and run wrapper-controlled install/build
-commands. Install lifecycle scripts are suppressed, but the build itself may
-execute repository-controlled npm scripts, `build.rs`, MSBuild targets, or
-equivalent code.
-
-Both "safe" and "full" build modes currently use the same install/build wrappers.
-Install lifecycle scripts remain suppressed in both. Full mode is not more
-isolated; its explicit `unsafe` acknowledgement changes admission/warning
-posture only and reserves a future distinction. It does not select a
-less-restricted installer.
-
-Build modes require:
-
-```text
-i_understand_build_executes_code=true
-```
-
-Full-build modes additionally require:
-
-```text
-unsafe=true
-```
-
-### Local mode reads exactly the supplied directory
-
-Local mode requires an absolute path and rejects traversal, credential-store
-paths, and unsafe root links. Wrapper enumeration does not follow symlinks,
-junctions, or other reparse points.
-
-Council reviewers may use built-in read/search tools under prompt-level path
-rules. Copilot CLI does not provide a pre-tool hook that can technically
-intercept every built-in tool call. Evidence enters the trusted report only
-when it matches the wrapper-owned index, content identity, line range, and
-excerpt hash.
-
-### Release assets are quarantined
-
-`verify_release` writes assets as `<asset-id>.bin` under the audit quarantine,
-never under attacker-controlled filenames. The limit is 512 assets and 100 MB
-per asset. Skipped, oversized, truncated, failed, or mismatched assets make the
-release acquisition incomplete.
-
-## Results
-
-Every completed audit writes:
-
-| File | Contents |
-|---|---|
-| `REPORT.md` | Human-readable verdict, findings, evidence summary, limitations, and remediation guidance. |
-| `FINDINGS.json` | Canonical source-text-free findings ledger for automation and verification. |
-
-Reports live outside any build clone so the clone can be removed without
-deleting the result.
-
-Overall verdicts are:
-
-- `critical`, `high`, `medium`, or `low`
-- `no red flags found`
-- `incomplete`
-
-`no red flags found` means the completed audit found no supported malicious
-behavior. It is not proof that the project is safe or bug-free.
-
-## Remediation choices
-
-Local-source and build audits offer an operator decision for every active,
-non-refuted finding, regardless of severity. Findings are handled one at a time:
-
-- **defang** — show one bounded diff for the trusted remediation candidate,
-  wait for explicit approval, back up the original file, then apply one edit;
-- **delete project** — remove only the exact path pinned by the audit, after a
-  second path confirmation;
-- **keep as-is** — retain the finding with the operator's written rationale.
-
-A finding can be recorded as `defanged` only when static verification permits a
-fix claim and the approved edit completed. Guidance-only unresolved findings may
-be investigated, deleted, or kept, but cannot be claimed as successfully
-defanged. After remediation, run a fresh audit to verify the resulting tree.
-
-API-direct, release-verification, and metadata-only modes do not offer source
-edits because they do not own a pinned editable source tree.
-
-## Cleanup
-
-Audits use a lifecycle-bound working area containing reports, optional clones,
-release quarantine, and metadata cache.
-
-The normal cleanup order is:
-
-1. `zerotrust_cleanup_audit` for a build clone.
-2. `zerotrust_cleanup_quarantine` for downloaded release assets.
-3. `zerotrust_sweep_audit_scratch` for unexpected top-level scratch files.
-4. `zerotrust_close_audit` to release the active audit state.
-
-`zerotrust_close_audit` refuses to strand a live clone or quarantine unless
-`abandon_artifacts:true` explicitly gives up cleanup authority.
-
-## Main options
-
-```text
-zerotrust_sourcecheck({
-  url?: "https://github.com/<owner>/<repo>[/...]",
-  local_path?: "C:\absolute\path",
-  mode?: "<mode from the table above>",
-  ref?: "branch, tag, or SHA override",
-  focus?: "area to emphasize",
-  build_root?: "C:\absolute\scratch\root",
-
-  i_understand_local_path_reads_my_disk?: true,
-  i_understand_build_executes_code?: true,
-  i_understand_private_repo_risk?: true,
-  unsafe?: true,
-
-  roles?: object,
-  extra_roles?: object[],
-  judge?: string,
-  max_premium_calls?: number,
-  validation_min_severity?: "high" | "medium" | "low" | "info"
-})
-```
-
-Most users should only need the URL or local-path forms shown in
-[Quick start](#quick-start).
-
-## Tool groups
-
-The extension registers more than the main entry point because each sensitive
-operation has a narrow wrapper:
-
-- **Acquire and index:** list/fetch a pinned Git tree, or enumerate/index an
-  exact local root.
-- **Analyze:** record council candidates, trace the behavior graph, and record
-  independent validation.
-- **Release verification:** list and fetch assets bound to the active release.
-- **Build:** hardened clone, dependency install, and build.
-- **Persist:** metadata-cache operations and final report creation.
-- **Clean up:** clone, quarantine, scratch, and lifecycle cleanup.
-
-These helpers are normally driven by the instruction packet rather than called
-manually.
+- `zerotrust_cleanup_audit`
+- `zerotrust_cleanup_quarantine`
+- `zerotrust_sweep_audit_scratch`
+- `zerotrust_close_audit`
 
 ## Development
 
-The extension requires the repository's Node dependencies:
+Run every `__tests__/*.test.mjs` file with the fail-fast test runner:
 
 ```powershell
-npm install
-npm run test:zerotrust
+node __tests__/runAll.mjs
 ```
 
-After changing extension code, restart Copilot CLI or reload extensions.
+Each file runs in a separate Node process with a 60-second timeout. The runner
+stops at the first failure or timeout and exits nonzero.
 
-## Scope and limitations
-
-This extension looks for malicious intent expressed through source-level
-behavior. It does not replace:
-
-- normal secure-code review;
-- dependency/CVE scanning;
-- malware scanning of arbitrary binaries;
-- reproducible-build verification;
-- license review;
-- sandboxing or endpoint protection.
-
-The audit is only as strong as its source coverage, pinned identity, evidence,
-review models, deterministic checks, and operator trust in the local
-environment.
-
-## License
-
-MIT
+The extension intentionally registers no broad pre-tool hook. Safety guarantees
+apply to operations routed through the registered wrappers.

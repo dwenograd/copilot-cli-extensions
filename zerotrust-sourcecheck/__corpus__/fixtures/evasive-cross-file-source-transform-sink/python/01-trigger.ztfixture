@@ -1,0 +1,3 @@
+marker.fact("activation-surface","scheduled-job","python");
+marker.fact("language","python","source-text");
+marker.node("cross-trigger","trigger","scheduled-job","activation,scheduled-job");

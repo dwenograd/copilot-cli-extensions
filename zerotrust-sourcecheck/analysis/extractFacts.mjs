@@ -82,7 +82,7 @@ function lineForKey(lines, key) {
     const escaped = key.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
     const pattern = new RegExp(`(?:^|[{"'\\s,])${escaped}(?:["'\\s]*[:=]|\\s*$)`, "u");
     const index = lines.findIndex((line) => pattern.test(line));
-    return index >= 0 ? index + 1 : 1;
+    return index >= 0 ? index + 1: 1;
 }
 
 function safeJson(text) {
@@ -102,7 +102,7 @@ function walkJsonKeys(value, visit, prefix = "", depth = 0) {
         return true;
     }
     for (const key of Object.keys(value).slice(0, 2048)) {
-        const qualified = prefix ? `${prefix}.${key}` : key;
+        const qualified = prefix ? `${prefix}.${key}`: key;
         if (visit(key, qualified) === false) return false;
         if (!walkJsonKeys(value[key], visit, qualified, depth + 1)) return false;
     }
@@ -131,7 +131,7 @@ function normalizeUrl(raw) {
 
 function commandTarget(fragment) {
     const match = fragment.match(/["'`]([^"'`\r\n]{1,256})["'`]/u);
-    const candidate = match ? match[1] : String(fragment || "").trim();
+    const candidate = match ? match[1]: String(fragment || "").trim();
     const first = candidate.split(/\s+/u)[0] || "";
     if (!/^[A-Za-z0-9_.@/\\:+-]{1,256}$/u.test(first)) return null;
     return normalizeToken(nodePath.basename(first.replace(/\\/g, "/"))).toLowerCase() || null;
@@ -160,8 +160,7 @@ export function extractFactsFromText({
         if (!FACT_KINDS.includes(kind)) return true;
         const normalizedName = normalizeToken(name);
         const normalizedValue = value === null || value === undefined
-            ? null
-            : normalizeText(value, EXTRACTION_LIMITS.factValue);
+            ? null: normalizeText(value, EXTRACTION_LIMITS.factValue);
         if (!normalizedName && !normalizedValue) return true;
         const line = Math.max(1, Math.min(Number(lineNumber) || 1, 10_000_000));
         const key = `${kind}\0${normalizedName}\0${normalizedValue || ""}\0${line}`;
@@ -189,14 +188,13 @@ export function extractFactsFromText({
 
     const base = nodePath.basename(normalizedPath).toLowerCase();
     const isJson = base.endsWith(".json") || base.endsWith(".jsonc");
-    const parsedJson = isJson ? safeJson(text) : null;
+    const parsedJson = isJson ? safeJson(text): null;
     if (parsedJson) {
         walkJsonKeys(parsedJson, (key, qualified) => {
             const line = lineForKey(lines, key);
             return add(
                 ["package.json", "manifest.json", "extension.json"].includes(base)
-                    ? "manifest-key"
-                    : "config-key",
+                    ? "manifest-key": "config-key",
                 key,
                 qualified,
                 line,
@@ -277,7 +275,7 @@ export function extractFactsFromText({
         }
         const workflow = lineText.match(/^\s*-?\s*(run|uses)\s*:\s*([^\r\n#]+)/u);
         if (workflow) {
-            const target = workflow[1] === "run" ? commandTarget(workflow[2]) : workflow[2];
+            const target = workflow[1] === "run" ? commandTarget(workflow[2]): workflow[2];
             add("execution-registration", `workflow-${workflow[1]}`, target || workflow[1], line, lineText);
         }
         if (base === ".gitattributes") {
@@ -340,3 +338,22 @@ export const __internals = Object.freeze({
     commandTarget,
     excerptHash,
 });
+
+// The baseline extractor above serves the earlier index stage; semantic scanner
+// output feeds the current assurance stages.
+export {
+    SCANNER_BLOCKER_CODES,
+    SCANNER_LIMITS,
+    SCANNER_REGISTRY,
+    SCANNER_SCHEMA_REVISION,
+    SEMANTIC_FACT_KINDS,
+    SEMANTIC_RESOLUTIONS,
+    createSemanticPluginInput,
+    getScannerRegistry,
+    scanSourceText,
+    scanSourceText as extractSemanticFactsFromText,
+    selectScanner,
+    validateScannerResult,
+    validateSemanticFact,
+    validateSemanticPluginInput,
+} from "./scanners/index.mjs";

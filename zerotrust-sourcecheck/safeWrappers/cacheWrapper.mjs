@@ -19,8 +19,9 @@ import nodePath from "node:path";
 
 import {
     CACHE_LIMITS,
-    CACHE_SCHEMA_VERSION,
-    CACHE_TOOL_VERSION,
+    CACHE_CONTENT_SCOPE,
+    CACHE_SCHEMA_REVISION,
+    CACHE_FORMAT_ID,
     __internals as cacheInternals,
     buildCachePaths,
     buildCachePayload,
@@ -49,7 +50,7 @@ const TEMP_FILE_RE = /^\.source-[a-f0-9]{64}\.json\.tmp-[0-9a-f-]{36}$/u;
 function pathsEqual(left, right) {
     const a = nodePath.resolve(left);
     const b = nodePath.resolve(right);
-    return process.platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b;
+    return process.platform === "win32" ? a.toLowerCase() === b.toLowerCase(): a === b;
 }
 
 function pathIsUnder(parent, child) {
@@ -178,13 +179,13 @@ function listCanonicalCacheFiles(namespacePath) {
         right.mtimeMs - left.mtimeMs || left.path.localeCompare(right.path));
 }
 
-function collectVersionCacheFiles(versionRoot) {
+function collectFormatCacheFiles(formatRoot) {
     const files = [];
-    for (const namespaceEntry of listPlainEntries(versionRoot)) {
+    for (const namespaceEntry of listPlainEntries(formatRoot)) {
         if (!/^namespace-[a-f0-9]{64}$/u.test(namespaceEntry.name)) {
-            throw new Error(`cache version root contains an unexpected entry: ${namespaceEntry.name}`);
+            throw new Error(`cache format root contains an unexpected entry: ${namespaceEntry.name}`);
         }
-        const namespacePath = nodePath.join(versionRoot, namespaceEntry.name);
+        const namespacePath = nodePath.join(formatRoot, namespaceEntry.name);
         if (!assertPlainDirectory(namespacePath, "cache namespace")) {
             throw new Error("cache namespace disappeared during enumeration");
         }
@@ -206,15 +207,15 @@ function collectAllCacheFiles(cacheRoot) {
         if (!assertPlainDirectory(schemaPath, "cache schema directory")) {
             throw new Error("cache schema directory disappeared during enumeration");
         }
-        for (const toolEntry of listPlainEntries(schemaPath)) {
-            if (!/^tool-[a-f0-9]{64}$/u.test(toolEntry.name)) {
-                throw new Error(`cache schema directory contains an unexpected entry: ${toolEntry.name}`);
+        for (const formatEntry of listPlainEntries(schemaPath)) {
+            if (!/^format-[a-f0-9]{64}$/u.test(formatEntry.name)) {
+                throw new Error(`cache schema directory contains an unexpected entry: ${formatEntry.name}`);
             }
-            const versionRoot = nodePath.join(schemaPath, toolEntry.name);
-            if (!assertPlainDirectory(versionRoot, "cache tool-version directory")) {
-                throw new Error("cache tool-version directory disappeared during enumeration");
+            const formatRoot = nodePath.join(schemaPath, formatEntry.name);
+            if (!assertPlainDirectory(formatRoot, "cache format directory")) {
+                throw new Error("cache format directory disappeared during enumeration");
             }
-            files.push(...collectVersionCacheFiles(versionRoot));
+            files.push(...collectFormatCacheFiles(formatRoot));
         }
     }
     return files;
@@ -330,7 +331,7 @@ function resolveActiveCacheContext(args, invocation) {
     if (typeof args.audit_id !== "string") throw new Error("audit_id is required");
     const auditId = validateAuditId(args.audit_id);
     if (auditId !== ctx.auditId) {
-        throw new Error("audit_id does not match the active audit generation");
+        throw new Error("audit_id does not match the active audit identity");
     }
     const indexState = getAnalysisIndexState(sessionId, { auditId });
     const sourceIdentity = deriveCacheSourceIdentity(ctx, indexState);
@@ -441,8 +442,7 @@ export async function cacheListHandler(args, invocation) {
                 exactSource: entry.payload.sourceKey === bound.paths.sourceKey,
                 storedAt: entry.payload.storedAt,
                 sourceSha: entry.payload.sourceIdentity.kind === "github"
-                    ? entry.payload.sourceIdentity.sourceSha
-                    : null,
+                    ? entry.payload.sourceIdentity.sourceSha: null,
                 fileCount: entry.payload.files.length,
                 pluginRecords: entry.payload.pluginRecords.map((record) => ({
                     pluginId: record.pluginId,
@@ -453,8 +453,9 @@ export async function cacheListHandler(args, invocation) {
             }));
         return success({
             available: entries.length > 0,
-            cacheSchemaVersion: valid[0]?.payload.cacheSchemaVersion || CACHE_SCHEMA_VERSION,
-            toolVersion: valid[0]?.payload.toolVersion || CACHE_TOOL_VERSION,
+            cacheSchemaRevision: valid[0]?.payload.cacheSchemaRevision || CACHE_SCHEMA_REVISION,
+            formatId: valid[0]?.payload.formatId || CACHE_FORMAT_ID,
+            contentScope: valid[0]?.payload.contentScope || CACHE_CONTENT_SCOPE,
             activeSourceKey: bound.paths.sourceKey,
             entries,
             discardedCorrupt: discarded,
@@ -497,8 +498,8 @@ export async function cacheLoadHandler(args, invocation) {
         const { valid, discarded } = loadNamespaceEntries(bound.paths);
         const allowPrior = args.include_prior_source_matches !== false;
         const ordered = valid.sort((left, right) => {
-            const leftExact = left.payload.sourceKey === bound.paths.sourceKey ? 0 : 1;
-            const rightExact = right.payload.sourceKey === bound.paths.sourceKey ? 0 : 1;
+            const leftExact = left.payload.sourceKey === bound.paths.sourceKey ? 0: 1;
+            const rightExact = right.payload.sourceKey === bound.paths.sourceKey ? 0: 1;
             return leftExact - rightExact || right.mtimeMs - left.mtimeMs;
         });
         const files = new Map();
@@ -645,8 +646,8 @@ export async function cacheStoreHandler(args, invocation) {
 function removeEmptyCacheDirectories(paths) {
     for (const directory of [
         paths.namespacePath,
-        paths.versionRoot,
-        nodePath.dirname(paths.versionRoot),
+        paths.formatRoot,
+        nodePath.dirname(paths.formatRoot),
         paths.cacheRoot,
     ]) {
         try {
@@ -719,7 +720,7 @@ export const __internals = Object.freeze({
     safeUnlinkCacheEntry,
     readCacheFile,
     listCanonicalCacheFiles,
-    collectVersionCacheFiles,
+    collectFormatCacheFiles,
     collectAllCacheFiles,
     enforceCapsBeforeWrite,
     atomicWriteCache,

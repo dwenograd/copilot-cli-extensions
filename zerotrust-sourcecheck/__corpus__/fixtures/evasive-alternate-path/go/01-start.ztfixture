@@ -1,0 +1,3 @@
+marker.fact("activation-surface","startup-load","go");
+marker.fact("language","go","source-text");
+marker.node("alternate-start","activation","startup-load","activation,startup");

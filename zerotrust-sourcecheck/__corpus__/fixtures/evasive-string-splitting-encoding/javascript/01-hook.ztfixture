@@ -1,0 +1,3 @@
+marker.fact("activation-surface","package-lifecycle","javascript");
+marker.fact("language","javascript","source-text");
+marker.node("split-start","activation","package-lifecycle","activation,package-lifecycle");

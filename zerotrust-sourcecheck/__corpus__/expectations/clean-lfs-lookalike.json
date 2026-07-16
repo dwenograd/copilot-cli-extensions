@@ -1,0 +1,24 @@
+{
+  "schema": "zerotrust-evaluation-expectation",
+  "schema_version": 1,
+  "slug": "clean-lfs-lookalike",
+  "kind": "benign-lookalike",
+  "source": {"type": "local", "path": "fixtures/clean-lfs-lookalike"},
+  "dimensions": {
+    "evasion_classes": ["unsupported-or-opaque-artifacts", "binary-and-embedded-payloads"],
+    "artifact_classes": ["lfs-pointer", "binary"],
+    "languages": ["git"],
+    "size": "small"
+  },
+  "expected": {
+    "stage": {"required": ["acquired", "prepared", "scanned", "traced", "validated", "finalized"], "final": "finalized"},
+    "activation_facts": {"required": ["manual-preview"], "minimum": 1},
+    "plugin_facts": {"required": ["lfs-pointer", "lfs-data-asset"], "minimum": 2},
+    "counts": {"candidate": 1, "validated": 0, "refuted": 1, "unresolved": 0},
+    "chains": {"required": ["behavior-chain"], "complete_required": ["behavior-chain"], "forbidden": []},
+    "scores": {"severity": {"min": "low", "max": "low"}, "confidence": {"min": "medium", "max": "medium"}, "project_fit": {"min": "unlikely", "max": "unlikely"}},
+    "tags": {"required": ["benign-lookalike", "lfs-pointer"], "forbidden": ["runtime-load"]},
+    "acceptable_blockers": [],
+    "failure_stage": null
+  }
+}

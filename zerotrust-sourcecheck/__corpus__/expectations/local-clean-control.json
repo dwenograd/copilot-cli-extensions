@@ -1,5 +1,5 @@
 {
-  "schema": "zerotrust-evaluation-expectation/v1",
+  "schema": "zerotrust-evaluation-expectation",
   "schema_version": 1,
   "slug": "local-clean-control",
   "kind": "clean-control",

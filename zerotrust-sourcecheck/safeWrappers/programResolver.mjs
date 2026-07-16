@@ -1,4 +1,4 @@
-// safeWrappers/programResolver.mjs — round-11 hardening (gpt-5.5 R11 F1).
+// safeWrappers/programResolver.mjs — security rationale.
 //
 // Problem: `execFileSync("npm", ...)` with `cwd: args.clone_path` on Windows
 // can resolve `npm` to a repo-planted `npm.cmd` because:
@@ -19,8 +19,7 @@ import nodePath from "node:path";
 
 const IS_WINDOWS = process.platform === "win32";
 const PATHEXT = IS_WINDOWS
-    ? (process.env.PATHEXT || ".COM;.EXE;.BAT;.CMD;.PS1").split(";").map((e) => e.toLowerCase())
-    : [""];
+    ? (process.env.PATHEXT || ".COM;.EXE;.BAT;.CMD;.PS1").split(";").map((e) => e.toLowerCase()): [""];
 
 function pathIsUnder(parent, child) {
     if (!parent || !child) return false;
@@ -45,7 +44,7 @@ export function resolveTrustedProgram(program, { forbiddenRoots = [] } = {}) {
     if (program.includes("/") || program.includes("\\")) {
         const abs = nodePath.resolve(program);
         if (forbiddenRoots.some((r) => pathIsUnder(r, abs))) return null;
-        return existsSync(abs) ? abs : null;
+        return existsSync(abs) ? abs: null;
     }
 
     const pathDirs = (process.env.PATH || "").split(nodePath.delimiter).filter(Boolean);

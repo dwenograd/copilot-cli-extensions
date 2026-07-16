@@ -137,11 +137,9 @@ export function recordReleaseAssetFetchSuccess(state, {
         sha256: sha256.toLowerCase(),
         path,
         classification: ["binary", "text", "unknown"].includes(classification)
-            ? classification
-            : "unknown",
+            ? classification: "unknown",
         previewByteCount: Number.isSafeInteger(previewByteCount) && previewByteCount >= 0
-            ? previewByteCount
-            : 0,
+            ? previewByteCount: 0,
     });
     delete state.failedAssets[id];
     delete state.oversizedAssets[id];
@@ -160,8 +158,7 @@ export function buildReleaseAssetCoverageSnapshot(state, {
     maxItems = MAX_RELEASE_ASSET_SNAPSHOT_ITEMS,
 } = {}) {
     const itemLimit = Number.isSafeInteger(maxItems) && maxItems >= 0
-        ? Math.min(maxItems, MAX_RELEASE_ASSET_SNAPSHOT_ITEMS)
-        : MAX_RELEASE_ASSET_SNAPSHOT_ITEMS;
+        ? Math.min(maxItems, MAX_RELEASE_ASSET_SNAPSHOT_ITEMS): MAX_RELEASE_ASSET_SNAPSHOT_ITEMS;
     if (!state) {
         return {
             schemaVersion: 1,
@@ -257,9 +254,9 @@ export function buildReleaseAssetCoverageSnapshot(state, {
 
 function normalizeAsset(asset) {
     if (!asset || typeof asset !== "object") throw new Error("invalid release asset");
-    const name = typeof asset.name === "string" ? asset.name : "";
-    const contentType = typeof asset.contentType === "string" ? asset.contentType : "";
-    const digest = typeof asset.digest === "string" ? asset.digest : null;
+    const name = typeof asset.name === "string" ? asset.name: "";
+    const contentType = typeof asset.contentType === "string" ? asset.contentType: "";
+    const digest = typeof asset.digest === "string" ? asset.digest: null;
     if (!Number.isSafeInteger(asset.sizeBytes) || asset.sizeBytes < 0) {
         throw new Error(`invalid size for release asset ${asset.id}`);
     }
@@ -269,7 +266,7 @@ function normalizeAsset(asset) {
         nameTruncated: name.length > 256,
         contentType: contentType.slice(0, 128),
         sizeBytes: asset.sizeBytes,
-        digest: digest ? digest.slice(0, 128) : null,
+        digest: digest ? digest.slice(0, 128): null,
     };
 }
 
@@ -316,14 +313,13 @@ function normalizeError(error) {
 function normalizeKind(kind) {
     const normalized = String(kind || "download_failed");
     return /^[a-z][a-z0-9_]{0,63}$/.test(normalized)
-        ? normalized
-        : "download_failed";
+        ? normalized: "download_failed";
 }
 
 function compareIds(left, right) {
     const a = BigInt(left);
     const b = BigInt(right);
-    return a < b ? -1 : a > b ? 1 : 0;
+    return a < b ? -1: a > b ? 1: 0;
 }
 
 export const __internals = {

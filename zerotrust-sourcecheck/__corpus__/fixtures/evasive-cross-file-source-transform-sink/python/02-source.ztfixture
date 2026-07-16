@@ -1,0 +1,3 @@
+marker.fact("source-shape","credential-like-source","cross-file");
+marker.node("cross-source","sensitive-source","credential-source","credential,credential-source");
+marker.edge("cross-trigger-source","reads-from","cross-trigger","cross-source","credential-source");

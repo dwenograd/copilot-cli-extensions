@@ -16,6 +16,8 @@ import {
     getAnalysisIndexSnapshot,
     getTreeEnumerationState,
     getTrustedAuditContext,
+    getAssuranceState,
+    advanceAssuranceStage,
     maybeAdvanceAnalysisPrepared,
     mutateAnalysisIndexState,
     recordAcquisitionCoverageState,
@@ -23,8 +25,14 @@ import {
     recordResolvedArtifactPaths,
     recordResolvedSha,
     recordTreeEnumerationState,
+    recordAssuranceSnapshot,
 } from "../enforcement.mjs";
 import { recordIndexEnumeration } from "../analysis/indexState.mjs";
+import {
+    EVASIVE_BLOCKERS,
+    buildGitObjectInventory,
+    classifyGitTreeEntry,
+} from "../analysis/index.mjs";
 import { DEFAULT_BUILD_ROOT } from "./defaults.mjs";
 import { failure, success } from "./result.mjs";
 import {
@@ -126,7 +134,7 @@ export async function safeListTreeHandler(args, invocation) {
         if (ctx.hasActiveAudit && ctx.urlKind === "release") {
             if (!releaseIdentity) {
                 releaseIdentity = apiClient.resolveReleaseIdentity(owner, repo, {
-                    requestedTag: ctx.releaseSelector === "tag" ? ctx.ref : null,
+                    requestedTag: ctx.releaseSelector === "tag" ? ctx.ref: null,
                 });
                 if (!releaseIdentity
                     || !recordReleaseIdentity(sessionId, releaseIdentity)) {
@@ -139,8 +147,7 @@ export async function safeListTreeHandler(args, invocation) {
             };
         } else if (ctx.hasActiveAudit && ctx.resolvedSha) {
             commitIdentity = ctx.rootTreeSha
-                ? { commitSha: ctx.resolvedSha, rootTreeSha: ctx.rootTreeSha }
-                : apiClient.getCommitIdentity(owner, repo, ctx.resolvedSha);
+                ? { commitSha: ctx.resolvedSha, rootTreeSha: ctx.rootTreeSha }: apiClient.getCommitIdentity(owner, repo, ctx.resolvedSha);
         } else {
             const sha = apiClient.resolveRefToSha(owner, repo, ref, refType);
             commitIdentity = apiClient.getCommitIdentity(owner, repo, sha);
@@ -173,13 +180,13 @@ export async function safeListTreeHandler(args, invocation) {
         return failure(`bound artifact path construction failed: ${err.message}`);
     }
 
-    let state = sessionId ? getTreeEnumerationState(sessionId) : null;
+    let state = sessionId ? getTreeEnumerationState(sessionId): null;
     if (state && (state.commitSha !== commitSha || state.rootTreeSha !== rootTreeSha)) {
         return failure("safe_list_tree refused: tree-enumeration state does not match the pinned commit/root tree");
     }
     if (!state) state = createEnumerationState(commitSha, rootTreeSha);
 
-    let acquisitionState = sessionId ? getAcquisitionCoverageState(sessionId) : null;
+    let acquisitionState = sessionId ? getAcquisitionCoverageState(sessionId): null;
     if (acquisitionState
         && !validateCoverageStateIdentity(acquisitionState, commitSha, rootTreeSha)) {
         return failure("safe_list_tree refused: acquisition-coverage state does not match the pinned commit/root tree");
@@ -269,6 +276,7 @@ export async function safeListTreeHandler(args, invocation) {
     let analysisStageState = ctx.analysisStageState;
     let analysisPlugins = ctx.analysisPlugins;
     let behaviorGraph = ctx.behaviorGraph;
+    let assuranceObjectInventory = null;
     if (sessionId) {
         try {
             const indexed = mutateAnalysisIndexState(sessionId, (indexState) =>
@@ -277,15 +285,14 @@ export async function safeListTreeHandler(args, invocation) {
                         .filter((entry) => entry.type === "blob")
                         .map((entry) => ({
                             path: entry.path,
-                            size: Number.isSafeInteger(entry.size) ? entry.size : 0,
+                            size: Number.isSafeInteger(entry.size) ? entry.size: 0,
                             blobSha: entry.sha,
                         })),
                     complete: acquisitionCoverage.enumeration.complete,
                     trackingTruncated: acquisitionCoverage.enumeration.stateTrackingTruncated
                         || acquisitionCoverage.enumeration.discoveryTruncated,
                     blocker: acquisitionCoverage.enumeration.coverageBlockers > 0
-                        ? "Git tree enumeration reported coverage blockers"
-                        : null,
+                        ? "Git tree enumeration reported coverage blockers": null,
                 }));
             if (!indexed.ok) {
                 return failure("safe_list_tree refused: could not persist analysis-index enumeration state");
@@ -297,6 +304,25 @@ export async function safeListTreeHandler(args, invocation) {
             behaviorGraph = preparation?.behaviorGraph || behaviorGraph;
         } catch (err) {
             return failure(`safe_list_tree analysis-index accounting failed: ${err.message}`);
+        }
+    }
+
+    if (sessionId && ctx.hasActiveAudit) {
+        try {
+            assuranceObjectInventory = persistGitObjectInventory({
+                sessionId,
+                ctx,
+                commitSha,
+                rootTreeSha,
+                treeState: state,
+                acquisitionState,
+            });
+        } catch {
+            assuranceObjectInventory = {
+                schemaVersion: 6,
+                complete: false,
+                blockerCodes: [EVASIVE_BLOCKERS.INVENTORY_INCOMPLETE],
+            };
         }
     }
 
@@ -315,6 +341,7 @@ export async function safeListTreeHandler(args, invocation) {
         analysisStageState,
         analysisPlugins,
         behaviorGraph,
+        assuranceObjectInventory,
     }));
 }
 
@@ -389,10 +416,17 @@ function validateTreeResult(result, expectedSha, recursive) {
 }
 
 function prefixEntries(basePath, entries) {
-    return entries.map((entry) => ({
-        ...entry,
-        path: basePath ? `${basePath}/${entry.path}` : entry.path,
-    }));
+    return entries.map((entry) => {
+        const classification = classifyGitTreeEntry(entry);
+        return {
+            ...entry,
+            mode: classification.mode,
+            modeInferred: classification.modeInferred,
+            objectKind: classification.objectKind,
+            executable: classification.executable,
+            path: basePath ? `${basePath}/${entry.path}`: entry.path,
+        };
+    });
 }
 
 function addDiscoveredSubtrees(state, basePath, discovered, { requireDirectChildren = false } = {}) {
@@ -404,7 +438,7 @@ function addDiscoveredSubtrees(state, basePath, discovered, { requireDirectChild
         if (requireDirectChildren && item.path.includes("/")) {
             throw new Error(`non-recursive tree response contained a non-direct path: ${item.path}`);
         }
-        const path = basePath ? `${basePath}/${item.path}` : item.path;
+        const path = basePath ? `${basePath}/${item.path}`: item.path;
         validateSubtreePath(path);
         const sha = item.sha.toLowerCase();
         const existing = state.discoveredSubtrees.find((entry) => entry.path === path);
@@ -456,7 +490,8 @@ function mergeEntries(state, entries) {
     for (const entry of entries) {
         const existing = byPath.get(entry.path);
         if (existing) {
-            if (existing.sha !== entry.sha || existing.type !== entry.type) {
+            if (existing.sha !== entry.sha || existing.type !== entry.type
+                || existing.mode !== entry.mode) {
                 throw new Error(`entry identity conflict at ${entry.path}`);
             }
             state.duplicateEntryCount += 1;
@@ -487,6 +522,7 @@ function renderEnumerationResult({
     analysisStageState,
     analysisPlugins,
     behaviorGraph,
+    assuranceObjectInventory,
 }) {
     const unresolved = [...state.unresolvedSubtrees].sort((a, b) => a.path.localeCompare(b.path));
     const coverageComplete = unresolved.length === 0
@@ -536,7 +572,63 @@ function renderEnumerationResult({
         analysisStageState,
         analysisPlugins,
         behaviorGraph,
+        assuranceObjectInventory,
     };
+}
+
+function persistGitObjectInventory({
+    sessionId,
+    ctx,
+    commitSha,
+    rootTreeSha,
+    treeState,
+    acquisitionState,
+}) {
+    let current = getAssuranceState(sessionId, { auditId: ctx.auditId });
+    if (!current || !["acquired", "inventoried"].includes(current.stageState.current)) {
+        return current?.analysisSnapshot
+            ? {
+                schemaVersion: 6,
+                snapshotId: current.analysisSnapshot.snapshotId,
+                stage: current.stageState.current,
+                complete: current.stageState.history.includes("inventoried"),
+                blockerCodes: current.analysisSnapshot.blockerCodes,
+                inventorySha256: current.analysisSnapshot.hashes.inventorySha256,
+                sourceIdentitySha256:
+                    current.analysisSnapshot.hashes.sourceIdentitySha256,
+            }: null;
+    }
+    let built = buildGitObjectInventory({
+        auditId: current.auditId,
+        sourceNamespace: current.sourceNamespace,
+        stageState: current.stageState,
+        commitSha,
+        rootTreeSha,
+        treeState,
+        acquisitionState,
+        previousSnapshot: current.analysisSnapshot,
+    });
+    if (built.summary.complete && current.stageState.current === "acquired") {
+        current = advanceAssuranceStage(sessionId, {
+            auditId: current.auditId,
+            from: "acquired",
+            to: "inventoried",
+        });
+        built = buildGitObjectInventory({
+            auditId: current.auditId,
+            sourceNamespace: current.sourceNamespace,
+            stageState: current.stageState,
+            commitSha,
+            rootTreeSha,
+            treeState,
+            acquisitionState,
+        });
+    }
+    recordAssuranceSnapshot(sessionId, {
+        auditId: current.auditId,
+        snapshot: built.snapshot,
+    });
+    return built.summary;
 }
 
 export const __internals = {

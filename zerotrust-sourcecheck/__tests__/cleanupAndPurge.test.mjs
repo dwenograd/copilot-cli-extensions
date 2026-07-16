@@ -1,6 +1,6 @@
 // __tests__/cleanupAndPurge.test.mjs
 //
-// Tests for v3.1 hardening:
+// Tests for security rationale:
 //   - safeWrappers/cleanupWrapper.mjs (zerotrust_cleanup_audit tool)
 //   - safeWrappers/autoPurge.mjs (stale-clone purge logic)
 
@@ -113,7 +113,7 @@ test("cleanupAuditHandler rejects clone_path equal to build_root (would delete s
 });
 
 test("cleanupAuditHandler rejects clone_path outside build_root", async () => {
-    const outside = process.platform === "win32" ? "C:\\Windows\\Temp\\evil" : "/etc/evil";
+    const outside = process.platform === "win32" ? "C:\\Windows\\Temp\\evil": "/etc/evil";
     const r = await cleanupAuditHandler({ clone_path: outside, build_root: BR }, {});
     assert.equal(r.resultType, "failure");
     assert.match(r.textResultForLlm, /requires an invocation sessionId/);
@@ -239,7 +239,7 @@ test("cleanupAuditHandler refuses legacy 7-character clone names for active clea
     await withCleanupAudit(cp, async (sessionId) => {
         const r = await cleanupAuditHandler({ clone_path: cp }, { sessionId });
         assert.equal(r.resultType, "failure");
-        assert.match(r.textResultForLlm, /zt-v1-<sha256>/);
+        assert.match(r.textResultForLlm, /zt-<sha256>/);
         assert.equal(existsSync(cp), true);
     });
 });
@@ -249,7 +249,7 @@ test("cleanupAuditHandler refuses legacy flattened full-SHA names for active cle
     await withCleanupAudit(cp, async (sessionId) => {
         const r = await cleanupAuditHandler({ clone_path: cp }, { sessionId });
         assert.equal(r.resultType, "failure");
-        assert.match(r.textResultForLlm, /zt-v1-<sha256>/);
+        assert.match(r.textResultForLlm, /zt-<sha256>/);
         assert.equal(existsSync(cp), true);
     });
 });
@@ -307,7 +307,7 @@ test("cleanupAuditHandler deletion errors fail and preserve trusted state", asyn
             { clone_path: cp, build_root: BR },
             { sessionId },
             {
-                remove: () => ({
+                remove:() => ({
                     existed: true,
                     removed: false,
                     error: "simulated access denied",

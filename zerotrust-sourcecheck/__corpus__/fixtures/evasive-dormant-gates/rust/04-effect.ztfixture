@@ -1,0 +1,3 @@
+marker.node("gate-effect","sink","execution-effect","execute-effect");
+marker.edge("gate-select-effect","flows-to","gate-select","gate-effect","execute-effect");
+marker.finding("dormant-gate-chain","validated","high","high","strong","execute","gated-capability","platform-target","environment-gate,time-gate,platform-gate,dormant,execute-effect");

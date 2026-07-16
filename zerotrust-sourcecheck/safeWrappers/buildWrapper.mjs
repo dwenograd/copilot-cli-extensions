@@ -1,17 +1,16 @@
 // safeWrappers/buildWrapper.mjs — zerotrust_safe_build tool implementation.
 //
-// Like installWrapper but for the build phase. Critically: when invoked
-// in a council-build mode, this wrapper checks the recorded council
-// outcome (state.mjs) and refuses to build if the council didn't pass.
-// THIS is where Feature 3's "council aborts the build" promise is
-// actually enforced — substitutionally, not via the (broken) hook.
+// Like installWrapper but for the build phase. Host execution is allowed only
+// after the canonical report pair is durable, its active-audit identity matches,
+// the finalization stage is sealed, assurance is complete when present, and no
+// supported critical/high malicious behavior remains.
 //
-// Trust model (v3.1 hardening):
-// - The "mode" used for the council-gate decision comes from the trusted
+// Trust model:
+// - The mode used for host-execution admission comes from the trusted
 //   active-audit state (enforcement.activeAudits), NOT from args.mode.
 //   args.mode is logged as advisory only — if the trusted mode differs,
 //   the trusted mode wins. This closes the cluster-A gate-bypass attack
-//   where an agent omits args.mode to skip the council check.
+//   where an agent omits args.mode to skip the build-mode check.
 // - The build_root used for containment also comes from the trusted
 //   active-audit state, not from args.build_root.
 // - Same extra_args denylist as installWrapper.
@@ -19,13 +18,13 @@
 import { execFileSync } from "node:child_process";
 import nodePath from "node:path";
 
-import {
-    councilOutcomeMatchesAudit,
-    evaluateCouncilGate,
-    getRecordedOutcome,
-} from "./state.mjs";
-import { modeIsBuild, modeUsesCouncil } from "../modes.mjs";
+import { modeIsBuild } from "../modes.mjs";
 import { getTrustedAuditContext } from "../enforcement.mjs";
+import {
+    evaluateFinalizedReportExecutionGate,
+    fileIdentity,
+    finalizedReportMatchesAudit,
+} from "./finalizedReportGate.mjs";
 import { resolveTrustedProgram } from "./programResolver.mjs";
 import { failure, success } from "./result.mjs";
 
@@ -62,7 +61,7 @@ const ARG_RE = /^[A-Za-z0-9._=:@/\\-]+$/;
 
 // Same denylist principle as installWrapper. For build, the negation surface
 // is smaller, but path-redirect / project-redirect args are the main risk.
-// Round-2 hardening: split-form coverage + absolute-path / `..` rejection.
+// security rationale: split-form coverage + absolute-path / `..` rejection.
 const ABS_PATH_RE = /(?:[A-Za-z]:[\\/]|^\\\\|^[\\/])/;
 const TRAVERSAL_RE = /\.\./;
 const URL_SCHEME_RE = /^[A-Za-z][A-Za-z0-9+.\-]*:\/\//;
@@ -133,7 +132,7 @@ function pathIsUnder(parent, child) {
 function pathsEqual(left, right) {
     const a = nodePath.resolve(left);
     const b = nodePath.resolve(right);
-    return process.platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b;
+    return process.platform === "win32" ? a.toLowerCase() === b.toLowerCase(): a === b;
 }
 
 /**
@@ -142,15 +141,26 @@ function pathsEqual(left, right) {
  *     ecosystem,
  *     clone_path,
  *     extra_args?: string[],
- *     mode?: string,                    // ADVISORY ONLY in v3.1+ — trusted mode comes from active audit
- *     council_build_override?: boolean, // bypass severity threshold (still requires complete OR proceed_on_council_failure)
- *     proceed_on_council_failure?: boolean, // bypass incomplete-council block (still requires verdict pass OR council_build_override)
- *     build_root?: string               // ADVISORY ONLY in v3.1+ — trusted build_root comes from active audit
+ *     mode?: string,                    // ADVISORY ONLY — trusted mode comes from active audit
+ *     build_root?: string               // ADVISORY ONLY — trusted build_root comes from active audit
  *   })
  */
 export async function safeBuildHandler(args, invocation) {
     args = args || {};
     const sessionId = invocation?.sessionId || null;
+    const allowedKeys = new Set([
+        "ecosystem",
+        "clone_path",
+        "extra_args",
+        "mode",
+        "build_root",
+    ]);
+    const unexpectedKeys = Object.keys(args).filter((key) => !allowedKeys.has(key));
+    if (unexpectedKeys.length > 0) {
+        return failure(
+            `safe_build does not accept arguments: ${unexpectedKeys.join(", ")}`,
+        );
+    }
 
     const ecosystem = args.ecosystem;
     if (typeof ecosystem !== "string" || !BUILD_ECOSYSTEMS[ecosystem]) {
@@ -165,7 +175,7 @@ export async function safeBuildHandler(args, invocation) {
     if (!ctx.ok) return failure(ctx.error);
     const buildRoot = ctx.buildRoot;
     const trustedMode = ctx.mode; // null when no active audit
-    const advisoryAgentMode = typeof args.mode === "string" ? args.mode : null;
+    const advisoryAgentMode = typeof args.mode === "string" ? args.mode: null;
 
     // Local-source mode refusal: same reason as the install/clone wrappers.
     // A local-source audit has no clone and no build step authorised; the
@@ -174,7 +184,7 @@ export async function safeBuildHandler(args, invocation) {
         return failure(`safe_build refused: active audit is local-source mode (target: ${ctx.localPath}). Build operations apply to build-mode audits only.`);
     }
 
-    // Round-3 hardening: when sessionId was supplied (production agents
+    // security rationale: when sessionId was supplied (production agents
     // always have one) but no active audit exists (TTL expired or
     // zerotrust_sourcecheck not invoked), REFUSE EARLY before any other
     // check. Without this guard, the trusted-mode check silently degrades
@@ -190,7 +200,7 @@ export async function safeBuildHandler(args, invocation) {
         return failure(`clone_path ${args.clone_path} is not under build_root ${buildRoot}`);
     }
 
-    // Round-4 hardening (gpt-5.5 F2) + round-6 hardening: if the active
+    // security rationale: if the active
     // audit has a recorded resolved clone path, the build must target THAT
     // path exactly. If the audit IS active but no resolved clone path has
     // been recorded yet, REFUSE — agent must call safe_clone first.
@@ -203,15 +213,11 @@ export async function safeBuildHandler(args, invocation) {
         }
     }
 
-    // Council-gate decision uses the TRUSTED mode (from activeAudits), NOT
-    // args.mode. This closes the cluster-A bypass where an agent passes
-    // mode: "audit_and_safe_build" (a non-council build mode) when the
-    // session's actual audit was activated as audit_and_safe_build_council.
+    // Host-execution admission uses the TRUSTED mode (from activeAudits), not
+    // args.mode. The caller-supplied value remains advisory metadata.
     const effectiveMode = trustedMode || advisoryAgentMode;
-    const isCouncilMode = effectiveMode && modeUsesCouncil(effectiveMode);
     const isBuildMode = effectiveMode && modeIsBuild(effectiveMode);
-    const isCouncilBuildMode = isCouncilMode && isBuildMode;
-    // Round-2 hardening: refuse to run a build when the trusted active-audit
+    // security rationale: refuse to run a build when the trusted active-audit
     // mode is not a build mode.
     if (trustedMode && !modeIsBuild(trustedMode)) {
         return failure(`safe_build refused: active audit mode '${trustedMode}' is not a build mode. Re-invoke zerotrust_sourcecheck with audit_and_safe_build* or audit_and_full_build* (and the required ack flags) to run a build.`);
@@ -223,22 +229,12 @@ export async function safeBuildHandler(args, invocation) {
         return failure(`safe_build refused: agent-supplied mode '${advisoryAgentMode}' is not a build mode and no active audit overrides it.`);
     }
 
-    let gateOpenReason;
-    if (isCouncilBuildMode) {
-        const outcome = getRecordedOutcome(sessionId);
-        if (outcome && !councilOutcomeMatchesAudit(outcome, ctx)) {
-            return failure(
-                "council-build gate CLOSED: recorded council outcome belongs to a different audit identity (auditId/owner/repo/resolvedSha mismatch)",
-            );
-        }
-        const gate = evaluateCouncilGate(outcome, {
-            override: !!args.council_build_override,
-            overrideOnFailure: !!args.proceed_on_council_failure,
-        });
-        if (!gate.passes) {
-            return failure(`council-build gate CLOSED: ${gate.reason}`);
-        }
-        gateOpenReason = gate.reason;
+    if (!isBuildMode) {
+        return failure("safe_build refused: effective mode is not a build mode");
+    }
+    const gate = evaluateFinalizedReportExecutionGate(ctx.reportFinalization, ctx);
+    if (!gate.passes) {
+        return failure(`host build gate CLOSED: ${gate.reason}`);
     }
 
     // If the agent's advisory mode disagrees with the trusted mode, log it
@@ -259,8 +255,8 @@ export async function safeBuildHandler(args, invocation) {
     const bareProgram = argv[0];
     const programArgs = argv.slice(1);
 
-    // Round-11 hardening (gpt-5.5 R11 F1): same trusted-program-resolution
-    // hardening as installWrapper. See programResolver.mjs for rationale.
+    // security rationale: same trusted-program-resolution
+    // security as installWrapper. See programResolver.mjs for rationale.
     const program = resolveTrustedProgram(bareProgram, {
         forbiddenRoots: [buildRoot, args.clone_path],
     });
@@ -280,8 +276,8 @@ export async function safeBuildHandler(args, invocation) {
             stdio: ["ignore", "pipe", "pipe"],
         });
     } catch (err) {
-        stdout = err.stdout ? String(err.stdout) : "";
-        stderr = err.stderr ? String(err.stderr) : err.message;
+        stdout = err.stdout ? String(err.stdout): "";
+        stderr = err.stderr ? String(err.stderr): err.message;
         exitCode = err.status || 1;
         return failure(`${ecosystem} build failed (exit ${exitCode}): ${stderr.slice(-2000)}`);
     }
@@ -294,8 +290,8 @@ export async function safeBuildHandler(args, invocation) {
         exitCode,
         stdout: stdout.slice(-4000),
         stderr: stderr.slice(-2000),
-        ...(gateOpenReason ? { councilGate: gateOpenReason } : {}),
-        ...(advisoryNote ? { advisoryNote } : {}),
+        hostBuildGate: gate.reason,
+        ...(advisoryNote ? { advisoryNote }: {}),
     });
 }
 
@@ -304,6 +300,9 @@ export const __internals = {
     ARG_RE,
     ARG_DENYLIST,
     validateExtraArgs,
+    evaluateFinalizedReportBuildGate: evaluateFinalizedReportExecutionGate,
+    fileIdentity,
+    finalizedReportMatchesAudit,
     pathIsUnder,
     pathsEqual,
 };

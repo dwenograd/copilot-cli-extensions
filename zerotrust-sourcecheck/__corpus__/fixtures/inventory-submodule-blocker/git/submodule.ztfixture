@@ -1,0 +1,9 @@
+marker.fact("activation-surface","package-lifecycle","git");
+marker.fact("inventory-object","submodule-gitlink","submodule");
+marker.node("submodule-start","activation","package-lifecycle","activation,package-lifecycle");
+marker.node("submodule-object","dependency","nested-submodule","submodule,dependency");
+marker.node("submodule-effect","sink","runtime-load","runtime-load");
+marker.edge("submodule-start-object","depends-on","submodule-start","submodule-object","submodule");
+marker.edge("submodule-object-effect","flows-to","submodule-object","submodule-effect","runtime-load");
+marker.finding("submodule-chain","validated","high","high","likely","load","nested-submodule","runtime-effect","submodule,dependency,runtime-load");
+marker.blocker("prepare","inventory-submodule-unresolved");

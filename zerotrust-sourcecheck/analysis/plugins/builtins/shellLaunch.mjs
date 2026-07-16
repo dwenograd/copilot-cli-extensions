@@ -14,7 +14,7 @@ export default defineRulePlugin({
         key: `shell:${fact.path}:${fact.kind}:${fact.name}:${fact.value || ""}`,
         activationLabel: `Shell launch surface: ${fact.name}`,
         targetLabel: `Shell command/module target: ${fact.value || fact.name}`,
-        edgeKind: fact.kind === "import" ? "depends-on" : "invokes",
+        edgeKind: fact.kind === "import" ? "depends-on": "invokes",
         tags: ["powershell", "shell", "process-launch"],
     }),
     detectedWarning: (count) =>

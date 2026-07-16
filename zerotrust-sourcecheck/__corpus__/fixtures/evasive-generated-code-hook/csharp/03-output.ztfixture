@@ -1,0 +1,2 @@
+marker.node("generate-output","provenance","generated-artifact","generated-code,cross-language");
+marker.edge("generate-template-output","depends-on","generate-template","generate-output","generated-code");

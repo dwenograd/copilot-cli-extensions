@@ -1,0 +1,25 @@
+{
+  "schema": "zerotrust-evaluation-expectation",
+  "schema_version": 1,
+  "slug": "inventory-submodule-blocker",
+  "kind": "synthetic-incomplete",
+  "source": {"type": "local", "path": "fixtures/inventory-submodule-blocker"},
+  "dimensions": {
+    "evasion_classes": ["unsupported-or-opaque-artifacts", "dependency-resolution-and-package-substitution"],
+    "artifact_classes": ["submodule"],
+    "languages": ["git"],
+    "size": "small",
+    "known_coverage_blockers": true
+  },
+  "expected": {
+    "stage": {"required": ["acquired"], "final": "acquired"},
+    "activation_facts": {"required": ["package-lifecycle"], "minimum": 1},
+    "plugin_facts": {"required": ["submodule-gitlink", "inventory-submodule-unresolved"], "minimum": 2},
+    "counts": {"candidate": 1, "validated": 1, "refuted": 0, "unresolved": 0},
+    "chains": {"required": ["behavior-chain"], "complete_required": ["behavior-chain"], "forbidden": []},
+    "scores": {"severity": {"min": "high", "max": "high"}, "confidence": {"min": "high", "max": "high"}, "project_fit": {"min": "likely", "max": "likely"}},
+    "tags": {"required": ["submodule", "dependency", "runtime-load"], "forbidden": ["benign"]},
+    "acceptable_blockers": ["inventory-submodule-unresolved"],
+    "failure_stage": "prepare"
+  }
+}

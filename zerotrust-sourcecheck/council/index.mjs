@@ -21,16 +21,19 @@ export {
 };
 export {
     renderRolePrompt,
+    renderNormalizedReviewPrompt,
     materializeCouncilManifest,
     normalizeCoverageSnapshot,
     selectRoleCandidatePaths,
 } from "./promptTemplate.mjs";
 export { validateExtraRoles } from "./extraRolesValidator.mjs";
+export { renderSemanticReviewPrompt } from "./semanticReviewPrompt.mjs";
 export {
-    renderConfirmValidatorPrompt,
-    renderRefuteValidatorPrompt,
-    renderValidationAdjudicationPrompt,
-} from "./validationPromptTemplate.mjs";
+    RED_TEAM_ROLES,
+    RED_TEAM_ROLE_BY_CATEGORY,
+    RED_TEAM_ROLE_IDS,
+} from "./redTeamRoster.mjs";
+export { renderRedTeamPrompt } from "./redTeamPrompt.mjs";
 
 /**
  * Resolve the effective roster from the defaults plus user overrides.

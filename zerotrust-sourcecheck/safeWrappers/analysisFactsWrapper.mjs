@@ -57,8 +57,8 @@ export async function safeListAnalysisFactsHandler(args, invocation) {
         && !FACT_KINDS.includes(args.kind)) {
         return failure(`kind must be one of: ${FACT_KINDS.join(" | ")}`);
     }
-    const cursor = args.cursor === undefined ? 0 : Number(args.cursor);
-    const limit = args.limit === undefined ? 256 : Number(args.limit);
+    const cursor = args.cursor === undefined ? 0: Number(args.cursor);
+    const limit = args.limit === undefined ? 256: Number(args.limit);
     if (!Number.isSafeInteger(cursor) || cursor < 0) {
         return failure("cursor must be a non-negative integer");
     }

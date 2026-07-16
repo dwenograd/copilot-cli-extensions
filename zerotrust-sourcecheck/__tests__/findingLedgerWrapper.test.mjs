@@ -35,8 +35,7 @@ import { __internals as stateInternals } from "../safeWrappers/state.mjs";
 
 const SESSION = "finding-ledger-wrapper-session";
 const LOCAL_PATH = process.platform === "win32"
-    ? "C:\\projects\\council-ingestion"
-    : "/srv/council-ingestion";
+    ? "C:\\projects\\council-ingestion": "/srv/council-ingestion";
 const BUILD_ROOT = process.cwd();
 const FILE_PATH = "src/loader.mjs";
 const CONTENT_SHA = "c".repeat(64);
@@ -59,8 +58,7 @@ function activateLocal(sessionId = SESSION) {
         mode: "audit_local_source_council",
         localPath: LOCAL_PATH,
         expectedReportPath: process.platform === "win32"
-            ? `${BUILD_ROOT}\\_reports\\local-council-ingestion-20260713230000`
-            : `${BUILD_ROOT}/_reports/local-council-ingestion-20260713230000`,
+            ? `${BUILD_ROOT}\\_reports\\local-council-ingestion-20260713230000`: `${BUILD_ROOT}/_reports/local-council-ingestion-20260713230000`,
         councilRoleManifest: ROLES.map((role) => ({
             id: role.id,
             category: role.category,
@@ -113,7 +111,7 @@ function evidence(roleId, blobSha = CONTENT_SHA, coverageScope = null) {
         excerptHash: EXCERPT_HASH,
         producer: roleId,
         coverageScope: coverageScope
-            || (blobSha.length === 40 ? "council_sample" : "local_source"),
+            || (blobSha.length === 40 ? "council_sample": "local_source"),
     };
 }
 
@@ -136,7 +134,7 @@ function candidate(roleId, auditId, {
         ...evidence(
             roleId,
             blobSha,
-            sourceType === "local-file" ? "local_source" : "council_sample",
+            sourceType === "local-file" ? "local_source": "council_sample",
         ),
         path,
         excerptHash,
@@ -426,7 +424,7 @@ test("finalizes scanned only after mandatory/category/90% gates and all submissi
     const auditId = activateLocal();
     indexOneFile(SESSION);
     for (const [index, role] of ROLES.entries()) {
-        const candidates = index === 0 ? [candidate(role.id, auditId)] : [];
+        const candidates = index === 0 ? [candidate(role.id, auditId)]: [];
         const submitted = parse(await call(localSubmit(auditId, role, candidates)));
         assert.equal(submitted.ok, true, role.id);
     }
@@ -547,7 +545,7 @@ test("candidate ingestion cannot satisfy API-direct mandatory acquisition", asyn
     }, {
         sessionId,
         apiClient: {
-            fetchFile: () => apiClientInternals.buildFetchResultFromBuffer(
+            fetchFile:() => apiClientInternals.buildFetchResultFromBuffer(
                 FILE_PATH,
                 Buffer.from("processExecution();", "utf8"),
                 { blobSha: GIT_BLOB_SHA },
@@ -604,12 +602,11 @@ test("extension registers the audit-bound candidate recorder and bounded schema"
     assert.match(extensionSource, /\brecordCouncilCandidatesHandler\b/);
     assert.match(extensionSource, /name:\s*"zerotrust_record_council_candidates"/);
     assert.match(extensionSource, /maxItems:\s*32/);
-    assert.match(extensionSource, /Candidate ingestion never satisfies mandatory acquisition/i);
-    assert.match(extensionSource, /name:\s*"zerotrust_trace_behavior_graph"/);
+    assert.match(extensionSource, /submissions never satisfy mandatory acquisition/i);
+    assert.match(extensionSource, /name:\s*"zerotrust_trace_evasive_graph"/);
 });
 
 function nodePathForTest(name) {
     return process.platform === "win32"
-        ? `${BUILD_ROOT}\\${name}`
-        : `${BUILD_ROOT}/${name}`;
+        ? `${BUILD_ROOT}\\${name}`: `${BUILD_ROOT}/${name}`;
 }

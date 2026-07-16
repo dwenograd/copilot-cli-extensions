@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import nodePath from "node:path";
 
 import {
-    ANALYSIS_SCHEMA_VERSION,
+    ANALYSIS_SCHEMA_REVISION,
     LIMITS,
     validateAuditId,
 } from "../schemas.mjs";
@@ -10,12 +10,18 @@ import {
     computePluginFactId,
     definePlugin,
 } from "./contract.mjs";
+import { validateSemanticPluginInput } from "../scanners/index.mjs";
 
 export const PLUGIN_EXECUTION_LIMITS = Object.freeze({
     nodesPerPlugin: 512,
     edgesPerPlugin: 512,
     factsPerPlugin: 512,
     warningsPerPlugin: LIMITS.pluginWarnings,
+});
+
+export const PLUGIN_SEMANTIC_INPUT_LIMITS = Object.freeze({
+    files: 50_000,
+    facts: 20_000,
 });
 
 const SUPPORTED_SOURCE_KINDS = new Set([
@@ -59,8 +65,7 @@ function normalizeTag(value) {
         .replace(/^-+|-+$/gu, "")
         .slice(0, LIMITS.tag);
     return /^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,63}$/u.test(normalized)
-        ? normalized
-        : null;
+        ? normalized: null;
 }
 
 function stableId(pluginId, kind, parts) {
@@ -96,6 +101,7 @@ export function buildPluginContext({
     auditId,
     indexState,
     sourceNamespace,
+    semanticInputs = [],
 } = {}) {
     const normalizedAuditId = validateAuditId(auditId);
     if (!indexState || indexState.auditId !== normalizedAuditId
@@ -137,16 +143,75 @@ export function buildPluginContext({
             ...file,
             facts: Object.freeze([...(factsByPath.get(file.path) || [])]),
         }));
+    if (!Array.isArray(semanticInputs)) {
+        throw new TypeError("plugin semanticInputs must be an array");
+    }
+    if (semanticInputs.length > PLUGIN_SEMANTIC_INPUT_LIMITS.files) {
+        throw new TypeError(
+            `plugin semanticInputs must contain at most ${PLUGIN_SEMANTIC_INPUT_LIMITS.files} files`,
+        );
+    }
+    const normalizedSemanticInputs = [];
+    const semanticFacts = [];
+    const semanticPathSet = new Set();
+    for (let index = 0; index < semanticInputs.length; index += 1) {
+        const input = validateSemanticPluginInput(
+            semanticInputs[index],
+            `semanticInputs[${index}]`,
+        );
+        if (semanticPathSet.has(input.path)) {
+            throw new TypeError(`duplicate plugin semantic input path: ${input.path}`);
+        }
+        semanticPathSet.add(input.path);
+        const file = fileByPath.get(input.path);
+        if (!file || file.status !== "indexed-text" || !file.contentSha256) {
+            throw new TypeError(
+                `plugin semantic input is not tied to fully indexed text: ${input.path}`,
+            );
+        }
+        if (input.contentSha256 !== file.contentSha256
+            || (input.blobSha && file.blobSha && input.blobSha !== file.blobSha)) {
+            throw new TypeError(`plugin semantic input identity mismatch: ${input.path}`);
+        }
+        normalizedSemanticInputs.push(Object.freeze({ ...input, file }));
+        for (const fact of input.facts) {
+            if (semanticFacts.length >= PLUGIN_SEMANTIC_INPUT_LIMITS.facts) {
+                throw new TypeError(
+                    `plugin semanticInputs must contain at most ${PLUGIN_SEMANTIC_INPUT_LIMITS.facts} facts`,
+                );
+            }
+            semanticFacts.push(Object.freeze({ ...fact, file }));
+        }
+    }
+    const indexedTextFileCount = files.filter((file) => file.status === "indexed-text").length;
     return Object.freeze({
         auditId: normalizedAuditId,
         sourceKind: indexState.sourceKind,
         sourceNamespace: namespace,
         coverageScope: indexState.sourceKind === "local-source"
-            ? "local_source"
-            : "mandatory",
+            ? "local_source": "mandatory",
         files: Object.freeze(files),
         facts: Object.freeze(facts),
         manifests: Object.freeze(manifests),
+        semanticInputs: Object.freeze(normalizedSemanticInputs),
+        semanticFacts: Object.freeze(semanticFacts),
+        semanticCoverage: Object.freeze({
+            provided: normalizedSemanticInputs.length > 0,
+            expectedFileCount: indexedTextFileCount,
+            providedFileCount: normalizedSemanticInputs.length,
+            missingFileCount: Math.max(
+                0,
+                indexedTextFileCount - normalizedSemanticInputs.length,
+            ),
+            factCount: semanticFacts.length,
+            complete: normalizedSemanticInputs.length === indexedTextFileCount
+                && normalizedSemanticInputs.every((input) =>
+                    input.truncated === false && input.blockers.length === 0),
+            truncatedFileCount: normalizedSemanticInputs.filter((input) =>
+                input.truncated).length,
+            blockedFileCount: normalizedSemanticInputs.filter((input) =>
+                input.blockers.length > 0).length,
+        }),
     });
 }
 
@@ -164,7 +229,7 @@ function evidenceFor(context, pluginId, fact) {
 
 function sourceIdentityFor(context, fact) {
     const sourceIdentity = {
-        type: context.sourceKind === "local-source" ? "local-file" : "git-blob",
+        type: context.sourceKind === "local-source" ? "local-file": "git-blob",
         namespace: context.sourceNamespace,
         path: fact.path,
         contentSha256: fact.file.contentSha256,
@@ -180,20 +245,17 @@ function sourceIdentityFor(context, fact) {
 export function createSeedCollector(context, plugin, limits = {}) {
     const maxNodes = Math.min(
         Number.isSafeInteger(limits.nodesPerPlugin)
-            ? limits.nodesPerPlugin
-            : PLUGIN_EXECUTION_LIMITS.nodesPerPlugin,
+            ? limits.nodesPerPlugin: PLUGIN_EXECUTION_LIMITS.nodesPerPlugin,
         PLUGIN_EXECUTION_LIMITS.nodesPerPlugin,
     );
     const maxEdges = Math.min(
         Number.isSafeInteger(limits.edgesPerPlugin)
-            ? limits.edgesPerPlugin
-            : PLUGIN_EXECUTION_LIMITS.edgesPerPlugin,
+            ? limits.edgesPerPlugin: PLUGIN_EXECUTION_LIMITS.edgesPerPlugin,
         PLUGIN_EXECUTION_LIMITS.edgesPerPlugin,
     );
     const maxFacts = Math.min(
         Number.isSafeInteger(limits.factsPerPlugin)
-            ? limits.factsPerPlugin
-            : PLUGIN_EXECUTION_LIMITS.factsPerPlugin,
+            ? limits.factsPerPlugin: PLUGIN_EXECUTION_LIMITS.factsPerPlugin,
         PLUGIN_EXECUTION_LIMITS.factsPerPlugin,
     );
     const nodes = new Map();
@@ -252,7 +314,7 @@ export function createSeedCollector(context, plugin, limits = {}) {
             endLine: fact.endLine,
             excerptHash: fact.excerptHash,
             name: fact.name,
-            ...(fact.value ? { value: fact.value } : {}),
+            ...(fact.value ? { value: fact.value }: {}),
         };
         if (pluginFact.id !== computePluginFactId(pluginFact)) {
             throw new Error(`non-canonical normalized fact: ${fact.id}`);
@@ -299,7 +361,7 @@ export function createSeedCollector(context, plugin, limits = {}) {
             sourceIdentity.contentSha256,
         ]);
         const activationAdded = addNode({
-            schemaVersion: ANALYSIS_SCHEMA_VERSION,
+            schemaVersion: ANALYSIS_SCHEMA_REVISION,
             auditId: context.auditId,
             id: activationId,
             kind: activationKind,
@@ -310,7 +372,7 @@ export function createSeedCollector(context, plugin, limits = {}) {
             tags: normalizedTags,
         });
         const targetAdded = addNode({
-            schemaVersion: ANALYSIS_SCHEMA_VERSION,
+            schemaVersion: ANALYSIS_SCHEMA_REVISION,
             auditId: context.auditId,
             id: targetId,
             kind: targetKind,
@@ -322,7 +384,7 @@ export function createSeedCollector(context, plugin, limits = {}) {
         });
         if (!activationAdded || !targetAdded) return;
         addEdge({
-            schemaVersion: ANALYSIS_SCHEMA_VERSION,
+            schemaVersion: ANALYSIS_SCHEMA_REVISION,
             auditId: context.auditId,
             id: stableId(plugin.id, "edge", [activationId, edgeKind, targetId]),
             kind: edgeKind,
@@ -336,7 +398,7 @@ export function createSeedCollector(context, plugin, limits = {}) {
 
     const finish = () => Object.freeze({
         output: {
-            schemaVersion: ANALYSIS_SCHEMA_VERSION,
+            schemaVersion: ANALYSIS_SCHEMA_REVISION,
             auditId: context.auditId,
             pluginId: plugin.id,
             pluginVersion: plugin.version,
@@ -375,8 +437,7 @@ export function defineRulePlugin({
             const matches = select(context);
             for (const fact of matches) collector.addSurface(seed(fact));
             collector.addWarning(matches.length > 0
-                ? detectedWarning(matches.length)
-                : emptyWarning);
+                ? detectedWarning(matches.length): emptyWarning);
             return collector.finish();
         },
     });

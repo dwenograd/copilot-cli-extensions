@@ -2,6 +2,7 @@ import {
     BINARY_PREVIEW_BYTES,
     isKnownBinaryPath,
 } from "./apiClient.mjs";
+import { classifyGitTreeEntry } from "../analysis/objectInventory.mjs";
 
 export const COVERAGE_SCOPES = Object.freeze(["mandatory", "council_sample"]);
 export const FETCH_OUTCOMES = Object.freeze({
@@ -75,8 +76,7 @@ export function annotateTreeEntry(entry) {
         ...entry,
         classificationRequired: entry?.type === "blob",
         likelyBinaryByExtension: entry?.type === "blob"
-            ? isKnownBinaryPath(entry.path)
-            : false,
+            ? isKnownBinaryPath(entry.path): false,
     };
 }
 
@@ -94,10 +94,11 @@ export function recordEnumeratedEntries(state, entries) {
         validateBlobEntry(entry);
         const existingIndex = state.enumeratedFileIndex.get(entry.path);
         const existing = Number.isInteger(existingIndex)
-            ? state.enumeratedFiles[existingIndex]
-            : null;
+            ? state.enumeratedFiles[existingIndex]: null;
         if (existing) {
-            if (existing.sha !== entry.sha.toLowerCase()) {
+            const classification = classifyGitTreeEntry(entry);
+            if (existing.sha !== entry.sha.toLowerCase()
+                || existing.mode !== classification.mode) {
                 throw new Error(`coverage entry identity conflict at ${entry.path}`);
             }
             state.duplicateEnumerationCount += 1;
@@ -107,10 +108,15 @@ export function recordEnumeratedEntries(state, entries) {
             state.enumeratedTrackingTruncated = true;
             continue;
         }
+        const classification = classifyGitTreeEntry(entry);
         const normalized = {
             path: entry.path,
             sha: entry.sha.toLowerCase(),
-            size: Number.isSafeInteger(entry.size) && entry.size >= 0 ? entry.size : 0,
+            size: Number.isSafeInteger(entry.size) && entry.size >= 0 ? entry.size: 0,
+            mode: classification.mode,
+            modeInferred: classification.modeInferred,
+            objectKind: classification.objectKind,
+            executable: classification.executable,
             classificationRequired: true,
             likelyBinaryByExtension: isKnownBinaryPath(entry.path),
         };
@@ -156,8 +162,7 @@ export function recordFetchResult(state, {
     }
     const enumeratedIndex = state.enumeratedFileIndex.get(path);
     const enumerated = Number.isInteger(enumeratedIndex)
-        ? state.enumeratedFiles[enumeratedIndex]
-        : null;
+        ? state.enumeratedFiles[enumeratedIndex]: null;
     if (!enumerated) {
         throw new Error(`fetch result path was not enumerated from the pinned tree: ${path}`);
     }
@@ -165,6 +170,10 @@ export function recordFetchResult(state, {
         || !/^[a-f0-9]{40}$/i.test(result.blobSha)
         || result.blobSha.toLowerCase() !== enumerated.sha) {
         throw new Error(`fetch result blob identity mismatch at ${path}`);
+    }
+    if (result.gitMode !== undefined && result.gitMode !== null
+        && result.gitMode !== enumerated.mode) {
+        throw new Error(`fetch result Git mode mismatch at ${path}`);
     }
 
     const detail = classifyFetchResult(result);
@@ -185,6 +194,13 @@ export function recordFetchFailure(state, {
         sizeBytes: null,
         sha256: null,
         blobSha: null,
+        gitBlobSha1: null,
+        gitBlobSha1Verified: false,
+        gitMode: null,
+        gitObjectKind: null,
+        executable: false,
+        symlinkTarget: null,
+        lfsPointer: null,
         encoding: null,
         contentReturned: false,
         textTruncated: false,
@@ -214,14 +230,11 @@ export function buildCoverageSnapshot(state, treeState, {
     maxItems = MAX_SNAPSHOT_ITEMS,
 } = {}) {
     const itemLimit = Number.isSafeInteger(maxItems) && maxItems >= 0
-        ? Math.min(maxItems, MAX_SNAPSHOT_ITEMS)
-        : MAX_SNAPSHOT_ITEMS;
+        ? Math.min(maxItems, MAX_SNAPSHOT_ITEMS): MAX_SNAPSHOT_ITEMS;
     const files = state?.enumeratedFiles
-        ? [...state.enumeratedFiles].sort((a, b) => a.path.localeCompare(b.path))
-        : [];
+        ? [...state.enumeratedFiles].sort((a, b) => a.path.localeCompare(b.path)): [];
     const records = state?.fetchRecords
-        ? [...state.fetchRecords].sort((a, b) => a.path.localeCompare(b.path))
-        : [];
+        ? [...state.fetchRecords].sort((a, b) => a.path.localeCompare(b.path)): [];
     const recordByPath = new Map(records.map((record) => [record.path, record]));
     const uniqueBlobShas = new Set(files.map((entry) => entry.sha));
 
@@ -307,11 +320,9 @@ export function buildCoverageSnapshot(state, treeState, {
     }
 
     const unresolved = Array.isArray(treeState?.unresolvedSubtrees)
-        ? [...treeState.unresolvedSubtrees].sort((a, b) => a.path.localeCompare(b.path))
-        : [];
+        ? [...treeState.unresolvedSubtrees].sort((a, b) => a.path.localeCompare(b.path)): [];
     const treeBlockers = Array.isArray(treeState?.coverageBlockers)
-        ? treeState.coverageBlockers
-        : [];
+        ? treeState.coverageBlockers: [];
     const enumerationComplete = !!treeState
         && unresolved.length === 0
         && treeBlockers.length === 0
@@ -463,39 +474,41 @@ function classifyFetchResult(result) {
     const hasText = typeof result.text === "string";
     const byteClassification = result.classification === "text"
         || result.classification === "binary"
-        ? result.classification
-        : "unknown";
+        ? result.classification: "unknown";
     const invisibleUnicodeScan = hasText
-        ? scanInvisibleUnicode(result.text, { complete: outcome === FETCH_OUTCOMES.FULL_TEXT })
-        : { complete: false, matchCount: 0 };
+        ? scanInvisibleUnicode(result.text, { complete: outcome === FETCH_OUTCOMES.FULL_TEXT }): { complete: false, matchCount: 0 };
     return {
         outcome,
         sizeBytes: Number.isSafeInteger(result.sizeBytes) && result.sizeBytes >= 0
-            ? result.sizeBytes
-            : null,
-        sha256: typeof result.sha256 === "string" ? result.sha256 : null,
-        blobSha: typeof result.blobSha === "string" ? result.blobSha : null,
+            ? result.sizeBytes: null,
+        sha256: typeof result.sha256 === "string" ? result.sha256: null,
+        blobSha: typeof result.blobSha === "string" ? result.blobSha: null,
+        gitBlobSha1: typeof result.gitBlobSha1 === "string"
+            ? result.gitBlobSha1.toLowerCase(): null,
+        gitBlobSha1Verified: result.gitBlobSha1Verified === true,
+        gitMode: typeof result.gitMode === "string" ? result.gitMode: null,
+        gitObjectKind: typeof result.gitObjectKind === "string"
+            ? result.gitObjectKind: null,
+        executable: result.executable === true,
+        symlinkTarget: normalizeSymlinkTarget(result.symlinkTarget),
+        lfsPointer: normalizeLfsPointer(result.lfsPointer),
         byteClassification,
         classificationComplete: result.classificationComplete === true,
         classificationReason: typeof result.classificationReason === "string"
-            ? result.classificationReason.slice(0, 100)
-            : null,
+            ? result.classificationReason.slice(0, 100): null,
         classificationBytesInspected:
             Number.isSafeInteger(result.classificationBytesInspected)
                 && result.classificationBytesInspected >= 0
-                ? result.classificationBytesInspected
-                : null,
-        encoding: typeof result.encoding === "string" ? result.encoding : null,
+                ? result.classificationBytesInspected: null,
+        encoding: typeof result.encoding === "string" ? result.encoding: null,
         contentReturned: result.contentReturned === true,
         textTruncated: result.textTruncated === true,
         contentTooLarge: result.contentTooLarge === true,
         previewBase64: typeof result.previewBase64 === "string"
-            ? result.previewBase64
-            : null,
+            ? result.previewBase64: null,
         previewByteCount: Number.isSafeInteger(result.previewByteCount)
             && result.previewByteCount >= 0
-            ? result.previewByteCount
-            : null,
+            ? result.previewByteCount: null,
         invisibleUnicodeScan,
         error: null,
     };
@@ -565,8 +578,7 @@ function recordFetchAttempt(state, path, scope, detail) {
     }
     const existingIndex = state.fetchRecordIndex.get(path);
     let record = Number.isInteger(existingIndex)
-        ? state.fetchRecords[existingIndex]
-        : null;
+        ? state.fetchRecords[existingIndex]: null;
     if (record) {
         assertConsistentFetchIdentity(record, detail, path);
     }
@@ -615,7 +627,8 @@ function recordFetchAttempt(state, path, scope, detail) {
         if (!record.identity || !candidate) return;
         if (record.identity.blobSha !== candidate.blobSha
             || record.identity.sha256 !== candidate.sha256
-            || record.identity.sizeBytes !== candidate.sizeBytes) {
+            || record.identity.sizeBytes !== candidate.sizeBytes
+            || record.identity.gitMode !== candidate.gitMode) {
             throw new Error(`duplicate fetch identity conflict at ${path}`);
         }
     }
@@ -630,6 +643,7 @@ function recordFetchAttempt(state, path, scope, detail) {
             blobSha: detail.blobSha,
             sha256: detail.sha256,
             sizeBytes: detail.sizeBytes,
+            gitMode: detail.gitMode,
         };
     }
     scopeRecord.best = chooseBetter(scopeRecord.best, detail);
@@ -647,8 +661,7 @@ function createScopeRecord() {
 function chooseBetter(current, candidate) {
     if (!current) return candidate;
     return (OUTCOME_RANK.get(candidate.outcome) ?? -1) > (OUTCOME_RANK.get(current.outcome) ?? -1)
-        ? candidate
-        : current;
+        ? candidate: current;
 }
 
 function incrementOutcomeCounter(target, outcome, bestOnly) {
@@ -669,7 +682,7 @@ function incrementOutcomeCounter(target, outcome, bestOnly) {
             target.metadataOnlyFiles += 1;
             break;
         case FETCH_OUTCOMES.FAILURE:
-            target[bestOnly ? "failureOnlyFiles" : "failureFiles"] += 1;
+            target[bestOnly ? "failureOnlyFiles": "failureFiles"] += 1;
             break;
         default:
             break;
@@ -705,6 +718,40 @@ function validateBlobEntry(entry) {
         || typeof entry.sha !== "string" || !/^[a-f0-9]{40}$/i.test(entry.sha)) {
         throw new Error("coverage received an invalid blob entry");
     }
+    classifyGitTreeEntry(entry);
+}
+
+function normalizeSymlinkTarget(value) {
+    if (!value || typeof value !== "object") return null;
+    const kind = ["relative", "absolute-posix", "absolute-windows", "unc", "invalid"]
+        .includes(value.kind)
+        ? value.kind: "invalid";
+    const byteLength = Number.isSafeInteger(value.byteLength) && value.byteLength >= 0
+        ? value.byteLength: 0;
+    const targetSha256 = typeof value.targetSha256 === "string"
+        && /^[a-f0-9]{64}$/iu.test(value.targetSha256)
+        ? value.targetSha256.toLowerCase(): null;
+    return {
+        valid: value.valid === true && targetSha256 !== null,
+        kind,
+        byteLength,
+        targetSha256,
+    };
+}
+
+function normalizeLfsPointer(value) {
+    if (!value || typeof value !== "object" || value.detected !== true) return null;
+    const oidSha256 = typeof value.oidSha256 === "string"
+        && /^[a-f0-9]{64}$/iu.test(value.oidSha256)
+        ? value.oidSha256.toLowerCase(): null;
+    const size = Number.isSafeInteger(value.size) && value.size >= 0
+        ? value.size: null;
+    return {
+        detected: true,
+        valid: value.valid === true && oidSha256 !== null && size !== null,
+        oidSha256,
+        size,
+    };
 }
 
 function validateFetchPath(path) {
@@ -715,12 +762,11 @@ function validateFetchPath(path) {
 
 function normalizeDisplayPath(path) {
     return typeof path === "string" && path.length > 0
-        ? path.slice(0, 1024)
-        : "<root>";
+        ? path.slice(0, 1024): "<root>";
 }
 
 function normalizeError(error) {
-    const message = error instanceof Error ? error.message : String(error || "unknown error");
+    const message = error instanceof Error ? error.message: String(error || "unknown error");
     return message.slice(0, MAX_ERROR_LENGTH);
 }
 

@@ -15,8 +15,7 @@ import {
 } from "../urlParser.mjs";
 
 const BUILD_ROOT = process.platform === "win32"
-    ? "C:\\test\\zerotrust-sourcecheck"
-    : "/tmp/zerotrust-sourcecheck";
+    ? "C:\\test\\zerotrust-sourcecheck": "/tmp/zerotrust-sourcecheck";
 
 // ---------- Happy-path URL shapes ----------
 
@@ -52,10 +51,10 @@ test("parses a /commit/<sha> URL", () => {
 });
 
 test("parses a /releases/tag/<tag> URL", () => {
-    const r = parseGithubUrl("https://github.com/octocat/hello-world/releases/tag/v1.2.3");
+    const r = parseGithubUrl("https://github.com/octocat/hello-world/releases/tag/baseline.2.3");
     assert.equal(r.ok, true);
     assert.equal(r.parsed.kind, "release");
-    assert.equal(r.parsed.ref, "v1.2.3");
+    assert.equal(r.parsed.ref, "baseline.2.3");
 });
 
 test("parses a /pull/<n> URL", () => {
@@ -197,7 +196,7 @@ test("buildClonePath produces a child of build_root", () => {
     const sha = "a".repeat(40);
     const p = buildClonePath(BUILD_ROOT, "octocat", "hello-world", sha);
     assert.ok(p.toLowerCase().startsWith(BUILD_ROOT.toLowerCase()));
-    assert.match(p, /zt-v1-[0-9a-f]{64}$/);
+    assert.match(p, /zt-[0-9a-f]{64}$/);
 });
 
 test("buildClonePath rejects bad components", () => {
@@ -214,21 +213,21 @@ test("artifact path builders hash the full identity and avoid SHA-prefix collisi
     const shaB = "abcdef0123456789abcdef0123456789abcdef02";
     const a = buildClonePath(BUILD_ROOT, "octocat", "hello-world", shaA);
     const b = buildClonePath(BUILD_ROOT, "octocat", "hello-world", shaB);
-    assert.match(a, /zt-v1-[0-9a-f]{64}$/);
-    assert.match(b, /zt-v1-[0-9a-f]{64}$/);
+    assert.match(a, /zt-[0-9a-f]{64}$/);
+    assert.match(b, /zt-[0-9a-f]{64}$/);
     assert.notEqual(a, b);
 });
 
 test("buildReportPath places report under _reports", () => {
     const sha = "b".repeat(40);
     const p = buildReportPath(BUILD_ROOT, "octocat", "hello-world", sha);
-    assert.match(p, /_reports[/\\]zt-v1-[0-9a-f]{64}$/);
+    assert.match(p, /_reports[/\\]zt-[0-9a-f]{64}$/);
 });
 
 test("buildQuarantinePath places quarantine under _quarantine", () => {
     const sha = "c".repeat(40);
     const p = buildQuarantinePath(BUILD_ROOT, "octocat", "hello-world", sha);
-    assert.match(p, /_quarantine[/\\]zt-v1-[0-9a-f]{64}$/);
+    assert.match(p, /_quarantine[/\\]zt-[0-9a-f]{64}$/);
 });
 
 test("artifact identity encoding is unambiguous and case-normalized", () => {

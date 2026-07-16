@@ -1,0 +1,3 @@
+marker.fact("activation-surface","package-lifecycle","rust");
+marker.fact("language","rust","source-text");
+marker.node("gate-start","activation","package-lifecycle","activation,package-lifecycle");

@@ -1,0 +1,26 @@
+{
+  "schema": "zerotrust-quality-gate",
+  "mandatory_evasion_classes": [
+    "unsupported-or-opaque-artifacts",
+    "encoding-and-parser-differentials",
+    "obfuscation-generation-and-self-modification",
+    "indirection-reflection-and-data-driven-execution",
+    "environment-time-and-state-gated-activation",
+    "dynamic-code-and-external-payload-loading",
+    "binary-and-embedded-payloads",
+    "cross-language-and-build-graph-indirection",
+    "reviewer-manipulation-and-prompt-injection",
+    "dependency-resolution-and-package-substitution",
+    "release-source-and-artifact-divergence"
+  ],
+  "minimum": {
+    "activation_recall": 0.98,
+    "candidate_recall_per_mandatory_evasion_class": 0.98,
+    "complete_chain_recall": 0.95,
+    "refutation_accuracy": 0.98
+  },
+  "maximum": {
+    "clean_control_false_positive_rate": 0.03,
+    "favorable_assurance_with_known_blockers": 0
+  }
+}

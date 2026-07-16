@@ -1,0 +1,5 @@
+marker.node("docs-generate","transform","documentation-generator","benign,generated-code");
+marker.node("docs-output","sink","documentation-output","benign,local-output");
+marker.edge("docs-generate-flow","invokes","docs-generate-start","docs-generate","benign");
+marker.edge("docs-output-flow","writes-to","docs-generate","docs-output","benign");
+marker.finding("generated-docs-lookalike","refuted","low","medium","unlikely","generate","documentation","local-output","benign,benign-lookalike,generated-code");

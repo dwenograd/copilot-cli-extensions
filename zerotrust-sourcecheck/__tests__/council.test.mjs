@@ -127,7 +127,7 @@ test("resolveRoles({}) returns 32 roles, 0 errors", () => {
     assert.equal(r.errors.length, 0);
 });
 
-test("resolveRoles() with no args returns 32 roles, 0 errors", () => {
+test("resolveRoles with no args returns 32 roles, 0 errors", () => {
     const r = resolveRoles();
     assert.equal(r.roles.length, 32);
     assert.equal(r.errors.length, 0);
@@ -297,7 +297,7 @@ test("handler council definitions are static and carry no pre-acquisition identi
     assert.doesNotMatch(councilSection, /"renderedPrompt"/);
 });
 
-test("council packet finalizes scan, traces the graph, then records outcome", () => {
+test("council discovery hands off through current scan, trace, validation, and finalization", () => {
     const sessionId = "council-candidate-sequencing";
     const result = runHandler({
         url: "https://github.com/octocat/Hello",
@@ -307,14 +307,21 @@ test("council packet finalizes scan, traces the graph, then records outcome", ()
     try {
         assert.equal(result.resultType, "success");
         const packet = result.textResultForLlm;
-        const submit = packet.indexOf("zerotrust_record_council_candidates(<the role's exact JSON object>)");
-        const finalize = packet.indexOf('action: "finalize"', submit);
-        const trace = packet.indexOf("zerotrust_trace_behavior_graph", finalize);
-        const outcome = packet.indexOf("zerotrust_record_council_outcome({", finalize);
+        const submit = packet.indexOf('zerotrust_record_council_candidates({ action: "submit", ... })');
+        const semantic = packet.indexOf("zerotrust_prepare_semantic_coverage", submit);
+        const scan = packet.indexOf("zerotrust_prepare_red_team", semantic);
+        const trace = packet.indexOf("zerotrust_trace_evasive_graph", scan);
+        const validation = packet.indexOf("zerotrust_finalize_assurance_validation", trace);
+        const report = packet.indexOf("Section 7 — Final report", validation);
         assert.ok(submit >= 0);
-        assert.ok(finalize > submit);
-        assert.ok(trace > finalize);
-        assert.ok(outcome > trace);
+        assert.ok(semantic > submit);
+        assert.ok(scan > semantic);
+        assert.ok(trace > scan);
+        assert.ok(validation > trace);
+        assert.ok(report > validation);
+        assert.doesNotMatch(packet, /action:\s*"finalize"/);
+        assert.doesNotMatch(packet, /zerotrust_trace_behavior_graph/);
+        assert.doesNotMatch(packet, /zerotrust_record_council_outcome\(\{/);
         assert.match(packet, /Candidate submission is advisory and \*\*does not\*\* count toward mandatory\s+acquisition/i);
     } finally {
         deactivateAudit(sessionId);

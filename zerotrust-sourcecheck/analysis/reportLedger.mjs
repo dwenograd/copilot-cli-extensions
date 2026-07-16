@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import nodePath from "node:path";
 
 import {
-    ANALYSIS_SCHEMA_VERSION,
+    ANALYSIS_SCHEMA_REVISION,
     CONFIDENCE_LEVELS,
     COVERAGE_SCOPES,
     FINDING_STATES,
@@ -14,10 +14,10 @@ import {
 } from "./schemas.mjs";
 import { FACT_KINDS } from "./extractFacts.mjs";
 
-// V5 council artifacts are deterministic projections of trusted structured
-// state. Legacy non-council callers remain supported through a separate
-// legacy-v4/trusted:false path.
-export const FINDINGS_ARTIFACT_VERSION = 1;
+// Baseline council artifacts are deterministic projections of trusted structured
+// state. Compatibility non-council callers remain supported through a separate
+// compatibility-report/trusted:false path.
+export const FINDINGS_ARTIFACT_SCHEMA_REVISION = 1;
 
 export const REPORT_LEDGER_LIMITS = Object.freeze({
     executiveSummaryBytes: 8 * 1024,
@@ -95,7 +95,7 @@ const CHAIN_PATTERNS = Object.freeze([
     "behavior-chain",
 ]);
 const CHAIN_STATUSES = Object.freeze(["complete", "unresolved", "contested"]);
-const V5_ALLOWED_STRING_KEYS = new Set([
+const BASELINE_ALLOWED_STRING_KEYS = new Set([
     "action",
     "adjudicatorId",
     "artifactType",
@@ -188,7 +188,7 @@ const V5_ALLOWED_STRING_KEYS = new Set([
     "brokenGraphEdges",
     "legitimateProjectFit",
 ]);
-const V5_ALLOWED_STRING_ARRAY_KEYS = new Set([
+const BASELINE_ALLOWED_STRING_ARRAY_KEYS = new Set([
     "alternateChainIds",
     "chainIds",
     "completeChainIds",
@@ -271,7 +271,7 @@ function sanitizeSourceIdentity(value) {
         namespace: value.namespace,
         path: value.path,
         contentSha256: value.contentSha256,
-        ...(value.blobSha ? { blobSha: value.blobSha } : {}),
+        ...(value.blobSha ? { blobSha: value.blobSha }: {}),
     };
 }
 
@@ -339,7 +339,7 @@ function sanitizeChain(value) {
 function sanitizeIndexBlocker(value) {
     return {
         kind: value.kind,
-        ...(value.path ? { path: value.path } : {}),
+        ...(value.path ? { path: value.path }: {}),
     };
 }
 
@@ -429,12 +429,10 @@ function compactPlugins(value) {
             endLine: fact.endLine,
             excerptHash: fact.excerptHash,
             ...(fact.sourceIdentity
-                ? { sourceIdentity: sanitizeSourceIdentity(fact.sourceIdentity) }
-                : {}),
+                ? { sourceIdentity: sanitizeSourceIdentity(fact.sourceIdentity) }: {}),
         })),
         factCount: Number.isSafeInteger(value.factCount)
-            ? value.factCount
-            : (value.facts || []).length,
+            ? value.factCount: (value.facts || []).length,
         factsTruncated: value.factsTruncated === true,
         plugins: (value.plugins || []).map((plugin) => ({
             id: plugin.pluginId,
@@ -454,7 +452,7 @@ function compactPlugins(value) {
             auditId: value.behaviorGraph.auditId,
             nodeCount: value.behaviorGraph.nodeCount,
             edgeCount: value.behaviorGraph.edgeCount,
-        } : null,
+        }: null,
     };
 }
 
@@ -480,7 +478,7 @@ function buildSourceIdentity(context) {
             rootTreeSha: context.releaseIdentity.rootTreeSha || null,
             tagObjectSha: context.releaseIdentity.tagObjectSha || null,
             tagRefSha: context.releaseIdentity.tagRefSha || null,
-        } : null,
+        }: null,
     };
 }
 
@@ -560,22 +558,20 @@ function sanitizeCanonicalFinding(finding) {
 function sanitizeBlocker(value) {
     if (!isPlainObject(value)) return { code: "invalid-blocker-shape" };
     return {
-        ...(value.code ? { code: value.code } : {}),
-        ...(value.kind ? { kind: value.kind } : {}),
-        ...(value.canonicalId ? { canonicalId: value.canonicalId } : {}),
+        ...(value.code ? { code: value.code }: {}),
+        ...(value.kind ? { kind: value.kind }: {}),
+        ...(value.canonicalId ? { canonicalId: value.canonicalId }: {}),
         ...(value.canonicalFindingId
-            ? { canonicalFindingId: value.canonicalFindingId }
-            : {}),
-        ...(value.currentStage ? { currentStage: value.currentStage } : {}),
-        ...(value.path ? { path: value.path } : {}),
-        ...(value.status ? { status: value.status } : {}),
-        ...(Number.isSafeInteger(value.count) ? { count: value.count } : {}),
-        ...(Number.isSafeInteger(value.cap) ? { cap: value.cap } : {}),
-        ...(Number.isSafeInteger(value.observed) ? { observed: value.observed } : {}),
-        ...(Number.isSafeInteger(value.attempts) ? { attempts: value.attempts } : {}),
+            ? { canonicalFindingId: value.canonicalFindingId }: {}),
+        ...(value.currentStage ? { currentStage: value.currentStage }: {}),
+        ...(value.path ? { path: value.path }: {}),
+        ...(value.status ? { status: value.status }: {}),
+        ...(Number.isSafeInteger(value.count) ? { count: value.count }: {}),
+        ...(Number.isSafeInteger(value.cap) ? { cap: value.cap }: {}),
+        ...(Number.isSafeInteger(value.observed) ? { observed: value.observed }: {}),
+        ...(Number.isSafeInteger(value.attempts) ? { attempts: value.attempts }: {}),
         ...(Array.isArray(value.blockers)
-            ? { blockers: value.blockers.map(sanitizeBlocker) }
-            : {}),
+            ? { blockers: value.blockers.map(sanitizeBlocker) }: {}),
     };
 }
 
@@ -764,7 +760,7 @@ function sanitizeCouncilCoverage(ledgerSnapshot) {
             deterministicBaselineComplete:
                 ledgerSnapshot.finalization.deterministicBaselineComplete === true,
             digest: ledgerSnapshot.finalization.digest,
-        } : null,
+        }: null,
     };
 }
 
@@ -961,8 +957,7 @@ export function normalizeOperatorDecisions(value = [], {
             );
         }
         const rationale = Object.hasOwn(entry, "operator_rationale")
-            ? normalizeOperatorRationale(entry.operator_rationale, knownSourceStrings)
-            : null;
+            ? normalizeOperatorRationale(entry.operator_rationale, knownSourceStrings): null;
         if (entry.rationale_category === "other" && !rationale) {
             throw new TypeError("rationale_category 'other' requires operator_rationale");
         }
@@ -992,7 +987,7 @@ export function normalizeOperatorDecisions(value = [], {
                     origin: "operator-supplied",
                     text: rationale,
                 }),
-            } : {}),
+            }: {}),
         });
     }));
 }
@@ -1009,11 +1004,11 @@ function renderManifestFor(document) {
             evidenceCount: finding.evidence.length,
             chainCount: finding.chainIds.length,
         })),
-        ...(document.flow === "v5-ledger" ? { remediation: {
+        ...(document.flow === "trusted-ledger" ? { remediation: {
             planId: document.remediation.planId,
             counts: document.remediation.counts,
             operatorDecisions: document.remediation.operatorDecisions,
-        } } : {}),
+        } }: {}),
     };
 }
 
@@ -1031,22 +1026,22 @@ function assertSourceTextFree(value, path = "findingsArtifact") {
     }
 }
 
-function assertV5ArtifactPrivacy(value, path = "findingsArtifact", parentKey = null) {
+function assertBaselineArtifactPrivacy(value, path = "findingsArtifact", parentKey = null) {
     if (Array.isArray(value)) {
         value.forEach((entry, index) => {
             if (typeof entry === "string"
-                && !V5_ALLOWED_STRING_ARRAY_KEYS.has(parentKey)) {
+                && !BASELINE_ALLOWED_STRING_ARRAY_KEYS.has(parentKey)) {
                 throw new Error(
                     `${path}[${index}] is not permitted to contain an arbitrary string`,
                 );
             }
-            assertV5ArtifactPrivacy(entry, `${path}[${index}]`, parentKey);
+            assertBaselineArtifactPrivacy(entry, `${path}[${index}]`, parentKey);
         });
         return;
     }
     if (typeof value === "string") {
-        if (!V5_ALLOWED_STRING_KEYS.has(parentKey)
-            && !V5_ALLOWED_STRING_ARRAY_KEYS.has(parentKey)) {
+        if (!BASELINE_ALLOWED_STRING_KEYS.has(parentKey)
+            && !BASELINE_ALLOWED_STRING_ARRAY_KEYS.has(parentKey)) {
             throw new Error(`${path} is not permitted to contain an arbitrary string`);
         }
         if (/[\u0000-\u001f\u007f]/u.test(value)) {
@@ -1064,10 +1059,10 @@ function assertV5ArtifactPrivacy(value, path = "findingsArtifact", parentKey = n
     for (const [key, entry] of Object.entries(value)) {
         if (FORBIDDEN_ARTIFACT_KEYS.has(key)) {
             throw new Error(
-                `${path}.${key} is not permitted in the version-5 privacy artifact`,
+                `${path}.${key} is not permitted in the baseline analysis privacy artifact`,
             );
         }
-        assertV5ArtifactPrivacy(entry, `${path}.${key}`, key);
+        assertBaselineArtifactPrivacy(entry, `${path}.${key}`, key);
     }
 }
 
@@ -1078,9 +1073,9 @@ function finalizeDocument(base) {
     };
     const document = {
         ...withManifest,
-        documentId: `ztfindings-v${FINDINGS_ARTIFACT_VERSION}-${sha256Canonical(withManifest)}`,
+        documentId: `ztfindings-${sha256Canonical(withManifest)}`,
     };
-    if (document.flow === "v5-ledger") assertV5ArtifactPrivacy(document);
+    if (document.flow === "trusted-ledger") assertBaselineArtifactPrivacy(document);
     else assertSourceTextFree(document);
     return Object.freeze(structuredClone(document));
 }
@@ -1123,10 +1118,10 @@ export function buildFindingsArtifact({
     });
     const canonicalFindings = decisionSnapshot.canonicalFindings.map(sanitizeCanonicalFinding);
     const base = {
-        schemaVersion: ANALYSIS_SCHEMA_VERSION,
-        artifactVersion: FINDINGS_ARTIFACT_VERSION,
+        schemaVersion: ANALYSIS_SCHEMA_REVISION,
+        artifactSchemaRevision: FINDINGS_ARTIFACT_SCHEMA_REVISION,
         artifactType: "zerotrust-sourcecheck-findings",
-        flow: "v5-ledger",
+        flow: "trusted-ledger",
         auditId,
         mode: context.mode,
         sourceIdentity: buildSourceIdentity(context),
@@ -1149,7 +1144,7 @@ export function buildFindingsArtifact({
         stage: {
             input: stageState.current,
             history: [...stageState.history],
-            final: stageState.current === "validated" ? "finalized" : stageState.current,
+            final: stageState.current === "validated" ? "finalized": stageState.current,
         },
         coverage: {
             decision: Object.fromEntries(Object.entries(decisionSnapshot.coverage).map(
@@ -1174,7 +1169,7 @@ export function buildFindingsArtifact({
                     ([key, truncated]) => [key, truncated === true],
                 )),
                 finalizationDigest: validation.finalization?.digest || null,
-            } : null,
+            }: null,
         },
         cache: normalizeCacheMetadata(cacheBinding),
         stateCounts: Object.fromEntries(FINDING_STATES.map((state) => [
@@ -1211,7 +1206,7 @@ export function buildFindingsArtifact({
             )),
             blockers: (traceSnapshot.blockers || []).map(sanitizeBlocker),
             chains: (traceSnapshot.chains || []).map(sanitizeChain),
-        } : null,
+        }: null,
         remediation: sanitizeRemediationPlan(
             ledgerSnapshot.findingLedger?.remediation || null,
             normalizedOperatorDecisions,
@@ -1221,7 +1216,7 @@ export function buildFindingsArtifact({
     return finalizeDocument(base);
 }
 
-export function buildLegacyFindingsArtifact({
+export function buildCompatibilityFindingsArtifact({
     context,
     reportIdentity,
     stageState,
@@ -1232,12 +1227,12 @@ export function buildLegacyFindingsArtifact({
     verdict,
 } = {}) {
     const auditId = validateAuditId(context?.auditId);
-    if (!VERDICTS.includes(verdict)) throw new Error(`invalid legacy findings verdict: ${verdict}`);
+    if (!VERDICTS.includes(verdict)) throw new Error(`invalid compatibility findings verdict: ${verdict}`);
     return finalizeDocument({
-        schemaVersion: ANALYSIS_SCHEMA_VERSION,
-        artifactVersion: FINDINGS_ARTIFACT_VERSION,
+        schemaVersion: ANALYSIS_SCHEMA_REVISION,
+        artifactSchemaRevision: FINDINGS_ARTIFACT_SCHEMA_REVISION,
         artifactType: "zerotrust-sourcecheck-findings",
-        flow: "legacy-v4",
+        flow: "compatibility-report",
         auditId,
         mode: context.mode,
         sourceIdentity: buildSourceIdentity(context),
@@ -1268,14 +1263,14 @@ export function buildLegacyFindingsArtifact({
         adjudications: [],
         graph: null,
         blockers: uniqueCanonical([
-            { code: "legacy-v4-no-validated-ledger" },
+            { code: "compatibility-report-no-validated-ledger" },
             ...blockers,
         ]),
     });
 }
 
 export function serializeFindingsArtifact(document) {
-    if (document?.flow === "v5-ledger") assertV5ArtifactPrivacy(document);
+    if (document?.flow === "trusted-ledger") assertBaselineArtifactPrivacy(document);
     else assertSourceTextFree(document);
     const serialized = `${canonicalJson(document)}\n`;
     const bytes = Buffer.byteLength(serialized, "utf8");
@@ -1299,7 +1294,7 @@ function deterministicExecutiveSummary(document) {
     const remediation = document.remediation;
     if (document.verdict.value === "incomplete") {
         return `The audit is incomplete because ${blockerCount} trusted blocker`
-            + `${blockerCount === 1 ? "" : "s"} remain. Partial active finding counts are `
+            + `${blockerCount === 1 ? "": "s"} remain. Partial active finding counts are `
             + `${activeCount} total (${active.critical} critical, ${active.high} high, `
             + `${active.medium} medium, ${active.low} low, ${active.info} info); these counts `
             + "are not a trusted overall severity conclusion.";
@@ -1310,11 +1305,11 @@ function deterministicExecutiveSummary(document) {
         + `${active.low} low, ${active.info} info); states: ${states.validated} validated, `
         + `${states.unresolved} unresolved, ${states.refuted} refuted. Remediation metadata `
         + `contains ${remediation.counts.candidates} candidate`
-        + `${remediation.counts.candidates === 1 ? "" : "s"}, `
+        + `${remediation.counts.candidates === 1 ? "": "s"}, `
         + `${remediation.counts.investigationGuidance} investigation-guidance record`
-        + `${remediation.counts.investigationGuidance === 1 ? "" : "s"}, and `
+        + `${remediation.counts.investigationGuidance === 1 ? "": "s"}, and `
         + `${remediation.operatorDecisions.length} operator decision`
-        + `${remediation.operatorDecisions.length === 1 ? "" : "s"}.`;
+        + `${remediation.operatorDecisions.length === 1 ? "": "s"}.`;
 }
 
 function deterministicRecommendation(document) {
@@ -1353,8 +1348,7 @@ function evidenceLine(evidence) {
 function renderOperatorDecisionLines(document) {
     return document.remediation.operatorDecisions.map((decision) => {
         const rationale = decision.operatorRationale
-            ? `; user-supplied rationale=${escapeMarkdown(decision.operatorRationale.text)}`
-            : "";
+            ? `; user-supplied rationale=${escapeMarkdown(decision.operatorRationale.text)}`: "";
         return `- ${decision.findingId}: action=${decision.action}; `
             + `rationale-category=${decision.rationaleCategory}${rationale}`;
     }).join("\n");
@@ -1387,24 +1381,20 @@ export function renderFindingsMarkdown({
 - **Evidence confidence:** ${score.evidenceConfidence.level}
 - **Malicious-project fit:** ${score.maliciousProjectFitLikelihood.level}
 - **Trusted validated chain:** ${score.trustedValidatedChain}
-- **Aliases:** ${aliases.length > 0 ? aliases.join("; ") : "none"}
-- **Chain IDs:** ${finding.chainIds.length > 0 ? finding.chainIds.join(", ") : "none"}
+- **Aliases:** ${aliases.length > 0 ? aliases.join("; "): "none"}
+- **Chain IDs:** ${finding.chainIds.length > 0 ? finding.chainIds.join(", "): "none"}
 - **Validation chain IDs:** ${finding.validationChainIds.length > 0
-        ? finding.validationChainIds.join(", ")
-        : "none"}
+        ? finding.validationChainIds.join(", "): "none"}
 - **Validated complete chain IDs:** ${finding.validatedChainIds.length > 0
-        ? finding.validatedChainIds.join(", ")
-        : "none"}
+        ? finding.validatedChainIds.join(", "): "none"}
 - **Evidence references:**
-${evidence.length > 0 ? evidence.join("\n") : "  - none"}
+${evidence.length > 0 ? evidence.join("\n"): "  - none"}
 `;
     }).join("\n");
     const blockers = document.blockers.length > 0
-        ? document.blockers.map((blocker) => `- \`${escapeMarkdown(canonicalJson(blocker))}\``).join("\n")
-        : "- none";
+        ? document.blockers.map((blocker) => `- \`${escapeMarkdown(canonicalJson(blocker))}\``).join("\n"): "- none";
     const title = incomplete
-        ? "# INCOMPLETE — DO NOT TRUST — zerotrust-sourcecheck report"
-        : "# zerotrust-sourcecheck report";
+        ? "# INCOMPLETE — DO NOT TRUST — zerotrust-sourcecheck report": "# zerotrust-sourcecheck report";
 
     return `${title}
 
@@ -1525,7 +1515,7 @@ export function assertMarkdownFindingsConsistency(markdown, document) {
 export const __internals = Object.freeze({
     FORBIDDEN_ARTIFACT_KEYS,
     VERDICTS,
-    assertV5ArtifactPrivacy,
+    assertBaselineArtifactPrivacy,
     assertSourceTextFree,
     compactPlugins,
     deterministicExecutiveSummary,

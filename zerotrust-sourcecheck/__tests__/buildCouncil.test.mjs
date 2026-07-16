@@ -1,4 +1,4 @@
-// buildCouncil.test.mjs — Wave 1 Feature 3 council-build integration tests.
+// Council-build integration tests.
 
 import { test, beforeEach } from "node:test";
 import assert from "node:assert/strict";
@@ -48,7 +48,7 @@ beforeEach(() => {
         owner: "octocat",
         repo: "Hello-World",
     });
-    // Round-6 hardening: build wrapper requires a recorded resolved clone
+    // security rationale: build wrapper requires a recorded resolved clone
     // path. These tests don't actually clone; record the planned path so
     // the council-gate and mode-is-build checks (which run AFTER the
     // resolved-path check) are reached.
@@ -128,10 +128,11 @@ test("modeIsCouncilBuild identifies safe council build mode", () => {
     assert.equal(modeIsCouncilBuild("audit_and_safe_build_council"), true);
 });
 
-test("safeBuildHandler refuses council build when no outcome is recorded", async () => {
+test("safeBuildHandler refuses host execution before report finalization", async () => {
     const r = await safeBuildHandler(safeBuildArgs(), { sessionId: SESSION });
     assert.equal(r.resultType, "failure");
-    assert.match(r.textResultForLlm, /council-build gate CLOSED/);
+    assert.match(r.textResultForLlm, /host build gate CLOSED/);
+    assert.match(r.textResultForLlm, /durable canonical REPORT\.md/i);
 });
 
 test("delayed audit-A outcome is refused after audit B activates in the same session", async () => {
@@ -174,39 +175,37 @@ test("delayed audit-A outcome is refused after audit B activates in the same ses
     });
     const build = await safeBuildHandler(safeBuildArgs(), { sessionId: SESSION });
     assert.equal(build.resultType, "failure");
-    assert.match(build.textResultForLlm, /different audit identity/i);
+    assert.match(build.textResultForLlm, /host build gate CLOSED/i);
 });
 
-test("safeBuildHandler blocks a complete critical council outcome", async () => {
+test("caller-recorded critical outcome cannot open the host build gate", async () => {
     await recordOutcome("critical", true, { critical_count: 1 });
     const r = await safeBuildHandler(safeBuildArgs(), { sessionId: SESSION });
     assert.equal(r.resultType, "failure");
-    assert.match(r.textResultForLlm, /council-build gate CLOSED/);
+    assert.match(r.textResultForLlm, /host build gate CLOSED/);
 });
 
-test("safeBuildHandler allows override for a complete critical council outcome", async () => {
-    await recordOutcome("critical", true, { critical_count: 1 });
-    const r = await safeBuildHandler(
-        safeBuildArgs({ council_build_override: true }),
-        { sessionId: SESSION },
-    );
-    assert.equal(r.resultType, "failure");
-    assert.doesNotMatch(r.textResultForLlm, /council-build gate CLOSED/);
+test("removed build bypass fields are rejected", async () => {
+    for (const field of [
+        "council_build_override",
+        "proceed_on_council_failure",
+    ]) {
+        const r = await safeBuildHandler(
+            safeBuildArgs({ [field]: true }),
+            { sessionId: SESSION },
+        );
+        assert.equal(r.resultType, "failure");
+        assert.match(r.textResultForLlm, /does not accept arguments/);
+        assert.match(r.textResultForLlm, new RegExp(field));
+    }
 });
 
-test("safeBuildHandler blocks incomplete low outcome unless proceed flag is set", async () => {
+test("caller-recorded incomplete low outcome cannot open the host build gate", async () => {
     await recordOutcome("low", false);
 
     const blocked = await safeBuildHandler(safeBuildArgs(), { sessionId: SESSION });
     assert.equal(blocked.resultType, "failure");
-    assert.match(blocked.textResultForLlm, /council-build gate CLOSED/);
-
-    const proceeded = await safeBuildHandler(
-        safeBuildArgs({ proceed_on_council_failure: true }),
-        { sessionId: SESSION },
-    );
-    assert.equal(proceeded.resultType, "failure");
-    assert.doesNotMatch(proceeded.textResultForLlm, /council-build gate CLOSED/);
+    assert.match(blocked.textResultForLlm, /host build gate CLOSED/);
 });
 
 test("handler accepts the new council-build modes with required acknowledgements", () => {
@@ -249,14 +248,26 @@ test("packet emits build instructions for audit_and_safe_build_council", () => {
     assert.match(getSafeCouncilPacket(), /zerotrust_safe_build/);
 });
 
-test("packet tells agent to record council outcome before safe build", () => {
-    assert.match(getSafeCouncilPacket(), /zerotrust_record_council_outcome/);
-    assert.match(getSafeCouncilPacket(), /audit_id:\s*runtimeContext\.auditId/);
+test("packet tells agent to finalize the report before host execution", () => {
+    const packet = getSafeCouncilPacket();
+    assert.doesNotMatch(
+        packet,
+        /zerotrust_record_council_outcome\(\{/,
+    );
+    const finalizerCall = packet.indexOf(
+        "const finalizeResult = zerotrust_finalize_report({",
+    );
+    const hostExecutionInstructions = packet.indexOf(
+        "Use `zerotrust_safe_install` for installs",
+        finalizerCall,
+    );
+    assert.ok(finalizerCall >= 0);
+    assert.ok(hostExecutionInstructions > finalizerCall);
     assert.match(
-        getSafeCouncilPacket(),
+        packet,
         /immutable active-audit ID[\s\S]*[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}/i,
     );
-    assert.match(getSafeCouncilPacket(), /runtimeContext[\s\S]*auditId = "[0-9a-f-]{36}"/i);
+    assert.match(packet, /runtimeContext[\s\S]*auditId:\s*"[0-9a-f-]{36}"/i);
 });
 
 test("build wrapper identity handoff materializes concrete council prompts", () => {
@@ -302,14 +313,20 @@ test("build wrapper identity handoff materializes concrete council prompts", () 
 });
 
 test("build-council orchestration consumes wrapper-returned runtime identities", () => {
-    const section = getSafeCouncilPacket().slice(
-        getSafeCouncilPacket().indexOf("## Section 5b"),
-        getSafeCouncilPacket().indexOf("## Section 6"),
-    );
-    assert.match(section, /cloneResult\.boundContext\.clonePath/);
-    assert.match(section, /runtimeContext\.reportPath/);
-    assert.match(section, /single Section 8 finalizer/);
-    assert.doesNotMatch(section, /zerotrust_finalize_report\(\{/);
-    assert.match(section, /only identities subsequent remediation, report, and cleanup instructions may consume/);
-    assert.doesNotMatch(section, /0000000|RESOLVED_SHA|not yet substituted/i);
+    const packet = getSafeCouncilPacket();
+    const acquisition = packet.indexOf("const cloneResult = zerotrust_safe_clone({");
+    const council = packet.indexOf("## Section 5b");
+    const validation = packet.indexOf("zerotrust_finalize_assurance_validation");
+    const finalizer = packet.indexOf("const finalizeResult = zerotrust_finalize_report({");
+    const hostExecution = packet.indexOf("## Section 8 — Hazardous post-audit host execution");
+    assert.ok(acquisition >= 0);
+    assert.ok(council > acquisition);
+    assert.ok(validation > council);
+    assert.ok(finalizer > validation);
+    assert.ok(hostExecution > finalizer);
+    assert.match(packet, /cloneResult\.boundContext\.clonePath/);
+    assert.match(packet, /runtimeContext\.sourceCommitSha/);
+    assert.match(packet, /runtimeContext\.reportPath/);
+    assert.match(packet, /only identities subsequent council, remediation,\s+report, host-execution, and cleanup instructions may consume/i);
+    assert.doesNotMatch(packet.slice(council, finalizer), /0{40}|<RESOLVED_SHA>|not yet substituted/i);
 });

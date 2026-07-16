@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 
 import {
-    ANALYSIS_SCHEMA_VERSION,
+    ANALYSIS_SCHEMA_REVISION,
     GRAPH_EDGE_KINDS,
     GRAPH_NODE_KINDS,
 } from "../../analysis/schemas.mjs";
@@ -92,7 +92,7 @@ export const FIXTURE_PLUGIN = definePlugin({
             if (nodeIds.has(logicalId)) throw new Error(`duplicate fixture node: ${logicalId}`);
             nodeIds.set(logicalId, id);
             nodes.push({
-                schemaVersion: ANALYSIS_SCHEMA_VERSION,
+                schemaVersion: ANALYSIS_SCHEMA_REVISION,
                 auditId: context.auditId,
                 id,
                 kind,
@@ -110,7 +110,7 @@ export const FIXTURE_PLUGIN = definePlugin({
                 throw new Error(`invalid fixture edge kind: ${kind}`);
             }
             edges.push({
-                schemaVersion: ANALYSIS_SCHEMA_VERSION,
+                schemaVersion: ANALYSIS_SCHEMA_REVISION,
                 auditId: context.auditId,
                 id: stableId("edge", logicalId),
                 kind,
@@ -124,7 +124,7 @@ export const FIXTURE_PLUGIN = definePlugin({
 
         return {
             output: {
-                schemaVersion: ANALYSIS_SCHEMA_VERSION,
+                schemaVersion: ANALYSIS_SCHEMA_REVISION,
                 auditId: context.auditId,
                 pluginId: FIXTURE_PLUGIN_ID,
                 pluginVersion: FIXTURE_PLUGIN_VERSION,

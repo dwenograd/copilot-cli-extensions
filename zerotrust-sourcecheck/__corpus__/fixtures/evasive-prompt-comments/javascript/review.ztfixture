@@ -1,0 +1,9 @@
+marker.comment("reviewer-instruction-like-comment");
+marker.fact("activation-surface","prompt-instruction","javascript");
+marker.fact("language","javascript","source-text");
+marker.node("prompt-start","activation","prompt-instruction","activation,prompt,instruction");
+marker.node("prompt-tool","capability","tool-invoke","tool,agent-action");
+marker.node("prompt-effect","sink","filesystem-effect","filesystem,file-write");
+marker.edge("prompt-start-tool","invokes","prompt-start","prompt-tool","tool");
+marker.edge("prompt-tool-effect","flows-to","prompt-tool","prompt-effect","filesystem");
+marker.finding("prompt-chain","validated","high","high","strong","write","tool-invoke","filesystem-target","prompt-like,reviewer-manipulation,tool,file-write");

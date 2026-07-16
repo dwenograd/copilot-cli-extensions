@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 
 import {
-    ANALYSIS_SCHEMA_VERSION,
+    ANALYSIS_SCHEMA_REVISION,
     LIMITS,
     validateAuditId,
     validateCandidateFinding,
@@ -197,33 +197,33 @@ function uniqueCanonical(values) {
 function behaviorForKind(signature, kind) {
     if (!signature) return null;
     if (kind === "activation" || kind === "trigger") {
-        return signature.trigger ? { trigger: signature.trigger } : null;
+        return signature.trigger ? { trigger: signature.trigger }: null;
     }
     if (kind === "capability") {
         return {
             capability: signature.capability,
-            ...(signature.mechanism ? { mechanism: signature.mechanism } : {}),
+            ...(signature.mechanism ? { mechanism: signature.mechanism }: {}),
         };
     }
     if (kind === "transform") {
         return {
             action: signature.action,
-            ...(signature.mechanism ? { mechanism: signature.mechanism } : {}),
-            ...(signature.qualifiers ? { qualifiers: signature.qualifiers } : {}),
+            ...(signature.mechanism ? { mechanism: signature.mechanism }: {}),
+            ...(signature.qualifiers ? { qualifiers: signature.qualifiers }: {}),
         };
     }
     if (kind === "persistence") {
         return {
             action: signature.action,
             target: signature.target,
-            ...(signature.persistence ? { persistence: signature.persistence } : {}),
+            ...(signature.persistence ? { persistence: signature.persistence }: {}),
         };
     }
     if (kind === "propagation") {
         return {
             action: signature.action,
             target: signature.target,
-            ...(signature.propagation ? { propagation: signature.propagation } : {}),
+            ...(signature.propagation ? { propagation: signature.propagation }: {}),
         };
     }
     return {
@@ -247,11 +247,11 @@ function buildIndexCatalog(indexState, auditId) {
         throw new Error("analysis index auditId does not match graph merge auditId");
     }
     const files = new Map();
-    for (const file of Array.isArray(indexState.files) ? indexState.files : []) {
+    for (const file of Array.isArray(indexState.files) ? indexState.files: []) {
         files.set(file.path, file);
     }
     const factsByPath = new Map();
-    for (const fact of Array.isArray(indexState.facts) ? indexState.facts : []) {
+    for (const fact of Array.isArray(indexState.facts) ? indexState.facts: []) {
         const list = factsByPath.get(fact.path) || [];
         list.push(fact);
         factsByPath.set(fact.path, list);
@@ -278,8 +278,7 @@ function validateSourceIdentityAgainstCatalog(sourceIdentity, sourceNamespace, c
         return "source-content-identity-mismatch";
     }
     const expectedBlob = catalog.sourceKind === "local-source"
-        ? file.contentSha256
-        : file.blobSha;
+        ? file.contentSha256: file.blobSha;
     if (expectedBlob) {
         if (sourceIdentity.blobSha !== expectedBlob) return "source-blob-identity-mismatch";
     } else if (Object.hasOwn(sourceIdentity, "blobSha")) {
@@ -305,7 +304,7 @@ function validateEvidenceAgainstCatalog(evidence, catalog) {
         fact.line === evidence.startLine
         && fact.endLine === evidence.endLine
         && fact.excerptHash === evidence.excerptHash);
-    return match ? null : "evidence-reference-not-indexed";
+    return match ? null: "evidence-reference-not-indexed";
 }
 
 function graphDocument(raw) {
@@ -319,7 +318,7 @@ function graphDocument(raw) {
 }
 
 function graphDigest(document) {
-    return hash("zerotrust-graph-input-v5", {
+    return hash("zerotrust-graph-input", {
         schemaVersion: document.schemaVersion,
         auditId: document.auditId,
         nodes: [...document.nodes].sort((left, right) =>
@@ -333,7 +332,7 @@ function associationMaps(findings, auditId, catalog, sourceNamespace, issue) {
     const nodeAssociations = new Map();
     const edgeAssociations = new Map();
     const normalizedFindings = [];
-    for (const rawFinding of Array.isArray(findings) ? findings : []) {
+    for (const rawFinding of Array.isArray(findings) ? findings: []) {
         let finding;
         try {
             finding = validateCandidateFinding(rawFinding);
@@ -380,18 +379,18 @@ function associationMaps(findings, auditId, catalog, sourceNamespace, issue) {
 }
 
 function bindingForNode(node, associations) {
-    const directSources = node.sourceIdentity ? [node.sourceIdentity] : [];
+    const directSources = node.sourceIdentity ? [node.sourceIdentity]: [];
     const fallbackSources = associations.map((finding) => finding.sourceIdentity);
     const directEvidence = node.evidence || [];
     const fallbackEvidence = associations.flatMap((finding) => finding.evidence);
-    const directBehaviors = node.behaviorSignature ? [node.behaviorSignature] : [];
+    const directBehaviors = node.behaviorSignature ? [node.behaviorSignature]: [];
     const fallbackBehaviors = associations
         .map((finding) => behaviorForKind(finding.behaviorSignature, node.kind))
         .filter(Boolean);
     return {
-        sources: uniqueCanonical(directSources.length > 0 ? directSources : fallbackSources),
+        sources: uniqueCanonical(directSources.length > 0 ? directSources: fallbackSources),
         evidence: uniqueCanonical(
-            (directEvidence.length > 0 ? directEvidence : fallbackEvidence)
+            (directEvidence.length > 0 ? directEvidence: fallbackEvidence)
                 .map(evidenceSemantic),
         ),
         behaviors: uniqueCanonical([...directBehaviors, ...fallbackBehaviors]),
@@ -404,7 +403,7 @@ function bindingForEdge(edge, associations) {
     const fallbackEvidence = associations.flatMap((finding) => finding.evidence);
     return {
         evidence: uniqueCanonical(
-            (directEvidence.length > 0 ? directEvidence : fallbackEvidence)
+            (directEvidence.length > 0 ? directEvidence: fallbackEvidence)
                 .map(evidenceSemantic),
         ),
         tags: [...(edge.tags || [])].sort(),
@@ -471,7 +470,7 @@ export function mergeBehaviorGraphs({
     const appendConflict = (reasonCode, details = {}) => {
         const semantic = { reasonCode, ...details };
         const conflict = {
-            id: `ztv-v5-${hash("zerotrust-graph-conflict-v5", semantic)}`,
+            id: `ztv-${hash("zerotrust-graph-conflict", semantic)}`,
             ...semantic,
         };
         if (!conflicts.some((entry) => entry.id === conflict.id)) {
@@ -513,7 +512,7 @@ export function mergeBehaviorGraphs({
     );
 
     const uniqueGraphs = new Map();
-    for (const rawGraph of Array.isArray(graphs) ? graphs : []) {
+    for (const rawGraph of Array.isArray(graphs) ? graphs: []) {
         let document;
         try {
             document = graphDocument(rawGraph);
@@ -521,7 +520,7 @@ export function mergeBehaviorGraphs({
             appendBlocker("invalid-graph-document");
             continue;
         }
-        if (document.schemaVersion !== ANALYSIS_SCHEMA_VERSION
+        if (document.schemaVersion !== ANALYSIS_SCHEMA_REVISION
             || document.auditId !== normalizedAuditId) {
             identityIssue("graph-document-audit-mismatch");
             continue;
@@ -547,7 +546,7 @@ export function mergeBehaviorGraphs({
     const rejectedNodeIds = new Set();
 
     for (const { document, node: rawNode } of rawNodes) {
-        if (document.schemaVersion !== ANALYSIS_SCHEMA_VERSION
+        if (document.schemaVersion !== ANALYSIS_SCHEMA_REVISION
             || document.auditId !== normalizedAuditId) {
             identityIssue("graph-document-audit-mismatch");
             continue;
@@ -557,7 +556,7 @@ export function mergeBehaviorGraphs({
             node = validateGraphNode(rawNode);
         } catch {
             appendBlocker("invalid-graph-node-contract", {
-                entryId: typeof rawNode?.id === "string" ? rawNode.id : undefined,
+                entryId: typeof rawNode?.id === "string" ? rawNode.id: undefined,
             });
             continue;
         }
@@ -585,7 +584,7 @@ export function mergeBehaviorGraphs({
         }
         if (rejectedNodeIds.has(node.id)) continue;
         const nodeAssociations = associations.nodeAssociations.get(node.id) || [];
-        const sourceError = (node.sourceIdentity ? [node.sourceIdentity] : [])
+        const sourceError = (node.sourceIdentity ? [node.sourceIdentity]: [])
             .map((source) =>
                 validateSourceIdentityAgainstCatalog(source, sourceNamespace, catalog))
             .find(Boolean);
@@ -629,7 +628,7 @@ export function mergeBehaviorGraphs({
             node,
             binding,
             semantic,
-            semanticKey: hash("zerotrust-graph-node-semantic-v5", semantic),
+            semanticKey: hash("zerotrust-graph-node-semantic", semantic),
         });
     }
 
@@ -642,7 +641,7 @@ export function mergeBehaviorGraphs({
     const rejectedEdgeIds = new Set();
 
     for (const { document, edge: rawEdge } of rawEdges) {
-        if (document.schemaVersion !== ANALYSIS_SCHEMA_VERSION
+        if (document.schemaVersion !== ANALYSIS_SCHEMA_REVISION
             || document.auditId !== normalizedAuditId) {
             identityIssue("graph-document-audit-mismatch");
             continue;
@@ -652,7 +651,7 @@ export function mergeBehaviorGraphs({
             edge = validateGraphEdge(rawEdge);
         } catch {
             appendBlocker("invalid-graph-edge-contract", {
-                entryId: typeof rawEdge?.id === "string" ? rawEdge.id : undefined,
+                entryId: typeof rawEdge?.id === "string" ? rawEdge.id: undefined,
             });
             continue;
         }
@@ -692,7 +691,7 @@ export function mergeBehaviorGraphs({
                 reasonCode: "edge-references-unresolved-node",
                 nodeIds: [edge.from, edge.to],
                 edgeIds: [edge.id],
-                ...(fromRecord ? { fromSemantic: fromRecord.semanticKey } : {}),
+                ...(fromRecord ? { fromSemantic: fromRecord.semanticKey }: {}),
             });
             continue;
         }
@@ -757,7 +756,7 @@ export function mergeBehaviorGraphs({
             edge,
             binding,
             semantic,
-            semanticKey: hash("zerotrust-graph-edge-semantic-v5", semantic),
+            semanticKey: hash("zerotrust-graph-edge-semantic", semantic),
             fromSemantic: fromRecord.semanticKey,
             toSemantic: toRecord.semanticKey,
         });
@@ -810,7 +809,7 @@ export function mergeBehaviorGraphs({
             contentSha256: file.contentSha256,
         })).sort((left, right) => left.path.localeCompare(right.path)),
     };
-    const inputFingerprint = hash("zerotrust-graph-merge-input-v5", {
+    const inputFingerprint = hash("zerotrust-graph-merge-input", {
         auditId: normalizedAuditId,
         sourceNamespace,
         graphs: [...uniqueGraphs.keys()].sort(),
@@ -834,13 +833,13 @@ export function mergeBehaviorGraphs({
         && identityMismatchCount === 0;
 
     return Object.freeze({
-        schemaVersion: ANALYSIS_SCHEMA_VERSION,
+        schemaVersion: ANALYSIS_SCHEMA_REVISION,
         auditId: normalizedAuditId,
         sourceNamespace,
         inputFingerprint,
         coverageComplete,
         counts: Object.freeze({
-            inputGraphs: Array.isArray(graphs) ? graphs.length : 0,
+            inputGraphs: Array.isArray(graphs) ? graphs.length: 0,
             uniqueGraphs: uniqueGraphs.size,
             mergedGraphs: graphDocuments.length,
             nodes: nodeRecords.length,

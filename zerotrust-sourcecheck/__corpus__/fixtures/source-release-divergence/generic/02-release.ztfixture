@@ -1,0 +1,7 @@
+marker.fact("artifact-shape","release-transform","release-divergence");
+marker.node("release-transform","transform","release-transform","release-divergence,transform");
+marker.node("release-output","sink","release-publish","release-asset,publish");
+marker.edge("release-source-transform","enables","release-source","release-transform","release-divergence");
+marker.edge("release-transform-output","flows-to","release-transform","release-output","publish");
+marker.finding("release-divergence-chain","validated","high","high","strong","publish","release-transform","release-asset","source-release-divergence,release-asset,provenance");
+marker.blocker("prepare","release-source-divergence");

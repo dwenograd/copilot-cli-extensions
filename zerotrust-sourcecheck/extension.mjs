@@ -6,7 +6,7 @@
 // deterministic dual-artifact finalization, and substitutional build wrappers.
 //
 // IMPORTANT — no `hooks: {}` registration (operator-elevated-permissions
-// minimization, v4-r3): earlier versions registered an onPreToolUse hook
+// minimization): an earlier implementation registered an onPreToolUse hook
 // (forward-compat against observed Copilot CLI 1.0.x behavior where the runtime
 // did not fire it for built-in tools; no public issue URL is recorded here)
 // and an onSessionEnd hook (per-session
@@ -20,12 +20,12 @@
 //   - onSessionEnd cleanup is replaced by the explicit, non-destructive
 //     zerotrust_close_audit lifecycle tool. Destructive cleanup wrappers run
 //     first and retain trusted audit context on failure so they can be retried;
-//     close_audit clears the audit/outcome Maps only after cleanup succeeds or
+//     close_audit clears active audit state only after cleanup succeeds or
 //     abandon_artifacts explicitly acknowledges leaving canonical artifacts.
 //     Per-mode TTL inside
 //     enforcement.mjs::getActiveAudit remains a secondary safety net for
 //     audits that never reach close (TTL expiry deletes the audit entry
-//     and dispatches clearRecordedOutcome). Worst case: a session that
+//     and discards expired audit state). Worst case: a session that
 //     ends without reaching close AND without further audit access
 //     leaves a few hundred bytes of stale Map state until the extension
 //     process exits — bounded and trivial.
@@ -36,13 +36,13 @@
 //
 // Architecture:
 //   - extension.mjs (this file): joinSession + tool registrations
-//   - handler.mjs              : URL parsing, mode resolution, scrub, council dispatch, packet build entry
-//   - modes.mjs                : single source of truth for mode taxonomy + helpers
-//   - urlParser.mjs            : pure URL/owner/repo/ref/path validation
-//   - enforcement.mjs          : audit-in-progress state machine (activate/getActive/deactivate) used by the wrappers; also exports the unregistered preToolUseHook for tests and future re-wiring
-//   - packet.mjs               : the natural-language playbook the agent executes
-//   - council/                 : 32-role roster + universal prompt template + extra-roles validator
-//   - safeWrappers/            : substitutional-safety tools
+//   - handler.mjs: URL parsing, mode resolution, scrub, council dispatch, packet build entry
+//   - modes.mjs: single source of truth for mode taxonomy + helpers
+//   - urlParser.mjs: pure URL/owner/repo/ref/path validation
+//   - enforcement.mjs: audit-in-progress state machine (activate/getActive/deactivate) used by the wrappers; also exports the unregistered preToolUseHook for tests and future re-wiring
+//   - packet.mjs: the natural-language playbook the agent executes
+//   - council/: 32-role roster + universal prompt template + extra-roles validator
+//   - safeWrappers/: substitutional-safety tools
 
 import { joinSession } from "@github/copilot-sdk/extension";
 import { runHandler } from "./handler.mjs";
@@ -51,7 +51,6 @@ import {
     safeCloneHandler,
     safeInstallHandler,
     safeBuildHandler,
-    recordOutcomeHandler,
     finalizeReportHandler,
     cleanupAuditHandler,
     cleanupQuarantineHandler,
@@ -63,14 +62,30 @@ import {
     safeListAnalysisFactsHandler,
     safeListSourceHandler,
     recordCouncilCandidatesHandler,
-    traceBehaviorGraphHandler,
-    recordValidationHandler,
     safeListReleaseAssetsHandler,
     safeFetchReleaseAssetHandler,
     cacheCleanupHandler,
     cacheListHandler,
     cacheLoadHandler,
     cacheStoreHandler,
+    assignSemanticReviewHandler,
+    getSemanticCoverageHandler,
+    prepareSemanticCoverageHandler,
+    recordSemanticReviewHandler,
+    recordSemanticScannerHandler,
+    safeAnalyzeDependenciesHandler,
+    safeInventoryDependenciesHandler,
+    assignRedTeamHandler,
+    finalizeRedTeamHandler,
+    getRedTeamHandler,
+    prepareRedTeamHandler,
+    recordRedTeamReviewHandler,
+    getEvasiveGraphHandler,
+    prepareEvasiveGraphHandler,
+    traceEvasiveGraphHandler,
+    finalizeAssuranceValidationHandler,
+    prepareAssuranceValidationHandler,
+    recordAssuranceValidationHandler,
 } from "./safeWrappers/index.mjs";
 
 const CACHE_PLUGIN_VERSION_SCHEMA = {
@@ -120,12 +135,114 @@ const CACHE_PLUGIN_RECORD_SCHEMA = {
     ],
 };
 
+const AUDIT_ID_SCHEMA = {
+    type: "string",
+    pattern:
+        "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+};
+
+const OBJECT_ID_SCHEMA = {
+    type: "string",
+    pattern: "^zto-[a-f0-9]{64}$",
+};
+
+const ARTIFACT_IDS_SCHEMA = {
+    type: "array",
+    maxItems: 64,
+    uniqueItems: true,
+    items: {
+        type: "string",
+        pattern: "^zta-[a-f0-9]{64}$",
+    },
+};
+
+const SEMANTIC_CHECKS_SCHEMA = {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+        activationAndEntryPoints: {
+            type: "string",
+            enum: ["checked", "not-applicable", "unresolved"],
+        },
+        dataflowSourcesTransformsSinks: {
+            type: "string",
+            enum: ["checked", "not-applicable", "unresolved"],
+        },
+        dynamicExecutionAndIndirection: {
+            type: "string",
+            enum: ["checked", "not-applicable", "unresolved"],
+        },
+        environmentTimeStateGates: {
+            type: "string",
+            enum: ["checked", "not-applicable", "unresolved"],
+        },
+        generatedAndDecodedContent: {
+            type: "string",
+            enum: ["checked", "not-applicable", "unresolved"],
+        },
+        externalPayloads: {
+            type: "string",
+            enum: ["checked", "not-applicable", "unresolved"],
+        },
+        buildAndWorkflowHooks: {
+            type: "string",
+            enum: ["checked", "not-applicable", "unresolved"],
+        },
+        dependencyResolution: {
+            type: "string",
+            enum: ["checked", "not-applicable", "unresolved"],
+        },
+    },
+    required: [
+        "activationAndEntryPoints",
+        "dataflowSourcesTransformsSinks",
+        "dynamicExecutionAndIndirection",
+        "environmentTimeStateGates",
+        "generatedAndDecodedContent",
+        "externalPayloads",
+        "buildAndWorkflowHooks",
+        "dependencyResolution",
+    ],
+};
+
+const DEPENDENCY_MANIFEST_SCHEMA = {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+        path: { type: "string", maxLength: 4096 },
+        content: { type: "string", maxLength: 8388608 },
+        content_sha256: {
+            type: "string",
+            pattern: "^[a-fA-F0-9]{64}$",
+        },
+    },
+    required: ["path", "content", "content_sha256"],
+};
+
+const DEPENDENCY_LIMITS_SCHEMA = {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+        maxDepth: { type: "integer", minimum: 0, maximum: 8 },
+        maxPackages: { type: "integer", minimum: 1, maximum: 512 },
+        maxRequests: { type: "integer", minimum: 1, maximum: 128 },
+        maxRedirects: { type: "integer", minimum: 0, maximum: 2 },
+        requestTimeoutMs: { type: "integer", minimum: 1, maximum: 15000 },
+        maxResponseBytes: { type: "integer", minimum: 1, maximum: 16777216 },
+        maxTotalBytes: { type: "integer", minimum: 1, maximum: 67108864 },
+        maxArchiveEntries: { type: "integer", minimum: 1, maximum: 2048 },
+        maxArchiveDepth: { type: "integer", minimum: 0, maximum: 4 },
+        maxScannedTextBytes: { type: "integer", minimum: 1, maximum: 8388608 },
+        maxFacts: { type: "integer", minimum: 1, maximum: 20000 },
+    },
+};
+
 const session = await joinSession({
     tools: [
         {
             name: "zerotrust_sourcecheck",
             description:
-                "Audit a GitHub URL or already-on-disk directory for source-level malicious behavior; this is not generic vulnerability or exploit scanning. Each activation emits a cryptographically random immutable audit ID used to bind council outcomes and lifecycle operations. URL wrappers do not intentionally create source files, although Copilot CLI/session logging may retain returned text; verify_release lists and downloads assets only through active-audit-bound wrappers into the canonical quarantine. Local and build-clone preparation uses exact-active-path-bound, non-executing source ingestion wrappers that do not follow reparse points and retain only bounded normalized facts. Council modes keep the 32-role discovery backbone and follow Prepare→Scan→Trace→Validate→Dedupe/score→Finalize: deterministic activation plugins seed the graph; candidates require exact indexed evidence; proof uses independent static confirm/refute/adjudication; and finalization deterministically writes REPORT.md + FINDINGS.json from trusted state and structured operator decisions. Any incomplete gate yields only incomplete. Build modes require explicit acknowledgements, but no separate prior-audit report is enforced. " +
+                "Audit a GitHub URL or already-on-disk directory for source-level malicious behavior; this is not generic vulnerability or exploit scanning. Every activation owns one current assurance lifecycle: acquisition, object inventory and decoding, dependency analysis, deterministic semantic scanning, assignment-bound model semantic review, 32-role council discovery where selected, mandatory evasive red-team categories, exhaustive evasive graph tracing, independent assurance validation, remediation decisions, and deterministic REPORT.md + FINDINGS.json finalization. Each activation emits a cryptographically random immutable audit ID binding all state and artifacts. URL wrappers do not intentionally create source files, although Copilot CLI/session logging may retain returned text; verify_release assets are confined to the canonical quarantine. Local and build-clone ingestion is exact-path-bound, non-executing, reparse-safe, and source-text-free. Any incomplete required stage yields incomplete assurance. Build modes require explicit acknowledgements and a durable identity-matching finalized assurance report before hazardous host execution. " +
                 BUILD_MODE_TAXONOMY_NOTE +
                 " Wrapper protections apply only to calls routed through the registered wrappers; no pre-tool hook intercepts raw built-in shell calls.",
             parameters: {
@@ -147,7 +264,7 @@ const session = await joinSession({
                         type: "string",
                         enum: [...VALID_MODES],
                         description:
-                            "Audit depth. Repo/tree/commit/pull URLs default to audit_source_council unless ZEROTRUST_DETERMINISTIC_ONLY=1; release URLs default to verify_release; local paths default to audit_local_source_council. Build modes require i_understand_build_executes_code. Council-build modes additionally require a recorded outcome unless the orthogonal incompleteness/severity overrides are supplied. " +
+                            "Audit depth. Repo/tree/commit/pull URLs default to audit_source_council; release URLs default to verify_release; local paths default to audit_local_source_council. Modes without the 32-role discovery council still run required semantic and evasive model coverage. Build modes require i_understand_build_executes_code and a durable identity-matching finalized assurance report before hazardous post-audit host execution. " +
                             BUILD_MODE_TAXONOMY_NOTE,
                     },
                     ref: {
@@ -178,7 +295,7 @@ const session = await joinSession({
                         type: "boolean",
                         default: false,
                         description:
-                            "Required ack flag for all build modes, including audit_and_safe_build_council and audit_and_full_build_council. Install lifecycle scripts remain suppressed, but build commands may execute repo-controlled npm build scripts, build.rs, and MSBuild targets on your host.",
+                            "Required ack flag for all build modes, including audit_and_safe_build_council and audit_and_full_build_council. Install lifecycle scripts remain suppressed, but hazardous post-audit host execution may run repo-controlled npm build scripts, build.rs, and MSBuild targets on your host.",
                     },
                     unsafe: {
                         type: "boolean",
@@ -215,13 +332,6 @@ const session = await joinSession({
                         description:
                             "Optional (council modes only). Launch-count circuit breaker. Default 200. This is not a billing/cost estimate.",
                     },
-                    validation_min_severity: {
-                        type: "string",
-                        enum: ["high", "medium", "low", "info"],
-                        default: "high",
-                        description:
-                            "Optional (council modes only). Critical/high candidates are always statically validated. This sets the lowest additional severity entering independent confirm/refute/adjudication. Default: high.",
-                    },
                 },
                 required: [],
             },
@@ -232,7 +342,7 @@ const session = await joinSession({
                 }),
         },
 
-        // ----- v4 API-direct audit tools (default for non-build modes) -----
+        // ----- API-direct audit tools for non-build modes -----
         // These tools fetch GitHub content via `gh api` and return it through
         // tool results. They do not intentionally create source files, but CLI
         // logging/output spill behavior is outside this extension. The audit
@@ -396,9 +506,690 @@ const session = await joinSession({
         },
 
         {
+            name: "zerotrust_inventory_dependencies",
+            description:
+                "Parse exact active-audit-bound dependency lockfile bytes without network access or execution. Supports npm package-lock/npm-shrinkwrap, Cargo.lock, hashed requirements/Poetry/Pipfile locks, NuGet packages.lock.json/packages.config, and Git/local dependency forms. Returns an audit-bound package/provenance graph with exact versions, sources, integrity, aliases, local paths, mutable refs, and lifecycle/build-hook declarations. Missing integrity, mutable refs, unsupported registries, unresolved transitives, and caps are blockers.",
+            parameters: {
+                type: "object",
+                additionalProperties: false,
+                properties: {
+                    audit_id: AUDIT_ID_SCHEMA,
+                    manifests: {
+                        type: "array",
+                        minItems: 1,
+                        maxItems: 32,
+                        items: DEPENDENCY_MANIFEST_SCHEMA,
+                    },
+                    limits: DEPENDENCY_LIMITS_SCHEMA,
+                    build_root: {
+                        type: "string",
+                        description:
+                            "Optional compatibility field; must exactly match the active audit build_root.",
+                    },
+                },
+                required: ["audit_id", "manifests"],
+            },
+            handler: (args, invocation) =>
+                safeInventoryDependenciesHandler(args, {
+                    sessionId: invocation?.sessionId,
+                }),
+        },
+
+        {
+            name: "zerotrust_analyze_dependencies",
+            description:
+                "Build and statically analyze the exact active-audit dependency closure without package managers, scripts, external libraries, registry CLIs, disk writes, or dependency execution. Metadata/artifact URLs are derived from bound lockfiles and fetched only with Node HTTPS from strict registry hosts under redirect/time/size/request/depth caps. Declared integrity is verified before in-memory tgz/tar/zip/wheel/nupkg/crate reading and existing language scanning. Hash mismatch, fetch failure, missing integrity, unsupported registry, mutable refs, or recursion caps remain blockers. Exact matching current object snapshots receive dependency-graph derived artifacts.",
+            parameters: {
+                type: "object",
+                additionalProperties: false,
+                properties: {
+                    audit_id: AUDIT_ID_SCHEMA,
+                    manifests: {
+                        type: "array",
+                        minItems: 1,
+                        maxItems: 32,
+                        items: DEPENDENCY_MANIFEST_SCHEMA,
+                    },
+                    limits: DEPENDENCY_LIMITS_SCHEMA,
+                    build_root: {
+                        type: "string",
+                        description:
+                            "Optional compatibility field; must exactly match the active audit build_root.",
+                    },
+                },
+                required: ["audit_id", "manifests"],
+            },
+            handler: (args, invocation) =>
+                safeAnalyzeDependenciesHandler(args, {
+                    sessionId: invocation?.sessionId,
+                }),
+        },
+
+        {
+            name: "zerotrust_prepare_semantic_coverage",
+            description:
+                "Bind the active decoded snapshot to deterministic object classifications, scanner shards, model-review shards, and the complete set of source-text-free prompt normalized views. The plan is immutable and idempotent; missing prompt assessments remain explicit semantic blockers.",
+            parameters: {
+                type: "object",
+                additionalProperties: false,
+                properties: {
+                    audit_id: AUDIT_ID_SCHEMA,
+                    normalized_views_json: {
+                        type: "string",
+                        maxLength: 8388608,
+                        description:
+                            "JSON array containing every validated prompt normalized view required by executable/config subjects. Use [] only when the plan has no such subjects.",
+                    },
+                    scanner_shard_count: {
+                        type: "integer",
+                        minimum: 1,
+                        maximum: 256,
+                        default: 16,
+                    },
+                    model_shard_count: {
+                        type: "integer",
+                        minimum: 1,
+                        maximum: 256,
+                        default: 16,
+                    },
+                },
+                required: ["audit_id", "normalized_views_json"],
+            },
+            handler: (args, invocation) =>
+                prepareSemanticCoverageHandler(args, {
+                    sessionId: invocation?.sessionId,
+                }),
+        },
+
+        {
+            name: "zerotrust_record_semantic_scanner",
+            description:
+                "Record one immutable scanner result against an exact deterministic scanner assignment/token and object or derived-artifact identity. Truncation and scanner blockers remain incomplete; retries are idempotent and replacement records are refused.",
+            parameters: {
+                type: "object",
+                additionalProperties: false,
+                properties: {
+                    audit_id: AUDIT_ID_SCHEMA,
+                    assignment_id: {
+                        type: "string",
+                        pattern: "^ztsa-[a-f0-9]{64}$",
+                    },
+                    assignment_token: {
+                        type: "string",
+                        pattern: "^ztst-[a-f0-9]{64}$",
+                    },
+                    scanner_result_json: {
+                        type: "string",
+                        maxLength: 8388608,
+                        description:
+                            "Exact JSON object returned by the trusted scanner for the assigned path/content identity.",
+                    },
+                },
+                required: [
+                    "audit_id",
+                    "assignment_id",
+                    "assignment_token",
+                    "scanner_result_json",
+                ],
+            },
+            handler: (args, invocation) =>
+                recordSemanticScannerHandler(args, {
+                    sessionId: invocation?.sessionId,
+                }),
+        },
+
+        {
+            name: "zerotrust_assign_semantic_review",
+            description:
+                "Issue and immutably store one wrapper-bound model semantic-review assignment for a deterministic model shard, only after every assigned scanner subject has an immutable record. The assignment embeds a strict source-text-free semanticView containing normalized scanner facts, unresolved targets/blockers, derived-artifact metadata, and all eight check bases. High-risk subjects expose two slots and require distinct reviewer IDs. Prompt-affected assignments also embed the normalized-view review contract.",
+            parameters: {
+                type: "object",
+                additionalProperties: false,
+                properties: {
+                    audit_id: AUDIT_ID_SCHEMA,
+                    object_id: OBJECT_ID_SCHEMA,
+                    reviewer_slot: {
+                        type: "integer",
+                        minimum: 1,
+                        maximum: 2,
+                    },
+                    reviewer_id: {
+                        type: "string",
+                        maxLength: 128,
+                        pattern: "^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,127}$",
+                    },
+                    reviewer_version: {
+                        type: "string",
+                        maxLength: 64,
+                        pattern: "^[A-Za-z0-9][A-Za-z0-9.+_-]{0,63}$",
+                    },
+                },
+                required: [
+                    "audit_id",
+                    "object_id",
+                    "reviewer_slot",
+                    "reviewer_id",
+                    "reviewer_version",
+                ],
+            },
+            handler: (args, invocation) =>
+                assignSemanticReviewHandler(args, {
+                    sessionId: invocation?.sessionId,
+                }),
+        },
+
+        {
+            name: "zerotrust_record_semantic_review",
+            description:
+                "Record one immutable wrapper-issued semantic review. Findings must be bounded structured candidates with behavior, severity, confidence, malicious-project fit, benign-hypothesis code, and exact assignment-bound object/artifact/fact/evidence identities; the wrapper derives candidate IDs. Completed reviews bind the exact semanticView ID/hash and review every assigned fact/artifact. Empty findings retain the exact negative-evidence contract. Duplicate retries/candidates never inflate the semantic candidate ledger.",
+            parameters: {
+                type: "object",
+                additionalProperties: false,
+                properties: {
+                    audit_id: AUDIT_ID_SCHEMA,
+                    assignment_id: {
+                        type: "string",
+                        pattern: "^ztsma-[a-f0-9]{64}$",
+                    },
+                    assignment_token: {
+                        type: "string",
+                        pattern: "^ztsmt-[a-f0-9]{64}$",
+                    },
+                    reviewer_id: {
+                        type: "string",
+                        maxLength: 128,
+                        pattern: "^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,127}$",
+                    },
+                    object_id: OBJECT_ID_SCHEMA,
+                    artifact_ids: ARTIFACT_IDS_SCHEMA,
+                    semantic_view_id: {
+                        type: "string",
+                        pattern: "^ztsv-[a-f0-9]{64}$",
+                    },
+                    semantic_view_sha256: {
+                        type: "string",
+                        pattern: "^[a-f0-9]{64}$",
+                    },
+                    reviewed_fact_ids: {
+                        type: "array",
+                        maxItems: 8192,
+                        uniqueItems: true,
+                        items: {
+                            type: "string",
+                            pattern: "^[a-f0-9]{64}$",
+                        },
+                    },
+                    reviewed_artifact_ids: ARTIFACT_IDS_SCHEMA,
+                    decision: {
+                        type: "string",
+                        enum: ["findings-recorded", "no-findings", "incomplete"],
+                    },
+                    checks: SEMANTIC_CHECKS_SCHEMA,
+                    negative_evidence_codes: {
+                        type: "array",
+                        maxItems: 8,
+                        uniqueItems: true,
+                        items: {
+                            type: "string",
+                            enum: [
+                                "no-activation-path-supported",
+                                "no-source-transform-sink-chain-supported",
+                                "no-dynamic-execution-supported",
+                                "no-environment-time-state-gate-supported",
+                                "no-generated-or-decoded-payload-supported",
+                                "no-external-payload-supported",
+                                "no-build-workflow-hook-supported",
+                                "no-dependency-substitution-supported",
+                            ],
+                        },
+                    },
+                    candidates: {
+                        type: "array",
+                        maxItems: 64,
+                        items: {
+                            type: "object",
+                            additionalProperties: false,
+                            properties: {
+                                behavior: {
+                                    type: "object",
+                                    additionalProperties: false,
+                                    properties: {
+                                        trigger: {
+                                            type: "string",
+                                            maxLength: 128,
+                                            pattern: "^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,127}$",
+                                        },
+                                        capability: {
+                                            type: "string",
+                                            maxLength: 128,
+                                            pattern: "^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,127}$",
+                                        },
+                                        action: {
+                                            type: "string",
+                                            maxLength: 128,
+                                            pattern: "^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,127}$",
+                                        },
+                                        target: {
+                                            type: "string",
+                                            maxLength: 128,
+                                            pattern: "^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,127}$",
+                                        },
+                                    },
+                                    required: ["trigger", "capability", "action", "target"],
+                                },
+                                severity: {
+                                    type: "string",
+                                    enum: ["info", "low", "medium", "high", "critical"],
+                                },
+                                confidence: {
+                                    type: "string",
+                                    enum: ["low", "medium", "high"],
+                                },
+                                maliciousProjectFit: {
+                                    type: "string",
+                                    enum: [
+                                        "unknown",
+                                        "unlikely",
+                                        "ambiguous",
+                                        "likely",
+                                        "strong",
+                                    ],
+                                },
+                                benignHypothesisCode: {
+                                    type: "string",
+                                    enum: [
+                                        "expected-build-or-runtime-behavior",
+                                        "test-or-development-only",
+                                        "user-initiated-operation",
+                                        "standard-dependency-resolution",
+                                        "generated-code-pipeline",
+                                        "platform-compatibility",
+                                        "insufficient-context",
+                                        "no-benign-hypothesis",
+                                    ],
+                                },
+                                objectIds: {
+                                    type: "array",
+                                    minItems: 1,
+                                    maxItems: 1,
+                                    uniqueItems: true,
+                                    items: OBJECT_ID_SCHEMA,
+                                },
+                                artifactIds: ARTIFACT_IDS_SCHEMA,
+                                factIds: {
+                                    type: "array",
+                                    maxItems: 64,
+                                    uniqueItems: true,
+                                    items: {
+                                        type: "string",
+                                        pattern: "^[a-f0-9]{64}$",
+                                    },
+                                },
+                                evidenceIds: {
+                                    type: "array",
+                                    minItems: 1,
+                                    maxItems: 64,
+                                    uniqueItems: true,
+                                    items: {
+                                        type: "string",
+                                        pattern: "^ztre-[a-f0-9]{64}$",
+                                    },
+                                },
+                            },
+                            required: [
+                                "behavior",
+                                "severity",
+                                "confidence",
+                                "maliciousProjectFit",
+                                "benignHypothesisCode",
+                                "objectIds",
+                                "artifactIds",
+                                "factIds",
+                                "evidenceIds",
+                            ],
+                        },
+                    },
+                    blocker_codes: {
+                        type: "array",
+                        maxItems: 2,
+                        uniqueItems: true,
+                        items: {
+                            type: "string",
+                            enum: ["semantic/incomplete", "semantic/truncated"],
+                        },
+                    },
+                    prompt_review_json: {
+                        type: "string",
+                        maxLength: 8388608,
+                        description:
+                            "Required only when the assignment embeds a prompt normalized-view assignment; encode the exact structured prompt review record.",
+                    },
+                },
+                required: [
+                    "audit_id",
+                    "assignment_id",
+                    "assignment_token",
+                    "reviewer_id",
+                    "object_id",
+                    "artifact_ids",
+                    "semantic_view_id",
+                    "semantic_view_sha256",
+                    "reviewed_fact_ids",
+                    "reviewed_artifact_ids",
+                    "decision",
+                    "checks",
+                    "negative_evidence_codes",
+                    "candidates",
+                    "blocker_codes",
+                ],
+            },
+            handler: (args, invocation) =>
+                recordSemanticReviewHandler(args, {
+                    sessionId: invocation?.sessionId,
+                }),
+        },
+
+        {
+            name: "zerotrust_get_semantic_coverage",
+            description:
+                "Read the active audit's semantic plan, immutable scanner/reviewer records, deterministic structured semantic candidate ledger, coverage evaluation, snapshot binding, and current assurance stage. Returns no source text.",
+            parameters: {
+                type: "object",
+                additionalProperties: false,
+                properties: {
+                    audit_id: AUDIT_ID_SCHEMA,
+                },
+                required: ["audit_id"],
+            },
+            handler: (args, invocation) =>
+                getSemanticCoverageHandler(args, {
+                    sessionId: invocation?.sessionId,
+                }),
+        },
+
+        {
+            name: "zerotrust_prepare_red_team",
+            description:
+                "Prepare the evasive red-team stage from an exact completed semantic plan/evaluation. The wrapper deterministically creates the source-text-free initial discovery handoff, graph/artifact/dependency views, all nine mandatory category plans, inserts the red-team incompleteness blocker, and owns the persisted semantically-covered→scanned transition. No caller completeness boolean is accepted.",
+            parameters: {
+                type: "object",
+                additionalProperties: false,
+                properties: {
+                    audit_id: AUDIT_ID_SCHEMA,
+                },
+                required: ["audit_id"],
+            },
+            handler: (args, invocation) =>
+                prepareRedTeamHandler(args, {
+                    sessionId: invocation?.sessionId,
+                }),
+        },
+
+        {
+            name: "zerotrust_assign_red_team_review",
+            description:
+                "Issue one immutable wrapper-bound evasive red-team assignment for a mandatory category. The assignment binds the active audit, scanned snapshot, semantic plan/evaluation, initial discovery handoff, supply-chain identity, exact subjects, normalized semantic views, graph/artifact/dependency metadata, falsification checks, and negative-evidence contract. Same-reviewer/model limits must use the exact procedural enum derived by the wrapper.",
+            parameters: {
+                type: "object",
+                additionalProperties: false,
+                properties: {
+                    audit_id: AUDIT_ID_SCHEMA,
+                    category_id: {
+                        type: "string",
+                        enum: [
+                            "split-cross-file-chains",
+                            "dormant-env-time-platform-gates",
+                            "generated-decoded-code",
+                            "dependency-staging-substitution",
+                            "source-release-divergence",
+                            "binary-archive-concealment",
+                            "benign-decoy-alternate-path",
+                            "prompt-reviewer-manipulation",
+                            "dynamic-external-payload-loading",
+                        ],
+                    },
+                    reviewer_id: {
+                        type: "string",
+                        maxLength: 128,
+                        pattern: "^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,127}$",
+                    },
+                    reviewer_version: {
+                        type: "string",
+                        maxLength: 64,
+                        pattern: "^[A-Za-z0-9][A-Za-z0-9.+_-]{0,63}$",
+                    },
+                    model_id: {
+                        type: "string",
+                        maxLength: 128,
+                        pattern: "^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,127}$",
+                    },
+                },
+                required: [
+                    "audit_id",
+                    "category_id",
+                    "reviewer_id",
+                    "reviewer_version",
+                    "model_id",
+                ],
+            },
+            handler: (args, invocation) =>
+                assignRedTeamHandler(args, {
+                    sessionId: invocation?.sessionId,
+                }),
+        },
+
+        {
+            name: "zerotrust_record_red_team_review",
+            description:
+                "Record one immutable wrapper-issued evasive red-team review and admit any new evidence-bound candidates into the red-team candidate ledger before trace. Empty category results require exact complete subject arrays, every assigned falsification check, the exact category negative-evidence codes, unchanged canary/output markers, and no blockers. Unknown fields, free-form source text, identity substitution, changed retries, and narrative-only coverage are refused.",
+            parameters: {
+                type: "object",
+                additionalProperties: false,
+                properties: {
+                    audit_id: AUDIT_ID_SCHEMA,
+                    assignment_id: {
+                        type: "string",
+                        pattern: "^ztra-[a-f0-9]{64}$",
+                    },
+                    review_json: {
+                        type: "string",
+                        maxLength: 8388608,
+                        description:
+                            "Exact JSON object emitted from the wrapper assignment contract. Candidate IDs are omitted and derived by the wrapper.",
+                    },
+                },
+                required: ["audit_id", "assignment_id", "review_json"],
+            },
+            handler: (args, invocation) =>
+                recordRedTeamReviewHandler(args, {
+                    sessionId: invocation?.sessionId,
+                }),
+        },
+
+        {
+            name: "zerotrust_get_red_team",
+            description:
+                "Read the active audit's red-team plan, wrapper assignments, immutable review records, deterministic category/90%/mandatory gates, source-text-free candidate ledger, blockers, current stage, and snapshot.",
+            parameters: {
+                type: "object",
+                additionalProperties: false,
+                properties: {
+                    audit_id: AUDIT_ID_SCHEMA,
+                },
+                required: ["audit_id"],
+            },
+            handler: (args, invocation) =>
+                getRedTeamHandler(args, {
+                    sessionId: invocation?.sessionId,
+                }),
+        },
+
+        {
+            name: "zerotrust_finalize_red_team",
+            description:
+                "Deterministically finalize evasive red-team coverage. The wrapper accepts no caller completeness boolean: all nine mandatory categories, immutable assignments/reviews, exact empty-result proof, at least 90% assignment coverage, no truncation, and no blockers are recomputed from trusted state. Only a complete result removes the red-team blocker and advances scanned→red-teamed; otherwise the stage remains scanned and exact blockers are returned.",
+            parameters: {
+                type: "object",
+                additionalProperties: false,
+                properties: {
+                    audit_id: AUDIT_ID_SCHEMA,
+                },
+                required: ["audit_id"],
+            },
+            handler: (args, invocation) =>
+                finalizeRedTeamHandler(args, {
+                    sessionId: invocation?.sessionId,
+                }),
+        },
+
+        {
+            name: "zerotrust_prepare_evasive_graph",
+            description:
+                "Prepare the evasive behavior graph from the exact red-teamed snapshot and trusted semantic scanner facts, derived artifacts, supply-chain graph, immutable semantic candidate ledger, and separate red-team candidate ledger. Exact object/artifact/fact/evidence identities and submitted severity are preserved. Unordered endpoint/kind contradiction buckets quarantine every direction variant and retain all competing records. No caller graph or completeness claim is accepted.",
+            parameters: {
+                type: "object",
+                additionalProperties: false,
+                properties: {
+                    audit_id: AUDIT_ID_SCHEMA,
+                },
+                required: ["audit_id"],
+            },
+            handler: (args, invocation) =>
+                prepareEvasiveGraphHandler(args, {
+                    sessionId: invocation?.sessionId,
+                }),
+        },
+
+        {
+            name: "zerotrust_trace_evasive_graph",
+            description:
+                "Exhaustively trace every activation/trigger root and alternate path in the prepared graph. Benign branches never suppress alternate effect paths. Dynamic or unsupported targets, missing targets, quarantined conflicts, cycles, caps, and truncation remain blockers. The wrapper recomputes all gates and alone may advance red-teamed→traced.",
+            parameters: {
+                type: "object",
+                additionalProperties: false,
+                properties: {
+                    audit_id: AUDIT_ID_SCHEMA,
+                },
+                required: ["audit_id"],
+            },
+            handler: (args, invocation) =>
+                traceEvasiveGraphHandler(args, {
+                    sessionId: invocation?.sessionId,
+                }),
+        },
+
+        {
+            name: "zerotrust_get_evasive_graph",
+            description:
+                "Read the active audit's immutable evasive graph plan, quarantined contradiction records, exhaustive trace, blockers, current stage, and bound snapshot. Returns source-text-free identities only.",
+            parameters: {
+                type: "object",
+                additionalProperties: false,
+                properties: {
+                    audit_id: AUDIT_ID_SCHEMA,
+                },
+                required: ["audit_id"],
+            },
+            handler: (args, invocation) =>
+                getEvasiveGraphHandler(args, {
+                    sessionId: invocation?.sessionId,
+                }),
+        },
+
+        {
+            name: "zerotrust_prepare_assurance_validation",
+            description:
+                "Prepare assurance validation from the exact complete trace. With no active findings, issue one wrapper-token-bound no-finding proof assignment covering semantic coverage, all red-team categories, supply chain, unsupported objects, alternate paths, dynamic targets, activation roots, and truncation. With findings, issue independent confirm/refute assignments for every active severity. No caller completeness boolean is accepted.",
+            parameters: {
+                type: "object",
+                additionalProperties: false,
+                properties: {
+                    audit_id: AUDIT_ID_SCHEMA,
+                    no_finding_validator_id: {
+                        type: "string",
+                        maxLength: 128,
+                        pattern: "^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,127}$",
+                    },
+                    confirm_validator_id: {
+                        type: "string",
+                        maxLength: 128,
+                        pattern: "^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,127}$",
+                    },
+                    refute_validator_id: {
+                        type: "string",
+                        maxLength: 128,
+                        pattern: "^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,127}$",
+                    },
+                    validator_version: {
+                        type: "string",
+                        maxLength: 64,
+                        pattern: "^[A-Za-z0-9][A-Za-z0-9.+_-]{0,63}$",
+                    },
+                },
+                required: [
+                    "audit_id",
+                    "no_finding_validator_id",
+                    "confirm_validator_id",
+                    "refute_validator_id",
+                    "validator_version",
+                ],
+            },
+            handler: (args, invocation) =>
+                prepareAssuranceValidationHandler(args, {
+                    sessionId: invocation?.sessionId,
+                }),
+        },
+
+        {
+            name: "zerotrust_record_assurance_validation",
+            description:
+                "Record one immutable wrapper-issued assurance decision. Records must bind the exact assignment token and assigned independent validator, may reference only existing graph/trace/evidence/basis identities, and cannot introduce evidence or topology. Changed retries and identity substitution are refused.",
+            parameters: {
+                type: "object",
+                additionalProperties: false,
+                properties: {
+                    audit_id: AUDIT_ID_SCHEMA,
+                    assignment_id: {
+                        type: "string",
+                        pattern: "^ztava-[a-f0-9]{64}$",
+                    },
+                    record_json: {
+                        type: "string",
+                        maxLength: 33554432,
+                        description:
+                            "Strict JSON record matching the wrapper assignment. Required fields: assignmentToken, validatorId, conclusion, reviewedNodeIds, reviewedEdgeIds, reviewedPathIds, reviewedEvidenceIds, reviewedBasisIds, checks, negativeEvidenceCodes, blockerCodes.",
+                    },
+                },
+                required: ["audit_id", "assignment_id", "record_json"],
+            },
+            handler: (args, invocation) =>
+                recordAssuranceValidationHandler(args, {
+                    sessionId: invocation?.sessionId,
+                }),
+        },
+
+        {
+            name: "zerotrust_finalize_assurance_validation",
+            description:
+                "Recompute no-finding or all-severity candidate validation from immutable assignments and records. No-finding proof is separate from candidate confirm/refute. Only complete, independent, identity-bound, untruncated validation with no unresolved outcomes advances traced→validated; otherwise exact blockers remain.",
+            parameters: {
+                type: "object",
+                additionalProperties: false,
+                properties: {
+                    audit_id: AUDIT_ID_SCHEMA,
+                },
+                required: ["audit_id"],
+            },
+            handler: (args, invocation) =>
+                finalizeAssuranceValidationHandler(args, {
+                    sessionId: invocation?.sessionId,
+                }),
+        },
+
+        {
             name: "zerotrust_cache_list",
             description:
-                "List canonical metadata-cache entries only for the exact active audit's derived source namespace. Cache files are untrusted derived data: every listed entry is schema/integrity/canonical-JSON revalidated, corrupt regular files are discarded, and symlinks/reparse points are never followed. Cache absence is a normal successful result.",
+                "List canonical metadata-cache entries for the exact active source namespace. Cache files are untrusted derived data: every entry is schema/integrity/canonical-JSON revalidated, corrupt regular files are discarded, and symlinks/reparse points are never followed. Cache records never supply assurance coverage, verdicts, report state, or finalization state.",
             parameters: {
                 type: "object",
                 additionalProperties: false,
@@ -426,7 +1217,7 @@ const session = await joinSession({
         {
             name: "zerotrust_cache_load",
             description:
-                "Load only active-identity-bound, strictly validated metadata cache records. Exact-source stage/coverage metadata may be returned; across source-SHA changes only records whose path and blob/content identity are unchanged are reusable. Plugin records require an exact requested plugin version. Verdicts, report/finalized state, source text, excerpts, prompts, credentials, and free-form model output are never cacheable.",
+                "Load active-identity-bound, strictly validated metadata cache records. Across source-SHA changes only records whose path and blob/content identity are unchanged are reusable. Plugin records require an exact requested plugin version. Assurance coverage, verdicts, report/finalized state, source text, excerpts, prompts, credentials, and free-form model output are never cacheable.",
             parameters: {
                 type: "object",
                 additionalProperties: false,
@@ -460,7 +1251,7 @@ const session = await joinSession({
         {
             name: "zerotrust_cache_store",
             description:
-                "Atomically store the active audit's normalized analysis-index hashes/facts and current compatible analysis-plugin facts/topology, plus optional strictly structured finding/validation metadata, in the canonical versioned cache under build_root. The wrapper derives all paths and source identity, enforces schema/tool compatibility and size/file-count caps, and refuses source text, snippets, prompts, credentials, verdicts, finalized report state, and arbitrary paths.",
+                "Atomically store the active audit's normalized analysis-index hashes/facts and compatible analysis-plugin facts/topology in the canonical metadata cache under build_root. The wrapper derives all paths and source identity, enforces schema/tool compatibility and size/file-count caps, and refuses source text, snippets, prompts, credentials, assurance coverage, verdicts, finalized report state, and arbitrary paths.",
             parameters: {
                 type: "object",
                 additionalProperties: false,
@@ -489,7 +1280,7 @@ const session = await joinSession({
         {
             name: "zerotrust_cache_cleanup",
             description:
-                "Delete only canonical metadata-cache files derived from the exact active audit identity. current_source removes one source-version entry; source_namespace removes current schema/tool-version entries for the active owner/repository or local source namespace. No raw path is accepted and no symlink/reparse point is followed.",
+                "Delete canonical metadata-cache files derived from the exact active audit identity. current_source removes one source-identity entry; source_namespace removes compatible schema/tool entries for the active owner/repository or local source namespace. No raw path is accepted and no symlink/reparse point is followed.",
             parameters: {
                 type: "object",
                 additionalProperties: false,
@@ -517,17 +1308,19 @@ const session = await joinSession({
         {
             name: "zerotrust_record_council_candidates",
             description:
-                "Audit-bound version-5 council candidate ingestion. action=submit validates and immutably records one known role/category batch of bounded structured candidate findings plus behavior-graph fragments against the current source identity and trusted analysis index. Evidence must reference enumerated paths, exact indexed line ranges, current blob/content identities, and valid excerpt hashes; source text/snippets and conflicting duplicate IDs are refused. Identical retries are idempotent. action=finalize rechecks the mandatory-role, per-category, 90%, deterministic-baseline, submission-completion, acquisition, and legal-stage gates before advancing prepared to scanned. Candidate ingestion never satisfies mandatory acquisition.",
+                "Audit-bound council discovery candidate ingestion. action=submit validates and immutably records one known role/category batch of bounded structured candidate findings plus behavior-graph fragments against the current source identity and trusted analysis index. Evidence must reference enumerated paths, exact indexed line ranges, current blob/content identities, and valid excerpt hashes; source text/snippets and conflicting duplicate IDs are refused. Identical retries are idempotent. Candidate ingestion is discovery-only: there is no council finalize/verdict action, and submissions never satisfy mandatory acquisition, semantic coverage, red-team coverage, trace, validation, or finalization.",
             parameters: {
                 type: "object",
                 properties: {
                     action: {
                         type: "string",
-                        enum: ["submit", "finalize"],
+                        enum: ["submit"],
                     },
                     schemaVersion: {
                         type: "integer",
                         enum: [5],
+                        description:
+                            "Strict candidate-batch contract metadata; not a workflow selector.",
                     },
                     audit_id: {
                         type: "string",
@@ -579,7 +1372,7 @@ const session = await joinSession({
                             properties: {
                                 finding: {
                                     type: "object",
-                                    description: "Version-5 candidate finding fields except the wrapper-derived id. Must include sourceIdentity, behaviorSignature trigger/capability/action/target, severity, confidence, maliciousProjectFit, candidate state, evidence references, exact nodeIds/edgeIds, and producer.",
+                                    description: "Strict candidate finding fields except the wrapper-derived id. Must include sourceIdentity, behaviorSignature trigger/capability/action/target, severity, confidence, maliciousProjectFit, candidate state, evidence references, exact nodeIds/edgeIds, and producer.",
                                 },
                                 strongestBenignHypothesis: {
                                     type: "string",
@@ -618,138 +1411,11 @@ const session = await joinSession({
                             ],
                         },
                     },
-                    successful_role_ids: {
-                        type: "array",
-                        maxItems: 256,
-                        items: {
-                            type: "string",
-                            pattern: "^[a-z][a-z0-9-]{2,63}$",
-                        },
-                        description: "finalize only; every successfully recorded role.",
-                    },
-                    failed_role_ids: {
-                        type: "array",
-                        maxItems: 256,
-                        items: {
-                            type: "string",
-                            pattern: "^[a-z][a-z0-9-]{2,63}$",
-                        },
-                        description: "finalize only; every remaining active-manifest role.",
-                    },
-                    deterministic_baseline_complete: {
-                        type: "boolean",
-                        description: "finalize only; must be true before scanned can be recorded.",
-                    },
                 },
                 required: ["action", "schemaVersion", "audit_id"],
             },
             handler: (args, invocation) =>
                 recordCouncilCandidatesHandler(args, { sessionId: invocation?.sessionId }),
-        },
-
-        {
-            name: "zerotrust_trace_behavior_graph",
-            description:
-                "Merge the active audit's deterministic plugin graph seeds with successfully finalized council graph fragments, validate exact audit/source/evidence identity against the prepared index, and build bounded source-text-free behavior chains. Contradictory or incompatible edges are quarantined for validation rather than selected. Missing references, identity conflicts, or any graph/chain truncation keep trace coverage incomplete and prevent scanned-to-traced advancement. Identical retries are idempotent.",
-            parameters: {
-                type: "object",
-                additionalProperties: false,
-                properties: {
-                    audit_id: {
-                        type: "string",
-                        pattern: "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
-                        description: "Exact immutable audit ID returned by zerotrust_sourcecheck.",
-                    },
-                },
-                required: ["audit_id"],
-            },
-            handler: (args, invocation) =>
-                traceBehaviorGraphHandler(args, { sessionId: invocation?.sessionId }),
-        },
-
-        {
-            name: "zerotrust_record_validation",
-            description:
-                "Audit-bound version-5 static validation lifecycle. prepare moves every required critical/high and configured lower-severity candidate to validating and returns paged source-text-free graph neighborhoods/facts. submit immutably records one independent confirm or refute decision using only existing chain/node/edge/evidence IDs. adjudicate records validated/refuted/unresolved without introducing evidence or topology. finalize advances traced to validated only after both sides and adjudication exist for every required candidate, with no truncation and all prior gates complete. Identical retries are idempotent; changed retries and identity/type conflicts are refused.",
-            parameters: {
-                type: "object",
-                additionalProperties: false,
-                properties: {
-                    action: {
-                        type: "string",
-                        enum: ["prepare", "submit", "adjudicate", "finalize"],
-                    },
-                    schemaVersion: { type: "integer", enum: [5] },
-                    audit_id: {
-                        type: "string",
-                        pattern: "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
-                    },
-                    cursor: { type: "integer", minimum: 0 },
-                    limit: { type: "integer", minimum: 1, maximum: 8 },
-                    finding_id: {
-                        type: "string",
-                        pattern: "^ztf-v5-[a-f0-9]{64}$",
-                    },
-                    validator_id: { type: "string", maxLength: 128 },
-                    decision_type: {
-                        type: "string",
-                        enum: ["confirm", "refute"],
-                    },
-                    conclusion: {
-                        type: "string",
-                        enum: [
-                            "confirmed",
-                            "not-confirmed",
-                            "refuted",
-                            "not-refuted",
-                            "unresolved",
-                        ],
-                    },
-                    adjudicator_id: { type: "string", maxLength: 128 },
-                    decision: {
-                        type: "string",
-                        enum: ["validated", "refuted", "unresolved"],
-                    },
-                    severity: {
-                        type: "string",
-                        enum: ["critical", "high", "medium", "low", "info"],
-                    },
-                    confidence: {
-                        type: "string",
-                        enum: ["high", "medium", "low"],
-                    },
-                    malicious_project_fit: {
-                        type: "string",
-                        enum: ["unknown", "unlikely", "ambiguous", "likely", "strong"],
-                    },
-                    rationale_code: { type: "string", maxLength: 128 },
-                    rationale: { type: "string", maxLength: 4096 },
-                    chain_ids: {
-                        type: "array",
-                        maxItems: 64,
-                        items: { type: "string", maxLength: 128 },
-                    },
-                    node_ids: {
-                        type: "array",
-                        maxItems: 64,
-                        items: { type: "string", maxLength: 128 },
-                    },
-                    edge_ids: {
-                        type: "array",
-                        maxItems: 64,
-                        items: { type: "string", maxLength: 128 },
-                    },
-                    evidence: {
-                        type: "array",
-                        maxItems: 64,
-                        items: { type: "object" },
-                    },
-                    checks: { type: "object" },
-                },
-                required: ["action", "schemaVersion", "audit_id"],
-            },
-            handler: (args, invocation) =>
-                recordValidationHandler(args, { sessionId: invocation?.sessionId }),
         },
 
         {
@@ -789,7 +1455,7 @@ const session = await joinSession({
         // ----- Substitutional-safety wrapper tools -----
         // These wrappers run the dangerous operations themselves with
         // hardened flags hardcoded. They remain available for build modes
-        // (audit_and_*_build*), but for default audit modes the v4
+        // (audit_and_*_build*), while non-build audit modes use the
         // API-direct tools above should be used instead — they avoid
         // the on-disk source-file step entirely.
 
@@ -852,7 +1518,7 @@ const session = await joinSession({
         {
             name: "zerotrust_safe_build",
             description:
-                "Run an allowlisted build command against the active clone. Safe/full modes use the same build implementation, and repo-controlled npm build scripts, build.rs, or MSBuild targets may execute in either mode. Council-build modes require an outcome whose audit ID, owner, repo, and resolved SHA exactly match the current audit; proceed_on_council_failure bypasses only incompleteness and council_build_override bypasses only severity.",
+                "Run hazardous post-audit host execution against the active clone through an allowlisted build command. Safe/full mode names are compatibility aliases for the same implementation. A durable identity-matching finalized assurance report with a finalizer-derived trusted outcome is mandatory. Incomplete assurance and supported critical/high malicious behavior are refused. No caller bypass exists, and build output is never assurance evidence.",
             parameters: {
                 type: "object",
                 properties: {
@@ -872,15 +1538,7 @@ const session = await joinSession({
                     },
                     mode: {
                         type: "string",
-                        description: "Optional. The audit mode in effect — when this is a council-build mode the council-gate check runs.",
-                    },
-                    council_build_override: {
-                        type: "boolean",
-                        description: "Optional (council-build modes only). Bypass the severity-threshold gate. Council must still be COMPLETE; doesn't bypass incomplete-council. Defaults to false.",
-                    },
-                    proceed_on_council_failure: {
-                        type: "boolean",
-                        description: "Optional (council-build modes only). Bypass the incomplete-council gate. Implies build proceeds with deterministic-baseline-only findings. Defaults to false.",
+                        description: "Optional advisory mode metadata. Trusted active-audit mode and the finalized-report host gate are authoritative.",
                     },
                     build_root: {
                         type: "string",
@@ -888,48 +1546,15 @@ const session = await joinSession({
                     },
                 },
                 required: ["ecosystem", "clone_path"],
+                additionalProperties: false,
             },
             handler: (args, invocation) => safeBuildHandler(args, { sessionId: invocation?.sessionId }),
         },
 
         {
-            name: "zerotrust_record_council_outcome",
-            description:
-                "Record the council's immutable verdict for the current audit ID. audit_id must exactly match the active sourcecheck packet; delayed outcomes and replacement outcomes are refused. The stored identity also binds owner/repo/full resolved SHA. Complete outcomes from sourcecheck-activated council manifests require successful candidate submission, graph tracing, and independent confirm/refute/adjudication at analysis stage validated or later. Every council mode must call this before report finalization; council-build modes must do so before safe_build. API-direct trusted verdicts are refused unless mandatory acquisition coverage is complete.",
-            parameters: {
-                type: "object",
-                properties: {
-                    audit_id: {
-                        type: "string",
-                        pattern: "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
-                        description: "Immutable cryptographically-random audit ID printed in the current zerotrust_sourcecheck packet/runtimeContext. Must match exactly.",
-                    },
-                    verdict: {
-                        type: "string",
-                        enum: ["critical", "high", "medium", "low", "no red flags found", "incomplete"],
-                    },
-                    critical_count: {
-                        type: "integer",
-                        minimum: 0,
-                    },
-                    high_count: {
-                        type: "integer",
-                        minimum: 0,
-                    },
-                    complete: {
-                        type: "boolean",
-                        description: "false when the council had to abort early (mandatory roles failed, per-category gap, <90% returns). true when the meta-judge produced a verdict on a complete-enough council.",
-                    },
-                },
-                required: ["audit_id", "verdict", "critical_count", "high_count", "complete"],
-            },
-            handler: (args, invocation) => recordOutcomeHandler(args, { sessionId: invocation?.sessionId }),
-        },
-
-        {
             name: "zerotrust_finalize_report",
             description:
-                "Finalize the canonical REPORT.md + FINDINGS.json pair exactly once through the active audit identity and return canonical reportPath/findingsPath values. v5 council flows deterministically render both artifacts from the trusted ledger/decision/graph/validation/remediation snapshot and accept only structured operator decision records; model-authored report prose is refused. Legacy non-council flows may still supply markdown_body and remain trusted:false outside the v5 privacy guarantee. Both files use exclusive same-directory publication with rollback where possible, are hashed and recorded together, and same-audit retries verify and return the existing pair without rewriting. Unrecorded pre-existing files fail closed. Trusted council verdicts require validated stage and every existing acquisition/release/council/trace/validation gate; incomplete output preserves exact blockers. validated advances to finalized only after both artifacts are durable and recorded.",
+                "Finalize the canonical REPORT.md + FINDINGS.json pair exactly once through the active audit identity and return canonical reportPath/findingsPath values. Validated current assurance state deterministically derives the findings verdict and separate assurance result, renders source-text-free stage/coverage/evasion, candidate-ledger, graph/trace, assurance-validation, supply-chain, and structured operator-decision artifacts, owns validated→finalized, and records the only trusted outcome. Caller verdict/count/completeness/prose fields are refused for source audits. Reconnaissance-only metadata Markdown remains trusted:false. Pair integrity, exclusive publication, rollback, and idempotent retry remain enforced.",
             parameters: {
                 type: "object",
                 properties: {
@@ -949,12 +1574,12 @@ const session = await joinSession({
                     markdown_body: {
                         type: "string",
                         maxLength: 1048576,
-                        description: "Legacy non-council compatibility only. Complete in-memory Markdown draft. v5 council finalization rejects this field so model-authored finding tables or verdicts cannot conflict with the trusted ledger.",
+                        description: "Reconnaissance-only metadata mode. Complete in-memory Markdown draft; source-audit assurance finalization rejects this field.",
                     },
                     operator_decisions: {
                         type: "array",
                         maxItems: 512,
-                        description: "v5 council flows only. Optional source-text-free operator/remediation decision records. Each record references one canonical finding ID and uses predefined action/rationale categories. operator_rationale is a short explicitly user-supplied one-line exception and is rejected if it resembles code, a URL, an encoded token, a finding/verdict claim, or known source-derived text.",
+                        description: "Validated assurance flow only. Optional source-text-free operator decision records. Each record references one active canonical/graph finding ID and uses predefined action/rationale categories. operator_rationale is a short explicitly user-supplied one-line exception and is rejected if it resembles code, a URL, an encoded token, a finding/verdict claim, unsupported safe/clean claims, or known source-derived text.",
                         items: {
                             type: "object",
                             properties: {
@@ -975,6 +1600,7 @@ const session = await joinSession({
                                     maxLength: 240,
                                     description: "Optional one-line rationale authored by the human operator. Never use model-authored text here.",
                                 },
+                                additionalProperties: false,
                             },
                             required: ["finding_id", "action", "rationale_category"],
                             additionalProperties: false,

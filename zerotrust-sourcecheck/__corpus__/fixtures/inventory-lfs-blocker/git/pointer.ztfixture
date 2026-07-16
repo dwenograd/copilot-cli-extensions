@@ -1,0 +1,9 @@
+marker.fact("activation-surface","startup-load","git");
+marker.fact("inventory-object","lfs-pointer","binary");
+marker.node("lfs-start","activation","startup-load","activation,startup");
+marker.node("lfs-object","dependency","lfs-object","lfs-pointer,binary-artifact");
+marker.node("lfs-effect","sink","runtime-load","runtime-load");
+marker.edge("lfs-start-object","depends-on","lfs-start","lfs-object","lfs-pointer");
+marker.edge("lfs-object-effect","flows-to","lfs-object","lfs-effect","runtime-load");
+marker.finding("lfs-chain","validated","high","high","likely","load","lfs-object","runtime-effect","lfs-pointer,binary-artifact,runtime-load");
+marker.blocker("prepare","inventory-lfs-object-unresolved");

@@ -35,7 +35,7 @@ import {
 } from "../__corpus__/runner/localFixtureExecutor.mjs";
 import {
     calculateMetrics,
-    evaluatePromotionGate,
+    evaluateQualityGate,
 } from "../__corpus__/runner/metrics.mjs";
 import {
     main as runCorpus,
@@ -140,30 +140,30 @@ test("findingMatches rejects category mismatch", () => {
 
 test("compareFindings passes when council preserves deterministic finding", () => {
     const result = compareFindings({
-        v1Findings: [finding()],
-        v2Findings: [finding()],
+        baselineFindings: [finding()],
+        councilFindings: [finding()],
         expectation: { kind: "risky", expected_min_verdict: "medium" },
     });
     assert.equal(result.status, "PASS");
 });
 
-test("compareFindings fails when v1 finding is missing", () => {
+test("compareFindings fails when baseline finding is missing", () => {
     const result = compareFindings({
-        v1Findings: [finding()],
-        v2Findings: [],
+        baselineFindings: [finding()],
+        councilFindings: [],
         expectation: { kind: "risky", expected_min_verdict: "none" },
     });
     assert.equal(result.status, "FAIL");
-    assert.match(result.failures.join("\n"), /missing v1 finding/);
+    assert.match(result.failures.join("\n"), /missing baseline finding/);
 });
 
 test("compareFindings fails on severity downgrade", () => {
     const result = compareFindings({
-        v1Findings: [finding({ severity: "high" })],
-        v2Findings: [finding({ severity: "low" })],
+        baselineFindings: [finding({ severity: "high" })],
+        councilFindings: [finding({ severity: "low" })],
         expectation: { kind: "risky", expected_min_verdict: "low" },
-        v1Verdict: "high",
-        v2Verdict: "low",
+        baselineVerdict: "high",
+        councilVerdict: "low",
     });
     assert.equal(result.status, "FAIL");
     assert.match(result.failures.join("\n"), /downgrade/);
@@ -171,8 +171,8 @@ test("compareFindings fails on severity downgrade", () => {
 
 test("compareFindings enforces required tags", () => {
     const result = compareFindings({
-        v1Findings: [],
-        v2Findings: [finding({ category: "E", tags: ["obfuscation"], severity: "medium" })],
+        baselineFindings: [],
+        councilFindings: [finding({ category: "E", tags: ["obfuscation"], severity: "medium" })],
         expectation: { kind: "risky", expected_min_verdict: "medium", required_tags: ["obfuscation"] },
     });
     assert.equal(result.status, "PASS");
@@ -180,8 +180,8 @@ test("compareFindings enforces required tags", () => {
 
 test("compareFindings fails when required tags are absent", () => {
     const result = compareFindings({
-        v1Findings: [],
-        v2Findings: [finding({ category: "B", tags: ["code-execution"], severity: "medium" })],
+        baselineFindings: [],
+        councilFindings: [finding({ category: "B", tags: ["code-execution"], severity: "medium" })],
         expectation: { kind: "risky", expected_min_verdict: "medium", required_tags: ["obfuscation"] },
     });
     assert.equal(result.status, "FAIL");
@@ -189,8 +189,8 @@ test("compareFindings fails when required tags are absent", () => {
 
 test("compareFindings fails clean controls with findings above info", () => {
     const result = compareFindings({
-        v1Findings: [],
-        v2Findings: [finding({ severity: "low" })],
+        baselineFindings: [],
+        councilFindings: [finding({ severity: "low" })],
         expectation: { kind: "clean-control", expected_min_verdict: "no red flags found" },
     });
     assert.equal(result.status, "FAIL");
@@ -199,8 +199,8 @@ test("compareFindings fails clean controls with findings above info", () => {
 
 test("compareFindings fails forbidden high-severity tags", () => {
     const result = compareFindings({
-        v1Findings: [],
-        v2Findings: [finding({ severity: "high", tags: ["network"] })],
+        baselineFindings: [],
+        councilFindings: [finding({ severity: "high", tags: ["network"] })],
         expectation: { kind: "risky", expected_min_verdict: "high", forbidden_tags: ["network"] },
     });
     assert.equal(result.status, "FAIL");
@@ -209,8 +209,8 @@ test("compareFindings fails forbidden high-severity tags", () => {
 
 test("compareFindings marks incomplete council as inconclusive", () => {
     const result = compareFindings({
-        v1Findings: [],
-        v2Findings: [],
+        baselineFindings: [],
+        councilFindings: [],
         expectation: { kind: "risky", expected_min_verdict: "none" },
         councilComplete: false,
     });
@@ -257,7 +257,7 @@ test("dispatchAudit dry-run plans without subprocess", async () => {
 });
 
 test("dispatchAudit finds Windows report paths in text", () => {
-    const canonical = `zt-v1-${"a".repeat(64)}`;
+    const canonical = `zt-${"a".repeat(64)}`;
     const p = dispatchInternals.findReportPath(`report written: C:\\work\\_reports\\${canonical}\\REPORT.md`);
     assert.equal(p, `C:\\work\\_reports\\${canonical}\\REPORT.md`);
 });
@@ -302,30 +302,30 @@ test("runCorpus parses list columns", () => {
     assert.deepEqual(runnerInternals.parseList(""), []);
 });
 
-test("expectation schema is versioned and rejects traversal or unknown fields", () => {
+test("expectation schema is unversioned and rejects traversal or unknown fields", () => {
     const expectation = runnerInternals.loadExpectation("local-clean-control");
     assert.equal(expectation.schema, EXPECTATION_SCHEMA);
-    assert.throws(
-        () => validateExpectation({
+    assert.throws(() => validateExpectation({
             ...expectation,
             source: { type: "local", path: "../outside" },
         }),
         /inside the corpus root/u,
     );
-    assert.throws(
-        () => validateExpectation({ ...expectation, extra: true }),
+    assert.throws(() => validateExpectation({ ...expectation, extra: true }),
         /not allowed/u,
     );
 });
 
 test("registry includes local clean, benign, risky, incomplete, and broken fixtures", () => {
     const expectations = runnerInternals.loadExpectations();
-    assert.equal(expectations.length, 11);
+    assert.equal(expectations.length >= 33, true);
     assert.ok(expectations.some((entry) => entry.kind === "clean-control"));
     assert.ok(expectations.some((entry) => entry.kind === "benign-lookalike"));
     assert.ok(expectations.some((entry) => entry.kind === "synthetic-risk"));
     assert.ok(expectations.some((entry) => entry.kind === "synthetic-incomplete"));
     assert.ok(expectations.some((entry) => entry.kind === "synthetic-broken"));
+    assert.ok(expectations.some((entry) =>
+        entry.dimensions.evasion_classes.length > 0));
 });
 
 test("all local fixtures are printable inert marker declarations", () => {
@@ -386,9 +386,9 @@ test("local deterministic executor covers index, plugin, graph, scoring, and exp
     assert.equal(metrics.falsePositiveRate, 0);
     assert.ok(metrics.unresolvedRate > 0 && metrics.unresolvedRate < 0.2);
     assert.equal(
-        evaluatePromotionGate(
+        evaluateQualityGate(
             metrics,
-            runnerInternals.loadPromotionThresholds(),
+            runnerInternals.loadQualityThresholds(),
         ).passed,
         true,
     );
@@ -486,8 +486,8 @@ test("stage failure classification covers prepare through finalize", () => {
 
 test("dry-run validates local fixtures without writing corpus results", async () => {
     const resultsDir = runnerInternals.RESULTS_DIR;
-    const before = existsSync(resultsDir) ? readdirSync(resultsDir).sort() : [];
-    assert.equal(await runCorpus(["--dry-run", "--promote-gate"]), 0);
-    const after = existsSync(resultsDir) ? readdirSync(resultsDir).sort() : [];
+    const before = existsSync(resultsDir) ? readdirSync(resultsDir).sort(): [];
+    assert.equal(await runCorpus(["--dry-run", "--quality-gate"]), 0);
+    const after = existsSync(resultsDir) ? readdirSync(resultsDir).sort(): [];
     assert.deepEqual(after, before);
 });

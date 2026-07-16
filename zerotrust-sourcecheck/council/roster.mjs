@@ -1,6 +1,6 @@
 // council/roster.mjs
 //
-// The 32-role security council roster for zerotrust-sourcecheck v2.
+// The 32-role security council roster for zerotrust-sourcecheck.
 //
 // DESIGN PRINCIPLE: each role is just a thematic ANGLE. We do not list
 // specific patterns, tools, cmdlets, registry paths, library names, or
@@ -8,7 +8,7 @@
 // classes look like — they were trained on the same security research
 // (MITRE ATT&CK, public PoCs, vendor blogs) that any human security
 // researcher would draw on. Spelling out the patterns here would (a)
-// re-introduce the prescriptive checklist v2 was designed to reject,
+// re-introduce a prescriptive checklist that the broad roster is designed to reject,
 // and (b) cause the source file itself to match endpoint-protection
 // signatures on the developer's machine.
 //
@@ -178,7 +178,7 @@ export const ROLES = [
         model: "claude-opus-4.8",
         tier: "source-inspection",
         mandatory: false,
-        angle: "Find cryptographic code that looks deliberately weakened or planted. Apply your knowledge of crypto-misuse and backdoor patterns; focus on what looks malicious-by-design rather than legacy weak code.",
+        angle: "Find cryptographic code that looks deliberately weakened or planted. Apply your knowledge of crypto-misuse and backdoor patterns; focus on what looks malicious-by-design rather than historically weak code.",
         ignore_clauses: [],
     },
     {
@@ -205,7 +205,7 @@ export const ROLES = [
         ignore_clauses: [
             "payloads hidden in non-code carriers — owned by steganography",
             "runtime resolution tricks without encoding — owned by indirection",
-            "the byte-level invisible-character scan — owned by the deterministic Section 5a baseline",
+            "the byte-level invisible-character scan — owned by the deterministic whole-tree scanner",
         ],
     },
     {
@@ -217,7 +217,7 @@ export const ROLES = [
         angle: "Find payloads hidden in non-executable carriers — comments, configs, images, fonts, locale data — and visual-rendering attacks on source.",
         ignore_clauses: [
             "executable text encoded inline as base64 — owned by obfuscation",
-            "the byte-level invisible-character scan — owned by the deterministic Section 5a baseline (but flag any instance you find by coincidence)",
+            "the byte-level invisible-character scan — owned by the deterministic whole-tree scanner (but flag any instance you find by coincidence)",
             "pre-built binaries — owned by prebuilt-binary",
         ],
     },
@@ -262,7 +262,7 @@ export const ROLES = [
         model: "claude-opus-4.7-1m-internal",
         tier: "source-inspection",
         mandatory: false,
-        angle: "Audit dependency lockfiles for risk: unusual resolution sources, missing integrity hashes, lockfile/manifest mismatches, suspicious package metadata. v1 supports npm primarily; flag other ecosystems as not-yet-implemented coverage gaps.",
+        angle: "Audit dependency lockfiles for risk: unusual resolution sources, missing integrity hashes, lockfile/manifest mismatches, suspicious package metadata, mutable references, and unsupported registries across every supported ecosystem.",
         ignore_clauses: [
             "AI-hallucinated package names specifically — owned by ai-slopsquat-and-hallucinated-deps",
             "submodule references — owned by submodule-vendored",

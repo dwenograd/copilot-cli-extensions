@@ -1,0 +1,2 @@
+marker.node("report-source","sensitive-source","public-metadata","benign,public-metadata");
+marker.edge("report-trigger-source","reads-from","report-trigger","report-source","benign");

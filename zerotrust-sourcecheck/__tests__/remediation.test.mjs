@@ -1,16 +1,4 @@
-// __tests__/remediation.test.mjs — Section 9b (defang/delete/keep)
-// wording tests. The same Section 9b block is rendered into:
-//   - local-source packets (audit_local_source[_council])
-//   - build-mode packets (audit_and_*_build*)
-// It is NOT rendered into:
-//   - API-direct audit packets (audit_source[_council])
-//   - verify_release
-//   - metadata_only
-//
-// These tests pin the wording so a change to the safety invariants
-// can't silently slip through.
-
-import { after, before, describe, test } from "node:test";
+import { after, before, test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import nodePath from "node:path";
@@ -19,262 +7,123 @@ import { tmpdir } from "node:os";
 import { runHandler } from "../handler.mjs";
 
 let tmpRoot;
-let validDir;
+let localPath;
 
 before(() => {
     tmpRoot = mkdtempSync(nodePath.join(tmpdir(), "zerotrust-remed-"));
-    validDir = nodePath.join(tmpRoot, "sample-project-fixture");
-    mkdirSync(validDir);
+    localPath = nodePath.join(tmpRoot, "sample-project");
+    mkdirSync(localPath);
 });
 
 after(() => {
     rmSync(tmpRoot, { recursive: true, force: true });
 });
 
-// ---- Modes that MUST contain Section 9b ----
+function packet(args) {
+    const result = runHandler(args);
+    assert.equal(result.resultType, "success");
+    return result.textResultForLlm;
+}
 
-describe("Section 9b present in local-source modes", () => {
-    test("audit_local_source contains remediation block", () => {
-        const r = runHandler({
-            local_path: validDir,
-            i_understand_local_path_reads_my_disk: true,
-            mode: "audit_local_source",
-        });
-        assert.equal(r.resultType, "success");
-        assert.match(r.textResultForLlm, /Section 9b — Remediation/);
-    });
-
-    test("audit_local_source_council contains remediation block", () => {
-        const r = runHandler({
-            local_path: validDir,
-            i_understand_local_path_reads_my_disk: true,
-            mode: "audit_local_source_council",
-        });
-        assert.equal(r.resultType, "success");
-        assert.match(r.textResultForLlm, /Section 9b — Remediation/);
-    });
-});
-
-describe("Section 9b present in build modes (existing modes gain the new block)", () => {
-    test("audit_and_safe_build contains remediation block", () => {
-        const r = runHandler({
-            url: "https://github.com/foo/bar",
-            mode: "audit_and_safe_build",
-            i_understand_build_executes_code: true,
-        });
-        assert.equal(r.resultType, "success");
-        assert.match(r.textResultForLlm, /Section 9b — Remediation/);
-    });
-
-    test("audit_and_full_build contains remediation block", () => {
-        const r = runHandler({
-            url: "https://github.com/foo/bar",
-            mode: "audit_and_full_build",
-            i_understand_build_executes_code: true,
-            unsafe: true,
-        });
-        assert.equal(r.resultType, "success");
-        assert.match(r.textResultForLlm, /Section 9b — Remediation/);
-    });
-
-    test("audit_and_safe_build_council contains remediation block", () => {
-        const r = runHandler({
-            url: "https://github.com/foo/bar",
-            mode: "audit_and_safe_build_council",
-            i_understand_build_executes_code: true,
-        });
-        assert.equal(r.resultType, "success");
-        assert.match(r.textResultForLlm, /Section 9b — Remediation/);
-    });
-
-    test("audit_and_full_build_council contains remediation block", () => {
-        const r = runHandler({
-            url: "https://github.com/foo/bar",
-            mode: "audit_and_full_build_council",
-            i_understand_build_executes_code: true,
-            unsafe: true,
-        });
-        assert.equal(r.resultType, "success");
-        assert.match(r.textResultForLlm, /Section 9b — Remediation/);
-    });
-});
-
-// ---- Modes that MUST NOT contain Section 9b ----
-
-describe("Section 9b absent from API-direct + metadata + release modes", () => {
-    test("audit_source (API-direct) does NOT contain remediation block", () => {
-        const r = runHandler({
-            url: "https://github.com/foo/bar",
-            mode: "audit_source",
-        });
-        assert.equal(r.resultType, "success");
-        assert.doesNotMatch(r.textResultForLlm, /Section 9b — Remediation/);
-    });
-
-    test("audit_source_council (API-direct) does NOT contain remediation block", () => {
-        const r = runHandler({
-            url: "https://github.com/foo/bar",
-            mode: "audit_source_council",
-        });
-        assert.equal(r.resultType, "success");
-        assert.doesNotMatch(r.textResultForLlm, /Section 9b — Remediation/);
-    });
-
-    test("verify_release does NOT contain remediation block", () => {
-        const r = runHandler({
-            url: "https://github.com/foo/bar/releases",
-            mode: "verify_release",
-        });
-        assert.equal(r.resultType, "success");
-        assert.doesNotMatch(r.textResultForLlm, /Section 9b — Remediation/);
-    });
-
-    test("metadata_only does NOT contain remediation block", () => {
-        const r = runHandler({
-            url: "https://github.com/foo/bar",
-            mode: "metadata_only",
-        });
-        assert.equal(r.resultType, "success");
-        assert.doesNotMatch(r.textResultForLlm, /Section 9b — Remediation/);
-    });
-});
-
-// ---- Verbatim safety-invariant presence ----
-
-describe("Section 9b — load-bearing safety invariants present verbatim", () => {
-    function findRemediationBlock(invocation) {
-        const r = runHandler(invocation);
-        assert.equal(r.resultType, "success");
-        return r.textResultForLlm;
-    }
-
-    const localInvocation = {
-        local_path: validDir,
+function localPacket() {
+    return packet({
+        local_path: localPath,
         i_understand_local_path_reads_my_disk: true,
         mode: "audit_local_source_council",
-    };
+    });
+}
 
-    const buildInvocation = {
+function buildPacket() {
+    return packet({
         url: "https://github.com/foo/bar",
         mode: "audit_and_safe_build_council",
         i_understand_build_executes_code: true,
-    };
+    });
+}
 
-    for (const [label, invocation] of [["local", localInvocation], ["build", buildInvocation]]) {
-        test(`(${label}) contains "defang" + "delete project" + "keep as-is"`, () => {
-            const out = findRemediationBlock(invocation);
-            assert.match(out, /\*\*defang\*\*/);
-            assert.match(out, /\*\*delete project\*\*/);
-            assert.match(out, /\*\*keep as-is\*\*/);
-        });
+test("all source-audit modes retain remediation decisions before finalization", () => {
+    for (const args of [
+        { url: "https://github.com/foo/bar", mode: "audit_source" },
+        { url: "https://github.com/foo/bar", mode: "audit_source_council" },
+        { url: "https://github.com/foo/bar/releases/tag/baseline", mode: "verify_release" },
+        {
+            url: "https://github.com/foo/bar",
+            mode: "audit_and_safe_build",
+            i_understand_build_executes_code: true,
+        },
+        {
+            local_path: localPath,
+            i_understand_local_path_reads_my_disk: true,
+            mode: "audit_local_source",
+        },
+    ]) {
+        const out = packet(args);
+        assert.match(out, /Step E — Remediation decisions before finalization/);
+        assert.ok(
+            out.indexOf("Step E — Remediation decisions before finalization")
+                < out.indexOf("const finalizeResult = zerotrust_finalize_report({"),
+        );
+    }
+    assert.doesNotMatch(
+        packet({ url: "https://github.com/foo/bar", mode: "metadata_only" }),
+        /Remediation decisions before finalization/,
+    );
+});
 
-        test(`(${label}) offers the decision flow at every severity`, () => {
-            const out = findRemediationBlock(invocation);
-            assert.match(out, /regardless of impact severity/);
-            assert.match(out, /Do NOT collapse MEDIUM\/LOW\/INFO findings/);
-            assert.doesNotMatch(out, /review at your leisure/);
-        });
-
-        test(`(${label}) contains "NEVER auto-apply" invariant`, () => {
-            const out = findRemediationBlock(invocation);
-            assert.match(out, /NEVER auto-apply/);
-        });
-
-        test(`(${label}) contains "NEVER batch" invariant`, () => {
-            const out = findRemediationBlock(invocation);
-            assert.match(out, /NEVER batch/);
-        });
-
-        test(`(${label}) contains backup-file naming pattern`, () => {
-            const out = findRemediationBlock(invocation);
-            assert.match(out, /\.zerotrust-backup-/);
-        });
-
-        test(`(${label}) contains mandatory rationale for "keep"`, () => {
-            const out = findRemediationBlock(invocation);
-            // The packet wraps "Refuse 'keep' without a written\n  rationale"
-            // across a line break; allow whitespace between "written" and "rationale".
-            assert.match(out, /Refuse "keep" without a written\s+rationale/);
-        });
-
-        test(`(${label}) contains re-audit recommendation`, () => {
-            const out = findRemediationBlock(invocation);
-            assert.match(out, /re-run.*sourcecheck.*invocation/i);
-        });
-
-        test(`(${label}) keeps operator decisions in memory until the single finalizer`, () => {
-            const out = findRemediationBlock(invocation);
-            assert.match(out, /structured `operatorDecisions`/);
-            assert.match(out, /Do NOT call `zerotrust_finalize_report` inside this block/);
-            assert.match(out, /write\s+REPORT\.md\/FINDINGS\.json directly/);
-            assert.equal((out.match(/zerotrust_finalize_report\(\{/g) || []).length, 1);
-            assert.ok(
-                out.indexOf("Section 9b — Remediation")
-                    < out.indexOf("const finalizeResult = zerotrust_finalize_report({"),
-                "remediation must complete before the only artifact finalization",
-            );
-        });
-
-        test(`(${label}) contains path-pinning instruction`, () => {
-            const out = findRemediationBlock(invocation);
-            // The block says "the pinned path for this audit is **exactly** ..."
-            assert.match(out, /pinned path for this audit is \*\*exactly\*\*/);
-        });
-
-        test(`(${label}) requires one-finding exact-diff approval wording`, () => {
-            const out = findRemediationBlock(invocation);
-            assert.match(
-                out,
-                /Approve this one finding's proposed diff exactly as shown\? \(yes\/no\)/,
-            );
-            assert.match(out, /one-finding approval/);
-            assert.match(out, /Never execute project code/i);
-            assert.match(out, /build output as proof/i);
-        });
+test("remediation preserves all-severity one-finding safety invariants", () => {
+    for (const out of [localPacket(), buildPacket()]) {
+        assert.match(out, /every active non-refuted finding, regardless of impact severity/i);
+        assert.match(out, /Do NOT\s+collapse MEDIUM\/LOW\/INFO findings/);
+        assert.match(out, /NEVER auto-apply/);
+        assert.match(out, /NEVER batch/);
+        assert.match(out, /\*\*defang\*\*/);
+        assert.match(out, /\*\*delete-project\*\*/);
+        assert.match(out, /\*\*keep-as-is\*\*/);
+        assert.match(out, /Approve this one finding's proposed diff exactly as shown\? \(yes\/no\)/);
+        assert.match(out, /explicit one-finding approval/);
+        assert.match(out, /\.zerotrust-backup-<utc-ts>/);
+        assert.match(out, /Never execute project code/i);
+        assert.match(out, /build output as proof/i);
+        assert.match(out, /Refuse\s+`keep-as-is` without a written rationale/i);
+        assert.match(out, /fresh invocation/i);
+        assert.match(out, /structured `operatorDecisions = \[\]`/);
+        assert.match(out, /Do NOT call\s+`zerotrust_finalize_report` inside this block/);
+        assert.match(out, /Do NOT write REPORT\.md\/FINDINGS\.json directly/);
+        assert.equal((out.match(/zerotrust_finalize_report\(\{/g) || []).length, 1);
     }
 });
 
-test("council remediation packet consumes validated ledger metadata", () => {
-    const r = runHandler({
-        local_path: validDir,
-        i_understand_local_path_reads_my_disk: true,
-        mode: "audit_local_source_council",
-    });
-    assert.equal(r.resultType, "success");
-    assert.match(r.textResultForLlm, /validationFinal\.remediation/);
-    assert.match(r.textResultForLlm, /alternate-path-remains/);
-    assert.match(r.textResultForLlm, /graph-incomplete/);
-    assert.match(r.textResultForLlm, /Refuted findings have no entry/);
-    assert.match(r.textResultForLlm, /confidentPatchAllowed: false/);
+test("local remediation pins delete and defang to the exact local root", () => {
+    const out = localPacket();
+    const resolved = nodePath.resolve(localPath);
+    assert.ok(out.includes(`pinned project path for this audit is **exactly** \`${resolved}\``));
+    assert.match(out, /delete-project.*delete only that root/is);
+    assert.match(out, /defang.*exact evidence-bound file beneath it/is);
 });
 
-// ---- Pinned-path identity ----
+test("build remediation uses only the wrapper-returned clone identity", () => {
+    const out = buildPacket();
+    assert.match(
+        out,
+        /pinned project path for remediation is \*\*exactly\*\*\s+`cloneResult\.boundContext\.clonePath`/,
+    );
+    assert.match(out, /Never substitute the placeholder path/);
+});
 
-describe("Section 9b pinned-path identity", () => {
-    test("local mode pins to localPath", () => {
-        const r = runHandler({
-            local_path: validDir,
-            i_understand_local_path_reads_my_disk: true,
-            mode: "audit_local_source_council",
-        });
-        assert.equal(r.resultType, "success");
-        const resolved = nodePath.resolve(validDir);
-        assert.ok(
-            r.textResultForLlm.includes(`pinned path for this audit is **exactly** \`${resolved}\``),
-            "local Section 9b should pin to resolved localPath",
-        );
+test("API-direct remediation records intent without pretending local mutation occurred", () => {
+    const out = packet({
+        url: "https://github.com/foo/bar",
+        mode: "audit_source_council",
     });
+    assert.match(out, /has no on-disk source tree to modify or delete/);
+    assert.match(out, /Record `defang` or `delete-project` as requested operator intent only/);
+});
 
-    test("build mode pins to expectedClonePath (not the local fixture path)", () => {
-        const r = runHandler({
-            url: "https://github.com/foo/bar",
-            mode: "audit_and_safe_build_council",
-            i_understand_build_executes_code: true,
-        });
-        assert.equal(r.resultType, "success");
-        // The pinned path for build modes is the expectedClonePath under build_root.
-        // The placeholder identity is hashed, so assert the canonical shape
-        // rather than expecting owner/repo text in the basename.
-        assert.match(r.textResultForLlm, /pinned path for this audit is \*\*exactly\*\* `[^`]*zt-v1-[0-9a-f]{64}`/);
-    });
+test("remediation consumes only validated identities and preserves graph limitations", () => {
+    const out = localPacket();
+    assert.match(out, /validationFinal\.analysisSnapshot/);
+    assert.match(out, /Refuted findings have no remediation entry/);
+    assert.match(out, /alternate-path-remains/);
+    assert.match(out, /graph-incomplete/);
+    assert.match(out, /confidentPatchAllowed: false/);
 });

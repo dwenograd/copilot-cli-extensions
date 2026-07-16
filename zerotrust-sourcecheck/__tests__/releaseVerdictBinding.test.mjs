@@ -85,7 +85,7 @@ function activateReleaseAudit(label) {
         expectedClonePath: buildClonePath(SCRATCH, OWNER, REPO, "0".repeat(40)),
         owner: OWNER,
         repo: REPO,
-        ref: "v1",
+        ref: "baseline",
         refType: "release_tag",
         urlKind: "release",
         releaseSelector: "tag",
@@ -93,7 +93,7 @@ function activateReleaseAudit(label) {
     assert.equal(recordResolvedSha(sessionId, SHA), true);
     assert.equal(recordReleaseIdentity(sessionId, {
         releaseId: "123",
-        tagName: "v1",
+        tagName: "baseline",
         sourceCommitSha: SHA,
         rootTreeSha: ROOT,
         tagRefSha: TAG_REF,
@@ -151,14 +151,14 @@ async function listReleaseAssets(sessionId, assets) {
             owner: OWNER,
             repo: REPO,
             release_id: "123",
-            tag_name: "v1",
+            tag_name: "baseline",
             source_sha: SHA,
         },
         { sessionId },
         {
             requestRelease: async () => ({
                 id: 123,
-                tag_name: "v1",
+                tag_name: "baseline",
                 assets,
             }),
         },
@@ -228,7 +228,7 @@ test("successfully enumerated zero-assets release may finalize a trusted verdict
     }
 });
 
-test("v5 council finalization rejects legacy Markdown verdict ownership", async () => {
+test("baseline council finalization rejects legacy Markdown verdict ownership", async () => {
     const sessionId = activateUrlAudit("legacy-markdown", "audit_and_safe_build_council");
     try {
         assert.equal((await recordOutcome(sessionId, {
@@ -247,7 +247,7 @@ test("v5 council finalization rejects legacy Markdown verdict ownership", async 
     }
 });
 
-test("v5 council finalization requires the trusted ledger even for incomplete output", async () => {
+test("baseline council finalization requires the trusted ledger even for incomplete output", async () => {
     const invalidSession = activateUrlAudit("missing-ledger", "audit_and_safe_build_council");
     try {
         assert.equal((await recordOutcome(invalidSession, {
@@ -264,7 +264,10 @@ test("v5 council finalization requires the trusted ledger even for incomplete ou
             { sessionId: invalidSession },
         );
         assert.equal(invalid.resultType, "failure");
-        assert.match(invalid.textResultForLlm, /requires the active audit's trusted finding ledger/i);
+        assert.match(
+            invalid.textResultForLlm,
+            /baseline council finalization[\s\S]*trusted finding ledger/i,
+        );
     } finally {
         clearRecordedOutcome(invalidSession);
         deactivateAudit(invalidSession);
@@ -284,7 +287,7 @@ test("deterministic report finalization remains unaffected by council outcome ga
     }
 });
 
-test("packet orchestration records outcomes in every council mode and uses release wrappers", () => {
+test("packet orchestration derives outcomes at finalization and uses release wrappers", () => {
     const source = runHandler(
         {
             url: "https://github.com/octocat/demo/tree/main",
@@ -294,8 +297,9 @@ test("packet orchestration records outcomes in every council mode and uses relea
         { sessionId: session("packet-source") },
     );
     assert.equal(source.resultType, "success");
-    assert.match(source.textResultForLlm, /Step 5c\.5 — Record the immutable council outcome/);
-    assert.match(source.textResultForLlm, /audit_id:\s*runtimeContext\.auditId/);
+    assert.match(source.textResultForLlm, /zerotrust_finalize_assurance_validation/);
+    assert.match(source.textResultForLlm, /const finalizeResult = zerotrust_finalize_report\(\{/);
+    assert.doesNotMatch(source.textResultForLlm, /zerotrust_record_council_outcome\(\{/);
 
     const build = runHandler(
         {
@@ -307,10 +311,15 @@ test("packet orchestration records outcomes in every council mode and uses relea
         { sessionId: session("packet-build") },
     );
     assert.equal(build.resultType, "success");
-    assert.equal(
-        (build.textResultForLlm.match(/zerotrust_record_council_outcome\(\{/g) || []).length,
-        1,
+    const finalizerCall = build.textResultForLlm.indexOf(
+        "const finalizeResult = zerotrust_finalize_report({",
     );
+    const hostExecutionInstructions = build.textResultForLlm.indexOf(
+        "Use `zerotrust_safe_install` for installs",
+        finalizerCall,
+    );
+    assert.ok(finalizerCall >= 0);
+    assert.ok(hostExecutionInstructions > finalizerCall);
 
     const localPath = nodePath.join(SCRATCH, "local-source");
     mkdirSync(localPath, { recursive: true });
@@ -324,12 +333,13 @@ test("packet orchestration records outcomes in every council mode and uses relea
         { sessionId: session("packet-local") },
     );
     assert.equal(local.resultType, "success");
-    assert.match(local.textResultForLlm, /Step 5d — Record the immutable council outcome/);
-    assert.match(local.textResultForLlm, /audit_id:\s*"[0-9a-f-]{36}"/i);
+    assert.match(local.textResultForLlm, /zerotrust_finalize_assurance_validation/);
+    assert.match(local.textResultForLlm, /const finalizeResult = zerotrust_finalize_report\(\{/);
+    assert.doesNotMatch(local.textResultForLlm, /zerotrust_record_council_outcome\(\{/);
 
     const release = runHandler(
         {
-            url: "https://github.com/octocat/demo/releases/tag/v1",
+            url: "https://github.com/octocat/demo/releases/tag/baseline",
             mode: "verify_release",
             build_root: SCRATCH,
         },

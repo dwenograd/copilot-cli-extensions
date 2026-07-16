@@ -1,0 +1,25 @@
+{
+  "schema": "zerotrust-evaluation-expectation",
+  "schema_version": 1,
+  "slug": "clean-prompt-comments-lookalike",
+  "kind": "benign-lookalike",
+  "source": {"type": "local", "path": "fixtures/clean-prompt-comments-lookalike"},
+  "dimensions": {
+    "evasion_classes": ["reviewer-manipulation-and-prompt-injection"],
+    "artifact_classes": ["source-text"],
+    "languages": ["javascript"],
+    "size": "small",
+    "metamorphic_transforms": ["whitespace-comments"]
+  },
+  "expected": {
+    "stage": {"required": ["acquired", "prepared", "scanned", "traced", "validated", "finalized"], "final": "finalized"},
+    "activation_facts": {"required": ["manual-doc-review"], "minimum": 1},
+    "plugin_facts": {"required": ["contributor-guidance-like-comment", "javascript"], "minimum": 2},
+    "counts": {"candidate": 1, "validated": 0, "refuted": 1, "unresolved": 0},
+    "chains": {"required": ["behavior-chain"], "complete_required": [], "forbidden": ["ai-instruction-tool-effect"]},
+    "scores": {"severity": {"min": "low", "max": "low"}, "confidence": {"min": "medium", "max": "medium"}, "project_fit": {"min": "unlikely", "max": "unlikely"}},
+    "tags": {"required": ["benign-lookalike", "prompt-like"], "forbidden": ["file-write"]},
+    "acceptable_blockers": [],
+    "failure_stage": null
+  }
+}

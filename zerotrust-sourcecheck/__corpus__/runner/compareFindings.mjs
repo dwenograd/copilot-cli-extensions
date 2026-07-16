@@ -26,7 +26,7 @@ export const PROJECT_FIT_RANK = Object.freeze({
 function normalizeSeverity(value) {
     const key = String(value || "info").trim().toLowerCase();
     if (key === "informational") return "info";
-    return Object.hasOwn(SEVERITY_RANK, key) ? key : "info";
+    return Object.hasOwn(SEVERITY_RANK, key) ? key: "info";
 }
 
 function severityRank(value) {
@@ -111,11 +111,11 @@ function highOrWorseForbidden(findings, forbiddenTags) {
 }
 
 export function compareFindings({
-    v1Findings = [],
-    v2Findings = [],
+    baselineFindings = [],
+    councilFindings = [],
     expectation = {},
-    v1Verdict = null,
-    v2Verdict = null,
+    baselineVerdict = null,
+    councilVerdict = null,
     councilComplete = true,
     lineTolerance = 5,
     requireEvidenceHash = false,
@@ -123,44 +123,53 @@ export function compareFindings({
     const failures = [];
     const warnings = [];
     const matches = [];
-    const missingV1 = [];
+    const missingBaseline = [];
 
     if (!councilComplete) warnings.push("council incomplete");
-    for (const v1 of v1Findings) {
-        const match = v2Findings.find((v2) =>
-            findingMatches(v1, v2, { lineTolerance, requireEvidenceHash }));
-        if (match) matches.push({ v1, v2: match });
+    for (const baseline of baselineFindings) {
+        const match = councilFindings.find((council) =>
+            findingMatches(baseline, council, { lineTolerance, requireEvidenceHash }));
+        if (match) matches.push({ baseline, council: match });
         else {
-            missingV1.push(v1);
+            missingBaseline.push(baseline);
             failures.push(
-                `missing v1 finding in council report: category ${v1.category || "?"} ${v1.file || "unknown"}`,
+                `missing baseline finding in council report: category ${baseline.category || "?"} ${baseline.file || "unknown"}`,
             );
         }
     }
 
-    const v1Max = normalizeSeverity(v1Verdict || maxSeverity(v1Findings));
-    const v2Max = normalizeSeverity(v2Verdict || maxSeverity(v2Findings));
-    if (severityRank(v2Max) < severityRank(v1Max)) {
-        failures.push(`council severity downgrade: v1=${v1Max} v2=${v2Max}`);
+    const baselineMax = normalizeSeverity(
+        baselineVerdict || maxSeverity(baselineFindings),
+    );
+    const councilMax = normalizeSeverity(councilVerdict || maxSeverity(councilFindings));
+    if (severityRank(councilMax) < severityRank(baselineMax)) {
+        failures.push(
+            `council severity downgrade: baseline=${baselineMax} council=${councilMax}`,
+        );
     }
     const expectedMin = normalizeSeverity(
         expectation.expected_min_verdict || expectation.expectedMinVerdict || "none",
     );
-    if (severityRank(v2Max) < severityRank(expectedMin)) {
-        failures.push(`council verdict below expected minimum: expected ${expectedMin}, got ${v2Max}`);
+    if (severityRank(councilMax) < severityRank(expectedMin)) {
+        failures.push(
+            `council verdict below expected minimum: expected ${expectedMin}, got ${councilMax}`,
+        );
     }
     for (const tag of expectation.required_tags || expectation.requiredTags || []) {
-        if (!tagPresent(v2Findings, tag)) failures.push(`missing required tag: ${tag}`);
+        if (!tagPresent(councilFindings, tag)) failures.push(`missing required tag: ${tag}`);
     }
     const forbiddenHits = highOrWorseForbidden(
-        v2Findings,
+        councilFindings,
         expectation.forbidden_tags || expectation.forbiddenTags || [],
     );
     for (const hit of forbiddenHits) {
         failures.push(`forbidden high-severity tag present: ${hit.category || "?"} ${hit.file || "unknown"}`);
     }
     if (isControl(expectation)) {
-        for (const [label, findings] of [["v1", v1Findings], ["v2", v2Findings]]) {
+        for (const [label, findings] of [
+            ["baseline", baselineFindings],
+            ["council", councilFindings],
+        ]) {
             for (const finding of findings) {
                 if (severityRank(finding.severity) > SEVERITY_RANK.info) {
                     failures.push(
@@ -171,20 +180,19 @@ export function compareFindings({
         }
     }
     const status = warnings.includes("council incomplete") && failures.length === 0
-        ? "INCONCLUSIVE"
-        : failures.length === 0 ? "PASS" : "FAIL";
+        ? "INCONCLUSIVE": failures.length === 0 ? "PASS": "FAIL";
     return {
         passed: status === "PASS",
         status,
         failures,
         warnings,
         matches,
-        missingV1,
+        missingBaseline,
         summary: {
-            v1Count: v1Findings.length,
-            v2Count: v2Findings.length,
-            v1Max,
-            v2Max,
+            baselineCount: baselineFindings.length,
+            councilCount: councilFindings.length,
+            baselineMax,
+            councilMax,
         },
     };
 }
@@ -263,7 +271,7 @@ export function compareEvaluation(actual, expectation) {
         ["confidence", CONFIDENCE_RANK],
         ["project_fit", PROJECT_FIT_RANK],
     ]) {
-        const actualKey = key === "project_fit" ? "projectFit" : key;
+        const actualKey = key === "project_fit" ? "projectFit": key;
         if (!inRange(actual.scores[actualKey], expected.scores[key], ranks)) {
             failures.push(
                 `${key} outside expected range ${expected.scores[key].min}-${expected.scores[key].max}: ${actual.scores[actualKey]}`,
@@ -288,7 +296,7 @@ export function compareEvaluation(actual, expectation) {
         );
     }
 
-    const status = failures.length === 0 ? "PASS" : "FAIL";
+    const status = failures.length === 0 ? "PASS": "FAIL";
     return {
         passed: status === "PASS",
         status,

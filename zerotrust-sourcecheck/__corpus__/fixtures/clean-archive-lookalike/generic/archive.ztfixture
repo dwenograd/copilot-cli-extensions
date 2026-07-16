@@ -1,0 +1,8 @@
+marker.fact("activation-surface","manual-preview","generic");
+marker.fact("inventory-object","documentation-archive","archive");
+marker.node("archive-preview","activation","manual-preview","activation,benign");
+marker.node("archive-docs","dependency","documentation-archive","benign,archive");
+marker.node("archive-output","sink","preview-output","benign,local-output");
+marker.edge("archive-preview-docs","depends-on","archive-preview","archive-docs","benign");
+marker.edge("archive-docs-output","flows-to","archive-docs","archive-output","benign");
+marker.finding("archive-lookalike","refuted","low","medium","unlikely","preview","documentation-archive","local-output","benign,benign-lookalike,archive");

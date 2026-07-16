@@ -10,20 +10,33 @@
 // - Per-fetch byte cap defends against accidental gigabyte-file pulls
 //   (over-ceiling results remain explicit mandatory-coverage gaps).
 
-import { fetchFile } from "./apiClient.mjs";
+import {
+    fetchFile,
+    takeFetchAnalysisBytes,
+} from "./apiClient.mjs";
 import {
     getAcquisitionCoverageState,
     getAnalysisIndexState,
     getAnalysisIndexSnapshot,
     getTreeEnumerationState,
     getTrustedAuditContext,
+    getAssuranceState,
+    advanceAssuranceStage,
     maybeAdvanceAnalysisPrepared,
     mutateAcquisitionCoverageState,
     mutateAnalysisIndexState,
+    recordAssuranceSnapshot,
 } from "../enforcement.mjs";
 import { modeUsesCouncil } from "../modes.mjs";
 import { extractFactsFromText } from "../analysis/extractFacts.mjs";
 import { listIndexedFacts, recordIndexedFile } from "../analysis/indexState.mjs";
+import {
+    EVASIVE_BLOCKERS,
+    applyDerivedArtifactsToSnapshot,
+    buildDerivedArtifacts,
+    buildGitObjectInventory,
+    rebindDerivedArtifactSummary,
+} from "../analysis/index.mjs";
 
 import { DEFAULT_BUILD_ROOT } from "./defaults.mjs";
 import { failure, success } from "./result.mjs";
@@ -69,7 +82,7 @@ export async function safeFetchFileHandler(args, invocation) {
         return failure(`safe_fetch_file refused: active audit is local-source mode (target: ${ctx.localPath}). API-direct file fetch applies to URL-driven audits only. Use \`view\` on a path under ${ctx.localPath} to read a local file.`);
     }
 
-    // v4-r2 round-13 (C-R13-1 high): if sessionId is supplied but no
+    // If sessionId is supplied but no
     // active audit (TTL expired or sourcecheck never invoked), REFUSE.
     // Mirrors the same guard in cloneWrapper.
     if (sessionId && !ctx.hasActiveAudit) {
@@ -80,7 +93,7 @@ export async function safeFetchFileHandler(args, invocation) {
             return failure(`safe_fetch_file refused: owner/repo (${owner}/${repo}) does not match the active audit's pinned target (${ctx.owner}/${ctx.repo}).`);
         }
     }
-    // v4-r2 round-5/round-6 (C-R5-2 + A-R6-2 high): SHA-binding gate.
+    // Bind every fetch to the audit's pinned commit SHA.
     // The audit must have pinned a specific commit SHA before any
     // fetch is allowed — pin happens via safe_list_tree (or safe_clone
     // in build modes). Without this gate, a malicious file in the
@@ -97,17 +110,17 @@ export async function safeFetchFileHandler(args, invocation) {
     }
 
     const coverageScope = args.coverage_scope
-        || (modeUsesCouncil(ctx.mode) ? "council_sample" : "mandatory");
-    const treeState = sessionId ? getTreeEnumerationState(sessionId) : null;
+        || (modeUsesCouncil(ctx.mode) ? "council_sample": "mandatory");
+    const treeState = sessionId ? getTreeEnumerationState(sessionId): null;
+    let enumerated = null;
     if (ctx.hasActiveAudit) {
         if (!treeState?.rootTreeSha) {
             return failure("safe_fetch_file refused: tree-enumeration state is missing. Call zerotrust_safe_list_tree before fetching files.");
         }
         const acquisitionState = getAcquisitionCoverageState(sessionId);
         const enumeratedIndex = acquisitionState?.enumeratedFileIndex?.get(path);
-        const enumerated = Number.isInteger(enumeratedIndex)
-            ? acquisitionState.enumeratedFiles[enumeratedIndex]
-            : null;
+        enumerated = Number.isInteger(enumeratedIndex)
+            ? acquisitionState.enumeratedFiles[enumeratedIndex]: null;
         if (!enumerated) {
             return failure(`safe_fetch_file refused: path was not enumerated as a blob in the pinned commit tree: ${path}`);
         }
@@ -116,13 +129,12 @@ export async function safeFetchFileHandler(args, invocation) {
         ? {
             commitSha: sha.toLowerCase(),
             rootTreeSha: treeState.rootTreeSha,
-            createState: () => {
+            createState:() => {
                 const state = createCoverageState(sha, treeState.rootTreeSha);
                 recordEnumeratedEntries(state, treeState.entries || []);
                 return state;
             },
-        }
-        : null;
+        }: null;
 
     // Optional per-call cap overrides (capped at hardcoded ceilings).
     const HARD_CEILING_BYTES = 50 * 1024 * 1024;     // 50 MB absolute
@@ -134,6 +146,11 @@ export async function safeFetchFileHandler(args, invocation) {
     if (typeof args.max_text_bytes === "number" && Number.isFinite(args.max_text_bytes) && args.max_text_bytes > 0) {
         opts.maxTextBytes = Math.min(args.max_text_bytes, HARD_CEILING_TEXT_INLINE);
     }
+    if (enumerated) {
+        opts.expectedBlobSha = enumerated.sha;
+        opts.expectedSize = enumerated.size;
+        opts.gitMode = enumerated.mode;
+    }
 
     let result;
     const doFetch = invocation?.apiClient?.fetchFile
@@ -141,6 +158,14 @@ export async function safeFetchFileHandler(args, invocation) {
         || fetchFile;
     try {
         result = doFetch(owner, repo, sha, path, opts);
+        if (enumerated && (result.gitMode === null || result.gitMode === undefined)) {
+            result = {
+                ...result,
+                gitMode: enumerated.mode,
+                gitObjectKind: enumerated.objectKind,
+                executable: enumerated.executable === true,
+            };
+        }
     } catch (err) {
         let acquisitionCoverage = null;
         if (coverageMutation) {
@@ -166,8 +191,7 @@ export async function safeFetchFileHandler(args, invocation) {
         return failure(
             `fetch_file failed: ${err.message}`,
             acquisitionCoverage
-                ? { acquisitionCoverage }
-                : {},
+                ? { acquisitionCoverage }: {},
         );
     }
 
@@ -202,6 +226,8 @@ export async function safeFetchFileHandler(args, invocation) {
     let analysisStageState = ctx.analysisStageState;
     let analysisPlugins = ctx.analysisPlugins;
     let behaviorGraph = ctx.behaviorGraph;
+    let assuranceObjectInventory = null;
+    let assuranceDerivedAnalysis = null;
     if (coverageScope === "mandatory") {
         let extraction = { facts: [], overflow: false, lineCount: null };
         const fullyReturnedText = result.classification === "text"
@@ -226,7 +252,7 @@ export async function safeFetchFileHandler(args, invocation) {
                     blobSha: result.blobSha || null,
                     facts: extraction.facts,
                     factsOverflow: extraction.overflow,
-                    lineCount: fullyReturnedText ? extraction.lineCount : null,
+                    lineCount: fullyReturnedText ? extraction.lineCount: null,
                     invisibleUnicodeScanComplete:
                         updated.value.acquisition.invisibleUnicodeScan?.complete === true,
                     invisibleUnicodeMatchCount:
@@ -258,9 +284,41 @@ export async function safeFetchFileHandler(args, invocation) {
     } else if (ctx.hasActiveAudit) {
         const indexState = getAnalysisIndexState(sessionId);
         analysisFacts = indexState
-            ? listIndexedFacts(indexState, { path, limit: 256 }).facts
-            : [];
+            ? listIndexedFacts(indexState, { path, limit: 256 }).facts: [];
         analysisIndex = getAnalysisIndexSnapshot(sessionId);
+    }
+
+    const analysisBytes = takeFetchAnalysisBytes(result);
+    if (ctx.hasActiveAudit) {
+        try {
+            assuranceObjectInventory = persistGitObjectInventory({
+                sessionId,
+                ctx,
+                treeState,
+            });
+        } catch {
+            assuranceObjectInventory = {
+                schemaVersion: 6,
+                complete: false,
+                blockerCodes: [EVASIVE_BLOCKERS.INVENTORY_INCOMPLETE],
+            };
+        }
+        if (analysisBytes) {
+            try {
+                assuranceDerivedAnalysis = persistGitDerivedAnalysis({
+                    sessionId,
+                    ctx,
+                    path,
+                    buffer: analysisBytes,
+                });
+            } catch {
+                assuranceDerivedAnalysis = null;
+            } finally {
+                analysisBytes.fill(0);
+            }
+        }
+    } else if (analysisBytes) {
+        analysisBytes.fill(0);
     }
 
     return success({
@@ -273,5 +331,90 @@ export async function safeFetchFileHandler(args, invocation) {
         analysisStageState,
         analysisPlugins,
         behaviorGraph,
+        assuranceObjectInventory,
+        assuranceDerivedAnalysis,
     });
+}
+
+function persistGitObjectInventory({ sessionId, ctx, treeState }) {
+    let current = getAssuranceState(sessionId, { auditId: ctx.auditId });
+    if (!current || !["acquired", "inventoried"].includes(current.stageState.current)) {
+        return current?.analysisSnapshot
+            ? {
+                schemaVersion: 6,
+                snapshotId: current.analysisSnapshot.snapshotId,
+                stage: current.stageState.current,
+                complete: current.stageState.history.includes("inventoried"),
+                blockerCodes: current.analysisSnapshot.blockerCodes,
+                inventorySha256: current.analysisSnapshot.hashes.inventorySha256,
+                sourceIdentitySha256:
+                    current.analysisSnapshot.hashes.sourceIdentitySha256,
+            }: null;
+    }
+    const acquisitionState = getAcquisitionCoverageState(sessionId);
+    let built = buildGitObjectInventory({
+        auditId: current.auditId,
+        sourceNamespace: current.sourceNamespace,
+        stageState: current.stageState,
+        commitSha: treeState.commitSha,
+        rootTreeSha: treeState.rootTreeSha,
+        treeState,
+        acquisitionState,
+        previousSnapshot: current.analysisSnapshot,
+    });
+    if (built.summary.complete && current.stageState.current === "acquired") {
+        current = advanceAssuranceStage(sessionId, {
+            auditId: current.auditId,
+            from: "acquired",
+            to: "inventoried",
+        });
+        built = buildGitObjectInventory({
+            auditId: current.auditId,
+            sourceNamespace: current.sourceNamespace,
+            stageState: current.stageState,
+            commitSha: treeState.commitSha,
+            rootTreeSha: treeState.rootTreeSha,
+            treeState,
+            acquisitionState,
+            previousSnapshot: built.snapshot,
+        });
+    }
+    recordAssuranceSnapshot(sessionId, {
+        auditId: current.auditId,
+        snapshot: built.snapshot,
+    });
+    return built.summary;
+}
+
+function persistGitDerivedAnalysis({ sessionId, ctx, path, buffer }) {
+    let current = getAssuranceState(sessionId, { auditId: ctx.auditId });
+    if (!current?.analysisSnapshot
+        || !["acquired", "inventoried"].includes(current.stageState.current)) {
+        return null;
+    }
+    const built = buildDerivedArtifacts({
+        snapshot: current.analysisSnapshot,
+        path,
+        buffer,
+    });
+    let snapshot = built.snapshot;
+    let summary = built.summary;
+    if (built.decodeComplete && current.stageState.current === "inventoried") {
+        current = advanceAssuranceStage(sessionId, {
+            auditId: current.auditId,
+            from: "inventoried",
+            to: "decoded",
+        });
+        snapshot = applyDerivedArtifactsToSnapshot({
+            snapshot,
+            artifacts: [],
+            stageState: current.stageState,
+        });
+        summary = rebindDerivedArtifactSummary(summary, snapshot);
+    }
+    recordAssuranceSnapshot(sessionId, {
+        auditId: current.auditId,
+        snapshot,
+    });
+    return summary;
 }

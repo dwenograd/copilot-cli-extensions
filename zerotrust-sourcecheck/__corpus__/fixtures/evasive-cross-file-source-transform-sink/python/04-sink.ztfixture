@@ -1,0 +1,4 @@
+marker.fact("sink-shape","external-send","cross-file");
+marker.node("cross-sink","sink","external-send","external-send,network-write");
+marker.edge("cross-transform-sink","flows-to","cross-transform","cross-sink","external-send");
+marker.finding("cross-file-chain","validated","high","high","strong","send","credential-read","external-target","credential-source,serialize,external-send,cross-file");

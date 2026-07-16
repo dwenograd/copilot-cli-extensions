@@ -1,0 +1,25 @@
+{
+  "schema": "zerotrust-evaluation-expectation",
+  "schema_version": 1,
+  "slug": "evasive-dormant-gates",
+  "kind": "synthetic-risk",
+  "source": {"type": "local", "path": "fixtures/evasive-dormant-gates"},
+  "dimensions": {
+    "evasion_classes": ["environment-time-and-state-gated-activation"],
+    "artifact_classes": ["source-text"],
+    "languages": ["rust"],
+    "size": "medium",
+    "metamorphic_transforms": ["rename", "whitespace-comments"]
+  },
+  "expected": {
+    "stage": {"required": ["acquired", "prepared", "scanned", "traced", "validated", "finalized"], "final": "finalized"},
+    "activation_facts": {"required": ["package-lifecycle", "environment-selector", "time-selector", "platform-selector"], "minimum": 4},
+    "plugin_facts": {"required": ["rust", "environment-gate", "time-gate", "platform-gate"], "minimum": 4},
+    "counts": {"candidate": 1, "validated": 1, "refuted": 0, "unresolved": 0},
+    "chains": {"required": ["behavior-chain"], "complete_required": ["behavior-chain"], "forbidden": []},
+    "scores": {"severity": {"min": "high", "max": "high"}, "confidence": {"min": "high", "max": "high"}, "project_fit": {"min": "strong", "max": "strong"}},
+    "tags": {"required": ["environment-gate", "time-gate", "platform-gate", "dormant"], "forbidden": ["benign"]},
+    "acceptable_blockers": [],
+    "failure_stage": null
+  }
+}

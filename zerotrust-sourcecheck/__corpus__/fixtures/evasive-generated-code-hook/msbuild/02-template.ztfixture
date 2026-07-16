@@ -1,0 +1,3 @@
+marker.fact("generated-input","template-generator","generated-code");
+marker.node("generate-template","transform","template-generator","generated-code,transform");
+marker.edge("generate-start-template","invokes","generate-start","generate-template","generated-code");

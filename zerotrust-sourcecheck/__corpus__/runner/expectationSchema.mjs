@@ -1,7 +1,10 @@
 import nodePath from "node:path";
 
-export const EXPECTATION_SCHEMA = "zerotrust-evaluation-expectation/v1";
-export const EXPECTATION_SCHEMA_VERSION = 1;
+import { EVASION_CLASS_VALUES } from "../../analysis/assurance.mjs";
+import { METAMORPHIC_TRANSFORMS } from "./metamorphicTransforms.mjs";
+
+export const EXPECTATION_SCHEMA = "zerotrust-evaluation-expectation";
+export const EXPECTATION_SCHEMA_REVISION = 1;
 
 export const STAGES = Object.freeze([
     "acquired",
@@ -35,6 +38,40 @@ export const FAILURE_STAGES = Object.freeze([
     "validate",
     "finalize",
 ]);
+export const ARTIFACT_CLASSES = Object.freeze([
+    "source-text",
+    "generated-source",
+    "submodule",
+    "lfs-pointer",
+    "archive",
+    "binary",
+    "release-asset",
+]);
+export const LANGUAGE_CLASSES = Object.freeze([
+    "javascript",
+    "typescript",
+    "json",
+    "jsonc",
+    "python",
+    "powershell",
+    "shell",
+    "c",
+    "cpp",
+    "csharp",
+    "msbuild",
+    "rust",
+    "yaml",
+    "github-actions",
+    "docker",
+    "devcontainer",
+    "cmake",
+    "make",
+    "go",
+    "git",
+    "markdown",
+    "generic",
+]);
+export const SIZE_CLASSES = Object.freeze(["small", "medium", "large"]);
 
 const TOKEN_RE = /^[a-z0-9][a-z0-9._:/@-]{0,127}$/u;
 const SLUG_RE = /^[a-z0-9][a-z0-9._-]{0,127}$/u;
@@ -126,6 +163,69 @@ function source(value, label) {
     return { type: "github", url: value.url };
 }
 
+function allowedTokenList(value, allowed, label) {
+    const normalized = tokenList(value, label);
+    for (const entry of normalized) {
+        if (!allowed.includes(entry)) {
+            throw new TypeError(`${label} contains unsupported value: ${entry}`);
+        }
+    }
+    return normalized;
+}
+
+function dimensions(value, label) {
+    if (value === undefined) {
+        return {
+            evasion_classes: [],
+            artifact_classes: [],
+            languages: [],
+            size: null,
+            known_coverage_blockers: false,
+            metamorphic_transforms: [],
+        };
+    }
+    exactKeys(value, [
+        "evasion_classes",
+        "artifact_classes",
+        "languages",
+        "size",
+    ], [
+        "known_coverage_blockers",
+        "metamorphic_transforms",
+    ], label);
+    if (!SIZE_CLASSES.includes(value.size)) {
+        throw new TypeError(`${label}.size must be small, medium, or large`);
+    }
+    if (Object.hasOwn(value, "known_coverage_blockers")
+        && typeof value.known_coverage_blockers !== "boolean") {
+        throw new TypeError(`${label}.known_coverage_blockers must be boolean`);
+    }
+    return {
+        evasion_classes: allowedTokenList(
+            value.evasion_classes,
+            EVASION_CLASS_VALUES,
+            `${label}.evasion_classes`,
+        ),
+        artifact_classes: allowedTokenList(
+            value.artifact_classes,
+            ARTIFACT_CLASSES,
+            `${label}.artifact_classes`,
+        ),
+        languages: allowedTokenList(
+            value.languages,
+            LANGUAGE_CLASSES,
+            `${label}.languages`,
+        ),
+        size: value.size,
+        known_coverage_blockers: value.known_coverage_blockers === true,
+        metamorphic_transforms: allowedTokenList(
+            value.metamorphic_transforms || [],
+            METAMORPHIC_TRANSFORMS,
+            `${label}.metamorphic_transforms`,
+        ),
+    };
+}
+
 export function validateExpectation(value, label = "expectation") {
     exactKeys(value, [
         "schema",
@@ -134,9 +234,9 @@ export function validateExpectation(value, label = "expectation") {
         "kind",
         "source",
         "expected",
-    ], ["notes"], label);
+    ], ["notes", "dimensions"], label);
     if (value.schema !== EXPECTATION_SCHEMA
-        || value.schema_version !== EXPECTATION_SCHEMA_VERSION) {
+        || value.schema_version !== EXPECTATION_SCHEMA_REVISION) {
         throw new TypeError(`${label} must use ${EXPECTATION_SCHEMA}`);
     }
     const slug = String(value.slug || "").trim().toLowerCase();
@@ -196,10 +296,11 @@ export function validateExpectation(value, label = "expectation") {
 
     return Object.freeze(structuredClone({
         schema: EXPECTATION_SCHEMA,
-        schema_version: EXPECTATION_SCHEMA_VERSION,
+        schema_version: EXPECTATION_SCHEMA_REVISION,
         slug,
         kind: token(value.kind, `${label}.kind`),
         source: normalizedSource,
+        dimensions: dimensions(value.dimensions, `${label}.dimensions`),
         expected: {
             stage: {
                 required: requiredStages,
@@ -266,7 +367,7 @@ export function validateExpectation(value, label = "expectation") {
             ),
             failure_stage: failureStage,
         },
-        ...(typeof value.notes === "string" ? { notes: value.notes.trim() } : {}),
+        ...(typeof value.notes === "string" ? { notes: value.notes.trim() }: {}),
     }));
 }
 
@@ -279,4 +380,6 @@ export const __internals = Object.freeze({
     range,
     factExpectation,
     source,
+    allowedTokenList,
+    dimensions,
 });

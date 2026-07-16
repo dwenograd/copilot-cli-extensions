@@ -6,8 +6,7 @@ import { buildInstructionPacket } from "../packet.mjs";
 import { buildClonePath, buildQuarantinePath, buildReportPath } from "../urlParser.mjs";
 
 const BUILD_ROOT = process.platform === "win32"
-    ? "C:\\test\\zerotrust-sourcecheck"
-    : "/var/zerotrust-sourcecheck";
+    ? "C:\\test\\zerotrust-sourcecheck": "/var/zerotrust-sourcecheck";
 const PLACEHOLDER = "0".repeat(40);
 const CLONE = buildClonePath(BUILD_ROOT, "octocat", "Hello", PLACEHOLDER);
 const REPORT = buildReportPath(BUILD_ROOT, "octocat", "Hello", PLACEHOLDER);
@@ -94,7 +93,7 @@ test("local completion sweeps before idempotent close", () => {
         mode: "audit_local_source",
         target: {
             kind: "local",
-            localPath: process.platform === "win32" ? "C:\\projects\\sample" : "/srv/sample",
+            localPath: process.platform === "win32" ? "C:\\projects\\sample": "/srv/sample",
             slug: "sample",
         },
         focusWrapped: null,
@@ -131,8 +130,14 @@ test("incomplete council outcomes continue to cleanup and close", () => {
         councilSubJudgeModel: "gpt-5.6-sol",
         maxPremiumCalls: 10,
     });
-    assert.match(packet, /ABORT SYNTHESIS[\s\S]*single Section 8 finalizer[\s\S]*Section 9 cleanup/);
-    assert.match(packet, /INCOMPLETE[\s\S]*Section 8 finalizer[\s\S]*zerotrust_close_audit/);
+    const failedRole = packet.indexOf("Retry one malformed role output once");
+    const semanticCoverage = packet.indexOf("Candidate submission is advisory", failedRole);
+    const finalizer = packet.lastIndexOf("zerotrust_finalize_report");
+    const close = packet.lastIndexOf("zerotrust_close_audit");
+    assert.ok(failedRole >= 0);
+    assert.ok(semanticCoverage > failedRole);
+    assert.ok(finalizer > semanticCoverage);
+    assert.ok(close > finalizer);
 });
 
 test("local incomplete council outcomes still reach lifecycle close", () => {
@@ -140,7 +145,7 @@ test("local incomplete council outcomes still reach lifecycle close", () => {
         mode: "audit_local_source_council",
         target: {
             kind: "local",
-            localPath: process.platform === "win32" ? "C:\\projects\\sample" : "/srv/sample",
+            localPath: process.platform === "win32" ? "C:\\projects\\sample": "/srv/sample",
             slug: "sample",
         },
         focusWrapped: null,
@@ -163,6 +168,12 @@ test("local incomplete council outcomes still reach lifecycle close", () => {
         councilSubJudgeModel: "gpt-5.6-sol",
         maxPremiumCalls: 10,
     });
-    assert.match(packet, /abort synthesis[\s\S]*INCOMPLETE — DO NOT TRUST[\s\S]*lifecycle sweep\/close/i);
-    assert.match(packet, /zerotrust_close_audit\(\{\}\)/);
+    const failedRole = packet.indexOf("mark that role FAILED and preserve the coverage limitation");
+    const semanticCoverage = packet.indexOf("Continue into semantic coverage", failedRole);
+    const finalizer = packet.lastIndexOf("zerotrust_finalize_report");
+    const close = packet.lastIndexOf("zerotrust_close_audit");
+    assert.ok(failedRole >= 0);
+    assert.ok(semanticCoverage > failedRole);
+    assert.ok(finalizer > semanticCoverage);
+    assert.ok(close > finalizer);
 });

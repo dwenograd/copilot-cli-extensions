@@ -61,7 +61,7 @@ function treeResult(treeSha, recursive, {
 function releaseIdentity(overrides = {}) {
     return {
         releaseId: "12345",
-        tagName: "v1.2.3",
+        tagName: "baseline.2.3",
         targetCommitish: "main",
         sourceCommitSha: COMMIT,
         rootTreeSha: ROOT,
@@ -89,7 +89,7 @@ function activateUrlAudit(sessionId, overrides = {}) {
 }
 
 test("release URLs distinguish tagged and latest selectors", () => {
-    const tagged = parseGithubUrl("https://github.com/octocat/demo/releases/tag/v1.2.3");
+    const tagged = parseGithubUrl("https://github.com/octocat/demo/releases/tag/baseline.2.3");
     assert.equal(tagged.ok, true);
     assert.equal(tagged.parsed.releaseSelector, "tag");
 
@@ -118,15 +118,15 @@ test("release URL identity cannot be replaced by ref override", () => {
     const latest = runHandler({
         url: "https://github.com/octocat/demo/releases",
         mode: "verify_release",
-        ref: "v1.2.3",
+        ref: "baseline.2.3",
     });
     assert.equal(latest.resultType, "failure");
     assert.match(latest.textResultForLlm, /ref override is not valid/i);
 
     const tagged = runHandler({
-        url: "https://github.com/octocat/demo/releases/tag/v1.2.3",
+        url: "https://github.com/octocat/demo/releases/tag/baseline.2.3",
         mode: "verify_release",
-        ref: "v9.9.9",
+        ref: "release-test",
     });
     assert.equal(tagged.resultType, "failure");
     assert.match(tagged.textResultForLlm, /cannot change.*release identity/i);
@@ -136,11 +136,11 @@ test("latest release resolves its actual lightweight tag and final commit", () =
     const { calls, requestJson } = requestMap({
         "repos/octocat/demo/releases/latest": {
             id: 12345,
-            tag_name: "v1.2.3",
+            tag_name: "baseline.2.3",
             target_commitish: "main",
         },
-        "repos/octocat/demo/git/refs/tags/v1.2.3": {
-            ref: "refs/tags/v1.2.3",
+        "repos/octocat/demo/git/refs/tags/baseline.2.3": {
+            ref: "refs/tags/baseline.2.3",
             object: { type: "commit", sha: COMMIT },
         },
         [`repos/octocat/demo/git/commits/${COMMIT}`]: {
@@ -153,20 +153,20 @@ test("latest release resolves its actual lightweight tag and final commit", () =
     assert.deepEqual(identity, releaseIdentity({ tagRefSha: COMMIT }));
     assert.deepEqual(calls, [
         "repos/octocat/demo/releases/latest",
-        "repos/octocat/demo/git/refs/tags/v1.2.3",
+        "repos/octocat/demo/git/refs/tags/baseline.2.3",
         `repos/octocat/demo/git/commits/${COMMIT}`,
     ]);
 });
 
 test("tagged release peels annotated tags before accepting source commit", () => {
     const { requestJson } = requestMap({
-        "repos/octocat/demo/releases/tags/v1.2.3": {
+        "repos/octocat/demo/releases/tags/baseline.2.3": {
             id: 12345,
-            tag_name: "v1.2.3",
+            tag_name: "baseline.2.3",
             target_commitish: "main",
         },
-        "repos/octocat/demo/git/refs/tags/v1.2.3": {
-            ref: "refs/tags/v1.2.3",
+        "repos/octocat/demo/git/refs/tags/baseline.2.3": {
+            ref: "refs/tags/baseline.2.3",
             object: { type: "tag", sha: TAG_OBJECT },
         },
         [`repos/octocat/demo/git/tags/${TAG_OBJECT}`]: {
@@ -179,7 +179,7 @@ test("tagged release peels annotated tags before accepting source commit", () =>
     });
 
     const identity = resolveReleaseIdentity("octocat", "demo", {
-        requestedTag: "v1.2.3",
+        requestedTag: "baseline.2.3",
         requestJson,
     });
     assert.equal(identity.sourceCommitSha, COMMIT);
@@ -191,14 +191,13 @@ test("tagged release peels annotated tags before accepting source commit", () =>
 
 test("release and tree identity mismatches are rejected", () => {
     const releaseMock = requestMap({
-        "repos/octocat/demo/releases/tags/v1.2.3": {
+        "repos/octocat/demo/releases/tags/baseline.2.3": {
             id: 12345,
-            tag_name: "v9.9.9",
+            tag_name: "release-test",
         },
     });
-    assert.throws(
-        () => resolveReleaseIdentity("octocat", "demo", {
-            requestedTag: "v1.2.3",
+    assert.throws(() => resolveReleaseIdentity("octocat", "demo", {
+            requestedTag: "baseline.2.3",
             requestJson: releaseMock.requestJson,
         }),
         /release tag mismatch/i,
@@ -211,8 +210,7 @@ test("release and tree identity mismatches are rejected", () => {
             tree: [],
         },
     });
-    assert.throws(
-        () => listTreeBySha("octocat", "demo", ROOT, {
+    assert.throws(() => listTreeBySha("octocat", "demo", ROOT, {
             requestJson: treeMock.requestJson,
         }),
         /tree identity mismatch/i,
@@ -229,11 +227,11 @@ test("bare release enumeration binds release, source, state, and artifact paths"
         releaseSelector: "latest",
     });
     const client = {
-        resolveReleaseIdentity: () => releaseIdentity(),
-        resolveRefToSha: () => {
+        resolveReleaseIdentity:() => releaseIdentity(),
+        resolveRefToSha:() => {
             throw new Error("release flow must not resolve HEAD");
         },
-        getCommitIdentity: () => {
+        getCommitIdentity:() => {
             throw new Error("release identity already includes commit/tree");
         },
         listTreeBySha: (_owner, _repo, sha, { recursive }) =>
@@ -251,7 +249,7 @@ test("bare release enumeration binds release, source, state, and artifact paths"
         assert.equal(parsed.sha, COMMIT);
         assert.equal(parsed.rootTreeSha, ROOT);
         assert.equal(parsed.releaseIdentity.releaseId, "12345");
-        assert.equal(parsed.releaseIdentity.tagName, "v1.2.3");
+        assert.equal(parsed.releaseIdentity.tagName, "baseline.2.3");
         assert.equal(parsed.boundContext.reportPath, buildReportPath(BUILD_ROOT, "octocat", "demo", COMMIT));
         assert.equal(parsed.boundContext.quarantinePath, buildQuarantinePath(BUILD_ROOT, "octocat", "demo", COMMIT));
         assert.equal(parsed.coverageComplete, true);
@@ -263,7 +261,7 @@ test("bare release enumeration binds release, source, state, and artifact paths"
         });
         assert.equal(ctx.resolvedSha, COMMIT);
         assert.equal(ctx.releaseIdentity.releaseId, "12345");
-        assert.equal(ctx.releaseIdentity.tagName, "v1.2.3");
+        assert.equal(ctx.releaseIdentity.tagName, "baseline.2.3");
         assert.equal(ctx.rootTreeSha, ROOT);
         assert.equal(ctx.expectedReportPath, buildReportPath(BUILD_ROOT, "octocat", "demo", COMMIT));
     } finally {
@@ -276,9 +274,9 @@ test("subtree traversal validates discovery, merges duplicates, and completes co
     activateUrlAudit(sessionId);
     let treeCalls = 0;
     const client = {
-        resolveRefToSha: () => COMMIT,
-        getCommitIdentity: () => ({ commitSha: COMMIT, rootTreeSha: ROOT }),
-        resolveReleaseIdentity: () => {
+        resolveRefToSha:() => COMMIT,
+        getCommitIdentity:() => ({ commitSha: COMMIT, rootTreeSha: ROOT }),
+        resolveReleaseIdentity:() => {
             throw new Error("not a release");
         },
         listTreeBySha: (_owner, _repo, sha, { recursive }) => {
@@ -361,9 +359,9 @@ test("flat entry-cap truncation exposes blockers and never claims complete cover
     const sessionId = `subtree-flat-${Math.random().toString(36).slice(2)}`;
     activateUrlAudit(sessionId);
     const client = {
-        resolveRefToSha: () => COMMIT,
-        getCommitIdentity: () => ({ commitSha: COMMIT, rootTreeSha: ROOT }),
-        resolveReleaseIdentity: () => {
+        resolveRefToSha:() => COMMIT,
+        getCommitIdentity:() => ({ commitSha: COMMIT, rootTreeSha: ROOT }),
+        resolveReleaseIdentity:() => {
             throw new Error("not a release");
         },
         listTreeBySha: (_owner, _repo, sha, { recursive }) => treeResult(sha, recursive, {

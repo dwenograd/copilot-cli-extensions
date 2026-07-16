@@ -1,0 +1,8 @@
+marker.fact("activation-surface","manual-preview","javascript");
+marker.fact("language","javascript","source-text");
+marker.fact("literal"+"-fragments","display"+"-label","string"+"-split");
+marker.fact("encoded-structure","display-escape","format-transform");
+marker.node("format-start","activation","manual-preview","activation,benign");
+marker.node("format-join","capability","display-format","benign,string-split");
+marker.edge("format-flow","invokes","format-start","format-join","benign");
+marker.finding("format-lookalike","refuted","low","medium","unlikely","format","display-label","preview-output","benign,benign-lookalike,string-split");

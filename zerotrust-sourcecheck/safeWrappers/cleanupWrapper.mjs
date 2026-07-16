@@ -7,7 +7,7 @@
 // Substitutional safety:
 // - Refuses paths outside build_root (containment check).
 // - Refuses clone_path that isn't an immediate child of build_root with the
-//   canonical hashed clone-naming pattern (`zt-v1-<sha256>`). This prevents
+//   canonical hashed clone-naming pattern (`zt-<sha256>`). This prevents
 //   a prompt-injected agent from passing `clone_path: "<build_root>\\_reports"`
 //   and wiping every prior audit's preserved REPORT.md in one call.
 // - Refuses paths whose basename starts with `_` (the meta-dirs convention).
@@ -39,7 +39,7 @@ function pathIsUnder(parent, child) {
 function pathsEqual(left, right) {
     const a = nodePath.resolve(left);
     const b = nodePath.resolve(right);
-    return process.platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b;
+    return process.platform === "win32" ? a.toLowerCase() === b.toLowerCase(): a === b;
 }
 
 function safeRemove(p) {
@@ -110,7 +110,7 @@ export async function cleanupAuditHandler(args, invocation, dependencies = {}) {
         return failure(`clone_path basename starts with '_' (reserved for meta-dirs like _reports/_quarantine); refusing to delete`);
     }
     if (!CLONE_NAME_RE.test(cloneBase)) {
-        return failure(`clone_path basename ${JSON.stringify(cloneBase)} does not match canonical clone-naming pattern zt-v1-<sha256>; refusing to delete`);
+        return failure(`clone_path basename ${JSON.stringify(cloneBase)} does not match canonical clone-naming pattern zt-<sha256>; refusing to delete`);
     }
 
     if (!pathsEqual(args.clone_path, ctx.resolvedClonePath)) {
@@ -178,10 +178,9 @@ export async function cleanupAuditHandler(args, invocation, dependencies = {}) {
         report: reportResult,
         quarantine: quarantineResult,
         auditStillActive: ctx.hasActiveAudit,
-        keptReportPath: alsoDeleteReport ? null : (existsSync(reportDir) ? reportDir : null),
+        keptReportPath: alsoDeleteReport ? null: (existsSync(reportDir) ? reportDir: null),
         keptReportArtifacts: alsoDeleteReport || !existsSync(reportDir)
-            ? []
-            : ["REPORT.md", "FINDINGS.json"]
+            ? []: ["REPORT.md", "FINDINGS.json"]
                 .map((name) => nodePath.join(reportDir, name))
                 .filter((path) => existsSync(path)),
         metadataCachePreserved: true,

@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 
 import {
-    ANALYSIS_SCHEMA_VERSION,
+    ANALYSIS_SCHEMA_REVISION,
     GRAPH_EDGE_KINDS,
     GRAPH_NODE_KINDS,
     LIMITS,
@@ -23,9 +23,9 @@ export const REMEDIATION_LIMITS = Object.freeze({
 
 const SHA256_RE = /^[a-f0-9]{64}$/u;
 const BLOB_SHA_RE = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/u;
-const REMEDIATION_ID_RE = /^ztr-v5-[a-f0-9]{64}$/u;
-const GUIDANCE_ID_RE = /^ztri-v5-[a-f0-9]{64}$/u;
-const PLAN_ID_RE = /^ztrp-v5-[a-f0-9]{64}$/u;
+const REMEDIATION_ID_RE = /^ztr-baseline-[a-f0-9]{64}$/u;
+const GUIDANCE_ID_RE = /^ztri-baseline-[a-f0-9]{64}$/u;
+const PLAN_ID_RE = /^ztrp-baseline-[a-f0-9]{64}$/u;
 const RISK_LEVELS = Object.freeze(["low", "medium", "high"]);
 const RISK_CODES = Object.freeze([
     "single-purpose-edge",
@@ -344,10 +344,8 @@ function riskForTarget(option) {
     if (riskCodes.length === 0) riskCodes.push("single-purpose-edge");
     return {
         level: sharedComplete.length > 0
-            ? "high"
-            : sharedUnresolved.length > 0 || option.edgeIds.length > 1
-                ? "medium"
-                : "low",
+            ? "high": sharedUnresolved.length > 0 || option.edgeIds.length > 1
+                ? "medium": "low",
         riskCodes: unique(riskCodes),
         sharedChainIds: unique([...sharedComplete, ...sharedUnresolved])
             .slice(0, REMEDIATION_LIMITS.sharedChainIds),
@@ -407,10 +405,8 @@ function createCandidate({
     const alternateChainIds = unique(target.remaining.map((chain) => chain.id))
         .slice(0, REMEDIATION_LIMITS.alternateChainIds);
     const outcome = incomplete
-        ? "graph-incomplete"
-        : alternateChainIds.length > 0
-            ? "alternate-path-remains"
-            : "breaks-all-known-chains";
+        ? "graph-incomplete": alternateChainIds.length > 0
+            ? "alternate-path-remains": "breaks-all-known-chains";
     const risk = riskForTarget(target);
     const expectedBehaviorRemoved = {
         chainIds: unique(relevantChains
@@ -422,7 +418,7 @@ function createCandidate({
         toKind: primaryChain.steps?.[target.index + 1]?.kind,
         effectKinds: unique(primaryChain.effectKinds || []),
         behaviorIntentHash: digest(
-            "zerotrust-remediation-behavior-intent-v5",
+            "zerotrust-remediation-behavior-intent-baseline",
             canonicalFinding.signature || {
                 canonicalFindingId: canonicalFinding.canonicalId,
             },
@@ -434,12 +430,12 @@ function createCandidate({
         edgeIds: target.edgeIds,
         linkKind: target.link.kind,
         evidence: targetEvidence,
-        locationHash: digest("zerotrust-remediation-locations-v5", targetEvidence),
+        locationHash: digest("zerotrust-remediation-locations-baseline", targetEvidence),
     };
     const staticVerification = {
-        graphCoverage: incomplete ? "incomplete" : "complete",
+        graphCoverage: incomplete ? "incomplete": "complete",
         outcome,
-        maliciousChainRemains: incomplete ? null : alternateChainIds.length > 0,
+        maliciousChainRemains: incomplete ? null: alternateChainIds.length > 0,
         fixClaimAllowed: outcome === "breaks-all-known-chains",
         alternateChainIds,
         criteriaCodes: unique(VERIFICATION_CRITERIA),
@@ -450,7 +446,7 @@ function createCandidate({
         sharedChainIds: risk.sharedChainIds,
     };
     const candidateWithoutIdentity = {
-        schemaVersion: ANALYSIS_SCHEMA_VERSION,
+        schemaVersion: ANALYSIS_SCHEMA_REVISION,
         auditId,
         canonicalFindingId: canonicalFinding.canonicalId,
         sourceFindingIds: canonicalFinding.sourceFindingIds,
@@ -460,7 +456,7 @@ function createCandidate({
         staticVerification,
     };
     const intentHash = digest(
-        "zerotrust-remediation-intent-v5",
+        "zerotrust-remediation-intent-baseline",
         {
             canonicalFindingId: candidateWithoutIdentity.canonicalFindingId,
             target: targetMetadata,
@@ -471,7 +467,7 @@ function createCandidate({
             },
         },
     );
-    const id = `ztr-v5-${digest("zerotrust-remediation-candidate-v5", {
+    const id = `ztr-baseline-${digest("zerotrust-remediation-candidate-baseline", {
         ...candidateWithoutIdentity,
         intentHash,
     })}`;
@@ -491,19 +487,19 @@ function createGuidance(auditId, canonicalFinding) {
         "investigationGuidance.evidence",
     );
     const guidanceWithoutIdentity = {
-        schemaVersion: ANALYSIS_SCHEMA_VERSION,
+        schemaVersion: ANALYSIS_SCHEMA_REVISION,
         auditId,
         canonicalFindingId: canonicalFinding.canonicalId,
         sourceFindingIds: canonicalFinding.sourceFindingIds,
         evidence,
         guidanceCodes: unique(GUIDANCE_CODES),
         confidentPatchAllowed: false,
-        locationHash: digest("zerotrust-remediation-guidance-locations-v5", evidence),
+        locationHash: digest("zerotrust-remediation-guidance-locations-baseline", evidence),
     };
     return Object.freeze({
         ...guidanceWithoutIdentity,
-        id: `ztri-v5-${digest(
-            "zerotrust-remediation-investigation-guidance-v5",
+        id: `ztri-baseline-${digest(
+            "zerotrust-remediation-investigation-guidance-baseline",
             guidanceWithoutIdentity,
         )}`,
     });
@@ -572,7 +568,7 @@ export function generateRemediationPlan({
     const boundedCandidates = candidates.slice(0, REMEDIATION_LIMITS.candidates);
     const boundedGuidance = investigationGuidance.slice(0, REMEDIATION_LIMITS.guidance);
     const boundedBlockers = blockers.slice(0, REMEDIATION_LIMITS.blockers);
-    const inputFingerprint = digest("zerotrust-remediation-input-v5", {
+    const inputFingerprint = digest("zerotrust-remediation-input-baseline", {
         auditId: normalizedAuditId,
         decisionId: decisionSnapshot.decisionId || null,
         traceInputFingerprint: traceSnapshot.inputFingerprint || null,
@@ -588,7 +584,7 @@ export function generateRemediationPlan({
         traceTruncation: traceSnapshot.truncation || {},
     });
     const planWithoutId = {
-        schemaVersion: ANALYSIS_SCHEMA_VERSION,
+        schemaVersion: ANALYSIS_SCHEMA_REVISION,
         auditId: normalizedAuditId,
         inputFingerprint,
         coverageComplete: traceSnapshot.coverageComplete === true
@@ -602,7 +598,7 @@ export function generateRemediationPlan({
     };
     return validateRemediationPlan({
         ...planWithoutId,
-        id: `ztrp-v5-${digest("zerotrust-remediation-plan-v5", planWithoutId)}`,
+        id: `ztrp-baseline-${digest("zerotrust-remediation-plan-baseline", planWithoutId)}`,
     });
 }
 
@@ -619,8 +615,8 @@ export function validateRemediationCandidate(value, label = "remediationCandidat
         "staticVerification",
         "intentHash",
     ], [], label);
-    if (value.schemaVersion !== ANALYSIS_SCHEMA_VERSION) {
-        throw new TypeError(`${label}.schemaVersion must equal ${ANALYSIS_SCHEMA_VERSION}`);
+    if (value.schemaVersion !== ANALYSIS_SCHEMA_REVISION) {
+        throw new TypeError(`${label}.schemaVersion must equal ${ANALYSIS_SCHEMA_REVISION}`);
     }
     exactObject(value.target, [
         "strategy",
@@ -656,11 +652,10 @@ export function validateRemediationCandidate(value, label = "remediationCandidat
     ], [], `${label}.staticVerification`);
 
     const normalized = {
-        schemaVersion: ANALYSIS_SCHEMA_VERSION,
+        schemaVersion: ANALYSIS_SCHEMA_REVISION,
         auditId: validateAuditId(value.auditId, `${label}.auditId`),
         id: typeof value.id === "string" && REMEDIATION_ID_RE.test(value.id)
-            ? value.id
-            : (() => { throw new TypeError(`${label}.id is invalid`); })(),
+            ? value.id: (() => { throw new TypeError(`${label}.id is invalid`); }),
         canonicalFindingId: validateIdentifier(
             value.canonicalFindingId,
             `${label}.canonicalFindingId`,
@@ -794,7 +789,7 @@ export function validateRemediationCandidate(value, label = "remediationCandidat
         throw new TypeError(`${label}.staticVerification criteria are incomplete`);
     }
     const expectedLocationHash = digest(
-        "zerotrust-remediation-locations-v5",
+        "zerotrust-remediation-locations-baseline",
         normalized.target.evidence,
     );
     if (normalized.target.locationHash !== expectedLocationHash) {
@@ -823,7 +818,7 @@ export function validateRemediationCandidate(value, label = "remediationCandidat
             throw new TypeError(`${label}.staticVerification fixed claim is inconsistent`);
         }
     }
-    const expectedIntentHash = digest("zerotrust-remediation-intent-v5", {
+    const expectedIntentHash = digest("zerotrust-remediation-intent-baseline", {
         canonicalFindingId: normalized.canonicalFindingId,
         target: normalized.target,
         expectedBehaviorRemoved: normalized.expectedBehaviorRemoved,
@@ -835,7 +830,7 @@ export function validateRemediationCandidate(value, label = "remediationCandidat
     if (normalized.intentHash !== expectedIntentHash) {
         throw new TypeError(`${label}.intentHash does not match candidate intent`);
     }
-    const expectedId = `ztr-v5-${digest("zerotrust-remediation-candidate-v5", {
+    const expectedId = `ztr-baseline-${digest("zerotrust-remediation-candidate-baseline", {
         schemaVersion: normalized.schemaVersion,
         auditId: normalized.auditId,
         canonicalFindingId: normalized.canonicalFindingId,
@@ -864,15 +859,14 @@ export function validateInvestigationGuidance(value, label = "investigationGuida
         "confidentPatchAllowed",
         "locationHash",
     ], [], label);
-    if (value.schemaVersion !== ANALYSIS_SCHEMA_VERSION) {
-        throw new TypeError(`${label}.schemaVersion must equal ${ANALYSIS_SCHEMA_VERSION}`);
+    if (value.schemaVersion !== ANALYSIS_SCHEMA_REVISION) {
+        throw new TypeError(`${label}.schemaVersion must equal ${ANALYSIS_SCHEMA_REVISION}`);
     }
     const normalized = {
-        schemaVersion: ANALYSIS_SCHEMA_VERSION,
+        schemaVersion: ANALYSIS_SCHEMA_REVISION,
         auditId: validateAuditId(value.auditId, `${label}.auditId`),
         id: typeof value.id === "string" && GUIDANCE_ID_RE.test(value.id)
-            ? value.id
-            : (() => { throw new TypeError(`${label}.id is invalid`); })(),
+            ? value.id: (() => { throw new TypeError(`${label}.id is invalid`); }),
         canonicalFindingId: validateIdentifier(
             value.canonicalFindingId,
             `${label}.canonicalFindingId`,
@@ -902,13 +896,13 @@ export function validateInvestigationGuidance(value, label = "investigationGuida
         throw new TypeError(`${label} must contain evidence locations and guidance criteria`);
     }
     if (normalized.locationHash !== digest(
-        "zerotrust-remediation-guidance-locations-v5",
+        "zerotrust-remediation-guidance-locations-baseline",
         normalized.evidence,
     )) {
         throw new TypeError(`${label}.locationHash does not match evidence locations`);
     }
-    const expectedId = `ztri-v5-${digest(
-        "zerotrust-remediation-investigation-guidance-v5",
+    const expectedId = `ztri-baseline-${digest(
+        "zerotrust-remediation-investigation-guidance-baseline",
         {
             schemaVersion: normalized.schemaVersion,
             auditId: normalized.auditId,
@@ -938,8 +932,8 @@ export function validateRemediationPlan(value, label = "remediationPlan") {
         "truncation",
         "blockers",
     ], [], label);
-    if (value.schemaVersion !== ANALYSIS_SCHEMA_VERSION) {
-        throw new TypeError(`${label}.schemaVersion must equal ${ANALYSIS_SCHEMA_VERSION}`);
+    if (value.schemaVersion !== ANALYSIS_SCHEMA_REVISION) {
+        throw new TypeError(`${label}.schemaVersion must equal ${ANALYSIS_SCHEMA_REVISION}`);
     }
     const auditId = validateAuditId(value.auditId, `${label}.auditId`);
     const candidates = boundedEntries(
@@ -1044,11 +1038,10 @@ export function validateRemediationPlan(value, label = "remediationPlan") {
         return Object.freeze(normalized);
     });
     const normalized = {
-        schemaVersion: ANALYSIS_SCHEMA_VERSION,
+        schemaVersion: ANALYSIS_SCHEMA_REVISION,
         auditId,
         id: typeof value.id === "string" && PLAN_ID_RE.test(value.id)
-            ? value.id
-            : (() => { throw new TypeError(`${label}.id is invalid`); })(),
+            ? value.id: (() => { throw new TypeError(`${label}.id is invalid`); }),
         inputFingerprint: hashValue(value.inputFingerprint, `${label}.inputFingerprint`),
         coverageComplete: booleanValue(value.coverageComplete, `${label}.coverageComplete`),
         candidates: Object.freeze(candidates),
@@ -1065,7 +1058,7 @@ export function validateRemediationPlan(value, label = "remediationPlan") {
                 candidate.staticVerification.graphCoverage !== "complete"))) {
         throw new TypeError(`${label}.coverageComplete cannot ignore remediation blockers`);
     }
-    const expectedId = `ztrp-v5-${digest("zerotrust-remediation-plan-v5", {
+    const expectedId = `ztrp-baseline-${digest("zerotrust-remediation-plan-baseline", {
         schemaVersion: normalized.schemaVersion,
         auditId: normalized.auditId,
         inputFingerprint: normalized.inputFingerprint,

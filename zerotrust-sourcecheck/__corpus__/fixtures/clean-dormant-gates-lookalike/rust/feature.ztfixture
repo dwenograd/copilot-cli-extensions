@@ -1,0 +1,9 @@
+marker.fact("activation-surface","manual-preview","rust");
+marker.fact("language","rust","source-text");
+marker.fact("feature-gate","environment-selector","display-choice");
+marker.fact("feature-gate","time-selector","display-window");
+marker.fact("feature-gate","platform-selector","display-layout");
+marker.node("feature-start","activation","manual-preview","activation,benign");
+marker.node("feature-select","capability","display-choice","benign,environment-gate,time-gate,platform-gate");
+marker.edge("feature-flow","guards","feature-start","feature-select","benign");
+marker.finding("feature-lookalike","refuted","low","medium","unlikely","select","display-choice","preview-output","benign,benign-lookalike,environment-gate,time-gate,platform-gate");

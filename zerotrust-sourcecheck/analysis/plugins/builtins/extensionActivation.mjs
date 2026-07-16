@@ -29,11 +29,9 @@ export default defineRulePlugin({
         fact,
         key: `extension:${fact.name}:${fact.value || ""}`,
         activationLabel: fact.name === "activation-event"
-            ? `VS Code activation event: ${fact.value}`
-            : `Extension activation surface: ${fact.name}`,
+            ? `VS Code activation event: ${fact.value}`: `Extension activation surface: ${fact.name}`,
         targetLabel: fact.name === "contributed-command"
-            ? `Contributed command: ${fact.value}`
-            : "Extension runtime entry surface",
+            ? `Contributed command: ${fact.value}`: "Extension runtime entry surface",
         edgeKind: "activates",
         tags: ["browser-extension", "vscode-extension", "activation"],
     }),

@@ -1,0 +1,3 @@
+marker.fact("dormant-gate","environment-selector","environment-gate");
+marker.node("gate-environment","trigger","environment-gate","environment-gate,dormant");
+marker.edge("gate-start-environment","guards","gate-start","gate-environment","environment-gate");

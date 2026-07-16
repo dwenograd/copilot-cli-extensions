@@ -21,7 +21,7 @@ export default defineRulePlugin({
         key: `native-build:${fact.path}:${fact.kind}:${fact.name}`,
         activationLabel: `CMake/Make build surface: ${fact.name}`,
         targetLabel: `Native build recipe capability: ${fact.value || fact.name}`,
-        edgeKind: fact.kind === "import" ? "depends-on" : "invokes",
+        edgeKind: fact.kind === "import" ? "depends-on": "invokes",
         tags: ["cmake", "make", "native-build"],
     }),
     detectedWarning: (count) =>

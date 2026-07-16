@@ -1,0 +1,8 @@
+marker.fact("activation-surface","manual-preview","git");
+marker.fact("inventory-object","lfs-pointer","binary");
+marker.node("lfs-preview","activation","manual-preview","activation,benign");
+marker.node("lfs-data","dependency","lfs-data-asset","benign,lfs-pointer");
+marker.node("lfs-preview-output","sink","preview-output","benign,local-output");
+marker.edge("lfs-preview-data","depends-on","lfs-preview","lfs-data","benign");
+marker.edge("lfs-data-output","flows-to","lfs-data","lfs-preview-output","benign");
+marker.finding("lfs-lookalike","refuted","low","medium","unlikely","preview","lfs-data-asset","local-output","benign,benign-lookalike,lfs-pointer");

@@ -1,5 +1,5 @@
 import {
-    ANALYSIS_SCHEMA_VERSION,
+    ANALYSIS_SCHEMA_REVISION,
     LIMITS,
     validateAuditId,
     validateCandidateFinding,
@@ -130,7 +130,7 @@ export class FindingLedger {
 
     getFinding(findingId) {
         const finding = this.#findings.get(findingId);
-        return finding ? clone(finding) : null;
+        return finding ? clone(finding): null;
     }
 
     listFindings({ state } = {}) {
@@ -195,12 +195,12 @@ export class FindingLedger {
     }
 
     getRemediationPlan() {
-        return this.#remediation ? clone(this.#remediation) : null;
+        return this.#remediation ? clone(this.#remediation): null;
     }
 
     toDocument() {
         return Object.freeze({
-            schemaVersion: ANALYSIS_SCHEMA_VERSION,
+            schemaVersion: ANALYSIS_SCHEMA_REVISION,
             auditId: this.#auditId,
             findings: Object.freeze(this.listFindings()),
             validationDecisions: Object.freeze(this.listDecisions()),

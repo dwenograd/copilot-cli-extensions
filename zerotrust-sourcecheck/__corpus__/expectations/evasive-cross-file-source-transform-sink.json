@@ -1,0 +1,25 @@
+{
+  "schema": "zerotrust-evaluation-expectation",
+  "schema_version": 1,
+  "slug": "evasive-cross-file-source-transform-sink",
+  "kind": "synthetic-risk",
+  "source": {"type": "local", "path": "fixtures/evasive-cross-file-source-transform-sink"},
+  "dimensions": {
+    "evasion_classes": ["indirection-reflection-and-data-driven-execution", "cross-language-and-build-graph-indirection"],
+    "artifact_classes": ["source-text"],
+    "languages": ["python"],
+    "size": "medium",
+    "metamorphic_transforms": ["rename", "whitespace-comments", "file-relocation"]
+  },
+  "expected": {
+    "stage": {"required": ["acquired", "prepared", "scanned", "traced", "validated", "finalized"], "final": "finalized"},
+    "activation_facts": {"required": ["scheduled-job"], "minimum": 1},
+    "plugin_facts": {"required": ["python", "credential-like-source", "serialize-transform", "external-send"], "minimum": 4},
+    "counts": {"candidate": 1, "validated": 1, "refuted": 0, "unresolved": 0},
+    "chains": {"required": ["credential-read-transform-send"], "complete_required": ["credential-read-transform-send"], "forbidden": []},
+    "scores": {"severity": {"min": "high", "max": "high"}, "confidence": {"min": "high", "max": "high"}, "project_fit": {"min": "strong", "max": "strong"}},
+    "tags": {"required": ["credential-source", "serialize", "external-send", "cross-file"], "forbidden": ["benign"]},
+    "acceptable_blockers": [],
+    "failure_stage": null
+  }
+}

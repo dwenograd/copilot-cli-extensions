@@ -34,7 +34,7 @@ function hashEvidence(text) {
 function normalizeSeverity(severity) {
     if (!severity) return "info";
     const value = String(severity).toLowerCase();
-    return value === "informational" ? "info" : value;
+    return value === "informational" ? "info": value;
 }
 
 function parseTags(block) {
@@ -53,8 +53,8 @@ function parseFileAndLine(block) {
     const pathToken = field || PATH_TOKEN_RE.exec(block);
     const lineMatch = LINE_RE.exec(block);
     return {
-        file: pathToken ? pathToken[1] : null,
-        line: lineMatch ? Number(lineMatch[1]) : null,
+        file: pathToken ? pathToken[1]: null,
+        line: lineMatch ? Number(lineMatch[1]): null,
     };
 }
 
@@ -162,12 +162,12 @@ function candidateCount(document, stateCounts) {
     }
     const submissions = document.coverage?.council?.submissions || [];
     const submitted = submissions.reduce((total, entry) =>
-        total + (Number.isSafeInteger(entry.candidateCount) ? entry.candidateCount : 0), 0);
+        total + (Number.isSafeInteger(entry.candidateCount) ? entry.candidateCount: 0), 0);
     if (submitted > 0) return submitted;
     const required = document.coverage?.validation?.requiredFindingIds;
     if (Array.isArray(required)) return required.length;
     return Object.values(stateCounts).reduce((total, value) =>
-        total + (Number.isSafeInteger(value) ? value : 0), 0);
+        total + (Number.isSafeInteger(value) ? value: 0), 0);
 }
 
 function blockerToken(blocker) {
@@ -186,7 +186,7 @@ function inferFailureStage(finalStage) {
 
 function maximum(values, order, fallback) {
     return values.reduce((best, value) =>
-        order.indexOf(value) > order.indexOf(best) ? value : best, fallback);
+        order.indexOf(value) > order.indexOf(best) ? value: best, fallback);
 }
 
 export function parseFindingsJson(document, { source = "FINDINGS.json" } = {}) {
@@ -237,11 +237,14 @@ export function parseFindingsJson(document, { source = "FINDINGS.json" } = {}) {
         unresolved: Number(document.evaluation?.counts?.unresolved ?? stateCounts.unresolved),
     };
     return Object.freeze({
-        sourceFormat: isArtifact ? "findings-json" : "decision-snapshot",
+        sourceFormat: isArtifact ? "findings-json": "decision-snapshot",
         source,
         findings,
         verdict: document.verdict?.value
             || document.overallVerdictEligibility?.recommendedVerdict
+            || null,
+        assuranceLevel: document.assurance?.level
+            || document.evaluation?.assuranceLevel
             || null,
         stage: {
             completed: unique(stages),
@@ -291,8 +294,8 @@ function legacySnapshot(markdown, { source }) {
         source,
         findings,
         verdict: /\bno\s+red\s+flags\s+found\b/iu.test(markdown)
-            ? "no red flags found"
-            : null,
+            ? "no red flags found": null,
+        assuranceLevel: null,
         stage: { completed: [], final: null },
         activationFacts: [],
         pluginFacts: [],
@@ -331,14 +334,13 @@ export function parseAuditArtifacts({
     }
     if (findingsJson) {
         const document = typeof findingsJson === "string"
-            ? JSON.parse(findingsJson)
-            : findingsJson;
+            ? JSON.parse(findingsJson): findingsJson;
         return parseFindingsJson(document, {
             source: findingsPath || "FINDINGS.json",
         });
     }
     const inferredFindingsPath = findingsPath
-        || (reportPath ? nodePath.join(nodePath.dirname(reportPath), "FINDINGS.json") : null);
+        || (reportPath ? nodePath.join(nodePath.dirname(reportPath), "FINDINGS.json"): null);
     if (inferredFindingsPath && existsSync(inferredFindingsPath)) {
         return parseFindingsJson(
             JSON.parse(readFileSync(inferredFindingsPath, "utf8")),
@@ -346,7 +348,7 @@ export function parseAuditArtifacts({
         );
     }
     const markdown = reportMarkdown
-        ?? (reportPath && existsSync(reportPath) ? readFileSync(reportPath, "utf8") : null);
+        ?? (reportPath && existsSync(reportPath) ? readFileSync(reportPath, "utf8"): null);
     if (markdown === null) {
         throw new Error("no FINDINGS.json or REPORT.md artifact was available");
     }

@@ -1,0 +1,9 @@
+marker.fact("activation-surface","startup-load","generic");
+marker.fact("inventory-object","prebuilt-binary","binary");
+marker.node("binary-start","activation","startup-load","activation,startup");
+marker.node("binary-object","dependency","prebuilt-binary","binary,binary-artifact");
+marker.node("binary-effect","sink","runtime-load","runtime-load");
+marker.edge("binary-start-object","depends-on","binary-start","binary-object","binary");
+marker.edge("binary-object-effect","flows-to","binary-object","binary-effect","runtime-load");
+marker.finding("binary-chain","validated","high","high","likely","load","prebuilt-binary","runtime-effect","binary,binary-artifact,runtime-load");
+marker.blocker("prepare","inventory-binary-unsupported");

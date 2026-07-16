@@ -1,0 +1,38 @@
+{
+  "$id": "zerotrust-evaluation-expectation",
+  "title": "Zero Trust source-check evaluation expectation",
+  "type": "object",
+  "required": [
+    "schema",
+    "schema_version",
+    "slug",
+    "kind",
+    "source",
+    "expected"
+  ],
+  "properties": {
+    "schema": {
+      "const": "zerotrust-evaluation-expectation"
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "slug": {
+      "type": "string"
+    },
+    "kind": {
+      "type": "string"
+    },
+    "source": {
+      "type": "object"
+    },
+    "dimensions": {
+      "type": "object",
+      "description": "Optional corpus grouping metadata for dimension metrics."
+    },
+    "expected": {
+      "type": "object"
+    }
+  },
+  "additionalProperties": false
+}

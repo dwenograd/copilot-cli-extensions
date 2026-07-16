@@ -1,0 +1,3 @@
+marker.node("alternate-external","sink","external-send","external-send,network-write");
+marker.edge("alternate-transform-external","flows-to","alternate-transform","alternate-external","external-send");
+marker.finding("alternate-malicious-path","validated","high","high","strong","send","credential-read","external-target","alternate-path,decoy-path,credential-source,serialize,external-send");

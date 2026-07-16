@@ -2,7 +2,7 @@
 //
 // Stable public assembly surface for zerotrust-sourcecheck instruction packets.
 // Stage renderers live under packet/ and remain pure/testable; this module only
-// selects local vs URL assembly and preserves the historical exports.
+// selects local vs URL assembly and exposes the current packet helpers.
 
 import {
     modeIsBuild,
@@ -16,11 +16,11 @@ import {
     modeUsesLocalSource,
 } from "./modes.mjs";
 import { renderAcquisitionStage, HARDENED_CLONE_FLAGS, HARDENED_CLONE_TAIL } from "./packet/acquisition.mjs";
+import { renderCurrentAssuranceStage } from "./packet/assurance.mjs";
 import { renderFinalizeReportLifecycleStage } from "./packet/finalize.mjs";
 import { buildLocalSourcePacket } from "./packet/local.mjs";
 import { createUrlPacketContext, renderPrepareStage } from "./packet/prepare.mjs";
 import { renderScanCouncilStage } from "./packet/scan.mjs";
-import { renderRemediationBlock } from "./packet/shared.mjs";
 
 export {
     mapOverallVerdict,
@@ -28,6 +28,14 @@ export {
     scoreInvisibleUnicode,
     validateFindingContract,
 } from "./packet/shared.mjs";
+export {
+    SEMANTIC_COVERAGE_WIRING_STATUS,
+    renderSemanticCoverageScaffold,
+} from "./packet/semanticCoverage.mjs";
+export {
+    RED_TEAM_WIRING_STATUS,
+    renderRedTeamScaffold,
+} from "./packet/redTeam.mjs";
 
 export function buildInstructionPacket(args) {
     const { target } = args;
@@ -42,6 +50,7 @@ export function buildInstructionPacket(args) {
     return renderPrepareStage(context)
         + renderAcquisitionStage(context)
         + renderScanCouncilStage(context)
+        + renderCurrentAssuranceStage(context)
         + renderFinalizeReportLifecycleStage(context);
 }
 
@@ -57,6 +66,5 @@ export const __internals = {
     modeIsCouncilBuild,
     modeUsesApiDirect,
     modeUsesLocalSource,
-    renderRemediationBlock,
     buildLocalSourcePacket,
 };
